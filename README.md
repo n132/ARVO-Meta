@@ -2,7 +2,7 @@
 
 The code to generate the ARVO dataset will be published soon. The generated dataset and related metadata are updated in this repository. Each report file represents one found vulnerability on OSS-Fuzz.
 
-# tl;dr
+# TL;DR
 
 Run the following command to feed the proof-of-concept (POC) to a vulnerability found on [this page][3]. You should see an ASAN report for a heap overflow bug.
 

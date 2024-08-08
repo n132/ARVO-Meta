@@ -38,6 +38,9 @@ arvo compile
 # Run this command inside the Docker container
 arvo
 ```
+# Patches
+
+In the [patches][5] folder, we present the patches ARVO located.
 
 # Bug Report
 
@@ -49,3 +52,4 @@ If you find any cases that are not reproducible, please open an issue for the ca
 [2]: https://hub.docker.com/repository/docker/n132/arvo/general
 [3]: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25402&q=25402&can=2
 [4]: https://x.com/moyix/status/1788943761352888777
+[5]: ./patches

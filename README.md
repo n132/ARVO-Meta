@@ -2,7 +2,7 @@
 
 The code to generate the ARVO dataset will be published soon. The generated dataset and related metadata are updated in this repository. Each report file represents one found vulnerability on OSS-Fuzz.
 
-# tl;dr
+# TL;DR
 
 Run the following command to feed the proof-of-concept (POC) to a vulnerability found on [this page][3]. You should see an ASAN report for a heap overflow bug.
 
@@ -27,7 +27,7 @@ The [meta][0] folder includes metadata for all the recompilable vulnerabilities.
 docker run -it n132/arvo:25402-vul bash # vulnerable version
 docker run -it n132/arvo:25402-fix bash # fixed version
 ```
-3. [Optional] [Optional] Modify the code or change the compile settings and recompile it:
+3. [Optional] Modify the code or change the compile settings and recompile it:
 
 ```bash
 # Run this command inside the Docker container

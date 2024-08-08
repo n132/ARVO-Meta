@@ -1,0 +1,118 @@
+commit 509812647060893522be508e0ab5b6c62dec03bd
+Merge: 87547defa 8034867d9
+Author: Treehugger Robot <treehugger-gerrit@google.com>
+Date:   Tue Jul 7 13:36:33 2020 +0000
+
+    Merge "Fix ASAN failure in clock tracker."
+
+diff --git a/src/trace_processor/importers/common/clock_tracker.cc b/src/trace_processor/importers/common/clock_tracker.cc
+index 40448d200..4f5202993 100644
+--- a/src/trace_processor/importers/common/clock_tracker.cc
++++ b/src/trace_processor/importers/common/clock_tracker.cc
+@@ -202,97 +202,104 @@ ClockTracker::ClockPath ClockTracker::FindPath(ClockId src, ClockId target) {
+ base::Optional<int64_t> ClockTracker::ConvertSlowpath(ClockId src_clock_id,
+                                                       int64_t src_timestamp,
+                                                       ClockId target_clock_id) {
+   PERFETTO_DCHECK(!IsReservedSeqScopedClockId(src_clock_id));
+   PERFETTO_DCHECK(!IsReservedSeqScopedClockId(target_clock_id));
+ 
+   context_->storage->IncrementStats(stats::clock_sync_cache_miss);
+ 
+   ClockPath path = FindPath(src_clock_id, target_clock_id);
+   if (!path.valid()) {
+     PERFETTO_DLOG("No path from clock %" PRIu64 " to %" PRIu64
+                   " at timestamp %" PRId64,
+                   src_clock_id, target_clock_id, src_timestamp);
+     context_->storage->IncrementStats(stats::clock_sync_failure);
+     return base::nullopt;
+   }
+ 
+   // We can cache only single-path resolutions between two clocks.
+   // Caching multi-path resolutions is harder because the (src,target) tuple
+   // is not enough as a cache key: at any step the |ns| value can yield to a
+   // different choice of the next snapshot. Multi-path resolutions don't seem
+   // too frequent these days, so we focus only on caching the more frequent
+   // one-step resolutions (typically from any clock to the trace clock).
+   const bool cacheable = path.len == 1;
+   CachedClockPath cache_entry{};
+ 
+   // Iterate trough the path found and translate timestamps onto the new clock
+   // domain on each step, until the target domain is reached.
+   ClockDomain* src_domain = GetClock(src_clock_id);
+   int64_t ns = src_domain->ToNs(src_timestamp);
+   for (uint32_t i = 0; i < path.len; ++i) {
+     const ClockGraphEdge edge = path.at(i);
+     ClockDomain* cur_clock = GetClock(std::get<0>(edge));
+     ClockDomain* next_clock = GetClock(std::get<1>(edge));
+     const SnapshotHash hash = std::get<2>(edge);
+ 
+     // Find the closest timestamp within the snapshots of the source clock.
+     const ClockSnapshots& cur_snap = cur_clock->GetSnapshot(hash);
+     const auto& ts_vec = cur_snap.timestamps_ns;
+     auto it = std::upper_bound(ts_vec.begin(), ts_vec.end(), ns);
+     if (it != ts_vec.begin())
+       --it;
+ 
+     // Now lookup the snapshot id that matches the closest timestamp.
+     size_t index = static_cast<size_t>(std::distance(ts_vec.begin(), it));
+     PERFETTO_DCHECK(index < ts_vec.size());
+     PERFETTO_DCHECK(cur_snap.snapshot_ids.size() == ts_vec.size());
+     uint32_t snapshot_id = cur_snap.snapshot_ids[index];
+ 
+     // And use that to retrieve the corresponding time in the next clock domain.
+     // The snapshot id must exist in the target clock domain. If it doesn't
+     // either the hash logic or the pathfinding logic are bugged.
++    // This can also happen if the sanity checks in AddSnapshot fail and we
++    // skip part of the snapshot.
+     const ClockSnapshots& next_snap = next_clock->GetSnapshot(hash);
++
++    // Using std::lower_bound because snapshot_ids is sorted, so we can do
++    // a binary search. std::find would do a linear scan.
+     auto next_it = std::lower_bound(next_snap.snapshot_ids.begin(),
+                                     next_snap.snapshot_ids.end(), snapshot_id);
+-    PERFETTO_DCHECK(next_it != next_snap.snapshot_ids.end() &&
+-                    *next_it == snapshot_id);
++    if (next_it == next_snap.snapshot_ids.end() || *next_it != snapshot_id) {
++      PERFETTO_DFATAL("Snapshot does not exist in clock domain.");
++      continue;
++    }
+     size_t next_index = static_cast<size_t>(
+         std::distance(next_snap.snapshot_ids.begin(), next_it));
+     PERFETTO_DCHECK(next_index < next_snap.snapshot_ids.size());
+     int64_t next_timestamp_ns = next_snap.timestamps_ns[next_index];
+ 
+     // The translated timestamp is the relative delta of the source timestamp
+     // from the closest snapshot found (ns - *it), plus the timestamp in
+     // the new clock domain for the same snapshot id.
+     const int64_t adj = next_timestamp_ns - *it;
+     ns += adj;
+ 
+     // On the first iteration, keep track of the bounds for the cache entry.
+     // This will allow future Convert() calls to skip the pathfinder logic
+     // as long as the query stays within the bound.
+     if (cacheable) {
+       PERFETTO_DCHECK(i == 0);
+       const int64_t kInt64Min = std::numeric_limits<int64_t>::min();
+       const int64_t kInt64Max = std::numeric_limits<int64_t>::max();
+       cache_entry.min_ts_ns = it == ts_vec.begin() ? kInt64Min : *it;
+       auto ubound = it + 1;
+       cache_entry.max_ts_ns = ubound == ts_vec.end() ? kInt64Max : *ubound;
+       cache_entry.translation_ns = adj;
+     }
+ 
+     // The last clock in the path must be the target clock.
+     PERFETTO_DCHECK(i < path.len - 1 || std::get<1>(edge) == target_clock_id);
+   }
+ 
+   if (cacheable) {
+     cache_entry.src = src_clock_id;
+     cache_entry.src_domain = src_domain;
+     cache_entry.target = target_clock_id;
+     cache_[rnd_() % cache_.size()] = cache_entry;
+   }
+ 
+   return ns;
+ }
+ 
+ }  // namespace trace_processor
+ }  // namespace perfetto

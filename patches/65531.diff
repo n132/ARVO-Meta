@@ -1,0 +1,336 @@
+commit d549c2b5c9a2880ba03b6522e055bbe673fa7753
+Author: John Reiser <jreiser@BitWagon.com>
+Date:   Wed Jan 10 13:38:18 2024 -0800
+
+    More care when recovering from slid b_info
+    
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=65531
+    https://github.com/upx/upx/issues/762
+            modified:   p_lx_elf.cpp
+
+diff --git a/src/p_lx_elf.cpp b/src/p_lx_elf.cpp
+index f0a7bf72..08b16e5a 100644
+--- a/src/p_lx_elf.cpp
++++ b/src/p_lx_elf.cpp
+@@ -7154,319 +7154,320 @@ void PackLinuxElf64::un_DT_INIT(
+ void PackLinuxElf64::unpack(OutputFile *fo)
+ {
+     if (e_phoff != sizeof(Elf64_Ehdr)) {// Phdrs not contiguous with Ehdr
+         throwCantUnpack("bad e_phoff");
+     }
+     unsigned const c_phnum = get_te16(&ehdri.e_phnum);
+     unsigned u_phnum = 0;
+     upx_uint64_t old_dtinit = 0;
+ 
+     if (Elf64_Ehdr::ET_EXEC == get_te16(&ehdri.e_type)) {
+         if (get_te64(&ehdri.e_entry) < 0x401180
+         &&  get_te16(&ehdri.e_machine)==Elf64_Ehdr::EM_X86_64) {
+             // old style, 8-byte b_info:
+             // sizeof(b_info.sz_unc) + sizeof(b_info.sz_cpr);
+             szb_info = 2*sizeof(unsigned);
+         }
+     }
+ 
+     fi->seek(overlay_offset - sizeof(l_info), SEEK_SET);
+     fi->readx(&linfo, sizeof(linfo));
+     if (UPX_MAGIC_LE32 != get_le32(&linfo.l_magic)) {
+         NE32 const *const lp = (NE32 const *)(void const *)&linfo;
+         // Workaround for bug of extra linfo by some asl_pack2_Shdrs().
+         if (0==lp[0] && 0==lp[1] && 0==lp[2]) { // looks like blank extra
+             fi->readx(&linfo, sizeof(linfo));
+             if (UPX_MAGIC_LE32 == get_le32(&linfo.l_magic)) {
+                 overlay_offset += sizeof(linfo);
+             }
+             else {
+                 throwCantUnpack("l_info corrupted");
+             }
+         }
+         else {
+             throwCantUnpack("l_info corrupted");
+         }
+     }
+     lsize = get_te16(&linfo.l_lsize);
+     p_info hbuf;  fi->readx(&hbuf, sizeof(hbuf));
+     unsigned orig_file_size = get_te32(&hbuf.p_filesize);
+     blocksize = get_te32(&hbuf.p_blocksize);
+     if ((u32_t)file_size > orig_file_size || blocksize > orig_file_size
+         || !mem_size_valid(1, blocksize, OVERHEAD))
+         throwCantUnpack("p_info corrupted");
+ 
+     ibuf.alloc(blocksize + OVERHEAD);
+     b_info bhdr; memset(&bhdr, 0, sizeof(bhdr));
+     fi->readx(&bhdr, szb_info);
+     ph.u_len = get_te32(&bhdr.sz_unc);
+     ph.c_len = get_te32(&bhdr.sz_cpr);
+     if (ph.c_len > (unsigned)file_size || ph.c_len == 0 || ph.u_len == 0
+     ||  ph.u_len > orig_file_size)
+         throwCantUnpack("b_info corrupted");
+     ph.filter_cto = bhdr.b_cto8;
+     prev_method = bhdr.b_method;  // FIXME if multiple de-compressors
+ 
+     MemBuffer u(ph.u_len);
+     Elf64_Ehdr *const ehdr = (Elf64_Ehdr *)&u[0];
+     Elf64_Phdr const *phdr = nullptr;
+     total_in = 0;
+     total_out = 0;
+     unsigned c_adler = upx_adler32(nullptr, 0);
+     unsigned u_adler = upx_adler32(nullptr, 0);
+ 
+     unsigned is_shlib = 0;
+     loader_offset = 0;
+     MemBuffer o_elfhdrs;
+     Elf64_Phdr const *const dynhdr = elf_find_ptype(Elf64_Phdr::PT_DYNAMIC, phdri, c_phnum);
+     // dynseg was set by PackLinuxElf64help1
+     if (dynhdr && !(Elf64_Dyn::DF_1_PIE & elf_unsigned_dynamic(Elf64_Dyn::DT_FLAGS_1))) {
+         // Packed shlib? (ET_DYN without -fPIE)
+         is_shlib = 1;
+         xct_off = overlay_offset - sizeof(l_info);
+         u_phnum = get_te16(&ehdri.e_phnum);
+         o_elfhdrs.alloc(sz_elf_hdrs);
+         un_shlib_1(fo, o_elfhdrs, c_adler, u_adler, orig_file_size);
+         *ehdr = ehdri;
+     }
+     else { // main executable
+         // Uncompress Ehdr and Phdrs: info for control of unpacking
+         if (ibuf.getSize() < ph.c_len)
+             throwCompressedDataViolation();
+ 
+         fi->readx(ibuf, ph.c_len);
+         // "clickhouse" ET_EXEC for amd64 has 0x200000 <= .e_entry
+         // instead of 0x400000 that we checked earlier.
+         if (8 == szb_info
+         &&  Elf64_Ehdr::EM_X86_64 == e_machine
+         &&  Elf64_Ehdr::ET_EXEC   == e_type
+         &&  ph.u_len <= MAX_ELF_HDR_64
+         ) {
+             unsigned b_method = ibuf[0];
+             unsigned b_extra  = ibuf[3];
+             if (M_ZSTD >= b_method && 0 == b_extra) {
+                 fi->seek( -(upx_off_t)(ph.c_len + szb_info), SEEK_CUR);
+                 szb_info = 12;
+                 fi->readx(&bhdr, szb_info);
+                 ph.filter_cto = bhdr.b_cto8;
+                 prev_method = bhdr.b_method;  // FIXME if multiple de-compressors
+                 fi->readx(ibuf, ph.c_len);
+             }
+         }
+         decompress(ibuf, (upx_byte *)ehdr, false);
+         if (ehdr->e_type   !=ehdri.e_type
+         ||  ehdr->e_machine!=ehdri.e_machine
+         ||  ehdr->e_version!=ehdri.e_version
+             // less strict for EM_PPC64 to workaround earlier bug
+         ||  !( ehdr->e_flags==ehdri.e_flags
+             || Elf64_Ehdr::EM_PPC64 == get_te16(&ehdri.e_machine))
+         ||  ehdr->e_ehsize !=ehdri.e_ehsize
+             // check EI_MAG[0-3], EI_CLASS, EI_DATA, EI_VERSION
+         ||  memcmp(ehdr->e_ident, ehdri.e_ident, Elf64_Ehdr::EI_OSABI)) {
+             throwCantUnpack("ElfXX_Ehdr corrupted");
+         }
+         // Rewind: prepare for data phase
+         fi->seek(- (off_t) (szb_info + ph.c_len), SEEK_CUR);
+ 
+         u_phnum = get_te16(&ehdr->e_phnum);
+         if ((umin64(MAX_ELF_HDR_64, ph.u_len) - sizeof(Elf64_Ehdr))/sizeof(Elf64_Phdr) < u_phnum) {
+             throwCantUnpack("bad compressed e_phnum");
+         }
+         o_elfhdrs.alloc(sizeof(Elf64_Ehdr) + u_phnum * sizeof(Elf64_Phdr));
+         memcpy(o_elfhdrs, ehdr, o_elfhdrs.getSize());
+ 
+         // Decompress each PT_LOAD.
+         bool first_PF_X = true;
+         phdr = (Elf64_Phdr *) (void *) (1+ ehdr);  // uncompressed
+         for (unsigned j=0; j < u_phnum; ++phdr, ++j) {
+             if (PT_LOAD64==get_te32(&phdr->p_type)) {
+                 unsigned const filesz = get_te64(&phdr->p_filesz);
+                 unsigned const offset = get_te64(&phdr->p_offset);
+                 if (fo)
+                     fo->seek(offset, SEEK_SET);
+                 if (Elf64_Phdr::PF_X & get_te32(&phdr->p_flags)) {
+                     unpackExtent(filesz, fo,
+                         c_adler, u_adler, first_PF_X);
+                     first_PF_X = false;
+                 }
+                 else {
+                     unpackExtent(filesz, fo,
+                         c_adler, u_adler, false);
+                 }
+             }
+         }
+     }
+ 
+     upx_uint64_t const e_entry = get_te64(&ehdri.e_entry);
+     unsigned off_entry = 0;
+     phdr = phdri;
+     load_va = 0;
+     for (unsigned j=0; j < c_phnum; ++j, ++phdr) {
+         if (PT_LOAD64==get_te32(&phdr->p_type)) {
+             upx_uint64_t offset = get_te64(&phdr->p_offset);
+             upx_uint64_t vaddr  = get_te64(&phdr->p_vaddr);
+             upx_uint64_t filesz = get_te64(&phdr->p_filesz);
+             if (!load_va) {
+                 load_va = vaddr;
+             }
+             if ((e_entry - vaddr) < filesz) {
+                 off_entry = (e_entry - vaddr) + offset;
+                 break;
+             }
+         }
+     }
+     unsigned d_info[6];
+     unsigned sz_d_info = sizeof(d_info);
+     if (!is_shlib) {
+         if (get_te32(&phdri[0].p_flags) & Elf64_Phdr::PF_X) {
+             // Old style, such as upx-3.91 thru upx-3.95
+             switch (this->e_machine) {
+                 default: {
+                     char msg[40]; snprintf(msg, sizeof(msg),
+                         "Unknown architecture %d", this->e_machine);
+                     throwCantUnpack(msg);
+                 }; break;
+                 case Elf64_Ehdr::EM_AARCH64: sz_d_info = 4 * sizeof(unsigned); break;
+                 case Elf64_Ehdr::EM_PPC64:   sz_d_info = 3 * sizeof(unsigned); break;
+                 case Elf64_Ehdr::EM_X86_64:  sz_d_info = 2 * sizeof(unsigned); break;
+             }
+         }
+         loader_offset = off_entry - sz_d_info;
+     }
+ 
+     if (0x1000==get_te64(&phdri[0].p_filesz)  // detect C_BASE style
+     &&  0==get_te64(&phdri[1].p_offset)
+     &&  0==get_te64(&phdri[0].p_offset)
+     &&     get_te64(&phdri[1].p_filesz) == get_te64(&phdri[1].p_memsz)) {
+         fi->seek(up4(get_te64(&phdri[1].p_memsz)), SEEK_SET);  // past the loader
+     }
+     else if (is_shlib
+     ||  (off_entry + up4(lsize) + ph.getPackHeaderSize() + sizeof(overlay_offset))
+             < up4(file_size)) {
+         // Loader is not at end; skip past it.
+         if (loader_offset) {
+             fi->seek(loader_offset, SEEK_SET);
+         }
+         else {
+             funpad4(fi);  // MATCH01
+         }
+         fi->readx(d_info, sz_d_info);
+         if (is_shlib && 0==old_dtinit) {
+             old_dtinit = get_te32(&d_info[2 + (0==d_info[0])]);
+             is_asl = 1u& get_te32(&d_info[0 + (0==d_info[0])]);
+         }
+         fi->seek(lsize - sz_d_info, SEEK_CUR);
+     }
+ 
+     // The gaps between PT_LOAD and after last PT_LOAD
+     phdr = (Elf64_Phdr const *)(1+ (Elf64_Ehdr const *)(void const *)o_elfhdrs);
+     upx_uint64_t hi_offset(0);
+     for (unsigned j = 0; j < u_phnum; ++j) {
+         if (PT_LOAD64==phdr[j].p_type
+         &&  hi_offset < phdr[j].p_offset)
+             hi_offset = phdr[j].p_offset;
+     }
+     for (unsigned j = 0; j < u_phnum; ++j) {
+         unsigned const size = find_LOAD_gap(phdr, j, u_phnum);
+         if (size) {
+             unsigned const where = get_te64(&phdr[j].p_offset) +
+                                    get_te64(&phdr[j].p_filesz);
+             if (fo)
+                 fo->seek(where, SEEK_SET);
+             { // Recover from some piracy [also serves as error tolerance :-) ]
+               // Getting past the loader is problematic, due to unintended
+               // variances between released versions:
+               //   l_info.l_lsize might be rounded up by 8 instead of by 4, and
+               //   sz_d_info might have changed.
+                 b_info b_peek, *bp = &b_peek;
+                 fi->readx(bp, sizeof(b_peek));
+                 upx_off_t pos = fi->seek(-(off_t)sizeof(b_peek), SEEK_CUR);
+                 unsigned sz_unc = get_te32(&bp->sz_unc);
+                 unsigned sz_cpr = get_te32(&bp->sz_cpr);
+                 unsigned word3  = get_te32(&bp->b_method);
+                 unsigned method = bp->b_method;
+                 unsigned ftid = bp->b_ftid;
+                 unsigned cto8 = bp->b_cto8;
+                 if (!( ((sz_cpr == sz_unc) && (0 == word3) && (size == sz_unc)) // incompressible literal
+                     || ((sz_cpr <  sz_unc) && (method == prev_method) && (0 == ftid) && (0 == cto8)))
+                 ) {
+                     opt->info_mode++;
+                     infoWarning("bad b_info at %#zx", (size_t)pos);
+                     unsigned const N_PEEK(16 * sizeof(int)), H_PEEK(N_PEEK >> 1);
+                     unsigned char peek_arr[N_PEEK];
+                     fi->seek(pos - H_PEEK, SEEK_SET);
+                     fi->readx(peek_arr, sizeof(peek_arr));
+                     fi->seek(pos, SEEK_SET);
+                     bool const is_be = ELFDATA2MSB == ehdri.e_ident[EI_DATA];
+                     if (is_be) {
+                         // Does the right thing for sz_unc and sz_cpr,
+                         // but swaps b_method and b_extra.  Need find_be32() :-)
+                         for (unsigned k = 0; k < N_PEEK; k += sizeof(int)) {
+                             set_le32(&peek_arr[k], get_be32(&peek_arr[k]));
+                         }
+                     }
+                     int boff = find_le32(peek_arr, sizeof(peek_arr), size);
+-                    if (boff < 0) {
++                    if (boff < 0
++                    || sizeof(peek_arr) < (boff + sizeof(b_info))) {
+                         throwCantUnpack("b_info corrupted");
+                     }
+                     bp = (b_info *)(void *)&peek_arr[boff];
+ 
+                     sz_unc = get_le32(&bp->sz_unc);
+                     sz_cpr = get_le32(&bp->sz_cpr);
+                     word3  = get_le32(&bp->b_method);
+                     ftid = bp->b_ftid;
+                     cto8 = bp->b_cto8;
+                     if (0 <= boff  // found
+                     && ( ((sz_cpr == sz_unc) && (0 == word3) && (size == sz_unc)) // incompressible literal
+                       || ((sz_cpr <  sz_unc) && (0 == ftid) && (0 == cto8)
+                           && ((is_be ? bp->b_extra : bp->b_method) == prev_method)) )
+                     ) {
+                         pos -= H_PEEK;
+                         pos += boff;
+                         infoWarning("... recovery at %#zx", (size_t)pos);
+                         fi->seek(pos, SEEK_SET);
+                     }
+                     opt->info_mode--;
+                 }
+             }
+             unpackExtent(size, fo,
+                 c_adler, u_adler, false,
+                 is_shlib && ((phdr[j].p_offset != hi_offset)));
+                 // FIXME: should not depend on is_shlib ?
+         }
+     }
+ 
+     // check for end-of-file
+     fi->readx(&bhdr, szb_info);
+     unsigned const sz_unc = ph.u_len = get_te32(&bhdr.sz_unc);
+ 
+     if (sz_unc == 0) { // uncompressed size 0 -> EOF
+         // note: magic is always stored le32
+         unsigned const sz_cpr = get_le32(&bhdr.sz_cpr);
+         if (sz_cpr != UPX_MAGIC_LE32)  // sz_cpr must be h->magic
+             throwCompressedDataViolation();
+     }
+     else { // extra bytes after end?
+         throwCompressedDataViolation();
+     }
+ 
+     if (is_shlib) {
+         un_DT_INIT(old_dtinit, (Elf64_Phdr *)(1+ (Elf64_Ehdr *)(void *)o_elfhdrs), dynhdr, fo);
+     }
+ 
+     // update header with totals
+     ph.c_len = total_in;
+     ph.u_len = total_out;
+ 
+     // all bytes must be written
+     if (fo && total_out != orig_file_size)
+         throwEOFException();
+ 
+     // finally test the checksums
+     if (ph.c_adler != c_adler || ph.u_adler != u_adler)
+         throwChecksumError();
+ }
+ 
+ 
+ /*************************************************************************
+ //
+ **************************************************************************/

@@ -1,0 +1,240 @@
+commit 3da35b7cc7e2f80ca4af89e55fef9a7bcb19c128
+Author: Limin Wang <lance.lmwang@gmail.com>
+Date:   Tue Oct 20 22:51:08 2020 +0800
+
+    fftools/ffmpeg: fix the wrong bitrate and speed stats
+    
+    The bitrate and speed stats are wrong if the copyts is enabled.
+    Please test with below command:
+    wget http://samples.mplayerhq.hu/MPEG2/foxksaz.ts
+    ./ffmpeg -y -copyts -i ./foxksaz.ts -c:v libx264 -x264opts \
+        nal-hrd=cbr:force-cfr=1 -b:v 3500k -minrate 3500k -maxrate 3500k -bufsize \
+        1000k  -c:a mp2 -muxrate 4500k  -vframes 1000 test.ts
+    
+    before:
+    frame= 1000 fps=112 q=-1.0 Lsize=    9063kB time=09:10:12.41 bitrate=   2.2kbits/s speed=3.7e+03x
+    after:
+    frame= 1000 fps=112 q=-1.0 Lsize=    9062kB time=00:00:15.78 bitrate=4703.4kbits/s speed=1.77x
+    
+    Signed-off-by: Limin Wang <lance.lmwang@gmail.com>
+
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index 788cf9c665..7a27258758 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -344,6 +344,7 @@ static volatile int received_nb_signals = 0;
+ static atomic_int transcode_init_done = ATOMIC_VAR_INIT(0);
+ static volatile int ffmpeg_exited = 0;
+ static int main_return_code = 0;
++static int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
+ 
+ static void
+ sigterm_handler(int sig)
+@@ -1675,198 +1676,206 @@ static void print_final_stats(int64_t total_size)
+ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_time)
+ {
+     AVBPrint buf, buf_script;
+     OutputStream *ost;
+     AVFormatContext *oc;
+     int64_t total_size;
+     AVCodecContext *enc;
+     int frame_number, vid, i;
+     double bitrate;
+     double speed;
+     int64_t pts = INT64_MIN + 1;
+     static int64_t last_time = -1;
+     static int qp_histogram[52];
+     int hours, mins, secs, us;
+     const char *hours_sign;
+     int ret;
+     float t;
+ 
+     if (!print_stats && !is_last_report && !progress_avio)
+         return;
+ 
+     if (!is_last_report) {
+         if (last_time == -1) {
+             last_time = cur_time;
+             return;
+         }
+         if ((cur_time - last_time) < 500000)
+             return;
+         last_time = cur_time;
+     }
+ 
+     t = (cur_time-timer_start) / 1000000.0;
+ 
+ 
+     oc = output_files[0]->ctx;
+ 
+     total_size = avio_size(oc->pb);
+     if (total_size <= 0) // FIXME improve avio_size() so it works with non seekable output too
+         total_size = avio_tell(oc->pb);
+ 
+     vid = 0;
+     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
+     av_bprint_init(&buf_script, 0, AV_BPRINT_SIZE_AUTOMATIC);
+     for (i = 0; i < nb_output_streams; i++) {
+         float q = -1;
+         ost = output_streams[i];
+         enc = ost->enc_ctx;
+         if (!ost->stream_copy)
+             q = ost->quality / (float) FF_QP2LAMBDA;
+ 
+         if (vid && enc->codec_type == AVMEDIA_TYPE_VIDEO) {
+             av_bprintf(&buf, "q=%2.1f ", q);
+             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
+                        ost->file_index, ost->index, q);
+         }
+         if (!vid && enc->codec_type == AVMEDIA_TYPE_VIDEO) {
+             float fps;
+ 
+             frame_number = ost->frame_number;
+             fps = t > 1 ? frame_number / t : 0;
+             av_bprintf(&buf, "frame=%5d fps=%3.*f q=%3.1f ",
+                      frame_number, fps < 9.95, fps, q);
+             av_bprintf(&buf_script, "frame=%d\n", frame_number);
+             av_bprintf(&buf_script, "fps=%.2f\n", fps);
+             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
+                        ost->file_index, ost->index, q);
+             if (is_last_report)
+                 av_bprintf(&buf, "L");
+             if (qp_hist) {
+                 int j;
+                 int qp = lrintf(q);
+                 if (qp >= 0 && qp < FF_ARRAY_ELEMS(qp_histogram))
+                     qp_histogram[qp]++;
+                 for (j = 0; j < 32; j++)
+                     av_bprintf(&buf, "%X", av_log2(qp_histogram[j] + 1));
+             }
+ 
+             if ((enc->flags & AV_CODEC_FLAG_PSNR) && (ost->pict_type != AV_PICTURE_TYPE_NONE || is_last_report)) {
+                 int j;
+                 double error, error_sum = 0;
+                 double scale, scale_sum = 0;
+                 double p;
+                 char type[3] = { 'Y','U','V' };
+                 av_bprintf(&buf, "PSNR=");
+                 for (j = 0; j < 3; j++) {
+                     if (is_last_report) {
+                         error = enc->error[j];
+                         scale = enc->width * enc->height * 255.0 * 255.0 * frame_number;
+                     } else {
+                         error = ost->error[j];
+                         scale = enc->width * enc->height * 255.0 * 255.0;
+                     }
+                     if (j)
+                         scale /= 4;
+                     error_sum += error;
+                     scale_sum += scale;
+                     p = psnr(error / scale);
+                     av_bprintf(&buf, "%c:%2.2f ", type[j], p);
+                     av_bprintf(&buf_script, "stream_%d_%d_psnr_%c=%2.2f\n",
+                                ost->file_index, ost->index, type[j] | 32, p);
+                 }
+                 p = psnr(error_sum / scale_sum);
+                 av_bprintf(&buf, "*:%2.2f ", psnr(error_sum / scale_sum));
+                 av_bprintf(&buf_script, "stream_%d_%d_psnr_all=%2.2f\n",
+                            ost->file_index, ost->index, p);
+             }
+             vid = 1;
+         }
+         /* compute min output value */
+-        if (av_stream_get_end_pts(ost->st) != AV_NOPTS_VALUE)
++        if (av_stream_get_end_pts(ost->st) != AV_NOPTS_VALUE) {
+             pts = FFMAX(pts, av_rescale_q(av_stream_get_end_pts(ost->st),
+                                           ost->st->time_base, AV_TIME_BASE_Q));
++            if (copy_ts) {
++                if (copy_ts_first_pts == AV_NOPTS_VALUE && pts > 1)
++                    copy_ts_first_pts = pts;
++                if (copy_ts_first_pts != AV_NOPTS_VALUE)
++                    pts -= copy_ts_first_pts;
++            }
++        }
++
+         if (is_last_report)
+             nb_frames_drop += ost->last_dropped;
+     }
+ 
+     secs = FFABS(pts) / AV_TIME_BASE;
+     us = FFABS(pts) % AV_TIME_BASE;
+     mins = secs / 60;
+     secs %= 60;
+     hours = mins / 60;
+     mins %= 60;
+     hours_sign = (pts < 0) ? "-" : "";
+ 
+     bitrate = pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
+     speed = t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
+ 
+     if (total_size < 0) av_bprintf(&buf, "size=N/A time=");
+     else                av_bprintf(&buf, "size=%8.0fkB time=", total_size / 1024.0);
+     if (pts == AV_NOPTS_VALUE) {
+         av_bprintf(&buf, "N/A ");
+     } else {
+         av_bprintf(&buf, "%s%02d:%02d:%02d.%02d ",
+                    hours_sign, hours, mins, secs, (100 * us) / AV_TIME_BASE);
+     }
+ 
+     if (bitrate < 0) {
+         av_bprintf(&buf, "bitrate=N/A");
+         av_bprintf(&buf_script, "bitrate=N/A\n");
+     }else{
+         av_bprintf(&buf, "bitrate=%6.1fkbits/s", bitrate);
+         av_bprintf(&buf_script, "bitrate=%6.1fkbits/s\n", bitrate);
+     }
+ 
+     if (total_size < 0) av_bprintf(&buf_script, "total_size=N/A\n");
+     else                av_bprintf(&buf_script, "total_size=%"PRId64"\n", total_size);
+     if (pts == AV_NOPTS_VALUE) {
+         av_bprintf(&buf_script, "out_time_us=N/A\n");
+         av_bprintf(&buf_script, "out_time_ms=N/A\n");
+         av_bprintf(&buf_script, "out_time=N/A\n");
+     } else {
+         av_bprintf(&buf_script, "out_time_us=%"PRId64"\n", pts);
+         av_bprintf(&buf_script, "out_time_ms=%"PRId64"\n", pts);
+         av_bprintf(&buf_script, "out_time=%s%02d:%02d:%02d.%06d\n",
+                    hours_sign, hours, mins, secs, us);
+     }
+ 
+     if (nb_frames_dup || nb_frames_drop)
+         av_bprintf(&buf, " dup=%d drop=%d", nb_frames_dup, nb_frames_drop);
+     av_bprintf(&buf_script, "dup_frames=%d\n", nb_frames_dup);
+     av_bprintf(&buf_script, "drop_frames=%d\n", nb_frames_drop);
+ 
+     if (speed < 0) {
+         av_bprintf(&buf, " speed=N/A");
+         av_bprintf(&buf_script, "speed=N/A\n");
+     } else {
+         av_bprintf(&buf, " speed=%4.3gx", speed);
+         av_bprintf(&buf_script, "speed=%4.3gx\n", speed);
+     }
+ 
+     if (print_stats || is_last_report) {
+         const char end = is_last_report ? '\n' : '\r';
+         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
+             fprintf(stderr, "%s    %c", buf.str, end);
+         } else
+             av_log(NULL, AV_LOG_INFO, "%s    %c", buf.str, end);
+ 
+         fflush(stderr);
+     }
+     av_bprint_finalize(&buf, NULL);
+ 
+     if (progress_avio) {
+         av_bprintf(&buf_script, "progress=%s\n",
+                    is_last_report ? "end" : "continue");
+         avio_write(progress_avio, buf_script.str,
+                    FFMIN(buf_script.len, buf_script.size - 1));
+         avio_flush(progress_avio);
+         av_bprint_finalize(&buf_script, NULL);
+         if (is_last_report) {
+             if ((ret = avio_closep(&progress_avio)) < 0)
+                 av_log(NULL, AV_LOG_ERROR,
+                        "Error closing progress log, loss of information possible: %s\n", av_err2str(ret));
+         }
+     }
+ 
+     if (is_last_report)
+         print_final_stats(total_size);
+ }

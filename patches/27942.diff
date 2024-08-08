@@ -1,0 +1,393 @@
+commit 345fcccb33795600b9c159908c606c5027a4ce19
+Author: Zhengyang Liu <liuz@cs.utah.edu>
+Date:   Thu Nov 26 00:10:36 2020 -0700
+
+    Fix use-of-uninitialized-value in rG75f50e15bf8f
+    
+    Differential Revision: https://reviews.llvm.org/D71126
+
+diff --git a/llvm/lib/IR/Constants.cpp b/llvm/lib/IR/Constants.cpp
+index f731021492bf..764d32e39b05 100644
+--- a/llvm/lib/IR/Constants.cpp
++++ b/llvm/lib/IR/Constants.cpp
+@@ -481,69 +481,72 @@ void Constant::destroyConstant() {
+ void llvm::deleteConstant(Constant *C) {
+   switch (C->getValueID()) {
+   case Constant::ConstantIntVal:
+     delete static_cast<ConstantInt *>(C);
+     break;
+   case Constant::ConstantFPVal:
+     delete static_cast<ConstantFP *>(C);
+     break;
+   case Constant::ConstantAggregateZeroVal:
+     delete static_cast<ConstantAggregateZero *>(C);
+     break;
+   case Constant::ConstantArrayVal:
+     delete static_cast<ConstantArray *>(C);
+     break;
+   case Constant::ConstantStructVal:
+     delete static_cast<ConstantStruct *>(C);
+     break;
+   case Constant::ConstantVectorVal:
+     delete static_cast<ConstantVector *>(C);
+     break;
+   case Constant::ConstantPointerNullVal:
+     delete static_cast<ConstantPointerNull *>(C);
+     break;
+   case Constant::ConstantDataArrayVal:
+     delete static_cast<ConstantDataArray *>(C);
+     break;
+   case Constant::ConstantDataVectorVal:
+     delete static_cast<ConstantDataVector *>(C);
+     break;
+   case Constant::ConstantTokenNoneVal:
+     delete static_cast<ConstantTokenNone *>(C);
+     break;
+   case Constant::BlockAddressVal:
+     delete static_cast<BlockAddress *>(C);
+     break;
+   case Constant::DSOLocalEquivalentVal:
+     delete static_cast<DSOLocalEquivalent *>(C);
+     break;
+   case Constant::UndefValueVal:
+     delete static_cast<UndefValue *>(C);
+     break;
++  case Constant::PoisonValueVal:
++    delete static_cast<PoisonValue *>(C);
++    break;
+   case Constant::ConstantExprVal:
+     if (isa<UnaryConstantExpr>(C))
+       delete static_cast<UnaryConstantExpr *>(C);
+     else if (isa<BinaryConstantExpr>(C))
+       delete static_cast<BinaryConstantExpr *>(C);
+     else if (isa<SelectConstantExpr>(C))
+       delete static_cast<SelectConstantExpr *>(C);
+     else if (isa<ExtractElementConstantExpr>(C))
+       delete static_cast<ExtractElementConstantExpr *>(C);
+     else if (isa<InsertElementConstantExpr>(C))
+       delete static_cast<InsertElementConstantExpr *>(C);
+     else if (isa<ShuffleVectorConstantExpr>(C))
+       delete static_cast<ShuffleVectorConstantExpr *>(C);
+     else if (isa<ExtractValueConstantExpr>(C))
+       delete static_cast<ExtractValueConstantExpr *>(C);
+     else if (isa<InsertValueConstantExpr>(C))
+       delete static_cast<InsertValueConstantExpr *>(C);
+     else if (isa<GetElementPtrConstantExpr>(C))
+       delete static_cast<GetElementPtrConstantExpr *>(C);
+     else if (isa<CompareConstantExpr>(C))
+       delete static_cast<CompareConstantExpr *>(C);
+     else
+       llvm_unreachable("Unexpected constant expr");
+     break;
+   default:
+     llvm_unreachable("Unexpected constant");
+   }
+ }
+@@ -1722,7 +1725,12 @@ UndefValue *UndefValue::get(Type *Ty) {
+ /// Remove the constant from the constant table.
+ void UndefValue::destroyConstantImpl() {
+   // Free the constant and any dangling references to it.
+-  getContext().pImpl->UVConstants.erase(getType());
++  if (getValueID() == UndefValueVal) {
++    getContext().pImpl->UVConstants.erase(getType());
++  } else if (getValueID() == PoisonValueVal) {
++    getContext().pImpl->PVConstants.erase(getType());
++  }
++  llvm_unreachable("Not a undef or a poison!");
+ }
+ 
+ PoisonValue *PoisonValue::get(Type *Ty) {
+diff --git a/llvm/lib/IR/LLVMContextImpl.cpp b/llvm/lib/IR/LLVMContextImpl.cpp
+index c4f0a0ac8549..875c61cda423 100644
+--- a/llvm/lib/IR/LLVMContextImpl.cpp
++++ b/llvm/lib/IR/LLVMContextImpl.cpp
+@@ -45,81 +45,82 @@ LLVMContextImpl::LLVMContextImpl(LLVMContext &C)
+ LLVMContextImpl::~LLVMContextImpl() {
+   // NOTE: We need to delete the contents of OwnedModules, but Module's dtor
+   // will call LLVMContextImpl::removeModule, thus invalidating iterators into
+   // the container. Avoid iterators during this operation:
+   while (!OwnedModules.empty())
+     delete *OwnedModules.begin();
+ 
+ #ifndef NDEBUG
+   // Check for metadata references from leaked Values.
+   for (auto &Pair : ValueMetadata)
+     Pair.first->dump();
+   assert(ValueMetadata.empty() && "Values with metadata have been leaked");
+ #endif
+ 
+   // Drop references for MDNodes.  Do this before Values get deleted to avoid
+   // unnecessary RAUW when nodes are still unresolved.
+   for (auto *I : DistinctMDNodes)
+     I->dropAllReferences();
+ #define HANDLE_MDNODE_LEAF_UNIQUABLE(CLASS)                                    \
+   for (auto *I : CLASS##s)                                                     \
+     I->dropAllReferences();
+ #include "llvm/IR/Metadata.def"
+ 
+   // Also drop references that come from the Value bridges.
+   for (auto &Pair : ValuesAsMetadata)
+     Pair.second->dropUsers();
+   for (auto &Pair : MetadataAsValues)
+     Pair.second->dropUse();
+ 
+   // Destroy MDNodes.
+   for (MDNode *I : DistinctMDNodes)
+     I->deleteAsSubclass();
+ #define HANDLE_MDNODE_LEAF_UNIQUABLE(CLASS)                                    \
+   for (CLASS * I : CLASS##s)                                                   \
+     delete I;
+ #include "llvm/IR/Metadata.def"
+ 
+   // Free the constants.
+   for (auto *I : ExprConstants)
+     I->dropAllReferences();
+   for (auto *I : ArrayConstants)
+     I->dropAllReferences();
+   for (auto *I : StructConstants)
+     I->dropAllReferences();
+   for (auto *I : VectorConstants)
+     I->dropAllReferences();
+   ExprConstants.freeConstants();
+   ArrayConstants.freeConstants();
+   StructConstants.freeConstants();
+   VectorConstants.freeConstants();
+   InlineAsms.freeConstants();
+ 
+   CAZConstants.clear();
+   CPNConstants.clear();
+   UVConstants.clear();
++  PVConstants.clear();
+   IntConstants.clear();
+   FPConstants.clear();
+   CDSConstants.clear();
+ 
+   // Destroy attribute node lists.
+   for (FoldingSetIterator<AttributeSetNode> I = AttrsSetNodes.begin(),
+          E = AttrsSetNodes.end(); I != E; ) {
+     FoldingSetIterator<AttributeSetNode> Elem = I++;
+     delete &*Elem;
+   }
+ 
+   // Destroy MetadataAsValues.
+   {
+     SmallVector<MetadataAsValue *, 8> MDVs;
+     MDVs.reserve(MetadataAsValues.size());
+     for (auto &Pair : MetadataAsValues)
+       MDVs.push_back(Pair.second);
+     MetadataAsValues.clear();
+     for (auto *V : MDVs)
+       delete V;
+   }
+ 
+   // Destroy ValuesAsMetadata.
+   for (auto &Pair : ValuesAsMetadata)
+     delete Pair.second;
+ }
+diff --git a/llvm/lib/Transforms/Utils/FunctionComparator.cpp b/llvm/lib/Transforms/Utils/FunctionComparator.cpp
+index f25c4e5d6e99..2696557a719f 100644
+--- a/llvm/lib/Transforms/Utils/FunctionComparator.cpp
++++ b/llvm/lib/Transforms/Utils/FunctionComparator.cpp
+@@ -201,201 +201,202 @@ int FunctionComparator::cmpOperandBundlesSchema(const CallBase &LCS,
+ /// Constants comparison:
+ /// 1. Check whether type of L constant could be losslessly bitcasted to R
+ /// type.
+ /// 2. Compare constant contents.
+ /// For more details see declaration comments.
+ int FunctionComparator::cmpConstants(const Constant *L,
+                                      const Constant *R) const {
+   Type *TyL = L->getType();
+   Type *TyR = R->getType();
+ 
+   // Check whether types are bitcastable. This part is just re-factored
+   // Type::canLosslesslyBitCastTo method, but instead of returning true/false,
+   // we also pack into result which type is "less" for us.
+   int TypesRes = cmpTypes(TyL, TyR);
+   if (TypesRes != 0) {
+     // Types are different, but check whether we can bitcast them.
+     if (!TyL->isFirstClassType()) {
+       if (TyR->isFirstClassType())
+         return -1;
+       // Neither TyL nor TyR are values of first class type. Return the result
+       // of comparing the types
+       return TypesRes;
+     }
+     if (!TyR->isFirstClassType()) {
+       if (TyL->isFirstClassType())
+         return 1;
+       return TypesRes;
+     }
+ 
+     // Vector -> Vector conversions are always lossless if the two vector types
+     // have the same size, otherwise not.
+     unsigned TyLWidth = 0;
+     unsigned TyRWidth = 0;
+ 
+     if (auto *VecTyL = dyn_cast<VectorType>(TyL))
+       TyLWidth = VecTyL->getPrimitiveSizeInBits().getFixedSize();
+     if (auto *VecTyR = dyn_cast<VectorType>(TyR))
+       TyRWidth = VecTyR->getPrimitiveSizeInBits().getFixedSize();
+ 
+     if (TyLWidth != TyRWidth)
+       return cmpNumbers(TyLWidth, TyRWidth);
+ 
+     // Zero bit-width means neither TyL nor TyR are vectors.
+     if (!TyLWidth) {
+       PointerType *PTyL = dyn_cast<PointerType>(TyL);
+       PointerType *PTyR = dyn_cast<PointerType>(TyR);
+       if (PTyL && PTyR) {
+         unsigned AddrSpaceL = PTyL->getAddressSpace();
+         unsigned AddrSpaceR = PTyR->getAddressSpace();
+         if (int Res = cmpNumbers(AddrSpaceL, AddrSpaceR))
+           return Res;
+       }
+       if (PTyL)
+         return 1;
+       if (PTyR)
+         return -1;
+ 
+       // TyL and TyR aren't vectors, nor pointers. We don't know how to
+       // bitcast them.
+       return TypesRes;
+     }
+   }
+ 
+   // OK, types are bitcastable, now check constant contents.
+ 
+   if (L->isNullValue() && R->isNullValue())
+     return TypesRes;
+   if (L->isNullValue() && !R->isNullValue())
+     return 1;
+   if (!L->isNullValue() && R->isNullValue())
+     return -1;
+ 
+   auto GlobalValueL = const_cast<GlobalValue *>(dyn_cast<GlobalValue>(L));
+   auto GlobalValueR = const_cast<GlobalValue *>(dyn_cast<GlobalValue>(R));
+   if (GlobalValueL && GlobalValueR) {
+     return cmpGlobalValues(GlobalValueL, GlobalValueR);
+   }
+ 
+   if (int Res = cmpNumbers(L->getValueID(), R->getValueID()))
+     return Res;
+ 
+   if (const auto *SeqL = dyn_cast<ConstantDataSequential>(L)) {
+     const auto *SeqR = cast<ConstantDataSequential>(R);
+     // This handles ConstantDataArray and ConstantDataVector. Note that we
+     // compare the two raw data arrays, which might differ depending on the host
+     // endianness. This isn't a problem though, because the endiness of a module
+     // will affect the order of the constants, but this order is the same
+     // for a given input module and host platform.
+     return cmpMem(SeqL->getRawDataValues(), SeqR->getRawDataValues());
+   }
+ 
+   switch (L->getValueID()) {
+   case Value::UndefValueVal:
++  case Value::PoisonValueVal:
+   case Value::ConstantTokenNoneVal:
+     return TypesRes;
+   case Value::ConstantIntVal: {
+     const APInt &LInt = cast<ConstantInt>(L)->getValue();
+     const APInt &RInt = cast<ConstantInt>(R)->getValue();
+     return cmpAPInts(LInt, RInt);
+   }
+   case Value::ConstantFPVal: {
+     const APFloat &LAPF = cast<ConstantFP>(L)->getValueAPF();
+     const APFloat &RAPF = cast<ConstantFP>(R)->getValueAPF();
+     return cmpAPFloats(LAPF, RAPF);
+   }
+   case Value::ConstantArrayVal: {
+     const ConstantArray *LA = cast<ConstantArray>(L);
+     const ConstantArray *RA = cast<ConstantArray>(R);
+     uint64_t NumElementsL = cast<ArrayType>(TyL)->getNumElements();
+     uint64_t NumElementsR = cast<ArrayType>(TyR)->getNumElements();
+     if (int Res = cmpNumbers(NumElementsL, NumElementsR))
+       return Res;
+     for (uint64_t i = 0; i < NumElementsL; ++i) {
+       if (int Res = cmpConstants(cast<Constant>(LA->getOperand(i)),
+                                  cast<Constant>(RA->getOperand(i))))
+         return Res;
+     }
+     return 0;
+   }
+   case Value::ConstantStructVal: {
+     const ConstantStruct *LS = cast<ConstantStruct>(L);
+     const ConstantStruct *RS = cast<ConstantStruct>(R);
+     unsigned NumElementsL = cast<StructType>(TyL)->getNumElements();
+     unsigned NumElementsR = cast<StructType>(TyR)->getNumElements();
+     if (int Res = cmpNumbers(NumElementsL, NumElementsR))
+       return Res;
+     for (unsigned i = 0; i != NumElementsL; ++i) {
+       if (int Res = cmpConstants(cast<Constant>(LS->getOperand(i)),
+                                  cast<Constant>(RS->getOperand(i))))
+         return Res;
+     }
+     return 0;
+   }
+   case Value::ConstantVectorVal: {
+     const ConstantVector *LV = cast<ConstantVector>(L);
+     const ConstantVector *RV = cast<ConstantVector>(R);
+     unsigned NumElementsL = cast<FixedVectorType>(TyL)->getNumElements();
+     unsigned NumElementsR = cast<FixedVectorType>(TyR)->getNumElements();
+     if (int Res = cmpNumbers(NumElementsL, NumElementsR))
+       return Res;
+     for (uint64_t i = 0; i < NumElementsL; ++i) {
+       if (int Res = cmpConstants(cast<Constant>(LV->getOperand(i)),
+                                  cast<Constant>(RV->getOperand(i))))
+         return Res;
+     }
+     return 0;
+   }
+   case Value::ConstantExprVal: {
+     const ConstantExpr *LE = cast<ConstantExpr>(L);
+     const ConstantExpr *RE = cast<ConstantExpr>(R);
+     unsigned NumOperandsL = LE->getNumOperands();
+     unsigned NumOperandsR = RE->getNumOperands();
+     if (int Res = cmpNumbers(NumOperandsL, NumOperandsR))
+       return Res;
+     for (unsigned i = 0; i < NumOperandsL; ++i) {
+       if (int Res = cmpConstants(cast<Constant>(LE->getOperand(i)),
+                                  cast<Constant>(RE->getOperand(i))))
+         return Res;
+     }
+     return 0;
+   }
+   case Value::BlockAddressVal: {
+     const BlockAddress *LBA = cast<BlockAddress>(L);
+     const BlockAddress *RBA = cast<BlockAddress>(R);
+     if (int Res = cmpValues(LBA->getFunction(), RBA->getFunction()))
+       return Res;
+     if (LBA->getFunction() == RBA->getFunction()) {
+       // They are BBs in the same function. Order by which comes first in the
+       // BB order of the function. This order is deterministic.
+       Function *F = LBA->getFunction();
+       BasicBlock *LBB = LBA->getBasicBlock();
+       BasicBlock *RBB = RBA->getBasicBlock();
+       if (LBB == RBB)
+         return 0;
+       for (BasicBlock &BB : F->getBasicBlockList()) {
+         if (&BB == LBB) {
+           assert(&BB != RBB);
+           return -1;
+         }
+         if (&BB == RBB)
+           return 1;
+       }
+       llvm_unreachable("Basic Block Address does not point to a basic block in "
+                        "its function.");
+       return -1;
+     } else {
+       // cmpValues said the functions are the same. So because they aren't
+       // literally the same pointer, they must respectively be the left and
+       // right functions.
+       assert(LBA->getFunction() == FnL && RBA->getFunction() == FnR);
+       // cmpValues will tell us if these are equivalent BasicBlocks, in the
+       // context of their respective functions.
+       return cmpValues(LBA->getBasicBlock(), RBA->getBasicBlock());
+     }
+   }
+   default: // Unknown constant, abort.
+     LLVM_DEBUG(dbgs() << "Looking at valueID " << L->getValueID() << "\n");
+     llvm_unreachable("Constant ValueID not recognized.");
+     return -1;
+   }
+ }

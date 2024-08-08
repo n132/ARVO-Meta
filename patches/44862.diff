@@ -1,0 +1,400 @@
+commit ee9dbcb018f20f16348b22bc413dec1c9d901183
+Author: Venkat Sanampudi <sanampudi.venkatarao@ittiam.com>
+Date:   Thu Feb 24 21:34:22 2022 +0530
+
+    Fix issues in row-mt decoding
+    
+    When an internal error occurs in row-mt path, xd->mi_row is used to
+    signal decoding/parsing for specific SB row is finished. This ensures
+    that other threads which wait on this specific SB row will exit decoding.
+    However, at some places xd->mi_row was not set to a valid value w.r.t.
+    current tile when an internal error occurs. This CL sets xd->mi_row
+    appropriately at these places.
+    
+    BUG=oss-fuzz:44846,oss-fuzz:44856,oss-fuzz:44862,oss-fuzz:44904,oss-fuzz:45056
+    
+    Change-Id: I21568ffb7bd388d782fb2e4615798e3bc9fbe425
+
+diff --git a/av1/decoder/decodeframe.c b/av1/decoder/decodeframe.c
+index b2d4160c92..5d6f5432f4 100644
+--- a/av1/decoder/decodeframe.c
++++ b/av1/decoder/decodeframe.c
+@@ -1252,160 +1252,179 @@ static PARTITION_TYPE read_partition(MACROBLOCKD *xd, int mi_row, int mi_col,
+ // TODO(slavarnway): eliminate bsize and subsize in future commits
+ static AOM_INLINE void decode_partition(AV1Decoder *const pbi,
+                                         ThreadData *const td, int mi_row,
+                                         int mi_col, aom_reader *reader,
+                                         BLOCK_SIZE bsize,
+                                         int parse_decode_flag) {
+   assert(bsize < BLOCK_SIZES_ALL);
+   AV1_COMMON *const cm = &pbi->common;
+   DecoderCodingBlock *const dcb = &td->dcb;
+   MACROBLOCKD *const xd = &dcb->xd;
+   const int bw = mi_size_wide[bsize];
+   const int hbs = bw >> 1;
+   PARTITION_TYPE partition;
+   BLOCK_SIZE subsize;
+   const int quarter_step = bw / 4;
+   BLOCK_SIZE bsize2 = get_partition_subsize(bsize, PARTITION_SPLIT);
+   const int has_rows = (mi_row + hbs) < cm->mi_params.mi_rows;
+   const int has_cols = (mi_col + hbs) < cm->mi_params.mi_cols;
+ 
+   if (mi_row >= cm->mi_params.mi_rows || mi_col >= cm->mi_params.mi_cols)
+     return;
+ 
+   // parse_decode_flag takes the following values :
+   // 01 - do parse only
+   // 10 - do decode only
+   // 11 - do parse and decode
+   static const block_visitor_fn_t block_visit[4] = { NULL, parse_decode_block,
+                                                      decode_block,
+                                                      parse_decode_block };
+ 
+   if (parse_decode_flag & 1) {
+     const int num_planes = av1_num_planes(cm);
+     for (int plane = 0; plane < num_planes; ++plane) {
+ #if CONFIG_REALTIME_ONLY
+       assert(cm->rst_info[plane].frame_restoration_type == RESTORE_NONE);
+ #else
+       int rcol0, rcol1, rrow0, rrow1;
+       if (av1_loop_restoration_corners_in_sb(cm, plane, mi_row, mi_col, bsize,
+                                              &rcol0, &rcol1, &rrow0, &rrow1)) {
+         const int rstride = cm->rst_info[plane].horz_units_per_tile;
+         for (int rrow = rrow0; rrow < rrow1; ++rrow) {
+           for (int rcol = rcol0; rcol < rcol1; ++rcol) {
+             const int runit_idx = rcol + rrow * rstride;
+             loop_restoration_read_sb_coeffs(cm, xd, reader, plane, runit_idx);
+           }
+         }
+       }
+ #endif
+     }
+ 
+     partition = (bsize < BLOCK_8X8) ? PARTITION_NONE
+                                     : read_partition(xd, mi_row, mi_col, reader,
+                                                      has_rows, has_cols, bsize);
+   } else {
+     partition = get_partition(cm, mi_row, mi_col, bsize);
+   }
+   subsize = get_partition_subsize(bsize, partition);
+   if (subsize == BLOCK_INVALID) {
++    // When an internal error occurs ensure that xd->mi_row is set appropriately
++    // w.r.t. current tile, which is used to signal processing of current row is
++    // done.
++    xd->mi_row = mi_row;
+     aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
+                        "Partition is invalid for block size %dx%d",
+                        block_size_wide[bsize], block_size_high[bsize]);
+   }
+   // Check the bitstream is conformant: if there is subsampling on the
+   // chroma planes, subsize must subsample to a valid block size.
+   const struct macroblockd_plane *const pd_u = &xd->plane[1];
+   if (get_plane_block_size(subsize, pd_u->subsampling_x, pd_u->subsampling_y) ==
+       BLOCK_INVALID) {
++    // When an internal error occurs ensure that xd->mi_row is set appropriately
++    // w.r.t. current tile, which is used to signal processing of current row is
++    // done.
++    xd->mi_row = mi_row;
+     aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
+                        "Block size %dx%d invalid with this subsampling mode",
+                        block_size_wide[subsize], block_size_high[subsize]);
+   }
+ 
+ #define DEC_BLOCK_STX_ARG
+ #define DEC_BLOCK_EPT_ARG partition,
+ #define DEC_BLOCK(db_r, db_c, db_subsize)                                  \
+   block_visit[parse_decode_flag](pbi, td, DEC_BLOCK_STX_ARG(db_r), (db_c), \
+                                  reader, DEC_BLOCK_EPT_ARG(db_subsize))
+ #define DEC_PARTITION(db_r, db_c, db_subsize)                        \
+   decode_partition(pbi, td, DEC_BLOCK_STX_ARG(db_r), (db_c), reader, \
+                    (db_subsize), parse_decode_flag)
+ 
+   switch (partition) {
+     case PARTITION_NONE: DEC_BLOCK(mi_row, mi_col, subsize); break;
+     case PARTITION_HORZ:
+       DEC_BLOCK(mi_row, mi_col, subsize);
+       if (has_rows) DEC_BLOCK(mi_row + hbs, mi_col, subsize);
+       break;
+     case PARTITION_VERT:
+       DEC_BLOCK(mi_row, mi_col, subsize);
+       if (has_cols) DEC_BLOCK(mi_row, mi_col + hbs, subsize);
+       break;
+     case PARTITION_SPLIT:
+       DEC_PARTITION(mi_row, mi_col, subsize);
+       DEC_PARTITION(mi_row, mi_col + hbs, subsize);
+       DEC_PARTITION(mi_row + hbs, mi_col, subsize);
+       DEC_PARTITION(mi_row + hbs, mi_col + hbs, subsize);
+       break;
+     case PARTITION_HORZ_A:
+       DEC_BLOCK(mi_row, mi_col, bsize2);
+       DEC_BLOCK(mi_row, mi_col + hbs, bsize2);
+       DEC_BLOCK(mi_row + hbs, mi_col, subsize);
+       break;
+     case PARTITION_HORZ_B:
+       DEC_BLOCK(mi_row, mi_col, subsize);
+       DEC_BLOCK(mi_row + hbs, mi_col, bsize2);
+       DEC_BLOCK(mi_row + hbs, mi_col + hbs, bsize2);
+       break;
+     case PARTITION_VERT_A:
+       DEC_BLOCK(mi_row, mi_col, bsize2);
+       DEC_BLOCK(mi_row + hbs, mi_col, bsize2);
+       DEC_BLOCK(mi_row, mi_col + hbs, subsize);
+       break;
+     case PARTITION_VERT_B:
+       DEC_BLOCK(mi_row, mi_col, subsize);
+       DEC_BLOCK(mi_row, mi_col + hbs, bsize2);
+       DEC_BLOCK(mi_row + hbs, mi_col + hbs, bsize2);
+       break;
+     case PARTITION_HORZ_4:
+       for (int i = 0; i < 4; ++i) {
+         int this_mi_row = mi_row + i * quarter_step;
+         if (i > 0 && this_mi_row >= cm->mi_params.mi_rows) break;
+         DEC_BLOCK(this_mi_row, mi_col, subsize);
+       }
+       break;
+     case PARTITION_VERT_4:
+       for (int i = 0; i < 4; ++i) {
+         int this_mi_col = mi_col + i * quarter_step;
+         if (i > 0 && this_mi_col >= cm->mi_params.mi_cols) break;
+         DEC_BLOCK(mi_row, this_mi_col, subsize);
+       }
+       break;
+     default: assert(0 && "Invalid partition type");
+   }
+ 
+ #undef DEC_PARTITION
+ #undef DEC_BLOCK
+ #undef DEC_BLOCK_EPT_ARG
+ #undef DEC_BLOCK_STX_ARG
+ 
+   if (parse_decode_flag & 1)
+     update_ext_partition_context(xd, mi_row, mi_col, subsize, bsize, partition);
+ }
+ 
+ static AOM_INLINE void setup_bool_decoder(
+-    const uint8_t *data, const uint8_t *data_end, const size_t read_size,
+-    struct aom_internal_error_info *error_info, aom_reader *r,
+-    uint8_t allow_update_cdf) {
++    MACROBLOCKD *const xd, const uint8_t *data, const uint8_t *data_end,
++    const size_t read_size, struct aom_internal_error_info *error_info,
++    aom_reader *r, uint8_t allow_update_cdf) {
+   // Validate the calculated partition length. If the buffer
+   // described by the partition can't be fully read, then restrict
+   // it to the portion that can be (for EC mode) or throw an error.
+-  if (!read_is_valid(data, read_size, data_end))
++  if (!read_is_valid(data, read_size, data_end)) {
++    // When internal error occurs ensure that xd->mi_row is set appropriately
++    // w.r.t. current tile, which is used to signal processing of current row is
++    // done in row-mt decoding.
++    xd->mi_row = xd->tile.mi_row_start;
++
+     aom_internal_error(error_info, AOM_CODEC_CORRUPT_FRAME,
+                        "Truncated packet or corrupt tile length");
++  }
++  if (aom_reader_init(r, data, read_size)) {
++    // When internal error occurs ensure that xd->mi_row is set appropriately
++    // w.r.t. current tile, which is used to signal processing of current row is
++    // done in row-mt decoding.
++    xd->mi_row = xd->tile.mi_row_start;
+ 
+-  if (aom_reader_init(r, data, read_size))
+     aom_internal_error(error_info, AOM_CODEC_MEM_ERROR,
+                        "Failed to allocate bool decoder %d", 1);
++  }
+ 
+   r->allow_update_cdf = allow_update_cdf;
+ }
+@@ -2721,146 +2740,147 @@ static AOM_INLINE void decode_tile(AV1Decoder *pbi, ThreadData *const td,
+ static const uint8_t *decode_tiles(AV1Decoder *pbi, const uint8_t *data,
+                                    const uint8_t *data_end, int start_tile,
+                                    int end_tile) {
+   AV1_COMMON *const cm = &pbi->common;
+   ThreadData *const td = &pbi->td;
+   CommonTileParams *const tiles = &cm->tiles;
+   const int tile_cols = tiles->cols;
+   const int tile_rows = tiles->rows;
+   const int n_tiles = tile_cols * tile_rows;
+   TileBufferDec(*const tile_buffers)[MAX_TILE_COLS] = pbi->tile_buffers;
+   const int dec_tile_row = AOMMIN(pbi->dec_tile_row, tile_rows);
+   const int single_row = pbi->dec_tile_row >= 0;
+   const int dec_tile_col = AOMMIN(pbi->dec_tile_col, tile_cols);
+   const int single_col = pbi->dec_tile_col >= 0;
+   int tile_rows_start;
+   int tile_rows_end;
+   int tile_cols_start;
+   int tile_cols_end;
+   int inv_col_order;
+   int inv_row_order;
+   int tile_row, tile_col;
+   uint8_t allow_update_cdf;
+   const uint8_t *raw_data_end = NULL;
+ 
+   if (tiles->large_scale) {
+     tile_rows_start = single_row ? dec_tile_row : 0;
+     tile_rows_end = single_row ? dec_tile_row + 1 : tile_rows;
+     tile_cols_start = single_col ? dec_tile_col : 0;
+     tile_cols_end = single_col ? tile_cols_start + 1 : tile_cols;
+     inv_col_order = pbi->inv_tile_order && !single_col;
+     inv_row_order = pbi->inv_tile_order && !single_row;
+     allow_update_cdf = 0;
+   } else {
+     tile_rows_start = 0;
+     tile_rows_end = tile_rows;
+     tile_cols_start = 0;
+     tile_cols_end = tile_cols;
+     inv_col_order = pbi->inv_tile_order;
+     inv_row_order = pbi->inv_tile_order;
+     allow_update_cdf = 1;
+   }
+ 
+   // No tiles to decode.
+   if (tile_rows_end <= tile_rows_start || tile_cols_end <= tile_cols_start ||
+       // First tile is larger than end_tile.
+       tile_rows_start * tiles->cols + tile_cols_start > end_tile ||
+       // Last tile is smaller than start_tile.
+       (tile_rows_end - 1) * tiles->cols + tile_cols_end - 1 < start_tile)
+     return data;
+ 
+   allow_update_cdf = allow_update_cdf && !cm->features.disable_cdf_update;
+ 
+   assert(tile_rows <= MAX_TILE_ROWS);
+   assert(tile_cols <= MAX_TILE_COLS);
+ 
+ #if EXT_TILE_DEBUG
+   if (tiles->large_scale && !pbi->ext_tile_debug)
+     raw_data_end = get_ls_single_tile_buffer(pbi, data, tile_buffers);
+   else if (tiles->large_scale && pbi->ext_tile_debug)
+     raw_data_end = get_ls_tile_buffers(pbi, data, data_end, tile_buffers);
+   else
+ #endif  // EXT_TILE_DEBUG
+     get_tile_buffers(pbi, data, data_end, tile_buffers, start_tile, end_tile);
+ 
+   if (pbi->tile_data == NULL || n_tiles != pbi->allocated_tiles) {
+     decoder_alloc_tile_data(pbi, n_tiles);
+   }
+   if (pbi->dcb.xd.seg_mask == NULL)
+     CHECK_MEM_ERROR(cm, pbi->dcb.xd.seg_mask,
+                     (uint8_t *)aom_memalign(
+                         16, 2 * MAX_SB_SQUARE * sizeof(*pbi->dcb.xd.seg_mask)));
+ #if CONFIG_ACCOUNTING
+   if (pbi->acct_enabled) {
+     aom_accounting_reset(&pbi->accounting);
+   }
+ #endif
+ 
+   set_decode_func_pointers(&pbi->td, 0x3);
+ 
+   // Load all tile information into thread_data.
+   td->dcb = pbi->dcb;
+ 
+   td->dcb.corrupted = 0;
+   td->dcb.mc_buf[0] = td->mc_buf[0];
+   td->dcb.mc_buf[1] = td->mc_buf[1];
+   td->dcb.xd.tmp_conv_dst = td->tmp_conv_dst;
+   for (int j = 0; j < 2; ++j) {
+     td->dcb.xd.tmp_obmc_bufs[j] = td->tmp_obmc_bufs[j];
+   }
+ 
+   for (tile_row = tile_rows_start; tile_row < tile_rows_end; ++tile_row) {
+     const int row = inv_row_order ? tile_rows - 1 - tile_row : tile_row;
+ 
+     for (tile_col = tile_cols_start; tile_col < tile_cols_end; ++tile_col) {
+       const int col = inv_col_order ? tile_cols - 1 - tile_col : tile_col;
+       TileDataDec *const tile_data = pbi->tile_data + row * tiles->cols + col;
+       const TileBufferDec *const tile_bs_buf = &tile_buffers[row][col];
+ 
+       if (row * tiles->cols + col < start_tile ||
+           row * tiles->cols + col > end_tile)
+         continue;
+ 
+       td->bit_reader = &tile_data->bit_reader;
+       av1_zero(td->cb_buffer_base.dqcoeff);
+       av1_tile_init(&td->dcb.xd.tile, cm, row, col);
+       td->dcb.xd.current_base_qindex = cm->quant_params.base_qindex;
+-      setup_bool_decoder(tile_bs_buf->data, data_end, tile_bs_buf->size,
+-                         &pbi->error, td->bit_reader, allow_update_cdf);
++      setup_bool_decoder(&td->dcb.xd, tile_bs_buf->data, data_end,
++                         tile_bs_buf->size, &pbi->error, td->bit_reader,
++                         allow_update_cdf);
+ #if CONFIG_ACCOUNTING
+       if (pbi->acct_enabled) {
+         td->bit_reader->accounting = &pbi->accounting;
+         td->bit_reader->accounting->last_tell_frac =
+             aom_reader_tell_frac(td->bit_reader);
+       } else {
+         td->bit_reader->accounting = NULL;
+       }
+ #endif
+       av1_init_macroblockd(cm, &td->dcb.xd);
+       av1_init_above_context(&cm->above_contexts, av1_num_planes(cm), row,
+                              &td->dcb.xd);
+ 
+       // Initialise the tile context from the frame context
+       tile_data->tctx = *cm->fc;
+       td->dcb.xd.tile_ctx = &tile_data->tctx;
+ 
+       // decode tile
+       decode_tile(pbi, td, row, col);
+       aom_merge_corrupted_flag(&pbi->dcb.corrupted, td->dcb.corrupted);
+       if (pbi->dcb.corrupted)
+         aom_internal_error(&pbi->error, AOM_CODEC_CORRUPT_FRAME,
+                            "Failed to decode tile data");
+     }
+   }
+ 
+   if (tiles->large_scale) {
+     if (n_tiles == 1) {
+       // Find the end of the single tile buffer
+       return aom_reader_find_end(&pbi->tile_data->bit_reader);
+     }
+     // Return the end of the last tile buffer
+     return raw_data_end;
+   }
+   TileDataDec *const tile_data = pbi->tile_data + end_tile;
+ 
+   return aom_reader_find_end(&tile_data->bit_reader);
+ }
+@@ -2885,41 +2905,42 @@ static TileJobsDec *get_dec_job_info(AV1DecTileMT *tile_mt_info) {
+ static AOM_INLINE void tile_worker_hook_init(
+     AV1Decoder *const pbi, DecWorkerData *const thread_data,
+     const TileBufferDec *const tile_buffer, TileDataDec *const tile_data,
+     uint8_t allow_update_cdf) {
+   AV1_COMMON *cm = &pbi->common;
+   ThreadData *const td = thread_data->td;
+   int tile_row = tile_data->tile_info.tile_row;
+   int tile_col = tile_data->tile_info.tile_col;
+ 
+   td->bit_reader = &tile_data->bit_reader;
+   av1_zero(td->cb_buffer_base.dqcoeff);
+ 
+   MACROBLOCKD *const xd = &td->dcb.xd;
+   av1_tile_init(&xd->tile, cm, tile_row, tile_col);
+   xd->current_base_qindex = cm->quant_params.base_qindex;
+-  setup_bool_decoder(tile_buffer->data, thread_data->data_end,
++
++  setup_bool_decoder(xd, tile_buffer->data, thread_data->data_end,
+                      tile_buffer->size, &thread_data->error_info,
+                      td->bit_reader, allow_update_cdf);
+ #if CONFIG_ACCOUNTING
+   if (pbi->acct_enabled) {
+     td->bit_reader->accounting = &pbi->accounting;
+     td->bit_reader->accounting->last_tell_frac =
+         aom_reader_tell_frac(td->bit_reader);
+   } else {
+     td->bit_reader->accounting = NULL;
+   }
+ #endif
+   av1_init_macroblockd(cm, xd);
+   xd->error_info = &thread_data->error_info;
+   av1_init_above_context(&cm->above_contexts, av1_num_planes(cm), tile_row, xd);
+ 
+   // Initialise the tile context from the frame context
+   tile_data->tctx = *cm->fc;
+   xd->tile_ctx = &tile_data->tctx;
+ #if CONFIG_ACCOUNTING
+   if (pbi->acct_enabled) {
+     tile_data->bit_reader.accounting->last_tell_frac =
+         aom_reader_tell_frac(&tile_data->bit_reader);
+   }
+ #endif
+ }

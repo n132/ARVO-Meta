@@ -1,0 +1,225 @@
+commit ebfb46da46e3f2872e4d1136571224a60891f80a
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Mon Sep 26 17:14:48 2022 +0100
+
+    pdfwrite - clean up proerly after errors writing TrueType fonts
+    
+    OSS-fuzz #51745
+    
+    Commit bd08091d295effb51de2cc7e739870e7b2628e38 already tackled a number
+    of other cases of the same problem, but sadly missed this one. Once
+    we've begun writing a font file we must end it before returning or we
+    will end up with the wrong stream in the pdfwrite device structure
+    which will lead to all kinds of problems.
+    
+    Add code to handle the missing case here.
+
+diff --git a/devices/vector/gdevpdtb.c b/devices/vector/gdevpdtb.c
+index 5c8fb8d8d..77341ccb4 100644
+--- a/devices/vector/gdevpdtb.c
++++ b/devices/vector/gdevpdtb.c
+@@ -593,202 +593,202 @@ int
+ pdf_write_embedded_font(gx_device_pdf *pdev, pdf_base_font_t *pbfont, font_type FontType,
+                         gs_int_rect *FontBBox, gs_id rid, cos_dict_t **ppcd)
+ {
+     bool do_subset = pdf_do_subset_font(pdev, pbfont, rid);
+     gs_font_base *out_font =
+         (do_subset || pbfont->complete == NULL ? pbfont->copied : pbfont->complete);
+     gs_const_string fnstr;
+     pdf_data_writer_t writer;
+     byte digest[6] = {0,0,0,0,0,0};
+     int code = 0;
+     int options=0;
+ 
+     if (pbfont->written)
+         return 0;		/* already written */
+     code = copied_order_font((gs_font *)out_font);
+     if (code < 0)
+         return code;
+     /* Since we now always ASCIIHex encode the eexec encrypted portion of a
+      * Type 1 font, such a font cannot contain any binary data, if its not being
+      * compressed then there is no reason to ASCII encode it (which will happen
+      * we set DATA_STREAM_BINARY and the device does not permit binary output)
+      * NB if HaveCFF is true then we convert type 1 to CFF which is a binary
+      * format, so we still need to set DATA_STREAM_BINARY.
+      */
+     if (pdev->CompressFonts)
+         options = DATA_STREAM_BINARY | DATA_STREAM_COMPRESS;
+     else
+          if (FontType != ft_encrypted || pdev->HaveCFF)
+             options = DATA_STREAM_BINARY;
+     /* Don't set DATA_STREAM_ENCRYPT since we write to a temporary file.
+      * See comment in pdf_begin_encrypt.
+      */
+     code = pdf_begin_data_stream(pdev, &writer, options, 0);
+     if (code < 0)
+         return code;
+     if (pdev->PDFA != 0) {
+         stream *s = s_MD5C_make_stream(pdev->pdf_memory, writer.binary.strm);
+ 
+         if (s == NULL)
+             return_error(gs_error_VMerror);
+         writer.binary.strm = s;
+     }
+     if (pdev->CompatibilityLevel == 1.2 &&
+         !do_subset && !pbfont->is_standard ) {
+         /*
+          * Due to a bug in Acrobat Reader 3, we need to generate
+          * unique font names, except base 14 fonts being not embedded.
+          * To recognize base 14 fonts here we used the knowledge
+          * that pbfont->is_standard is true for base 14 fonts only.
+          * Note that subsetted fonts already have an unique name
+          * due to subset prefix.
+          */
+          int code = pdf_adjust_font_name(pdev, writer.pres->object->id, pbfont);
+          if (code < 0)
+             return code;
+     }
+     fnstr.data = pbfont->font_name.data;
+     fnstr.size = pbfont->font_name.size;
+     /* Now write the font (or subset). */
+     switch (FontType) {
+ 
+     case ft_composite:
+         /* Nothing to embed -- the descendant fonts do it all. */
+         code = 0;
+         break;
+ 
+     case ft_encrypted2:
+         if (!pdev->HaveCFF) {
+             /* Must convert to Type 1 charstrings. */
+             return_error(gs_error_unregistered); /* Not implemented yet. */
+         }
+     case ft_encrypted:
+         if (pdev->HavePDFWidths) {
+             code = copied_drop_extension_glyphs((gs_font *)out_font);
+             if (code < 0)
+                 return code;
+         }
+         if (!pdev->HaveCFF) {
+             /* Write the type 1 font with no converting to CFF. */
+             int lengths[3];
+ 
+             if (pbfont->do_subset != DO_SUBSET_NO)
+                 code = psf_write_type1_font(writer.binary.strm,
+                                 (gs_font_type1 *)out_font,
+                                 WRITE_TYPE1_WITH_LENIV | WRITE_TYPE1_EEXEC |
+                                 WRITE_TYPE1_EEXEC_PAD | WRITE_TYPE1_ASCIIHEX,
+                                 NULL, 0, &fnstr, lengths);
+             else
+                 code = psf_write_type1_font(writer.binary.strm,
+                                 (gs_font_type1 *)out_font,
+                                 WRITE_TYPE1_WITH_LENIV | WRITE_TYPE1_EEXEC |
+                                 WRITE_TYPE1_EEXEC_PAD | WRITE_TYPE1_ASCIIHEX | WRITE_TYPE1_XUID,
+                                 NULL, 0, &fnstr, lengths);
+             if (lengths[0] > 0) {
+                 if (code < 0)
+                     goto finish;
+                 code = cos_dict_put_c_key_int((cos_dict_t *)writer.pres->object,
+                             "/Length1", lengths[0]);
+             }
+             if (lengths[1] > 0) {
+                 if (code < 0)
+                     goto finish;
+                 code = cos_dict_put_c_key_int((cos_dict_t *)writer.pres->object,
+                             "/Length2", lengths[1]);
+                 if (code < 0)
+                     return code;
+                 code = cos_dict_put_c_key_int((cos_dict_t *)writer.pres->object,
+                             "/Length3", lengths[2]);
+             }
+         } else {
+             /*
+              * Since we only support PDF 1.2 and later, always write Type 1
+              * fonts as Type1C (Type 2).  Acrobat Reader apparently doesn't
+              * accept CFF fonts with Type 1 CharStrings, so we need to convert
+              * them.  Also remove lenIV, so Type 2 fonts will compress better.
+              */
+ #define TYPE2_OPTIONS (WRITE_TYPE2_NO_LENIV | WRITE_TYPE2_CHARSTRINGS)
+             code = cos_dict_put_string_copy((cos_dict_t *)writer.pres->object, "/Subtype", "/Type1C");
+             if (code < 0)
+                 return code;
+             code = psf_write_type2_font(writer.binary.strm,
+                                         (gs_font_type1 *)out_font,
+                                         TYPE2_OPTIONS |
+                             (pdev->CompatibilityLevel < 1.3 ? WRITE_TYPE2_AR3 : 0) |
+                             (pbfont->do_subset == DO_SUBSET_NO ? WRITE_TYPE2_XUID : 0),
+                                         NULL, 0, &fnstr, FontBBox);
+         }
+         goto finish;
+ 
+     case ft_TrueType: {
+         gs_font_type42 *const pfont = (gs_font_type42 *)out_font;
+ #define TRUETYPE_OPTIONS (WRITE_TRUETYPE_NAME | WRITE_TRUETYPE_HVMTX)
+         /* Acrobat Reader 3 doesn't handle cmap format 6 correctly. */
+         const int options = TRUETYPE_OPTIONS |
+             (pdev->PDFA != 0 ? WRITE_TRUETYPE_UNICODE_CMAP : 0) |
+             (pdev->CompatibilityLevel <= 1.2 ?
+              WRITE_TRUETYPE_NO_TRIMMED_TABLE : 0) |
+             /* Generate a cmap only for incrementally downloaded fonts
+                and for subsetted fonts. */
+             (pfont->data.numGlyphs != pfont->data.trueNumGlyphs ||
+              pbfont->do_subset == DO_SUBSET_YES ?
+              WRITE_TRUETYPE_CMAP : 0);
+         stream poss;
+ 
+         if (pdev->HavePDFWidths) {
+             code = copied_drop_extension_glyphs((gs_font *)out_font);
+             if (code < 0)
+                 return code;
+         }
+         s_init(&poss, pdev->memory);
+         swrite_position_only(&poss);
+         code = psf_write_truetype_font(&poss, pfont, options, NULL, 0, &fnstr);
+         if (code < 0)
+-            return code;
++            goto finish;
+         code = cos_dict_put_c_key_int((cos_dict_t *)writer.pres->object, "/Length1", stell(&poss));
+         if (code < 0)
+-            return code;
++            goto finish;
+         code = psf_write_truetype_font(writer.binary.strm, pfont,
+                                        options, NULL, 0, &fnstr);
+         goto finish;
+     }
+ 
+     case ft_CID_encrypted:
+         code = cos_dict_put_string_copy((cos_dict_t *)writer.pres->object, "/Subtype", "/CIDFontType0C");
+         if (code < 0)
+             return code;
+         code = psf_write_cid0_font(writer.binary.strm,
+                                    (gs_font_cid0 *)out_font, TYPE2_OPTIONS,
+                                    NULL, 0, &fnstr);
+         goto finish;
+ 
+     case ft_CID_TrueType:
+         /* CIDFontType 2 fonts don't use cmap, name, OS/2, or post. */
+ #define CID2_OPTIONS WRITE_TRUETYPE_HVMTX
+         code = psf_write_cid2_font(writer.binary.strm,
+                                    (gs_font_cid2 *)out_font,
+                                    CID2_OPTIONS, NULL, 0, &fnstr);
+     finish:
+         if (pdev->PDFA != 0) {
+             sflush(writer.binary.strm);
+             s_MD5C_get_digest(writer.binary.strm, digest, sizeof(digest));
+         }
+         *ppcd = (cos_dict_t *)writer.pres->object;
+         if (code < 0) {
+             pdf_end_fontfile(pdev, &writer);
+             pdf_obj_mark_unused(pdev, writer.pres->object->id);
+             return code;
+         }
+         code = pdf_end_fontfile(pdev, &writer);
+         break;
+ 
+     default:
+         code = gs_note_error(gs_error_rangecheck);
+     }
+ 
+     pbfont->written = true;
+     return code;
+ }
+ 
+ /*
+  * Write the CharSet for a subsetted font, as a PDF string.
+  */

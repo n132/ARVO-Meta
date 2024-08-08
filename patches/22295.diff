@@ -1,0 +1,764 @@
+commit 33e0c892ff0036da5d23dce834f384df786c91bb
+Author: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date:   Sun May 17 22:34:01 2020 -0700
+
+    Fixed oss-fuzz issue 22295: Heap-buffer-overflow in pixGetRGBComponentCmap()
+    * use converted RGB pix when extracting components
+    * prevent indexing overflow into colormap
+    * extra checks in pixSetColormap() and pixCopyColormap()
+    * do not use pixSetColormap() in pixTransferAllData(), because at the
+      time the colormap is transferred, the colormap and destination pix can
+      have diffeent depths.
+
+diff --git a/src/allheaders.h b/src/allheaders.h
+index 22836c8..4e2b8b0 100644
+--- a/src/allheaders.h
++++ b/src/allheaders.h
+@@ -476,7 +476,7 @@ LEPT_DLL extern PIXCMAP * pixcmapCreateRandom ( l_int32 depth, l_int32 hasblack,
+ LEPT_DLL extern PIXCMAP * pixcmapCreateLinear ( l_int32 d, l_int32 nlevels );
+ LEPT_DLL extern PIXCMAP * pixcmapCopy ( const PIXCMAP *cmaps );
+ LEPT_DLL extern void pixcmapDestroy ( PIXCMAP **pcmap );
+-LEPT_DLL extern l_ok pixcmapIsValid ( const PIXCMAP *cmap, l_int32 *pvalid );
++LEPT_DLL extern l_ok pixcmapIsValid ( const PIXCMAP *cmap, const PIX *pix, l_int32 *pvalid );
+ LEPT_DLL extern l_ok pixcmapAddColor ( PIXCMAP *cmap, l_int32 rval, l_int32 gval, l_int32 bval );
+ LEPT_DLL extern l_ok pixcmapAddRGBA ( PIXCMAP *cmap, l_int32 rval, l_int32 gval, l_int32 bval, l_int32 aval );
+ LEPT_DLL extern l_ok pixcmapAddNewColor ( PIXCMAP *cmap, l_int32 rval, l_int32 gval, l_int32 bval, l_int32 *pindex );
+diff --git a/src/colormap.c b/src/colormap.c
+index 88ac812..86e0ef2 100644
+--- a/src/colormap.c
++++ b/src/colormap.c
+@@ -250,27 +250,27 @@ l_int32   nbytes, valid;
+ PIXCMAP  *cmapd;
+ 
+     PROCNAME("pixcmapCopy");
+ 
+     if (!cmaps)
+         return (PIXCMAP *)ERROR_PTR("cmaps not defined", procName, NULL);
+-    pixcmapIsValid(cmaps, &valid);
++    pixcmapIsValid(cmaps, NULL, &valid);
+     if (!valid)
+         return (PIXCMAP *)ERROR_PTR("invalid cmap", procName, NULL);
+ 
+     cmapd = (PIXCMAP *)LEPT_CALLOC(1, sizeof(PIXCMAP));
+     nbytes = cmaps->nalloc * sizeof(RGBA_QUAD);
+     cmapd->array = (void *)LEPT_CALLOC(1, nbytes);
+     memcpy(cmapd->array, cmaps->array, cmaps->n * sizeof(RGBA_QUAD));
+     cmapd->n = cmaps->n;
+     cmapd->nalloc = cmaps->nalloc;
+     cmapd->depth = cmaps->depth;
+     return cmapd;
+ }
+ 
+ 
+ /*!
+  * \brief   pixcmapDestroy()
+  *
+  * \param[in,out]   pcmap    set to null on return
+  * \return  void
+  */
+@@ -279,73 +279,90 @@ pixcmapDestroy(PIXCMAP  **pcmap)
+ {
+ PIXCMAP  *cmap;
+ 
+     PROCNAME("pixcmapDestroy");
+ 
+     if (pcmap == NULL) {
+         L_WARNING("ptr address is null!\n", procName);
+         return;
+     }
+ 
+     if ((cmap = *pcmap) == NULL)
+         return;
+ 
+     LEPT_FREE(cmap->array);
+     LEPT_FREE(cmap);
+     *pcmap = NULL;
+ }
+ 
+ /*!
+  * \brief   pixcmapIsValid()
+  *
+  * \param[in]    cmap
++ * \param[in]    pix        optional; can be NULL
+  * \param[out]   pvalid     return 1 if valid; 0 if not
+  * \return  0 if OK, 1 on error or if cmap is not valid
++ *
++ * <pre>
++ * Notes:
++ *      (1) If %pix is input, verify that pix values cannot overflow the cmap.
++ * </pre>
+  */
+ l_ok
+ pixcmapIsValid(const PIXCMAP  *cmap,
++               const PIX      *pix,
+                l_int32        *pvalid)
+ {
+-l_int32  d;
++l_int32  d, nalloc;
+ 
+     PROCNAME("pixcmapIsValid");
+ 
+     if (!pvalid)
+         return ERROR_INT("&valid not defined", procName, 1);
+     *pvalid = 0;
+     if (!cmap)
+         return ERROR_INT("cmap not defined", procName, 1);
+     if (!cmap->array)
+         return ERROR_INT("cmap array not defined", procName, 1);
+     d = cmap->depth;
+-    if (d !=1 && d != 2 && d != 4 && d != 8) {
++    if (d != 1 && d != 2 && d != 4 && d != 8) {
+         L_ERROR("invalid cmap depth: %d\n", procName, d);
+         return 1;
+     }
+-    if (cmap->nalloc < 2 || cmap->nalloc > 256) {
+-        L_ERROR("invalid cmap nalloc: %d\n", procName, cmap->nalloc);
++    nalloc = cmap->nalloc;
++    if (nalloc != (1 << d)) {
++        L_ERROR("invalid cmap nalloc: %d; d = %d\n", procName, nalloc, d);
+         return 1;
+     }
+-    if (cmap->n < 0 || cmap->n > 256 || cmap->n > cmap->nalloc) {
+-        L_ERROR("invalid cmap n: %d (nalloc = %d)\n", procName,
+-                cmap->n, cmap->nalloc);
++    if (cmap->n < 0 || cmap->n > nalloc) {
++        L_ERROR("invalid cmap n: %d; nalloc = %d\n", procName, cmap->n, nalloc);
+         return 1;
+     }
++
++        /* To prevent indexing overflow into the cmap, the pix depth
++         * must not exceed the cmap depth.  Do not require depth equality,
++         * because some functions such as median cut quantizers do not. */
++    if (pix && (pixGetDepth(pix) > d)) {
++        L_ERROR("pix depth = %d > cmap depth = %d\n", procName,
++                pixGetDepth(pix), d);
++        return 1;
++    }
++
+     *pvalid = 1;
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   pixcmapAddColor()
+  *
+  * \param[in]    cmap
+  * \param[in]    rval, gval, bval   colormap entry to be added; each number
+  *                                  is in range [0, ... 255]
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) This always adds the color if there is room.
+  *      (2) The alpha component is 255 (opaque)
+  * </pre>
+  */
+diff --git a/src/enhance.c b/src/enhance.c
+index 8765664..1dee841 100644
+--- a/src/enhance.c
++++ b/src/enhance.c
+@@ -1003,66 +1003,66 @@ pixUnsharpMasking(PIX       *pixs,
+                   l_float32  fract)
+ {
+ l_int32  d;
+-PIX     *pixt, *pixd, *pixr, *pixrs, *pixg, *pixgs, *pixb, *pixbs;
++PIX     *pix1, *pixd, *pixr, *pixrs, *pixg, *pixgs, *pixb, *pixbs;
+ 
+     PROCNAME("pixUnsharpMasking");
+ 
+     if (!pixs || (pixGetDepth(pixs) == 1))
+         return (PIX *)ERROR_PTR("pixs not defined or 1 bpp", procName, NULL);
+     if (fract <= 0.0 || halfwidth <= 0) {
+         L_WARNING("no sharpening requested; clone returned\n", procName);
+         return pixClone(pixs);
+     }
+ 
+     if (halfwidth == 1 || halfwidth == 2)
+         return pixUnsharpMaskingFast(pixs, halfwidth, fract, L_BOTH_DIRECTIONS);
+ 
+         /* Remove colormap; clone if possible; result is either 8 or 32 bpp */
+-    if ((pixt = pixConvertTo8Or32(pixs, L_CLONE, 0)) == NULL)
+-        return (PIX *)ERROR_PTR("pixt not made", procName, NULL);
++    if ((pix1 = pixConvertTo8Or32(pixs, L_CLONE, 0)) == NULL)
++        return (PIX *)ERROR_PTR("pix1 not made", procName, NULL);
+ 
+         /* Sharpen */
+-    d = pixGetDepth(pixt);
++    d = pixGetDepth(pix1);
+     if (d == 8) {
+-        pixd = pixUnsharpMaskingGray(pixt, halfwidth, fract);
++        pixd = pixUnsharpMaskingGray(pix1, halfwidth, fract);
+     } else {  /* d == 32 */
+-        pixr = pixGetRGBComponent(pixs, COLOR_RED);
++        pixr = pixGetRGBComponent(pix1, COLOR_RED);
+         pixrs = pixUnsharpMaskingGray(pixr, halfwidth, fract);
+         pixDestroy(&pixr);
+-        pixg = pixGetRGBComponent(pixs, COLOR_GREEN);
++        pixg = pixGetRGBComponent(pix1, COLOR_GREEN);
+         pixgs = pixUnsharpMaskingGray(pixg, halfwidth, fract);
+         pixDestroy(&pixg);
+-        pixb = pixGetRGBComponent(pixs, COLOR_BLUE);
++        pixb = pixGetRGBComponent(pix1, COLOR_BLUE);
+         pixbs = pixUnsharpMaskingGray(pixb, halfwidth, fract);
+         pixDestroy(&pixb);
+         pixd = pixCreateRGBImage(pixrs, pixgs, pixbs);
+         pixDestroy(&pixrs);
+         pixDestroy(&pixgs);
+         pixDestroy(&pixbs);
+         if (pixGetSpp(pixs) == 4)
+             pixScaleAndTransferAlpha(pixd, pixs, 1.0, 1.0);
+     }
+ 
+-    pixDestroy(&pixt);
++    pixDestroy(&pix1);
+     return pixd;
+ }
+ 
+ 
+ /*!
+  * \brief   pixUnsharpMaskingGray()
+  *
+  * \param[in]    pixs       8 bpp; no colormap
+  * \param[in]    halfwidth  "half-width" of smoothing filter
+  * \param[in]    fract      fraction of edge added back into image
+  * \return  pixd, or NULL on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) We use symmetric smoothing filters of odd dimension,
+  *          typically use sizes of 3, 5, 7, etc.  The %halfwidth parameter
+  *          for these is (size - 1)/2; i.e., 1, 2, 3, etc.
+  *      (2) The fract parameter is typically taken in the range:
+  *          0.2 < fract < 0.7
+  *      (3) Returns a clone if no sharpening is requested.
+  * </pre>
+  */
+diff --git a/src/pix1.c b/src/pix1.c
+index 1590823..8abadfc 100644
+--- a/src/pix1.c
++++ b/src/pix1.c
+@@ -809,31 +809,33 @@ const PIXCMAP  *cmaps;
+ PIXCMAP        *cmapd;
+ 
+     PROCNAME("pixCopyColormap");
+ 
+     if (!pixs)
+         return ERROR_INT("pixs not defined", procName, 1);
+     if (!pixd)
+         return ERROR_INT("pixd not defined", procName, 1);
+     if (pixs == pixd)
+         return 0;   /* no-op */
++    if (pixGetDepth(pixs) != pixGetDepth(pixd))
++        return ERROR_INT("depths of pixs and pixd differ", procName, 1);
+ 
+     pixDestroyColormap(pixd);
+     if ((cmaps = pixs->colormap) == NULL)  /* not an error */
+         return 0;
+-    pixcmapIsValid(cmaps, &valid);
++    pixcmapIsValid(cmaps, pixs, &valid);
+     if (!valid)
+         return ERROR_INT("cmap not valid", procName, 1);
+ 
+     if ((cmapd = pixcmapCopy(cmaps)) == NULL)
+         return ERROR_INT("cmapd not made", procName, 1);
+     pixSetColormap(pixd, cmapd);
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   pixSizesEqual()
+  *
+  * \param[in]    pix1, pix2
+  * \return  1 if the two pix have same {h, w, d}; 0 otherwise.
+  */
+@@ -921,83 +923,84 @@ l_int32  nbytes;
+ PIX     *pixs;
+ 
+     PROCNAME("pixTransferAllData");
+ 
+     if (!ppixs)
+         return ERROR_INT("&pixs not defined", procName, 1);
+     if ((pixs = *ppixs) == NULL)
+         return ERROR_INT("pixs not defined", procName, 1);
+     if (!pixd)
+         return ERROR_INT("pixd not defined", procName, 1);
+     if (pixs == pixd)  /* no-op */
+         return ERROR_INT("pixd == pixs", procName, 1);
+ 
+     if (pixGetRefcount(pixs) == 1) {  /* transfer the data, cmap, text */
+         pixFreeData(pixd);  /* dealloc any existing data */
+         pixSetData(pixd, pixGetData(pixs));  /* transfer new data from pixs */
+         pixs->data = NULL;  /* pixs no longer owns data */
+-        pixSetColormap(pixd, pixGetColormap(pixs));  /* frees old; sets new */
++        pixDestroyColormap(pixd);  /* free the old one, if it exists */
++        pixd->colormap = pixGetColormap(pixs);  /* transfer to pixd */
+         pixs->colormap = NULL;  /* pixs no longer owns colormap */
+         if (copytext) {
+             pixSetText(pixd, pixGetText(pixs));
+             pixSetText(pixs, NULL);
+         }
+     } else {  /* preserve pixs by making a copy of the data, cmap, text */
+         pixResizeImageData(pixd, pixs);
+         nbytes = 4 * pixGetWpl(pixs) * pixGetHeight(pixs);
+         memcpy(pixGetData(pixd), pixGetData(pixs), nbytes);
+         pixCopyColormap(pixd, pixs);
+         if (copytext)
+             pixCopyText(pixd, pixs);
+     }
+ 
+     pixCopySpp(pixd, pixs);
+     pixCopyResolution(pixd, pixs);
+     pixCopyDimensions(pixd, pixs);
+     if (copyformat)
+         pixCopyInputFormat(pixd, pixs);
+ 
+         /* This will destroy pixs if data was transferred;
+          * otherwise, it just decrements its refcount. */
+     pixDestroy(ppixs);
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   pixSwapAndDestroy()
+  *
+  * \param[out]     ppixd   [optional] input pixd can be null,
+  *                         and it must be different from pixs
+  * \param[in,out]  ppixs   will be nulled after the swap
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) Simple operation to change the handle name safely.
+  *          After this operation, the original image in pixd has
+  *          been destroyed, pixd points to what was pixs, and
+  *          the input pixs ptr has been nulled.
+  *      (2) This works safely whether or not pixs and pixd are cloned.
+  *          If pixs is cloned, the other handles still point to
+  *          the original image, with the ref count reduced by 1.
+  *      (3) Usage example:
+  * \code
+  *            Pix *pix1 = pixRead("...");
+  *            Pix *pix2 = function(pix1, ...);
+  *            pixSwapAndDestroy(&pix1, &pix2);
+  *            pixDestroy(&pix1);  // holds what was in pix2
+  * \endcode
+  *          Example with clones ([] shows ref count of image generated
+  *                               by the function):
+  * \code
+  *            Pix *pixs = pixRead("...");
+  *            Pix *pix1 = pixClone(pixs);
+  *            Pix *pix2 = function(pix1, ...);   [1]
+  *            Pix *pix3 = pixClone(pix2);   [1] --> [2]
+  *            pixSwapAndDestroy(&pix1, &pix2);
+  *            pixDestroy(&pixs);  // still holds read image
+  *            pixDestroy(&pix1);  // holds what was in pix2  [2] --> [1]
+  *            pixDestroy(&pix3);  // holds what was in pix2  [1] --> [0]
+  * \endcode
+  * </pre>
+  */
+@@ -1612,46 +1615,54 @@ PIXCMAP *
+ pixGetColormap(PIX  *pix)
+ {
+     PROCNAME("pixGetColormap");
+ 
+     if (!pix)
+         return (PIXCMAP *)ERROR_PTR("pix not defined", procName, NULL);
+     return pix->colormap;
+ }
+ 
+ 
+ /*!
+  * \brief   pixSetColormap()
+  *
+  * \param[in]   pix
+- * \param[in]   colormap   to be assigned
++ * \param[in]   colormap   optional; can be null.
+  * \return  0 if OK, 1 on error.
+  *
+  * <pre>
+  * Notes:
+- *      (1) Unlike with the pix data field, pixSetColormap() destroys
+- *          any existing colormap before assigning the new one.
+- *          Because colormaps are not ref counted, it is important that
+- *          the new colormap does not belong to any other pix.
++ *      (1) If %colormap is not defined, or on error, this is a no-op.
++ *      (2) pixSetColormap() destroys any existing colormap before
++ *          assigning the new %colormap to %pix.
++ *      (3) Because colormaps are not ref counted, the new colormap
++ *          must not belong to any other pix.
+  * </pre>
+  */
+ l_ok
+ pixSetColormap(PIX      *pix,
+                PIXCMAP  *colormap)
+ {
++l_int32  valid;
++
+     PROCNAME("pixSetColormap");
+ 
+     if (!pix)
+         return ERROR_INT("pix not defined", procName, 1);
++    if (!colormap) return 0;
++
++    pixcmapIsValid(colormap, pix, &valid);
++    if (!valid)
++        return ERROR_INT("colormap is not valid", procName, 1);
+ 
+     pixDestroyColormap(pix);
+     pix->colormap = colormap;
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   pixDestroyColormap()
+  *
+  * \param[in]   pix
+  * \return  0 if OK, 1 on error
+  */
+diff --git a/src/pix2.c b/src/pix2.c
+index 6a4abdc..34552b7 100644
+--- a/src/pix2.c
++++ b/src/pix2.c
+@@ -2589,7 +2589,7 @@ PIX *
+ pixGetRGBComponentCmap(PIX     *pixs,
+                        l_int32  comp)
+ {
+-l_int32     i, j, w, h, val, index;
++l_int32     i, j, w, h, val, index, valid;
+ l_int32     wplc, wpld;
+ l_uint32   *linec, *lined;
+ l_uint32   *datac, *datad;
+@@ -2598,75 +2598,80 @@ PIXCMAP    *cmap;
+ RGBA_QUAD  *cta;
+ 
+     PROCNAME("pixGetRGBComponentCmap");
+ 
+     if (!pixs)
+         return (PIX *)ERROR_PTR("pixs not defined", procName, NULL);
+     if ((cmap = pixGetColormap(pixs)) == NULL)
+         return (PIX *)ERROR_PTR("pixs not cmapped", procName, NULL);
+     if (comp == L_ALPHA_CHANNEL)
+         return (PIX *)ERROR_PTR("alpha in cmaps not supported", procName, NULL);
+     if (comp != COLOR_RED && comp != COLOR_GREEN && comp != COLOR_BLUE)
+         return (PIX *)ERROR_PTR("invalid comp", procName, NULL);
+ 
+         /* If not 8 bpp, make a cmapped 8 bpp pix */
+     if (pixGetDepth(pixs) == 8)
+         pixc = pixClone(pixs);
+     else
+         pixc = pixConvertTo8(pixs, TRUE);
++    pixcmapIsValid(cmap, pixc, &valid);
++    if (!valid) {
++        pixDestroy(&pixc);
++        return (PIX *)ERROR_PTR("invalid colormap", procName, NULL);
++    }
+ 
+     pixGetDimensions(pixs, &w, &h, NULL);
+     if ((pixd = pixCreateNoInit(w, h, 8)) == NULL) {
+         pixDestroy(&pixc);
+         return (PIX *)ERROR_PTR("pixd not made", procName, NULL);
+     }
+     pixCopyResolution(pixd, pixs);
+     wplc = pixGetWpl(pixc);
+     wpld = pixGetWpl(pixd);
+     datac = pixGetData(pixc);
+     datad = pixGetData(pixd);
+     cta = (RGBA_QUAD *)cmap->array;
+ 
+     for (i = 0; i < h; i++) {
+         linec = datac + i * wplc;
+         lined = datad + i * wpld;
+         if (comp == COLOR_RED) {
+             for (j = 0; j < w; j++) {
+                 index = GET_DATA_BYTE(linec, j);
+                 val = cta[index].red;
+                 SET_DATA_BYTE(lined, j, val);
+             }
+         } else if (comp == COLOR_GREEN) {
+             for (j = 0; j < w; j++) {
+                 index = GET_DATA_BYTE(linec, j);
+                 val = cta[index].green;
+                 SET_DATA_BYTE(lined, j, val);
+             }
+         } else if (comp == COLOR_BLUE) {
+             for (j = 0; j < w; j++) {
+                 index = GET_DATA_BYTE(linec, j);
+                 val = cta[index].blue;
+                 SET_DATA_BYTE(lined, j, val);
+             }
+         }
+     }
+ 
+     pixDestroy(&pixc);
+     return pixd;
+ }
+ 
+ 
+ /*!
+  * \brief   pixCopyRGBComponent()
+  *
+  * \param[in]   pixd   32 bpp
+  * \param[in]   pixs   32 bpp
+  * \param[in]   comp   one of the set: {COLOR_RED, COLOR_GREEN,
+  *                                      COLOR_BLUE, L_ALPHA_CHANNEL}
+  * \return  0 if OK; 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) The two images are registered to the UL corner.  The sizes
+  *          are usually the same, and a warning is issued if they differ.
+  * </pre>
+  */
+diff --git a/src/readfile.c b/src/readfile.c
+index 07ba5cd..d7bd421 100644
+--- a/src/readfile.c
++++ b/src/readfile.c
+@@ -325,117 +325,117 @@ PIX      *pix;
+ PIXCMAP  *cmap;
+ 
+     PROCNAME("pixReadStream");
+ 
+     if (!fp)
+         return (PIX *)ERROR_PTR("stream not defined", procName, NULL);
+     pix = NULL;
+ 
+     findFileFormatStream(fp, &format);
+     switch (format)
+     {
+     case IFF_BMP:
+         if ((pix = pixReadStreamBmp(fp)) == NULL )
+             return (PIX *)ERROR_PTR( "bmp: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_JFIF_JPEG:
+         if ((pix = pixReadStreamJpeg(fp, 0, 1, NULL, hint)) == NULL)
+             return (PIX *)ERROR_PTR( "jpeg: no pix returned", procName, NULL);
+         ret = fgetJpegComment(fp, &comment);
+         if (!ret && comment)
+             pixSetText(pix, (char *)comment);
+         LEPT_FREE(comment);
+         break;
+ 
+     case IFF_PNG:
+         if ((pix = pixReadStreamPng(fp)) == NULL)
+             return (PIX *)ERROR_PTR("png: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_TIFF:
+     case IFF_TIFF_PACKBITS:
+     case IFF_TIFF_RLE:
+     case IFF_TIFF_G3:
+     case IFF_TIFF_G4:
+     case IFF_TIFF_LZW:
+     case IFF_TIFF_ZIP:
+     case IFF_TIFF_JPEG:
+         if ((pix = pixReadStreamTiff(fp, 0)) == NULL)  /* page 0 by default */
+             return (PIX *)ERROR_PTR("tiff: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_PNM:
+         if ((pix = pixReadStreamPnm(fp)) == NULL)
+             return (PIX *)ERROR_PTR("pnm: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_GIF:
+         if ((pix = pixReadStreamGif(fp)) == NULL)
+             return (PIX *)ERROR_PTR("gif: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_JP2:
+         if ((pix = pixReadStreamJp2k(fp, 1, NULL, 0, 0)) == NULL)
+             return (PIX *)ERROR_PTR("jp2: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_WEBP:
+         if ((pix = pixReadStreamWebP(fp)) == NULL)
+             return (PIX *)ERROR_PTR("webp: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_PS:
+         L_ERROR("PostScript reading is not supported\n", procName);
+         return NULL;
+ 
+     case IFF_LPDF:
+         L_ERROR("Pdf reading is not supported\n", procName);
+         return NULL;
+ 
+     case IFF_SPIX:
+         if ((pix = pixReadStreamSpix(fp)) == NULL)
+             return (PIX *)ERROR_PTR("spix: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_UNKNOWN:
+         return (PIX *)ERROR_PTR( "Unknown format: no pix returned",
+                 procName, NULL);
+         break;
+     }
+ 
+     if (pix) {
+         pixSetInputFormat(pix, format);
+         if ((cmap = pixGetColormap(pix))) {
+-            pixcmapIsValid(cmap, &valid);
++            pixcmapIsValid(cmap, pix, &valid);
+             if (!valid) {
+                 pixDestroy(&pix);
+                 return (PIX *)ERROR_PTR("invalid colormap", procName, NULL);
+             }
+         }
+     }
+     return pix;
+ }
+ 
+ 
+ 
+ /*---------------------------------------------------------------------*
+  *                     Read header information from file               *
+  *---------------------------------------------------------------------*/
+ /*!
+  * \brief   pixReadHeader()
+  *
+  * \param[in]    filename    with full pathname or in local directory
+  * \param[out]   pformat     [optional] file format
+  * \param[out]   pw, ph      [optional] width and height
+  * \param[out]   pbps        [optional] bits/sample
+  * \param[out]   pspp        [optional] samples/pixel 1, 3 or 4
+  * \param[out]   piscmap     [optional] 1 if cmap exists; 0 otherwise
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) This reads the actual headers for jpeg, png, tiff and pnm.
+  *          For bmp and gif, we cheat and read the entire file into a pix,
+  *          from which we extract the "header" information.
+  * </pre>
+  */
+@@ -845,124 +845,124 @@ PIX      *pix;
+ PIXCMAP  *cmap;
+ 
+     PROCNAME("pixReadMem");
+ 
+     if (!data)
+         return (PIX *)ERROR_PTR("data not defined", procName, NULL);
+     if (size < 12)
+         return (PIX *)ERROR_PTR("size < 12", procName, NULL);
+     pix = NULL;
+ 
+     findFileFormatBuffer(data, &format);
+     switch (format)
+     {
+     case IFF_BMP:
+         if ((pix = pixReadMemBmp(data, size)) == NULL )
+             return (PIX *)ERROR_PTR( "bmp: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_JFIF_JPEG:
+         if ((pix = pixReadMemJpeg(data, size, 0, 1, NULL, 0)) == NULL)
+             return (PIX *)ERROR_PTR( "jpeg: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_PNG:
+         if ((pix = pixReadMemPng(data, size)) == NULL)
+             return (PIX *)ERROR_PTR("png: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_TIFF:
+     case IFF_TIFF_PACKBITS:
+     case IFF_TIFF_RLE:
+     case IFF_TIFF_G3:
+     case IFF_TIFF_G4:
+     case IFF_TIFF_LZW:
+     case IFF_TIFF_ZIP:
+             /* Reading page 0 by default */
+         if ((pix = pixReadMemTiff(data, size, 0)) == NULL)
+             return (PIX *)ERROR_PTR("tiff: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_PNM:
+         if ((pix = pixReadMemPnm(data, size)) == NULL)
+             return (PIX *)ERROR_PTR("pnm: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_GIF:
+         if ((pix = pixReadMemGif(data, size)) == NULL)
+             return (PIX *)ERROR_PTR("gif: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_JP2:
+         if ((pix = pixReadMemJp2k(data, size, 1, NULL, 0, 0)) == NULL)
+             return (PIX *)ERROR_PTR("jp2k: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_WEBP:
+         if ((pix = pixReadMemWebP(data, size)) == NULL)
+             return (PIX *)ERROR_PTR("webp: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_PS:
+         L_ERROR("PostScript reading is not supported\n", procName);
+         return NULL;
+ 
+     case IFF_LPDF:
+         L_ERROR("Pdf reading is not supported\n", procName);
+         return NULL;
+ 
+     case IFF_SPIX:
+         if ((pix = pixReadMemSpix(data, size)) == NULL)
+             return (PIX *)ERROR_PTR("spix: no pix returned", procName, NULL);
+         break;
+ 
+     case IFF_UNKNOWN:
+         return (PIX *)ERROR_PTR("Unknown format: no pix returned",
+                 procName, NULL);
+         break;
+     }
+ 
+         /* Set the input format.  For tiff reading from memory we lose
+          * the actual input format; for 1 bpp, default to G4.  Also
+          * verify that the colormap is valid.  */
+     if (pix) {
+         if (format == IFF_TIFF && pixGetDepth(pix) == 1)
+             format = IFF_TIFF_G4;
+         pixSetInputFormat(pix, format);
+         if ((cmap = pixGetColormap(pix))) {
+-            pixcmapIsValid(cmap, &valid);
++            pixcmapIsValid(cmap, pix, &valid);
+             if (!valid) {
+                 pixDestroy(&pix);
+                 return (PIX *)ERROR_PTR("invalid colormap", procName, NULL);
+             }
+         }
+         pixSetPadBits(pix, 0);
+     }
+     return pix;
+ }
+ 
+ 
+ /*!
+  * \brief   pixReadHeaderMem()
+  *
+  * \param[in]    data       const; encoded
+  * \param[in]    size       size of data
+  * \param[out]   pformat    [optional] image format
+  * \param[out]   pw, ph     [optional] width and height
+  * \param[out]   pbps       [optional] bits/sample
+  * \param[out]   pspp       [optional] samples/pixel 1, 3 or 4
+  * \param[out]   piscmap    [optional] 1 if cmap exists; 0 otherwise
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) This reads the actual headers for jpeg, png, tiff, jp2k and pnm.
+  *          For bmp and gif, we cheat and read all the data into a pix,
+  *          from which we extract the "header" information.
+  *      (2) The amount of data required depends on the format.  For
+  *          png, it requires less than 30 bytes, but for jpeg it can
+  *          require most of the compressed file.  In practice, the data
+  *          is typically the entire compressed file in memory.
+  *      (3) findFileFormatBuffer() requires up to 12 bytes to decide on
+  *          the format, which we require.
+  * </pre>
+  */

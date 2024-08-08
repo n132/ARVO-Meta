@@ -1,0 +1,184 @@
+commit f09acef2b2c900f7c76d2530c6683a637e158ecf
+Author: John Stiles <johnstiles@google.com>
+Date:   Mon May 1 10:51:05 2023 -0400
+
+    Use SkArenaAlloc for SkSL memory pooling.
+    
+    Previously we used GrMemoryPool, but this is only available when
+    SK_GANESH is defined. SkArenaAlloc, on the other hand, is available
+    everywhere. On my machine, the benchmark timings using SkArenaAlloc
+    are basically the same as GrMemoryPool or even slightly better. We do
+    sacrifice a leak warning, but I can't remember the last time I saw
+    one (~everything uses smart pointers) and ASAN should still still be
+    able to detect and report leaks.
+    
+    Change-Id: I84f5849ef1c9c30cd50eb744590aae7d7bc53523
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/686876
+    Auto-Submit: John Stiles <johnstiles@google.com>
+    Reviewed-by: Michael Ludwig <michaelludwig@google.com>
+    Commit-Queue: John Stiles <johnstiles@google.com>
+
+diff --git a/src/sksl/SkSLMemoryPool.h b/src/sksl/SkSLMemoryPool.h
+index 0d16d84ac0..abdb85f306 100644
+--- a/src/sksl/SkSLMemoryPool.h
++++ b/src/sksl/SkSLMemoryPool.h
+@@ -1,44 +1,36 @@
+ /*
+  * Copyright 2020 Google LLC
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #ifndef SKSL_MEMORYPOOL
+ #define SKSL_MEMORYPOOL
+ 
+ #include <memory>
+ 
+ #include "include/core/SkTypes.h"
++#include "src/base/SkArenaAlloc.h"
+ 
+-#if defined(SK_GANESH)
+-
+-#include "src/gpu/ganesh/GrMemoryPool.h"
+-
+-namespace SkSL {
+-using MemoryPool = ::GrMemoryPool;
+-}
+-
+-#else
+-
+-// When Ganesh is disabled, GrMemoryPool is not linked in. We include a minimal class which mimics
+-// the GrMemoryPool interface but simply redirects to the system allocator.
+ namespace SkSL {
+ 
+ class MemoryPool {
+ public:
+-    static std::unique_ptr<MemoryPool> Make(size_t, size_t) {
++    static std::unique_ptr<MemoryPool> Make() {
+         return std::make_unique<MemoryPool>();
+     }
+-    void resetScratchSpace() {}
+-    void reportLeaks() const {}
+-    bool isEmpty() const { return true; }
+-    void* allocate(size_t size) { return ::operator new(size); }
+-    void release(void* p) { ::operator delete(p); }
++    void* allocate(size_t size) {
++        return fArena.makeBytesAlignedTo(size, sizeof(void*));
++    }
++    void release(void*) {
++        // SkArenaAlloc does not ever attempt to reclaim space.
++    }
++
++private:
++    SkSTArenaAlloc<65536> fArena{/*firstHeapAllocation=*/32768};
+ };
+ 
+ }  // namespace SkSL
+ 
+-#endif // defined(SK_GANESH)
+ #endif // SKSL_MEMORYPOOL
+diff --git a/src/sksl/SkSLPool.cpp b/src/sksl/SkSLPool.cpp
+index 5ef5d0065e..d35e8e64fa 100644
+--- a/src/sksl/SkSLPool.cpp
++++ b/src/sksl/SkSLPool.cpp
+@@ -1,18 +1,13 @@
+ /*
+  * Copyright 2020 Google LLC
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+-#include "src/sksl/SkSLPool.h"
+-
+ #include "include/core/SkTypes.h"
+-
+-#if defined(SK_GANESH)
+-// With GPU support, SkSL::MemoryPool is really GrMemoryPool
+-#include "src/gpu/ganesh/GrMemoryPool.h"
+-#endif
++#include "src/sksl/SkSLMemoryPool.h"
++#include "src/sksl/SkSLPool.h"
+ 
+ #define VLOG(...) // printf(__VA_ARGS__)
+ 
+@@ -28,21 +23,20 @@ static void set_thread_local_memory_pool(MemoryPool* memPool) {
+     sMemPool = memPool;
+ }
+ 
++Pool::Pool() = default;
++
+ Pool::~Pool() {
+     if (get_thread_local_memory_pool() == fMemPool.get()) {
+         SkDEBUGFAIL("SkSL pool is being destroyed while it is still attached to the thread");
+         set_thread_local_memory_pool(nullptr);
+     }
+ 
+-    fMemPool->reportLeaks();
+-    SkASSERT(fMemPool->isEmpty());
+-
+     VLOG("DELETE Pool:0x%016llX\n", (uint64_t)fMemPool.get());
+ }
+ 
+ std::unique_ptr<Pool> Pool::Create() {
+     auto pool = std::unique_ptr<Pool>(new Pool);
+-    pool->fMemPool = MemoryPool::Make(/*preallocSize=*/65536, /*minAllocSize=*/32768);
++    pool->fMemPool = MemoryPool::Make();
+     VLOG("CREATE Pool:0x%016llX\n", (uint64_t)pool->fMemPool.get());
+     return pool;
+ }
+@@ -58,10 +52,8 @@ void Pool::attachToThread() {
+ }
+ 
+ void Pool::detachFromThread() {
+-    MemoryPool* memPool = get_thread_local_memory_pool();
+     VLOG("DETACH Pool:0x%016llX\n", (uint64_t)memPool);
+-    SkASSERT(memPool == fMemPool.get());
+-    memPool->resetScratchSpace();
++    SkASSERT(get_thread_local_memory_pool() == fMemPool.get());
+     set_thread_local_memory_pool(nullptr);
+ }
+ 
+diff --git a/src/sksl/SkSLPool.h b/src/sksl/SkSLPool.h
+index 9e64d44b9a..3a8cd48a65 100644
+--- a/src/sksl/SkSLPool.h
++++ b/src/sksl/SkSLPool.h
+@@ -1,23 +1,23 @@
+ /*
+  * Copyright 2020 Google LLC
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #ifndef SKSL_POOL
+ #define SKSL_POOL
+ 
+-#include "src/sksl/SkSLMemoryPool.h"
+-
+ #include <cstddef>
+ #include <memory>
+ 
+ namespace SkSL {
+ 
++class MemoryPool;
++
+ /**
+  * Efficiently allocates memory in an SkSL program. Optimized for allocate/release performance over
+  * memory efficiency.
+  *
+  * All allocated memory must be released back to the pool before it can be destroyed or recycled.
+  */
+@@ -51,10 +51,10 @@ public:
+     static bool IsAttached();
+ 
+ private:
+-    Pool() = default;  // use Create to make a pool
++    Pool();  // use Create to make a pool
+     std::unique_ptr<SkSL::MemoryPool> fMemPool;
+ };
+ 
+ /**
+  * If your class inherits from Poolable, its objects will be allocated from the pool.
+  */

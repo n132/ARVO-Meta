@@ -1,0 +1,180 @@
+commit 372b7efe8d597b56fb96bf6137af42a48e644fb4
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Tue Feb 14 11:12:17 2023 +0000
+
+    Ghostscript - clean up exec stack on error sampling functions
+    
+    OSS-fuzz #55898
+    
+    When sampling a PostScript function, if the supplied function consumes
+    more operands from the operand stack than were present, then we throw
+    an error, attempt to unwind the stack and exit.
+    
+    However, we weren't cleaning up the execution stack. This could
+    eventually lead to us trying to execute the completion routine stored
+    there, which would fail badly.
+    
+    This commit just tidies up the execution stack, removing the objects we
+    no longer need when returning an error.
+
+diff --git a/psi/zfsample.c b/psi/zfsample.c
+index 791f24b4b..6bbadfd75 100644
+--- a/psi/zfsample.c
++++ b/psi/zfsample.c
+@@ -1,54 +1,54 @@
+-/* Copyright (C) 2001-2022 Artifex Software, Inc.
++/* Copyright (C) 2001-2023 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+    implied.
+ 
+    This software is distributed under license and may not be copied,
+    modified or distributed except as expressly authorized under the terms
+    of the license contained in the file LICENSE in this distribution.
+ 
+    Refer to licensing information at http://www.artifex.com or contact
+    Artifex Software, Inc.,  1305 Grant Avenue - Suite 200, Novato,
+    CA 94945, U.S.A., +1(415)492-9861, for further information.
+ */
+ 
+ 
+ /* Sample data to create a type 0 function */
+ #include "memory_.h"
+ #include "ghost.h"
+ #include "oper.h"
+ #include "gxcspace.h"
+ #include "estack.h"
+ #include "ialloc.h"
+ #include "idict.h"
+ #include "idparam.h"
+ #include "ifunc.h"
+ #include "ostack.h"
+ #include "store.h"
+ #include "gsfunc0.h"
+ #include "gscdevn.h"
+ #include "zfunc.h"
+ #include "zcolor.h"
+ 
+ /*
+  * We store the data in a string.  Since the max size for a string is 64k,
+  * we use that as our max data size.
+  */
+ #define MAX_DATA_SIZE 0x10000
+ /*
+  * We cannot handle more than  16 inputs.  Otherwise the the data will not
+  * fit within MAX_DATA_SIZE.
+  */
+ #define MAX_NUM_INPUTS 16
+ /*
+  * This value is rather arbitrary.
+  */
+ #define MAX_NUM_OUTPUTS 128
+ 
+ /* --- Build sampled data function --- */
+ 
+ /*
+  * This structure is used to hold data required while collecting samples
+  * for a type 0 function (sampled data).
+  */
+@@ -478,99 +478,100 @@ static int
+ sampled_data_continue(i_ctx_t *i_ctx_p)
+ {
+     os_ptr op = osp;
+     gs_sampled_data_enum *penum = senum;
+     gs_function_Sd_params_t * params =
+             (gs_function_Sd_params_t *)&penum->pfn->params;
+     int i, j, num_out = params->n;
+     int code = 0;
+     byte * data_ptr;
+     double sampled_data_value_max = (double)((1 << params->BitsPerSample) - 1);
+     int bps = bits2bytes(params->BitsPerSample), stack_depth_adjust = 0;
+ 
+     /*
+      * Check to make sure that the procedure produced the correct number of
+      * values.  If not, move the stack back to where it belongs and abort
+      */
+     if (num_out + O_STACK_PAD + penum->o_stack_depth != ref_stack_count(&o_stack)) {
+         stack_depth_adjust = ref_stack_count(&o_stack) - penum->o_stack_depth;
+ 
+         if (stack_depth_adjust < 0) {
+             /*
+              * If we get to here then there were major problems.  The function
+              * removed too many items off of the stack.  We had placed extra
+              * (unused) stack stack space to allow for this but the function
+              * exceeded even that.  Data on the stack may have been lost.
+              * The only thing that we can do is move the stack pointer back and
+              * hope.
+              */
+             push(-stack_depth_adjust);
++            esp -= estack_storage;
+             return_error(gs_error_undefinedresult);
+         }
+     }
+ 
+     /* Save data from the given function */
+     data_ptr = cube_ptr_from_index(params, penum->indexes);
+     for (i=0; i < num_out; i++) {
+         ulong cv;
+         double value;
+         double rmin = params->Range[2 * i];
+         double rmax = params->Range[2 * i + 1];
+ 
+         code = real_param(op + i - num_out + 1, &value);
+         if (code < 0) {
+             esp -= estack_storage;
+             return code;
+         }
+         if (value < rmin)
+             value = rmin;
+         else if (value > rmax)
+             value = rmax;
+         value = (value - rmin) / (rmax - rmin);		/* Convert to 0 to 1.0 */
+         cv = (int) (value * sampled_data_value_max + 0.5);
+         for (j = 0; j < bps; j++)
+             data_ptr[bps * i + j] = (byte)(cv >> ((bps - 1 - j) * 8));	/* MSB first */
+     }
+ 
+     pop(num_out); /* Move op to base of result values */
+ 
+     /* From here on, we have to use ref_stack_pop() rather than pop()
+        so that it handles stack extension blocks properly, before calling
+        sampled_data_sample() which also uses the op stack.
+      */
+     /* Check if we are done collecting data. */
+     if (increment_cube_indexes(params, penum->indexes)) {
+         if (stack_depth_adjust == 0)
+             ref_stack_pop(&o_stack, O_STACK_PAD);	    /* Remove spare stack space */
+         else
+             ref_stack_pop(&o_stack, stack_depth_adjust - num_out);
+         /* Execute the closing procedure, if given */
+         code = 0;
+         if (esp_finish_proc != 0)
+             code = esp_finish_proc(i_ctx_p);
+ 
+         return code;
+     } else {
+         if (stack_depth_adjust) {
+             stack_depth_adjust -= num_out;
+             if ((O_STACK_PAD - stack_depth_adjust) < 0) {
+                 stack_depth_adjust = -(O_STACK_PAD - stack_depth_adjust);
+                 check_op(stack_depth_adjust);
+                 ref_stack_pop(&o_stack, stack_depth_adjust);
+             }
+             else {
+                 check_ostack(O_STACK_PAD - stack_depth_adjust);
+                 ref_stack_push(&o_stack, O_STACK_PAD - stack_depth_adjust);
+                 for (i=0;i<O_STACK_PAD - stack_depth_adjust;i++)
+                     make_null(op - i);
+             }
+         }
+     }
+ 
+     /* Now get the data for the next location */
+ 
+     return sampled_data_sample(i_ctx_p);
+ }
+ 
+ /*
+  * We have collected all of the sample data.  Create a type 0 function stucture.
+  */

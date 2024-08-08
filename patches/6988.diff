@@ -1,0 +1,246 @@
+commit 959fbed58acaf922199d2940ed365033e290cdef
+Author: Even Rouault <even.rouault@mines-paris.org>
+Date:   Sat Mar 17 11:12:47 2018 +0000
+
+    VRTRawLink: fix recent use-after-free error (plus another older memory leak). Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=6987. Credit to OSS Fuzz
+    
+    git-svn-id: https://svn.osgeo.org/gdal/trunk@41840 f0d54148-0727-0410-94bb-9a71ac55c965
+
+diff --git a/autotest/gdrivers/vrtrawlink.py b/autotest/gdrivers/vrtrawlink.py
+index 516f0edc60..0503c99b80 100755
+--- a/autotest/gdrivers/vrtrawlink.py
++++ b/autotest/gdrivers/vrtrawlink.py
+@@ -266,45 +266,99 @@ def vrtrawlink_6():
+ def vrtrawlink_7():
+ 
+     driver = gdal.GetDriverByName( "VRT" )
+     ds = driver.Create( 'tmp/rawlink.vrt', 31, 35, 0 )
+ 
+     # Add a new band pointing to this bogus file.
+     options = [
+         'subClass=VRTRawRasterBand',
+         'SourceFilename=rawlink7.dat',
+         'relativeToVRT=1',
+         'ImageOffset=100',
+         'PixelOffset=3',
+         'LineOffset=93',
+         'ByteOrder=MSB'
+         ]
+ 
+     result = ds.AddBand( gdal.GDT_UInt16, options )
+     if result != gdal.CE_None:
+         gdaltest.post_reason( 'AddBand() returned error code' )
+         return 'fail'
+ 
+     ds.FlushCache()
+ 
+     # Close and reopen to ensure we are getting data from disk.
+     ds = None
+ 
+     os.chdir('tmp')
+     try:
+         ds = gdal.Open('rawlink.vrt')
+         if ds is None:
+             gdaltest.post_reason( 'unable to open the dataset: "rawlink.vrt"' )
+             return 'fail'
+ 
+         b = ds.GetRasterBand(1)
+         if b is None:
+             gdaltest.post_reason( 'unable to open the raster band #1' )
+             return 'fail'
+     finally:
+         os.chdir('..')
+ 
+     return 'success'
+ 
++###############################################################################
++# Test error case (too much memory allocation)
++
++def vrtrawlink_8():
++
++    for i in range(2):
++        with gdaltest.error_handler():
++            ds = gdal.Open("""<VRTDataset rasterXSize="200000" rasterYSize="1">
++        <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++            <SourceFilename relativetoVRT="0">data/small.raw</SourceFilename>
++            <ImageOffset>0</ImageOffset>
++            <PixelOffset>200000</PixelOffset>
++            <LineOffset>1</LineOffset>
++            <ByteOrder>LSB</ByteOrder>
++        </VRTRasterBand>
++        </VRTDataset>""")
++        if ds:
++            return 'fail'
++
++    return 'success'
++
++###############################################################################
++# Test error case (inexisting file)
++
++def vrtrawlink_9():
++
++    with gdaltest.error_handler():
++        ds = gdal.Open("""<VRTDataset rasterXSize="1 rasterYSize="1">
++    <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++        <SourceFilename relativetoVRT="0">i/do/not/exist</SourceFilename>
++    </VRTRasterBand>
++    </VRTDataset>""")
++    if ds:
++        return 'fail'
++
++    return 'success'
++
++###############################################################################
++# Test error case (invalid byte order)
++
++def vrtrawlink_10():
++
++    with gdaltest.error_handler():
++        ds = gdal.Open("""<VRTDataset rasterXSize="1 rasterYSize="1">
++    <VRTRasterBand dataType="Byte" band="1" subClass="VRTRawRasterBand">
++        <SourceFilename relativetoVRT="0">data/small.raw</SourceFilename>
++        <ByteOrder>invalid</ByteOrder>
++    </VRTRasterBand>
++    </VRTDataset>""")
++    if ds:
++        return 'fail'
++
++    return 'success'
++
+ ###############################################################################
+ # Cleanup.
+ 
+@@ -324,11 +378,14 @@ def vrtrawlink_cleanup():
+ gdaltest_list = [
+     vrtrawlink_1,
+     vrtrawlink_2,
+     vrtrawlink_3,
+     vrtrawlink_4,
+     vrtrawlink_5,
+     vrtrawlink_6,
+     vrtrawlink_7,
++    vrtrawlink_8,
++    vrtrawlink_9,
++    vrtrawlink_10,
+     vrtrawlink_cleanup ]
+ 
+ if __name__ == '__main__':
+diff --git a/gdal/frmts/vrt/vrtrawrasterband.cpp b/gdal/frmts/vrt/vrtrawrasterband.cpp
+index 9c959f4b09..74f39ec92f 100644
+--- a/gdal/frmts/vrt/vrtrawrasterband.cpp
++++ b/gdal/frmts/vrt/vrtrawrasterband.cpp
+@@ -182,112 +182,113 @@ CPLErr VRTRawRasterBand::IWriteBlock( int nBlockXOff, int nBlockYOff,
+ CPLErr VRTRawRasterBand::SetRawLink( const char *pszFilename,
+                                      const char *pszVRTPath,
+                                      int bRelativeToVRTIn,
+                                      vsi_l_offset nImageOffset,
+                                      int nPixelOffset, int nLineOffset,
+                                      const char *pszByteOrder )
+ 
+ {
+     ClearRawLink();
+ 
+     reinterpret_cast<VRTDataset *>( poDS )->SetNeedsFlush();
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Prepare filename.                                               */
+ /* -------------------------------------------------------------------- */
+     if( pszFilename == nullptr )
+     {
+         CPLError( CE_Warning, CPLE_AppDefined,
+                   "Missing <SourceFilename> element in VRTRasterBand." );
+         return CE_Failure;
+     }
+ 
+     char *pszExpandedFilename = nullptr;
+     if( pszVRTPath != nullptr && bRelativeToVRTIn )
+     {
+         pszExpandedFilename = CPLStrdup(
+             CPLProjectRelativeFilename( pszVRTPath, pszFilename ) );
+     }
+     else
+     {
+         pszExpandedFilename = CPLStrdup( pszFilename );
+     }
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Try and open the file.  We always use the large file API.       */
+ /* -------------------------------------------------------------------- */
+     CPLPushErrorHandler(CPLQuietErrorHandler);
+     FILE *fp = CPLOpenShared( pszExpandedFilename, "rb+", TRUE );
+ 
+     if( fp == nullptr )
+         fp = CPLOpenShared( pszExpandedFilename, "rb", TRUE );
+ 
+     if( fp == nullptr
+         && reinterpret_cast<VRTDataset *>( poDS )->GetAccess() == GA_Update )
+     {
+         fp = CPLOpenShared( pszExpandedFilename, "wb+", TRUE );
+     }
+     CPLPopErrorHandler();
+     CPLErrorReset();
+ 
+     if( fp == nullptr )
+     {
+         CPLError( CE_Failure, CPLE_OpenFailed,
+                   "Unable to open %s.%s",
+                   pszExpandedFilename, VSIStrerror( errno ) );
+ 
+         CPLFree( pszExpandedFilename );
+         return CE_Failure;
+     }
+ 
+     CPLFree( pszExpandedFilename );
+ 
+     if( !RAWDatasetCheckMemoryUsage(
+                         nRasterXSize, nRasterYSize, 1,
+                         nPixelOffset, nLineOffset, nImageOffset, 0,
+                         reinterpret_cast<VSILFILE*>(fp)) )
+     {
+-        VSIFCloseL(reinterpret_cast<VSILFILE*>(fp));
++        CPLCloseShared(fp);
+         return CE_Failure;
+     }
+ 
+     m_pszSourceFilename = CPLStrdup(pszFilename);
+     m_bRelativeToVRT = bRelativeToVRTIn;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Work out if we are in native mode or not.                       */
+ /* -------------------------------------------------------------------- */
+     bool bNative = true;
+ 
+     if( pszByteOrder != nullptr )
+     {
+         if( EQUAL(pszByteOrder,"LSB") )
+             bNative = CPL_TO_BOOL(CPL_IS_LSB);
+         else if( EQUAL(pszByteOrder,"MSB") )
+             bNative = !CPL_IS_LSB;
+         else
+         {
+             CPLError( CE_Failure, CPLE_AppDefined,
+                       "Illegal ByteOrder value '%s', should be LSB or MSB.",
+                       pszByteOrder );
++            CPLCloseShared(fp);
+             return CE_Failure;
+         }
+     }
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Create a corresponding RawRasterBand.                           */
+ /* -------------------------------------------------------------------- */
+     m_poRawRaster = new RawRasterBand( fp, nImageOffset, nPixelOffset,
+                                        nLineOffset, GetRasterDataType(),
+                                        bNative, GetXSize(), GetYSize(), TRUE );
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Reset block size to match the raw raster.                       */
+ /* -------------------------------------------------------------------- */
+     m_poRawRaster->GetBlockSize( &nBlockXSize, &nBlockYSize );
+ 
+     return CE_None;
+ }
+ 
+ /************************************************************************/
+ /*                            ClearRawLink()                            */
+ /************************************************************************/

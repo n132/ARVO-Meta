@@ -1,0 +1,230 @@
+commit 31a301389bc94b6cac513e315cca0c621f7e1684
+Author: DRC <information@libjpeg-turbo.org>
+Date:   Fri Jun 30 17:58:45 2023 -0400
+
+    jchuff.c: Test for out-of-range coefficients
+    
+    Restore two coefficient range checks from libjpeg to the C baseline
+    Huffman encoder.  This fixes an issue
+    (https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=60253) whereby
+    the encoder could read from uninitialized memory when attempting to
+    transform a specially-crafted malformed arithmetic-coded JPEG source
+    image into a baseline Huffman-coded JPEG destination image with default
+    Huffman tables.  More specifically, the out-of-range coefficients caused
+    r to equal 256, which overflowed the actbl->ehufsi[] array.  Because the
+    overflow was contained within the huff_entropy_encoder structure, this
+    issue was not exploitable (nor was it observable at all on x86 or Arm
+    CPUs unless JSIMD_NOHUFFENC=1 or JSIMD_FORCENONE=1 was set in the
+    environment or unless libjpeg-turbo was built with WITH_SIMD=0.)
+    
+    The fix is performance-neutral (+/- 1-2%) for x86-64 code and causes a
+    0-4% (avg. 1-2%, +/- 1-2%) compression regression for i386 code on Intel
+    CPUs when the C baseline Huffman encoder is used (JSIMD_NOHUFFENC=1).
+    The fix is performance-neutral (+/- 1-2%) on Intel CPUs when all of the
+    libjpeg-turbo SIMD extensions are disabled (JSIMD_FORCENONE=1).  The fix
+    causes a 0-2% (avg. <1%, +/- 1%) compression regression for PowerPC
+    code.
+
+diff --git a/ChangeLog.md b/ChangeLog.md
+index 1a917cba..92d82cce 100644
+--- a/ChangeLog.md
++++ b/ChangeLog.md
+@@ -33,10 +33,15 @@ cannot reliably transform JPEG source images that contain a large amount of
+ metadata unless automatic JPEG destination buffer (re)allocation is used or
+ `TJXOPT_COPYNONE` is set.
+ 
++4. Fixed an issue that caused the C Huffman encoder (which is not used by
++default on x86 and Arm CPUs) to read from uninitialized memory when attempting
++to transform a specially-crafted malformed arithmetic-coded JPEG source image
++into a baseline Huffman-coded JPEG destination image.
++
+ 
+ 2.1.5.1
+ =======
+ 
+ ### Significant changes relative to 2.1.5:
+ 
+ 1. The SIMD dispatchers in libjpeg-turbo 2.1.4 and prior stored the list of
+diff --git a/jchuff.c b/jchuff.c
+index 5d0276ad..063f5b24 100644
+--- a/jchuff.c
++++ b/jchuff.c
+@@ -1,74 +1,74 @@
+ /*
+  * jchuff.c
+  *
+  * This file was part of the Independent JPEG Group's software:
+  * Copyright (C) 1991-1997, Thomas G. Lane.
+  * libjpeg-turbo Modifications:
+- * Copyright (C) 2009-2011, 2014-2016, 2018-2022, D. R. Commander.
++ * Copyright (C) 2009-2011, 2014-2016, 2018-2023, D. R. Commander.
+  * Copyright (C) 2015, Matthieu Darbois.
+  * Copyright (C) 2018, Matthias Räncker.
+  * Copyright (C) 2020, Arm Limited.
+  * For conditions of distribution and use, see the accompanying README.ijg
+  * file.
+  *
+  * This file contains Huffman entropy encoding routines.
+  *
+  * Much of the complexity here has to do with supporting output suspension.
+  * If the data destination module demands suspension, we want to be able to
+  * back up to the start of the current MCU.  To do this, we copy state
+  * variables into local working storage, and update them back to the
+  * permanent JPEG objects only upon successful completion of an MCU.
+  *
+  * NOTE: All referenced figures are from
+  * Recommendation ITU-T T.81 (1992) | ISO/IEC 10918-1:1994.
+  */
+ 
+ #define JPEG_INTERNALS
+ #include "jinclude.h"
+ #include "jpeglib.h"
+ #include "jsimd.h"
+ #include <limits.h>
+ 
+ /*
+  * NOTE: If USE_CLZ_INTRINSIC is defined, then clz/bsr instructions will be
+  * used for bit counting rather than the lookup table.  This will reduce the
+  * memory footprint by 64k, which is important for some mobile applications
+  * that create many isolated instances of libjpeg-turbo (web browsers, for
+  * instance.)  This may improve performance on some mobile platforms as well.
+  * This feature is enabled by default only on Arm processors, because some x86
+  * chips have a slow implementation of bsr, and the use of clz/bsr cannot be
+  * shown to have a significant performance impact even on the x86 chips that
+  * have a fast implementation of it.  When building for Armv6, you can
+  * explicitly disable the use of clz/bsr by adding -mthumb to the compiler
+  * flags (this defines __thumb__).
+  */
+ 
+ /* NOTE: Both GCC and Clang define __GNUC__ */
+ #if (defined(__GNUC__) && (defined(__arm__) || defined(__aarch64__))) || \
+     defined(_M_ARM) || defined(_M_ARM64)
+ #if !defined(__thumb__) || defined(__thumb2__)
+ #define USE_CLZ_INTRINSIC
+ #endif
+ #endif
+ 
+ #ifdef USE_CLZ_INTRINSIC
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #define JPEG_NBITS_NONZERO(x)  (32 - _CountLeadingZeros(x))
+ #else
+ #define JPEG_NBITS_NONZERO(x)  (32 - __builtin_clz(x))
+ #endif
+ #define JPEG_NBITS(x)          (x ? JPEG_NBITS_NONZERO(x) : 0)
+ #else
+ #include "jpeg_nbits_table.h"
+ #define JPEG_NBITS(x)          (jpeg_nbits_table[x])
+ #define JPEG_NBITS_NONZERO(x)  JPEG_NBITS(x)
+ #endif
+ 
+ 
+ /* Expanded entropy encoder object for Huffman encoding.
+  *
+  * The savable_state subrecord contains fields that change within an MCU,
+  * but must not be updated permanently until we complete the MCU.
+  */
+ 
+ #if defined(__x86_64__) && defined(__ILP32__)
+@@ -564,94 +564,102 @@ LOCAL(boolean)
+ encode_one_block(working_state *state, JCOEFPTR block, int last_dc_val,
+                  c_derived_tbl *dctbl, c_derived_tbl *actbl)
+ {
+   int temp, nbits, free_bits;
+   bit_buf_type put_buffer;
+   JOCTET _buffer[BUFSIZE], *buffer;
+   int localbuf = 0;
+ 
+   free_bits = state->cur.free_bits;
+   put_buffer = state->cur.put_buffer.c;
+   LOAD_BUFFER()
+ 
+   /* Encode the DC coefficient difference per section F.1.2.1 */
+ 
+   temp = block[0] - last_dc_val;
+ 
+   /* This is a well-known technique for obtaining the absolute value without a
+    * branch.  It is derived from an assembly language technique presented in
+    * "How to Optimize for the Pentium Processors", Copyright (c) 1996, 1997 by
+    * Agner Fog.  This code assumes we are on a two's complement machine.
+    */
+   nbits = temp >> (CHAR_BIT * sizeof(int) - 1);
+   temp += nbits;
+   nbits ^= temp;
+ 
+   /* Find the number of bits needed for the magnitude of the coefficient */
+   nbits = JPEG_NBITS(nbits);
++  /* Check for out-of-range coefficient values.
++   * Since we're encoding a difference, the range limit is twice as much.
++   */
++  if (nbits > MAX_COEF_BITS + 1)
++    ERREXIT(state->cinfo, JERR_BAD_DCT_COEF);
+ 
+   /* Emit the Huffman-coded symbol for the number of bits.
+    * Emit that number of bits of the value, if positive,
+    * or the complement of its magnitude, if negative.
+    */
+   PUT_CODE(dctbl->ehufco[nbits], dctbl->ehufsi[nbits])
+ 
+   /* Encode the AC coefficients per section F.1.2.2 */
+ 
+   {
+     int r = 0;                  /* r = run length of zeros */
+ 
+ /* Manually unroll the k loop to eliminate the counter variable.  This
+  * improves performance greatly on systems with a limited number of
+  * registers (such as x86.)
+  */
+ #define kloop(jpeg_natural_order_of_k) { \
+   if ((temp = block[jpeg_natural_order_of_k]) == 0) { \
+     r += 16; \
+   } else { \
+     /* Branch-less absolute value, bitwise complement, etc., same as above */ \
+     nbits = temp >> (CHAR_BIT * sizeof(int) - 1); \
+     temp += nbits; \
+     nbits ^= temp; \
+     nbits = JPEG_NBITS_NONZERO(nbits); \
++    /* Check for out-of-range coefficient values */ \
++    if (nbits > MAX_COEF_BITS) \
++      ERREXIT(state->cinfo, JERR_BAD_DCT_COEF); \
+     /* if run length > 15, must emit special run-length-16 codes (0xF0) */ \
+     while (r >= 16 * 16) { \
+       r -= 16 * 16; \
+       PUT_BITS(actbl->ehufco[0xf0], actbl->ehufsi[0xf0]) \
+     } \
+     /* Emit Huffman symbol for run length / number of bits */ \
+     r += nbits; \
+     PUT_CODE(actbl->ehufco[r], actbl->ehufsi[r]) \
+     r = 0; \
+   } \
+ }
+ 
+     /* One iteration for each value in jpeg_natural_order[] */
+     kloop(1);   kloop(8);   kloop(16);  kloop(9);   kloop(2);   kloop(3);
+     kloop(10);  kloop(17);  kloop(24);  kloop(32);  kloop(25);  kloop(18);
+     kloop(11);  kloop(4);   kloop(5);   kloop(12);  kloop(19);  kloop(26);
+     kloop(33);  kloop(40);  kloop(48);  kloop(41);  kloop(34);  kloop(27);
+     kloop(20);  kloop(13);  kloop(6);   kloop(7);   kloop(14);  kloop(21);
+     kloop(28);  kloop(35);  kloop(42);  kloop(49);  kloop(56);  kloop(57);
+     kloop(50);  kloop(43);  kloop(36);  kloop(29);  kloop(22);  kloop(15);
+     kloop(23);  kloop(30);  kloop(37);  kloop(44);  kloop(51);  kloop(58);
+     kloop(59);  kloop(52);  kloop(45);  kloop(38);  kloop(31);  kloop(39);
+     kloop(46);  kloop(53);  kloop(60);  kloop(61);  kloop(54);  kloop(47);
+     kloop(55);  kloop(62);  kloop(63);
+ 
+     /* If the last coef(s) were zero, emit an end-of-block code */
+     if (r > 0) {
+       PUT_BITS(actbl->ehufco[0], actbl->ehufsi[0])
+     }
+   }
+ 
+   state->cur.put_buffer.c = put_buffer;
+   state->cur.free_bits = free_bits;
+   STORE_BUFFER()
+ 
+   return TRUE;
+ }
+ 
+ 
+ /*
+  * Emit a restart marker & resynchronize predictions.
+  */

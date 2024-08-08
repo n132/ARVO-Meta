@@ -1,0 +1,273 @@
+commit 245efe608d083fd4e4ec96793fdefd218e26fde7
+Author: Jakub Jelen <jjelen@redhat.com>
+Date:   Thu Aug 17 13:54:42 2023 +0200
+
+    pkcs15: Avoid buffer overflow when getting last update
+    
+    Thanks oss-fuzz
+    
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=60769
+
+diff --git a/src/libopensc/pkcs15.c b/src/libopensc/pkcs15.c
+index eb7fc6af..4215b733 100644
+--- a/src/libopensc/pkcs15.c
++++ b/src/libopensc/pkcs15.c
+@@ -530,48 +530,50 @@ char *
+ sc_pkcs15_get_lastupdate(struct sc_pkcs15_card *p15card)
+ {
+ 	struct sc_context *ctx  = p15card->card->ctx;
+ 	struct sc_file *file = NULL;
+ 	struct sc_asn1_entry asn1_last_update[C_ASN1_LAST_UPDATE_SIZE];
+-	unsigned char *content, last_update[32];
++	unsigned char *content, last_update[32] = {0};
+ 	size_t lupdate_len = sizeof(last_update) - 1;
+ 	int r, content_len;
+ 	size_t size;
+ 
+ 	if (p15card->tokeninfo->last_update.gtime)
+ 		goto done;
+ 
+ 	if (!p15card->tokeninfo->last_update.path.len)
+ 		return NULL;
+ 
+ 	r = sc_select_file(p15card->card, &p15card->tokeninfo->last_update.path, &file);
+ 	if (r < 0)
+ 		return NULL;
+ 
+ 	size = file->size ? file->size : 1024;
+ 	sc_file_free(file);
+ 
+ 	content = calloc(size, 1);
+ 	if (!content)
+ 		return NULL;
+ 
+ 	r = sc_read_binary(p15card->card, 0, content, size, 0);
+ 	if (r < 0) {
+ 		free(content);
+ 		return NULL;
+ 	}
+ 	content_len = r;
+ 
+ 	sc_copy_asn1_entry(c_asn1_last_update, asn1_last_update);
+ 	sc_format_asn1_entry(asn1_last_update + 0, last_update, &lupdate_len, 0);
+ 
+ 	r = sc_asn1_decode(ctx, asn1_last_update, content, content_len, NULL, NULL);
+ 	free(content);
+ 	if (r < 0)
+ 		return NULL;
+ 
+-	p15card->tokeninfo->last_update.gtime = strdup((char *)last_update);
+-	if (!p15card->tokeninfo->last_update.gtime)
+-		return NULL;
++	if (asn1_last_update[0].flags & SC_ASN1_PRESENT) {
++		p15card->tokeninfo->last_update.gtime = strdup((char *)last_update);
++		if (!p15card->tokeninfo->last_update.gtime)
++			return NULL;
++	}
+ done:
+ 	sc_log(ctx, "lastUpdate.gtime '%s'", p15card->tokeninfo->last_update.gtime);
+ 	return p15card->tokeninfo->last_update.gtime;
+@@ -2401,30 +2403,30 @@ sc_pkcs15_parse_unusedspace(const unsigned char *buf, size_t buflen, struct sc_p
+ 	return 0;
+ }
+ 
+-static int decompress_file(sc_card_t *card, unsigned char *buf, size_t buflen, 
++static int decompress_file(sc_card_t *card, unsigned char *buf, size_t buflen,
+ 		unsigned char **out, size_t *outlen, unsigned long flags)
+ {
+ 	LOG_FUNC_CALLED(card->ctx);
+ #ifdef ENABLE_ZLIB
+ 	int rv = SC_SUCCESS;
+ 	int method = 0;
+ 
+ 	if (flags & SC_FILE_FLAG_COMPRESSED_GZIP) {
+ 		method = COMPRESSION_GZIP;
+ 	} else if (flags & SC_FILE_FLAG_COMPRESSED_ZLIB) {
+ 		method = COMPRESSION_ZLIB;
+ 	} else {
+ 		method = COMPRESSION_AUTO;
+ 	}
+ 
+ 	rv = sc_decompress_alloc(out, outlen, buf, buflen, method);
+ 	if (rv != SC_SUCCESS) {
+ 		sc_log(card->ctx,  "Decompression failed: %d", rv);
+ 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_DATA);
+ 	}
+ 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+ #else
+ 	sc_log(card->ctx, "Compression not supported, no zlib");
+ 	LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+ #endif
+ }
+@@ -2455,169 +2457,169 @@ int
+ sc_pkcs15_read_file(struct sc_pkcs15_card *p15card, const struct sc_path *in_path,
+ 		unsigned char **buf, size_t *buflen, int private_data)
+ {
+ 	struct sc_context *ctx;
+ 	struct sc_file *file = NULL;
+ 	unsigned char *data = NULL;
+ 	size_t	len = 0, offset = 0;
+ 	int	r;
+ 
+ 	if (p15card == NULL || p15card->card == NULL || in_path == NULL || buf == NULL) {
+ 		return SC_ERROR_INVALID_ARGUMENTS;
+ 	}
+ 	ctx = p15card->card->ctx;
+ 
+ 	LOG_FUNC_CALLED(ctx);
+ 	sc_log(ctx, "path=%s, index=%u, count=%d", sc_print_path(in_path), in_path->index, in_path->count);
+ 
+ 	r = -1; /* file state: not in cache */
+ 	if (p15card->opts.use_file_cache
+ 	    && ((p15card->opts.use_file_cache & SC_PKCS15_OPTS_CACHE_ALL_FILES) || !private_data)) {
+ 		r = sc_pkcs15_read_cached_file(p15card, in_path, &data, &len);
+ 
+ 		if (!r && in_path->aid.len > 0 && in_path->len >= 2)   {
+ 			struct sc_path parent = *in_path;
+ 
+ 			parent.len -= 2;
+ 			parent.type = SC_PATH_TYPE_PATH;
+ 			r = sc_select_file(p15card->card, &parent, NULL);
+ 		}
+ 	}
+ 
+ 	if (r) {
+ 		r = sc_lock(p15card->card);
+ 		if (r)
+ 			goto fail;
+ 		r = sc_select_file(p15card->card, in_path, &file);
+ 		if (r)
+ 			goto fail_unlock;
+ 
+ 		/* Handle the case where the ASN.1 Path object specified
+ 		 * index and length values */
+ 
+ 		if (file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE) {
+ 
+ 			// in_path->index: record_no
+ 			// in_path->count: ignored!
+ 
+ 			if(file->record_length > 0) {
+ 				if(file->record_length > MAX_FILE_SIZE) {
+ 					len = MAX_FILE_SIZE;
+ 					sc_log(ctx, "  record size truncated, encoded length: %"SC_FORMAT_LEN_SIZE_T"u", file->record_length);
+ 				} else {
+ 					len = file->record_length;
+ 				}
+ 			} else {
+ 				len = MAX_FILE_SIZE;
+ 			}
+-			
++
+ 			if ((in_path->index <= 0) || (in_path->index > (int)(file->record_count))) {
+ 				sc_log(ctx, "  record number out of bounds: %d", in_path->index);
+ 				r = SC_ERROR_RECORD_NOT_FOUND;
+ 				goto fail_unlock;
+ 			}
+-		
++
+ 		} else {
+ 
+ 			if (in_path->count < 0) {
+ 				if (file->size)
+ 					len = (file->size > MAX_FILE_SIZE)? MAX_FILE_SIZE:file->size;
+ 				else
+ 					len = 1024;
+ 				offset = 0;
+ 			}
+ 			else {
+ 				offset = in_path->index;
+ 				len = in_path->count;
+ 				/* Make sure we're within proper bounds */
+ 				if (offset >= file->size || offset + len > file->size) {
+ 					r = SC_ERROR_INVALID_ASN1_OBJECT;
+ 					goto fail_unlock;
+ 				}
+ 			}
+ 		}
+ 
+ 		data = malloc(len);
+ 		if (data == NULL) {
+ 			r = SC_ERROR_OUT_OF_MEMORY;
+ 			goto fail_unlock;
+ 		}
+ 
+ 		if (file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE_TLV) {
+ 			unsigned int i;
+ 			size_t l, record_len;
+ 			unsigned char *head = data;
+ 
+ 			for (i=1; ; i++) {
+ 				l = len - (head - data);
+ 				if (l > 256) {
+ 					l = 256;
+ 				}
+ 				r = sc_read_record(p15card->card, i, 0, head, l, SC_RECORD_BY_REC_NR);
+ 				if (r == SC_ERROR_RECORD_NOT_FOUND)
+ 					break;
+ 				if (r < 0) {
+ 					goto fail_unlock;
+ 				}
+ 				if (r < 2)
+ 					break;
+ 				record_len = head[1];
+ 				if (record_len != 0xff) {
+ 					memmove(head, head+2, r-2);
+ 					head += (r-2);
+ 				}
+ 				else {
+ 					if (r < 4)
+ 						break;
+ 					memmove(head, head+4, r-4);
+ 					head += (r-4);
+ 				}
+ 			}
+ 			len = head-data;
+ 		}
+ 		else if (file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE) {
+ 			r = sc_read_record(p15card->card, in_path->index, offset, data, len, SC_RECORD_BY_REC_NR);
+ 			if (r < 0) {
+ 				goto fail_unlock;
+ 			}
+ 			/* sc_read_record may return less than requested */
+ 			len = r;
+ 		}
+ 		else {
+ 			unsigned long flags = 0;
+ 			r = sc_read_binary(p15card->card, offset, data, len, &flags);
+ 			if (r < 0) {
+ 				goto fail_unlock;
+ 			}
+ 			/* sc_read_binary may return less than requested */
+ 			len = r;
+ 
+ 			if (flags & SC_FILE_FLAG_COMPRESSED_AUTO
+ 			    || flags & SC_FILE_FLAG_COMPRESSED_ZLIB
+ 			    || flags & SC_FILE_FLAG_COMPRESSED_GZIP) {
+ 				unsigned char *decompressed_buf = NULL;
+ 				size_t decompressed_len = 0;
+ 				r = decompress_file(p15card->card, data, len, &decompressed_buf, &decompressed_len, flags);
+ 				if (r != SC_SUCCESS) {
+ 					goto fail_unlock;
+ 				}
+ 				free(data);
+ 				data = decompressed_buf;
+ 				len = decompressed_len;
+ 			}
+ 		}
+ 		sc_unlock(p15card->card);
+ 
+ 		sc_file_free(file);
+ 
+ 		if (len && p15card->opts.use_file_cache
+ 		    && ((p15card->opts.use_file_cache & SC_PKCS15_OPTS_CACHE_ALL_FILES) || !private_data)) {
+ 			sc_pkcs15_cache_file(p15card, in_path, data, len);
+ 		}
+ 		if (len == 0) {
+ 			free(data);
+ 			data = NULL;
+ 		}
+ 	}
+ 	*buf = data;
+ 	*buflen = len;
+ 	LOG_FUNC_RETURN(ctx, SC_SUCCESS);

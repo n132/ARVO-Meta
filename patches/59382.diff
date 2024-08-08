@@ -1,0 +1,566 @@
+commit 425d4b24e08e21e7052e3163d0d69af1c1e591a6
+Author: Kimball Thurston <kdt3rd@gmail.com>
+Date:   Mon May 29 19:19:02 2023 +1200
+
+    Fix scenario where malformed dwa file could read past end of buffer (#1439)
+    
+    Fixes OSS-Fuzz 59382
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+diff --git a/src/lib/OpenEXRCore/internal_dwa_compressor.h b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+index 688bd51a..a8e83f4a 100644
+--- a/src/lib/OpenEXRCore/internal_dwa_compressor.h
++++ b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+@@ -701,537 +701,551 @@ exr_result_t
+ DwaCompressor_uncompress (
+     DwaCompressor* me,
+     const uint8_t* inPtr,
+     uint64_t       iSize,
+     void*          uncompressed_data,
+     uint64_t       uncompressed_size)
+ {
+     uint64_t     headerSize = NUM_SIZES_SINGLE * sizeof (uint64_t);
+     exr_result_t rv         = EXR_ERR_SUCCESS;
+     uint64_t     counters[NUM_SIZES_SINGLE];
+     uint64_t     version;
+     uint64_t     unknownUncompressedSize;
+     uint64_t     unknownCompressedSize;
+     uint64_t     acCompressedSize;
+     uint64_t     dcCompressedSize;
+     uint64_t     rleCompressedSize;
+     uint64_t     rleUncompressedSize;
+     uint64_t     rleRawSize;
+ 
+     uint64_t totalAcUncompressedCount;
+     uint64_t totalDcUncompressedCount;
+ 
+     uint64_t acCompression;
+ 
+     size_t         outBufferSize;
+     uint64_t       compressedSize;
+     const uint8_t* dataPtr;
+     uint64_t       dataLeft;
+     uint8_t*       outBufferEnd;
+     uint8_t*       packedAcBufferEnd;
+     uint8_t*       packedDcBufferEnd;
++    const uint8_t* dataPtrEnd;
+     const uint8_t* compressedUnknownBuf;
+     const uint8_t* compressedAcBuf;
+     const uint8_t* compressedDcBuf;
+     const uint8_t* compressedRleBuf;
+ 
+     if (iSize < headerSize) return EXR_ERR_CORRUPT_CHUNK;
+ 
+     //
+     // Flip the counters from XDR to NATIVE
+     //
+ 
+     memset (uncompressed_data, 0, uncompressed_size);
+ 
+     memcpy (counters, inPtr, headerSize);
+     priv_to_native64 (counters, NUM_SIZES_SINGLE);
+ 
+     //
+     // Unwind all the counter info
+     //
+     version                 = counters[VERSION];
+     unknownUncompressedSize = counters[UNKNOWN_UNCOMPRESSED_SIZE];
+     unknownCompressedSize   = counters[UNKNOWN_COMPRESSED_SIZE];
+     acCompressedSize        = counters[AC_COMPRESSED_SIZE];
+     dcCompressedSize        = counters[DC_COMPRESSED_SIZE];
+     rleCompressedSize       = counters[RLE_COMPRESSED_SIZE];
+     rleUncompressedSize     = counters[RLE_UNCOMPRESSED_SIZE];
+     rleRawSize              = counters[RLE_RAW_SIZE];
+ 
+     totalAcUncompressedCount = counters[AC_UNCOMPRESSED_COUNT];
+     totalDcUncompressedCount = counters[DC_UNCOMPRESSED_COUNT];
+ 
+     acCompression = counters[AC_COMPRESSION];
+ 
+     compressedSize = unknownCompressedSize + acCompressedSize +
+                      dcCompressedSize + rleCompressedSize;
+ 
++    dataPtrEnd = inPtr + iSize;
+     dataPtr  = inPtr + headerSize;
+     dataLeft = iSize - headerSize;
+ 
+     /* Both the sum and individual sizes are checked in case of overflow. */
+     if (iSize < (headerSize + compressedSize) ||
+         iSize < unknownCompressedSize || iSize < acCompressedSize ||
+         iSize < dcCompressedSize || iSize < rleCompressedSize)
+     {
+         return EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     if ((int64_t) unknownUncompressedSize < 0 ||
+         (int64_t) unknownCompressedSize < 0 || (int64_t) acCompressedSize < 0 ||
+         (int64_t) dcCompressedSize < 0 || (int64_t) rleCompressedSize < 0 ||
+         (int64_t) rleUncompressedSize < 0 || (int64_t) rleRawSize < 0 ||
+         (int64_t) totalAcUncompressedCount < 0 ||
+         (int64_t) totalDcUncompressedCount < 0)
+     {
+         return EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     if (version < 2)
+     {
+         me->_channelRules = sLegacyChannelRules;
+         me->_channelRuleCount =
+             sizeof (sLegacyChannelRules) / sizeof (Classifier);
+     }
+     else
+     {
+         uint64_t ruleSize;
+         rv =
+             DwaCompressor_readChannelRules (me, &dataPtr, &dataLeft, &ruleSize);
+ 
+         headerSize += ruleSize;
+     }
+ 
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     outBufferSize = 0;
+     rv            = DwaCompressor_initializeBuffers (me, &outBufferSize);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     //
+     // Allocate _outBuffer, if we haven't done so already
+     //
+ 
+     // the C++ classes used to have one buffer size for compress / uncompress
+     // but here we want to do zero-ish copy...
+     outBufferEnd  = me->_decode->unpacked_buffer;
+     outBufferSize = me->_decode->unpacked_alloc_size;
+ 
+     //
+     // Find the start of the RLE packed AC components and
+     // the DC components for each channel. This will be handy
+     // if you want to decode the channels in parallel later on.
+     //
+ 
+     packedAcBufferEnd = NULL;
+ 
+     if (me->_packedAcBuffer) packedAcBufferEnd = me->_packedAcBuffer;
+ 
+     packedDcBufferEnd = NULL;
+ 
+     if (me->_packedDcBuffer) packedDcBufferEnd = me->_packedDcBuffer;
+ 
+     //
+     // UNKNOWN data is packed first, followed by the
+     // Huffman-compressed AC, then the DC values,
+     // and then the zlib compressed RLE data.
+     //
+ 
+     compressedUnknownBuf = dataPtr;
+ 
+     compressedAcBuf =
+         compressedUnknownBuf + (ptrdiff_t) (unknownCompressedSize);
+     compressedDcBuf  = compressedAcBuf + (ptrdiff_t) (acCompressedSize);
+     compressedRleBuf = compressedDcBuf + (ptrdiff_t) (dcCompressedSize);
+ 
++    if (compressedUnknownBuf >= dataPtrEnd ||
++        dataPtr > compressedAcBuf ||
++        compressedAcBuf >= dataPtrEnd ||
++        dataPtr > compressedDcBuf ||
++        compressedDcBuf >= dataPtrEnd ||
++        dataPtr > compressedRleBuf ||
++        compressedRleBuf >= dataPtrEnd ||
++        (compressedRleBuf + rleCompressedSize) > dataPtrEnd)
++    {
++        return EXR_ERR_CORRUPT_CHUNK;
++    }
++
+     //
+     // Sanity check that the version is something we expect. Right now,
+     // we can decode version 0, 1, and 2. v1 adds 'end of block' symbols
+     // to the AC RLE. v2 adds channel classification rules at the
+     // start of the data block.
+     //
+ 
+     if (version > 2) { return EXR_ERR_BAD_CHUNK_LEADER; }
+ 
+     rv = DwaCompressor_setupChannelData (me);
+ 
+     //
+     // Uncompress the UNKNOWN data into _planarUncBuffer[UNKNOWN]
+     //
+ 
+     if (unknownCompressedSize > 0)
+     {
+         if (unknownUncompressedSize > me->_planarUncBufferSize[UNKNOWN])
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (EXR_ERR_SUCCESS != exr_uncompress_buffer (
+                                    me->_decode->context,
+                                    compressedUnknownBuf,
+                                    unknownCompressedSize,
+                                    me->_planarUncBuffer[UNKNOWN],
+                                    unknownUncompressedSize,
+                                    NULL))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+     }
+ 
+     //
+     // Uncompress the AC data into _packedAcBuffer
+     //
+ 
+     if (acCompressedSize > 0)
+     {
+         if (!me->_packedAcBuffer ||
+             totalAcUncompressedCount * sizeof (uint16_t) >
+                 me->_packedAcBufferSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         //
+         // Don't trust the user to get it right, look in the file.
+         //
+ 
+         switch (acCompression)
+         {
+             case STATIC_HUFFMAN:
+                 rv = internal_huf_decompress (
+                     me->_decode,
+                     compressedAcBuf,
+                     acCompressedSize,
+                     (uint16_t*) me->_packedAcBuffer,
+                     totalAcUncompressedCount,
+                     me->_decode->scratch_buffer_1,
+                     me->_decode->scratch_alloc_size_1);
+                 if (rv != EXR_ERR_SUCCESS) { return rv; }
+                 break;
+ 
+             case DEFLATE: {
+                 size_t destLen;
+ 
+                 rv = exr_uncompress_buffer (
+                     me->_decode->context,
+                     compressedAcBuf,
+                     acCompressedSize,
+                     me->_packedAcBuffer,
+                     totalAcUncompressedCount * sizeof (uint16_t),
+                     &destLen);
+                 if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+                 if (totalAcUncompressedCount * sizeof (uint16_t) != destLen)
+                 {
+                     return EXR_ERR_CORRUPT_CHUNK;
+                 }
+             }
+             break;
+ 
+             default: return EXR_ERR_CORRUPT_CHUNK; break;
+         }
+     }
+ 
+     //
+     // Uncompress the DC data into _packedDcBuffer
+     //
+ 
+     if (dcCompressedSize > 0)
+     {
+         size_t destLen;
+         size_t uncompBytes = totalDcUncompressedCount * sizeof (uint16_t);
+         if (uncompBytes > me->_packedDcBufferSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         rv = internal_decode_alloc_buffer (
+             me->_decode,
+             EXR_TRANSCODE_BUFFER_SCRATCH1,
+             &(me->_decode->scratch_buffer_1),
+             &(me->_decode->scratch_alloc_size_1),
+             uncompBytes);
+ 
+         if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+         rv = exr_uncompress_buffer (
+             me->_decode->context,
+             compressedDcBuf,
+             dcCompressedSize,
+             me->_decode->scratch_buffer_1,
+             uncompBytes,
+             &destLen);
+         if (rv != EXR_ERR_SUCCESS || (uncompBytes != destLen))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         internal_zip_reconstruct_bytes (
+             me->_packedDcBuffer, me->_decode->scratch_buffer_1, uncompBytes);
+     }
+     else
+     {
+         // if the compressed size is 0, then the uncompressed size must also be zero
+         if (totalDcUncompressedCount != 0) { return EXR_ERR_CORRUPT_CHUNK; }
+     }
+ 
+     //
+     // Uncompress the RLE data into _rleBuffer, then unRLE the results
+     // into _planarUncBuffer[RLE]
+     //
+ 
+     if (rleRawSize > 0)
+     {
+         size_t dstLen;
+ 
+         if (rleUncompressedSize > me->_rleBufferSize ||
+             rleRawSize > me->_planarUncBufferSize[RLE])
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (EXR_ERR_SUCCESS != exr_uncompress_buffer (
+                                    me->_decode->context,
+                                    compressedRleBuf,
+                                    rleCompressedSize,
+                                    me->_rleBuffer,
+                                    rleUncompressedSize,
+                                    &dstLen))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (dstLen != rleUncompressedSize) { return EXR_ERR_CORRUPT_CHUNK; }
+ 
+         if (internal_rle_decompress (
+                 me->_planarUncBuffer[RLE],
+                 rleRawSize,
+                 (const uint8_t*) me->_rleBuffer,
+                 rleUncompressedSize) != rleRawSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+     }
+ 
+     //
+     // Determine the start of each row in the output buffer
+     //
+     for (int c = 0; c < me->_numChannels; ++c)
+     {
+         me->_channelData[c].processed = 0;
+     }
+ 
+     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+     {
+         for (int c = 0; c < me->_numChannels; ++c)
+         {
+             ChannelData*               cd   = &(me->_channelData[c]);
+             exr_coding_channel_info_t* chan = cd->chan;
+ 
+             if ((y % chan->y_samples) != 0) continue;
+ 
+             rv = DctCoderChannelData_push_row (
+                 me->alloc_fn, me->free_fn, &(cd->_dctData), outBufferEnd);
+             if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+             outBufferEnd += chan->width * chan->bytes_per_element;
+         }
+     }
+ 
+     //
+     // Setup to decode each block of 3 channels that need to
+     // be handled together
+     //
+ 
+     for (int csc = 0; csc < me->_numCscChannelSets; ++csc)
+     {
+         LossyDctDecoder decoder;
+         CscChannelSet*  cset = &(me->_cscChannelSets[csc]);
+ 
+         int rChan = cset->idx[0];
+         int gChan = cset->idx[1];
+         int bChan = cset->idx[2];
+ 
+         if (me->_channelData[rChan].compression != LOSSY_DCT ||
+             me->_channelData[gChan].compression != LOSSY_DCT ||
+             me->_channelData[bChan].compression != LOSSY_DCT)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         rv = LossyDctDecoderCsc_construct (
+             &decoder,
+             &(me->_channelData[rChan]._dctData),
+             &(me->_channelData[gChan]._dctData),
+             &(me->_channelData[bChan]._dctData),
+             packedAcBufferEnd,
+             packedAcBufferEnd + totalAcUncompressedCount * sizeof (uint16_t),
+             packedDcBufferEnd,
+             dwaCompressorToLinear,
+             me->_channelData[rChan].chan->width,
+             me->_channelData[rChan].chan->height);
+ 
+         if (rv == EXR_ERR_SUCCESS)
+             rv = LossyDctDecoder_execute (me->alloc_fn, me->free_fn, &decoder);
+ 
+         packedAcBufferEnd += decoder._packedAcCount * sizeof (uint16_t);
+ 
+         packedDcBufferEnd += decoder._packedDcCount * sizeof (uint16_t);
+ 
+         me->_channelData[rChan].processed = 1;
+         me->_channelData[gChan].processed = 1;
+         me->_channelData[bChan].processed = 1;
+ 
+         if (rv != EXR_ERR_SUCCESS) { return rv; }
+     }
+ 
+     //
+     // Setup to handle the remaining channels by themselves
+     //
+ 
+     for (int c = 0; c < me->_numChannels; ++c)
+     {
+         ChannelData*               cd        = &(me->_channelData[c]);
+         exr_coding_channel_info_t* chan      = cd->chan;
+         DctCoderChannelData*       dcddata   = &(cd->_dctData);
+         int                        pixelSize = chan->bytes_per_element;
+ 
+         if (cd->processed) continue;
+ 
+         switch (cd->compression)
+         {
+             case LOSSY_DCT:
+ 
+                 //
+                 // Setup a single-channel lossy DCT decoder pointing
+                 // at the output buffer
+                 //
+ 
+                 {
+                     const uint16_t* linearLut = NULL;
+                     LossyDctDecoder decoder;
+ 
+                     if (!chan->p_linear) linearLut = dwaCompressorToLinear;
+ 
+                     rv = LossyDctDecoder_construct (
+                         &decoder,
+                         dcddata,
+                         packedAcBufferEnd,
+                         packedAcBufferEnd +
+                             totalAcUncompressedCount * sizeof (uint16_t),
+                         packedDcBufferEnd,
+                         linearLut,
+                         chan->width,
+                         chan->height);
+ 
+                     if (rv == EXR_ERR_SUCCESS)
+                         rv = LossyDctDecoder_execute (
+                             me->alloc_fn, me->free_fn, &decoder);
+ 
+                     packedAcBufferEnd +=
+                         (size_t) decoder._packedAcCount * sizeof (uint16_t);
+ 
+                     packedDcBufferEnd +=
+                         (size_t) decoder._packedDcCount * sizeof (uint16_t);
+ 
+                     if (rv != EXR_ERR_SUCCESS) { return rv; }
+                 }
+ 
+                 break;
+ 
+             case RLE:
+ 
+                 //
+                 // For the RLE case, the data has been un-RLE'd into
+                 // planarUncRleEnd[], but is still split out by bytes.
+                 // We need to rearrange the bytes back into the correct
+                 // order in the output buffer;
+                 //
+ 
+                 {
+                     int row = 0;
+ 
+                     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+                     {
+                         uint8_t* dst;
+                         if ((y % chan->y_samples) != 0) continue;
+ 
+                         dst = dcddata->_rows[row];
+ 
+                         if (pixelSize == 2)
+                         {
+                             interleaveByte2 (
+                                 dst,
+                                 cd->planarUncRleEnd[0],
+                                 cd->planarUncRleEnd[1],
+                                 chan->width);
+ 
+                             cd->planarUncRleEnd[0] += chan->width;
+                             cd->planarUncRleEnd[1] += chan->width;
+                         }
+                         else
+                         {
+                             for (int x = 0; x < chan->width; ++x)
+                             {
+                                 for (int byte = 0; byte < pixelSize; ++byte)
+                                 {
+                                     *dst++ = *cd->planarUncRleEnd[byte]++;
+                                 }
+                             }
+                         }
+ 
+                         row++;
+                     }
+                 }
+ 
+                 break;
+ 
+             case UNKNOWN:
+ 
+                 //
+                 // In the UNKNOWN case, data is already in planarUncBufferEnd
+                 // and just needs to copied over to the output buffer
+                 //
+ 
+                 {
+                     int    row = 0;
+                     size_t dstScanlineSize =
+                         (size_t) chan->width * (size_t) pixelSize;
+ 
+                     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+                     {
+                         if ((y % chan->y_samples) != 0) continue;
+ 
+                         //
+                         // sanity check for buffer data lying within range
+                         //
+                         if ((cd->planarUncBufferEnd +
+                              (size_t) (dstScanlineSize)) >
+                             (me->_planarUncBuffer[UNKNOWN] +
+                              me->_planarUncBufferSize[UNKNOWN]))
+                         {
+                             return EXR_ERR_CORRUPT_CHUNK;
+                         }
+ 
+                         memcpy (
+                             dcddata->_rows[row],
+                             cd->planarUncBufferEnd,
+                             dstScanlineSize);
+ 
+                         cd->planarUncBufferEnd += dstScanlineSize;
+                         row++;
+                     }
+                 }
+ 
+                 break;
+ 
+             case NUM_COMPRESSOR_SCHEMES:
+             default: return EXR_ERR_CORRUPT_CHUNK; break;
+         }
+ 
+         cd->processed = 1;
+     }
+ 
+     return rv;
+ }
+ 
+ /**************************************/

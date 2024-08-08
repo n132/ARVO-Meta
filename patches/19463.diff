@@ -1,0 +1,210 @@
+commit 66d12eb98aba10948f829d08b4144969ead5ddbb
+Author: Andrew Bartlett <abartlet@samba.org>
+Date:   Fri Dec 13 22:41:10 2019 +1300
+
+    lib/fuzzing: Initialise st buffer in fuzz_ndr_X
+    
+    An NDR pull of a function will fill in either the in. or out.
+    elements of this structure, but never both.
+    
+    However, some structures have size_is() in the out. that reference
+    the in. elements.  This is the reason for the --context-file option
+    in ndrdump.
+    
+    We have a special handler in the fuzzing case embedded in the
+    pidl-generated output to cope with this, by filling in pointers
+    for elements declared [ref,in] but it relies on the in-side
+    (at least) of the buffer being zeroed.
+    
+    So zero the buffer before we start.  Sadly this means things
+    like valgrind can not find a use of uninitialised data, but that
+    is a price we have to pay.
+    
+    Credit to OSS-Fuzz
+    
+    Signed-off-by: Andrew Bartlett <abartlet@samba.org>
+    Reviewed-by: Gary Lockyer <gary@catalyst.net.nz>
+
+diff --git a/lib/fuzzing/fuzz_ndr_X.c b/lib/fuzzing/fuzz_ndr_X.c
+index 5fc21dcef26..e8c3bb4cf76 100644
+--- a/lib/fuzzing/fuzz_ndr_X.c
++++ b/lib/fuzzing/fuzz_ndr_X.c
+@@ -153,168 +153,178 @@ static void ndr_print_nothing(struct ndr_print *ndr, const char *format, ...)
+ int LLVMFuzzerTestOneInput(uint8_t *data, size_t size) {
+ 	uint8_t type;
+ 	int pull_push_print_flags;
+ 	uint16_t fuzz_packet_flags, function;
+ 	TALLOC_CTX *mem_ctx = NULL;
+ 	uint32_t ndr_flags = 0;
+ 	struct ndr_push *ndr_push;
+ 	enum ndr_err_code ndr_err;
+ 	struct ndr_interface_call f_buffer;
+ 	const struct ndr_interface_call *f = NULL;
+ 	NTSTATUS status;
+ 
+ /*
+  * This allows us to build binaries to fuzz just one target function
+  *
+  * In this mode the input becomes the 'stub data', there is no prefix.
+  *
+  * There is no NDR64 support in this mode at this time.
+  */
+ #if defined(FUZZ_TYPE) && defined(FUZZ_FUNCTION)
+ #undef HEADER_SIZE
+ #define HEADER_SIZE 0
+ 	fuzz_packet_flags = 0;
+ 	type = FUZZ_TYPE;
+ 	function = FUZZ_FUNCTION;
+ #else
+ 	if (size < HEADER_SIZE) {
+ 		/*
+ 		 * the first few bytes decide what is being fuzzed --
+ 		 * if they aren't all there we do nothing.
+ 		 */
+ 		return 0;
+ 	}
+ 
+ 	fuzz_packet_flags = SVAL(data, 0);
+ 	if (fuzz_packet_flags & INVALID_FLAGS) {
+ 		return 0;
+ 	}
+ 
+ 	function = SVAL(data, 2);
+ 
+ 	type = fuzz_packet_flags & 3;
+ 
+ #ifdef FUZZ_TYPE
+ 	/*
+ 	 * Fuzz targets should have as small an interface as possible.
+ 	 * This allows us to create 3 binaries for most pipes,
+ 	 * TYPE_IN, TYPE_OUT and TYPE_STRUCT
+ 	 *
+ 	 * We keep the header format, and just exit early if it does
+ 	 * not match.
+ 	 */
+ 	if (type != FUZZ_TYPE) {
+ 		return 0;
+ 	}
+ #endif
+ #endif
+ 
+ 	switch (type) {
+ 	case TYPE_STRUCT:
+ 		pull_push_print_flags = NDR_SCALARS|NDR_BUFFERS;
+ 		f = find_struct(&FUZZ_PIPE_TABLE, function, &f_buffer);
+ 		break;
+ 	case TYPE_IN:
+ 		pull_push_print_flags = NDR_IN;
+ 		f = find_function(&FUZZ_PIPE_TABLE, function);
+ 		break;
+ 	case TYPE_OUT:
+ 		pull_push_print_flags = NDR_OUT;
+ 		f = find_function(&FUZZ_PIPE_TABLE, function);
+ 		break;
+ 	default:
+ 		return 0;
+ 	}
+ 
+ 	if (f == NULL) {
+ 		return 0;
+ 	}
+ 	if (fuzz_packet_flags & FLAG_NDR64) {
+ 		ndr_flags |= LIBNDR_FLAG_NDR64;
+ 	}
+ 
+ 	mem_ctx = talloc_init("ndrfuzz");
+ 
+ 	{
+ 		/*
+ 		 * f->struct_size is well-controlled, it is essentially
+ 		 * defined in the IDL
+ 		 */
+ 		uint8_t st[f->struct_size];
+ 
+ 		DATA_BLOB blob = data_blob_const(data + HEADER_SIZE,
+ 						 size - HEADER_SIZE);
+ 		struct ndr_pull *ndr_pull = ndr_pull_init_blob(&blob,
+ 							       mem_ctx);
+ 
+ 		if (ndr_pull == NULL) {
+ 			perror("ndr_pull_init_blob");
+ 			TALLOC_FREE(mem_ctx);
+ 			return 0;
+ 		}
++
++		/*
++		 * We must initialise the buffer (even if we would
++		 * prefer not to for the sake of eg valgrind) as
++		 * otherwise the special handler for 'out pointer with
++		 * [size_is()] refers to in value with [ref]' fails to
++		 * trigger
++		 */
++		memset(st, '\0', sizeof(st));
++
+ 		ndr_pull->flags |= LIBNDR_FLAG_REF_ALLOC;
+ 
+ 		if (type == TYPE_OUT) {
+ 			status = pull_chunks(ndr_pull,
+ 					     &f->out_pipes);
+ 			if (!NT_STATUS_IS_OK(status)) {
+ 				TALLOC_FREE(mem_ctx);
+ 				return 0;
+ 			}
+ 		}
+ 
+ 		ndr_err = f->ndr_pull(ndr_pull,
+ 				      pull_push_print_flags,
+ 				      st);
+ 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+ 			TALLOC_FREE(mem_ctx);
+ 			return 0;
+ 		}
+ 
+ 		if (type == TYPE_IN) {
+ 			status = pull_chunks(ndr_pull,
+ 					     &f->in_pipes);
+ 			if (!NT_STATUS_IS_OK(status)) {
+ 				TALLOC_FREE(mem_ctx);
+ 				return 0;
+ 			}
+ 		}
+ 
+ 		ndr_push = ndr_push_init_ctx(mem_ctx);
+ 		if (ndr_push == NULL) {
+ 			TALLOC_FREE(mem_ctx);
+ 			return 0;
+ 		}
+ 
+ 		ndr_push->flags |= ndr_flags;
+ 
+ 		/*
+ 		 * Now push what was pulled, just in case we generated an
+ 		 * invalid structure in memory, this should notice
+ 		 */
+ 		ndr_err = f->ndr_push(ndr_push,
+ 				      pull_push_print_flags,
+ 				      st);
+ 		if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+ 			TALLOC_FREE(mem_ctx);
+ 			return 0;
+ 		}
+ 
+ 		{
+ 			struct ndr_print *ndr_print = talloc_zero(mem_ctx, struct ndr_print);
+ 			ndr_print->print = ndr_print_nothing;
+ 			ndr_print->depth = 1;
+ 
+ 			/*
+ 			 * Finally print (to nowhere) the structure, this may also
+ 			 * notice invalid memory
+ 			 */
+ 			f->ndr_print(ndr_print,
+ 				     f->name,
+ 				     pull_push_print_flags,
+ 				     st);
+ 		}
+ 	}
+ 	TALLOC_FREE(mem_ctx);
+ 
+ 	return 0;
+ }

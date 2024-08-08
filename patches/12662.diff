@@ -1,0 +1,254 @@
+commit 15d2192da9028fee80da0b2dd8df1b6a00873e46
+Author: Evan Miller <emmiller@gmail.com>
+Date:   Thu Jan 24 12:58:43 2019 -0500
+
+    SAS7BDAT reader: Improve bounds checking
+    
+    Fix buffer overrun when reading in the subheader pointers.
+    
+    Credit to OSS-Fuzz #12662
+
+diff --git a/src/sas/readstat_sas7bdat_read.c b/src/sas/readstat_sas7bdat_read.c
+index e017954..12284c6 100644
+--- a/src/sas/readstat_sas7bdat_read.c
++++ b/src/sas/readstat_sas7bdat_read.c
+@@ -25,6 +25,13 @@ typedef struct col_info_s {
+     int         type;
+ } col_info_t;
+ 
++typedef struct subheader_pointer_s {
++    uint64_t offset;
++    uint64_t len;
++    unsigned char compression;
++    unsigned char is_compressed_data;
++} subheader_pointer_t;
++
+ typedef struct sas7bdat_ctx_s {
+     readstat_callbacks_t handle;
+     int64_t              file_size;
+@@ -647,67 +654,87 @@ cleanup:
+ static int sas7bdat_signature_is_recognized(uint32_t signature) {
+     return (signature == SAS_SUBHEADER_SIGNATURE_ROW_SIZE ||
+             signature == SAS_SUBHEADER_SIGNATURE_COLUMN_SIZE ||
+             signature == SAS_SUBHEADER_SIGNATURE_COUNTS ||
+             signature == SAS_SUBHEADER_SIGNATURE_COLUMN_FORMAT ||
+             (signature & SAS_SUBHEADER_SIGNATURE_COLUMN_MASK) == SAS_SUBHEADER_SIGNATURE_COLUMN_MASK);
+ }
+ 
++static readstat_error_t sas7bdat_parse_subheader_pointer(const char *shp, size_t shp_size,
++        subheader_pointer_t *info, sas7bdat_ctx_t *ctx) {
++    readstat_error_t retval = READSTAT_OK;
++    if (ctx->u64) {
++        if (shp_size <= 17) {
++            retval = READSTAT_ERROR_PARSE;
++            goto cleanup;
++        }
++        info->offset = sas_read8(&shp[0], ctx->bswap);
++        info->len = sas_read8(&shp[8], ctx->bswap);
++        info->compression = shp[16];
++        info->is_compressed_data = shp[17];
++    } else {
++        if (shp_size <= 9) {
++            retval = READSTAT_ERROR_PARSE;
++            goto cleanup;
++        }
++        info->offset = sas_read4(&shp[0], ctx->bswap);
++        info->len = sas_read4(&shp[4], ctx->bswap);
++        info->compression = shp[8];
++        info->is_compressed_data = shp[9];
++    }
++cleanup:
++    return retval;
++}
++
+ /* First, extract column text */
+ static readstat_error_t sas7bdat_parse_page_pass1(const char *page, size_t page_size, sas7bdat_ctx_t *ctx) {
+     readstat_error_t retval = READSTAT_OK;
+ 
+     uint16_t subheader_count = sas_read2(&page[ctx->page_header_size-4], ctx->bswap);
+ 
+     int i;
+     const char *shp = &page[ctx->page_header_size];
+     int lshp = ctx->subheader_pointer_size;
+ 
+     if (ctx->page_header_size + subheader_count*lshp > ctx->page_size) {
+         retval = READSTAT_ERROR_PARSE;
+         goto cleanup;
+     }
+ 
+     for (i=0; i<subheader_count; i++) {
+-        uint64_t offset = 0, len = 0;
++        subheader_pointer_t shp_info = { 0 };
+         uint32_t signature = 0;
+-        unsigned char compression = 0;
+         size_t signature_len = ctx->u64 ? 8 : 4;
+-        if (ctx->u64) {
+-            offset = sas_read8(&shp[0], ctx->bswap);
+-            len = sas_read8(&shp[8], ctx->bswap);
+-            compression = shp[16];
+-        } else {
+-            offset = sas_read4(&shp[0], ctx->bswap);
+-            len = sas_read4(&shp[4], ctx->bswap);
+-            compression = shp[8];
++        if ((retval = sas7bdat_parse_subheader_pointer(shp, page + page_size - shp, &shp_info, ctx)) != READSTAT_OK) {
++            goto cleanup;
+         }
+-
+-        if (len > 0 && compression != SAS_COMPRESSION_TRUNC) {
+-            if (offset > page_size || offset + len > page_size || offset < ctx->page_header_size+subheader_count*lshp) {
++        if (shp_info.len > 0 && shp_info.compression != SAS_COMPRESSION_TRUNC) {
++            if (shp_info.offset > page_size || shp_info.offset + shp_info.len > page_size
++                    || shp_info.offset < ctx->page_header_size+subheader_count*lshp) {
+                 retval = READSTAT_ERROR_PARSE;
+                 goto cleanup;
+             }
+-            if (compression == SAS_COMPRESSION_NONE) {
+-                if (len < signature_len || offset + 4 > page_size) {
++            if (shp_info.compression == SAS_COMPRESSION_NONE) {
++                if (shp_info.len < signature_len || shp_info.offset + 4 > page_size) {
+                     retval = READSTAT_ERROR_PARSE;
+                     goto cleanup;
+                 }
+-                signature = sas_read4(page + offset, ctx->bswap);
++                signature = sas_read4(page + shp_info.offset, ctx->bswap);
+                 if (!ctx->little_endian && signature == -1 && signature_len == 8) {
+-                    signature = sas_read4(page + offset + 4, ctx->bswap);
++                    signature = sas_read4(page + shp_info.offset + 4, ctx->bswap);
+                 }
+                 if (signature == SAS_SUBHEADER_SIGNATURE_COLUMN_TEXT) {
+-                    if ((retval = sas7bdat_parse_subheader(signature, page + offset, len, ctx)) != READSTAT_OK) {
++                    if ((retval = sas7bdat_parse_subheader(signature, page + shp_info.offset, shp_info.len, ctx))
++                            != READSTAT_OK) {
+                         goto cleanup;
+                     }
+                 }
+-            } else if (compression == SAS_COMPRESSION_ROW) {
++            } else if (shp_info.compression == SAS_COMPRESSION_ROW) {
+                 /* void */
+             } else {
+                 retval = READSTAT_ERROR_UNSUPPORTED_COMPRESSION;
+                 goto cleanup;
+             }
+         }
+ 
+         shp += lshp;
+     }
+@@ -720,103 +747,92 @@ cleanup:
+ static readstat_error_t sas7bdat_parse_page_pass2(const char *page, size_t page_size, sas7bdat_ctx_t *ctx) {
+     uint16_t page_type;
+ 
+     readstat_error_t retval = READSTAT_OK;
+ 
+     page_type = sas_read2(&page[ctx->page_header_size-8], ctx->bswap);
+ 
+     const char *data = NULL;
+ 
+     if ((page_type & SAS_PAGE_TYPE_MASK) == SAS_PAGE_TYPE_DATA) {
+         ctx->page_row_count = sas_read2(&page[ctx->page_header_size-6], ctx->bswap);
+         data = &page[ctx->page_header_size];
+     } else if (!(page_type & SAS_PAGE_TYPE_COMP)) {
+         uint16_t subheader_count = sas_read2(&page[ctx->page_header_size-4], ctx->bswap);
+ 
+         int i;
+         const char *shp = &page[ctx->page_header_size];
+         for (i=0; i<subheader_count; i++) {
+-            uint64_t offset = 0, len = 0;
++            subheader_pointer_t shp_info = { 0 };
+             uint32_t signature = 0;
+-            unsigned char compression = 0;
+-            unsigned char is_compressed_data = 0;
+             int lshp = ctx->subheader_pointer_size;
+-            if (ctx->u64) {
+-                offset = sas_read8(&shp[0], ctx->bswap);
+-                len = sas_read8(&shp[8], ctx->bswap);
+-                compression = shp[16];
+-                is_compressed_data = shp[17];
+-            } else {
+-                offset = sas_read4(&shp[0], ctx->bswap);
+-                len = sas_read4(&shp[4], ctx->bswap);
+-                compression = shp[8];
+-                is_compressed_data = shp[9];
++            if ((retval = sas7bdat_parse_subheader_pointer(shp, page + page_size - shp, &shp_info, ctx)) != READSTAT_OK) {
++                goto cleanup;
+             }
+-
+-            if (len > 0 && compression != SAS_COMPRESSION_TRUNC) {
+-                if (offset > page_size || offset + len > page_size ||
+-                        offset < ctx->page_header_size+subheader_count*lshp) {
++            if (shp_info.len > 0 && shp_info.compression != SAS_COMPRESSION_TRUNC) {
++                if (shp_info.offset > page_size || shp_info.offset + shp_info.len > page_size ||
++                        shp_info.offset < ctx->page_header_size+subheader_count*lshp) {
+                     retval = READSTAT_ERROR_PARSE;
+                     goto cleanup;
+                 }
+-                if (compression == SAS_COMPRESSION_NONE) {
+-                    signature = sas_read4(page + offset, ctx->bswap);
++                if (shp_info.compression == SAS_COMPRESSION_NONE) {
++                    signature = sas_read4(page + shp_info.offset, ctx->bswap);
+                     if (!ctx->little_endian && signature == -1 && ctx->u64) {
+-                        signature = sas_read4(page + offset + 4, ctx->bswap);
++                        signature = sas_read4(page + shp_info.offset + 4, ctx->bswap);
+                     }
+-                    if (is_compressed_data && !sas7bdat_signature_is_recognized(signature)) {
+-                        if (len != ctx->row_length) {
++                    if (shp_info.is_compressed_data && !sas7bdat_signature_is_recognized(signature)) {
++                        if (shp_info.len != ctx->row_length) {
+                             retval = READSTAT_ERROR_ROW_WIDTH_MISMATCH;
+                             goto cleanup;
+                         }
+                         if ((retval = sas7bdat_submit_columns_if_needed(ctx, 1)) != READSTAT_OK) {
+                             goto cleanup;
+                         }
+-                        if ((retval = sas7bdat_parse_single_row(page + offset, ctx)) != READSTAT_OK) {
++                        if ((retval = sas7bdat_parse_single_row(page + shp_info.offset, ctx)) != READSTAT_OK) {
+                             goto cleanup;
+                         }
+                     } else {
+                         if (signature != SAS_SUBHEADER_SIGNATURE_COLUMN_TEXT) {
+-                            if ((retval = sas7bdat_parse_subheader(signature, page + offset, len, ctx)) != READSTAT_OK) {
++                            if ((retval = sas7bdat_parse_subheader(signature, page + shp_info.offset, shp_info.len, ctx)) != READSTAT_OK) {
+                                 goto cleanup;
+                             }
+                         }
+                     }
+-                } else if (compression == SAS_COMPRESSION_ROW) {
++                } else if (shp_info.compression == SAS_COMPRESSION_ROW) {
+                     if ((retval = sas7bdat_submit_columns_if_needed(ctx, 1)) != READSTAT_OK) {
+                         goto cleanup;
+                     }
+-                    if ((retval = sas7bdat_parse_subheader_rle(page + offset, len, ctx)) != READSTAT_OK) {
++                    if ((retval = sas7bdat_parse_subheader_rle(page + shp_info.offset, shp_info.len, ctx)) != READSTAT_OK) {
+                         goto cleanup;
+                     }
+                 } else {
+                     retval = READSTAT_ERROR_UNSUPPORTED_COMPRESSION;
+                     goto cleanup;
+                 }
+             }
+ 
+             shp += lshp;
+         }
+ 
+         if ((page_type & SAS_PAGE_TYPE_MASK) == SAS_PAGE_TYPE_MIX) {
+             /* HACK - this is supposed to obey 8-byte boundaries but
+              * some files created by Stat/Transfer don't. So verify that the
+              * padding is { 0, 0, 0, 0 } or { ' ', ' ', ' ', ' ' } (or that
+              * the file is not from Stat/Transfer) before skipping it */
+             if ((shp-page)%8 == 4 && 
+                     (*(uint32_t *)shp == 0x00000000 ||
+                      *(uint32_t *)shp == 0x20202020 ||
+                      ctx->vendor != READSTAT_VENDOR_STAT_TRANSFER)) {
+                 data = shp + 4;
+             } else {
+                 data = shp;
+             }
+         }
+     }
+     if (data) {
+         if ((retval = sas7bdat_submit_columns_if_needed(ctx, 0)) != READSTAT_OK) {
+             goto cleanup;
+         }
+         if (ctx->handle.value) {
+             retval = sas7bdat_parse_rows(data, page + page_size - data, ctx);
+         }
+     } 

@@ -1,0 +1,1727 @@
+commit 756d716867a4e862faa07ae395254b048b1322dc
+Author: Reini Urban <rurban@cpan.org>
+Date:   Thu Nov 17 09:21:52 2022 +0100
+
+    decode: fix fuzzing type confusion
+    
+    leading to arbitrary pointer reads.
+    set the obj->type to UNKNOWN_* on unknown class, as the
+    further type switches act on this type. eg out_json.
+    Fixes oss-fuzzer #53468
+
+diff --git a/src/bits.c b/src/bits.c
+index 5be82caf..43c8b803 100644
+--- a/src/bits.c
++++ b/src/bits.c
+@@ -1213,75 +1213,73 @@ int
+ bit_read_H (Bit_Chain *restrict dat, Dwg_Handle *restrict handle)
+ {
+   unsigned long pos = dat->byte;
+   handle->code = bit_read_RC (dat);
+   if (pos == dat->byte)
+     return DWG_ERR_INVALIDHANDLE;
+   handle->is_global = 0;
+   handle->value = 0;
+   if (dat->from_version < R_13)
+     {
+       BITCODE_RC *restrict val;
+-      if (pos == dat->byte)
+-        return DWG_ERR_INVALIDHANDLE;
+       handle->size = handle->code;
+       if (handle->size > sizeof(BITCODE_RC *))
+         {
+           loglevel = dat->opts & DWG_OPTS_LOGLEVEL;
+           LOG_WARN ("Invalid handle-reference, longer than 8 bytes: " FORMAT_H,
+                     ARGS_H (*handle));
+           return DWG_ERR_INVALIDHANDLE;
+         }
+       handle->code = 0;
+       val = (BITCODE_RC *)&(handle->value);
+       for (int i = handle->size - 1; i >= 0; i--)
+         val[i] = bit_read_RC (dat);
+       return 0;
+     }
+   handle->size = handle->code & 0xf;
+   handle->code = (handle->code & 0xf0) >> 4;
+ 
+   // size must not exceed 8
+   if (handle->size > sizeof(BITCODE_RC *) || handle->code > 14)
+     {
+       loglevel = dat->opts & DWG_OPTS_LOGLEVEL;
+       LOG_WARN ("Invalid handle-reference, longer than 8 bytes: " FORMAT_H,
+                 ARGS_H (*handle));
+       return DWG_ERR_INVALIDHANDLE;
+     }
+ 
+   // TODO: little-endian only
+   // x86_64 gcc-9.[0-2] miscompilation with val[i]: (%rbx) being dat+1
+   // we work aorund this one, but you never know what else is being miscompiled.
+   // apparently fixed in gcc-9.3, but 9.3 is still broken for cperl.
+ #if defined(__GNUC__) && (__GNUC__ == 9) && (__GNUC_MINOR__ <= 2) \
+   && (SIZEOF_SIZE_T == 8)                                         \
+   && (defined(__x86_64__) || defined(__x86_64) || defined(_M_AMD64) || defined(_M_X64))
+   {
+ #warning x86_64 gcc-9.[0-2] codegen is seriously broken. better use 9.3 or an older version
+     BITCODE_RC *restrict val;
+     val = (BITCODE_RC *)&(handle->value);
+     for (int i = handle->size - 1; i >= 0; i--)
+       {
+         BITCODE_RC c = bit_read_RC (dat);
+         val[i] = c;
+       }
+   }
+ #else
+   {
+     BITCODE_RC *restrict val;
+     val = (BITCODE_RC *)&(handle->value);
+     for (int i = handle->size - 1; i >= 0; i--)
+       val[i] = bit_read_RC (dat);
+   }
+ #endif
+ 
+   return 0;
+ }
+ 
+ /** Write handle-references.
+  *  TODO
+  *  separate SoftPtr:   BB 0 + RLL
+  *           HardPtr:   BB 1 + RLL
+  *           SoftOwner: BB 2 + RLL
+  *           HardOwner: BB 3 + RLL
+  */
+diff --git a/src/decode.c b/src/decode.c
+index c00c82cb..bf347337 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -3814,93 +3814,95 @@ static int
+ dwg_decode_entity (Bit_Chain *dat, Bit_Chain *hdl_dat, Bit_Chain *str_dat,
+                    Dwg_Object_Entity *restrict ent)
+ {
+   unsigned int i;
+   int error = 0;
+   Dwg_Data *dwg = ent->dwg;
+   Dwg_Object *obj = &dwg->object[ent->objid];
+   Dwg_Object_Entity *_obj = ent;
+   Dwg_Object_Entity *_ent = ent;
+   Dwg_Class *klass = NULL;
+   unsigned long objectpos = bit_position (dat);
+   int has_wrong_bitsize = 0;
+ 
+   // obj->dat_address = dat->byte; // the data stream offset
+   obj->bitsize_pos = objectpos; // absolute. needed for encode
+   VERSIONS (R_2000, R_2007)
+   {
+     obj->bitsize = bit_read_RL (dat); // until the handles
+     LOG_TRACE ("bitsize: " FORMAT_RL " [RL] @%lu.%u\n", obj->bitsize,
+                dat->byte-2, dat->bit);
+     if (obj->bitsize > obj->size * 8)
+       {
+         LOG_ERROR ("Invalid bitsize " FORMAT_RL " > " FORMAT_RL, obj->bitsize,
+                    obj->size * 8);
+         obj->bitsize = obj->size * 8;
+         has_wrong_bitsize = 1;
+         error |= DWG_ERR_VALUEOUTOFBOUNDS;
+       }
+     else
+       error |= obj_handle_stream (dat, obj, hdl_dat);
+   }
+   SINCE (R_2007)
+   {
+     SINCE (R_2010) {
+       LOG_HANDLE (" bitsize: " FORMAT_RL ",", obj->bitsize);
+       // restrict the hdl_dat stream
+       error |= obj_handle_stream (dat, obj, hdl_dat);
+     }
+     // and set the string stream (restricted to size)
+     // skip for all types without strings
+     if (obj->type >= 500 || obj_has_strings (obj->type))
+       error |= obj_string_stream (dat, obj, str_dat);
+     else
+       {
+         bit_set_position (str_dat, obj->bitsize - 1);
+         str_dat->size = 0;
+       }
+   }
+ 
+   error |= bit_read_H (dat, &(obj->handle));
+-  if (error & DWG_ERR_INVALIDHANDLE || !obj->handle.value || !obj->handle.size
+-      || obj->handle.code)
++  if (error & DWG_ERR_INVALIDHANDLE || !obj->handle.value || !obj->handle.size)
+     {
+       LOG_ERROR ("Invalid object handle " FORMAT_H " at pos @%lu.%u",
+                  ARGS_H (obj->handle), dat->byte, dat->bit);
+       // TODO reconstruct the handle and search in the bitsoup?
+       if (has_wrong_bitsize)
+         obj->bitsize = 0;
++      //obj->handle.value = 0;
++      //obj->handle.size = 0;
++      //obj->handle.code = 0;
+       ent->num_eed = 0;
+       ent->preview_exists = 0;
+       return error | DWG_ERR_INVALIDHANDLE;
+     }
+   LOG_TRACE ("handle: " FORMAT_H " [H 5]", ARGS_H (obj->handle))
+   LOG_INSANE (" @%lu.%u", dat->byte, dat->bit)
+   LOG_TRACE ("\n")
+ 
+   if (has_wrong_bitsize)
+     LOG_WARN ("Skip eed")
+   else
+     error |= dwg_decode_eed (dat, (Dwg_Object_Object *)ent);
+   LOG_INSANE (" @%lu.%u\n", dat->byte, dat->bit)
+   //LOG_TRACE ("\n")
+   if (error & (DWG_ERR_INVALIDEED | DWG_ERR_VALUEOUTOFBOUNDS))
+     return error;
+ 
+   // clang-format off
+   #include "common_entity_data.spec"
+   // clang-format on
+ 
+   dwg_decode_common_entity_handle_data (dat, hdl_dat, obj);
+ 
+   // elsewhere: object data, handles, padding bits, crc
+   obj->common_size = bit_position (dat) - objectpos;
+   LOG_HANDLE ("--common_size: %lu\n", obj->common_size); // needed for unknown
+ 
+   return error;
+ }
+ 
+ /* The first common part of every object.
+ 
+    There is no COMMON_ENTITY_DATA for objects.
+    Check page 269, par 28 (Extended Object Data)
+  */
+@@ -4773,463 +4775,469 @@ int
+ dwg_decode_add_object (Dwg_Data *restrict dwg, Bit_Chain *dat,
+                        Bit_Chain *hdl_dat, long unsigned int address)
+ {
+   long unsigned int objpos, restartpos;
+   Bit_Chain abs_dat = { NULL };
+   unsigned char previous_bit;
+   Dwg_Object *restrict obj;
+   BITCODE_BL num = dwg->num_objects;
+   int error = 0;
+   int realloced = 0;
+ 
+   /* Keep the previous full chain  */
+   abs_dat = *dat;
+ 
+   /* Use the indicated address for the object
+    */
+   dat->byte = address;
+   dat->bit = 0;
+ 
+   // DEBUG_HERE;
+   /*
+    * Reserve memory space for objects. A realloc violates all internal
+    * pointers.
+    */
+   realloced = dwg_add_object (dwg);
+   if (realloced > 0) // i.e. not realloced, but error
+     {
+       *dat = abs_dat;
+       return realloced; // i.e. DWG_ERR_OUTOFMEM
+     }
+   obj = &dwg->object[num];
+   LOG_INFO ("==========================================\n"
+             "Object number: %lu/%lX",
+             (unsigned long)num, (unsigned long)num)
+ 
+   obj->size = bit_read_MS (dat);
+   LOG_INFO (", Size: %d [MS]", obj->size)
+   SINCE (R_2010)
+   {
+     /* This is not counted in the object size */
+     obj->handlestream_size = bit_read_UMC (dat);
+     LOG_INFO (", Hdlsize: " FORMAT_UMC " [UMC] ", obj->handlestream_size);
+     obj->bitsize = obj->size * 8 - obj->handlestream_size;
+     // TODO boundscheck
+   }
+ 
+   objpos = bit_position (dat); // absolute
+   obj->address = dat->byte;
+ 
+   /* Until here dat is absolute. now restrict it */
+   bit_reset_chain (dat);
+   if (obj->size > dat->size ||
+       dat->size > abs_dat.size ||
+       (long)(dat->chain + dat->size) < (long)dat->chain ||
+       (long)(abs_dat.chain + abs_dat.size) < (long)abs_dat.chain ||
+       (long)(dat->chain + dat->size) > (long)(abs_dat.chain + abs_dat.size))
+     {
+       LOG_TRACE ("\n");
+       LOG_WARN ("Invalid object size %u > %ld. Would overflow", obj->size,
+                  dat->size);
+       error |= DWG_ERR_VALUEOUTOFBOUNDS;
+ #if 0
+       obj->size = dat->size - 1;
+ #else
+       *dat = abs_dat;
+       return error;
+ #endif
+     }
+   dat->size = obj->size;
+ 
+   SINCE (R_2010) { obj->type = bit_read_BOT (dat); }
+   else { obj->type = bit_read_BS (dat); }
+   LOG_INFO (", Type: %d [%s], Address: %lu\n", obj->type,
+             dat->from_version >= R_2010 ? "BOT" : "BS", obj->address);
+   restartpos = bit_position (dat); // relative
+ 
+   /* Check the type of the object
+    */
+   switch (obj->type)
+     {
+     case DWG_TYPE_TEXT:
+       error = dwg_decode_TEXT (dat, obj);
+       break;
+     case DWG_TYPE_ATTRIB:
+       error = dwg_decode_ATTRIB (dat, obj);
+       break;
+     case DWG_TYPE_ATTDEF:
+       error = dwg_decode_ATTDEF (dat, obj);
+       break;
+     case DWG_TYPE_BLOCK:
+       error = dwg_decode_BLOCK (dat, obj);
+       break;
+     case DWG_TYPE_ENDBLK:
+       error = dwg_decode_ENDBLK (dat, obj);
+       break;
+     case DWG_TYPE_SEQEND:
+       error = dwg_decode_SEQEND (dat, obj);
+       if (dat->from_version >= R_13 && obj->tio.entity->ownerhandle)
+         {
+           Dwg_Object *restrict owner = dwg_resolve_handle (
+               dwg, obj->tio.entity->ownerhandle->absolute_ref);
+           if (!owner)
+             {
+               LOG_WARN ("no SEQEND.ownerhandle")
+             }
+           else if (owner->fixedtype == DWG_TYPE_INSERT
+                    || owner->fixedtype == DWG_TYPE_MINSERT)
+             {
+               /* SEQEND handle for the owner needed in validate_INSERT */
+               hash_set (dwg->object_map, obj->handle.value, (uint32_t)num);
+               (void)dwg_validate_INSERT (owner);
+             }
+           else if (owner->fixedtype == DWG_TYPE_POLYLINE_2D
+                    || owner->fixedtype == DWG_TYPE_POLYLINE_3D
+                    || owner->fixedtype == DWG_TYPE_POLYLINE_PFACE
+                    || owner->fixedtype == DWG_TYPE_POLYLINE_MESH)
+             {
+               Dwg_Entity_POLYLINE_2D *restrict _obj
+                   = owner->tio.entity->tio.POLYLINE_2D;
+               if (!_obj->seqend)
+                 /* SEQEND handle for the owner needed in validate_POLYLINE */
+                 hash_set (dwg->object_map, obj->handle.value, (uint32_t)num);
+               (void)dwg_validate_POLYLINE (owner);
+             }
+         }
+       break;
+     case DWG_TYPE_INSERT:
+       error = dwg_decode_INSERT (dat, obj);
+       break;
+     case DWG_TYPE_MINSERT:
+       error = dwg_decode_MINSERT (dat, obj);
+       break;
+     case DWG_TYPE_VERTEX_2D:
+       error = dwg_decode_VERTEX_2D (dat, obj);
+       break;
+     case DWG_TYPE_VERTEX_3D:
+       error = dwg_decode_VERTEX_3D (dat, obj);
+       break;
+     case DWG_TYPE_VERTEX_MESH:
+       error = dwg_decode_VERTEX_MESH (dat, obj);
+       break;
+     case DWG_TYPE_VERTEX_PFACE:
+       error = dwg_decode_VERTEX_PFACE (dat, obj);
+       break;
+     case DWG_TYPE_VERTEX_PFACE_FACE:
+       error = dwg_decode_VERTEX_PFACE_FACE (dat, obj);
+       break;
+     case DWG_TYPE_POLYLINE_2D:
+       error = dwg_decode_POLYLINE_2D (dat, obj);
+       if (dat->from_version >= R_2010 && error < DWG_ERR_CRITICAL)
+         check_POLYLINE_handles (obj);
+       break;
+     case DWG_TYPE_POLYLINE_3D:
+       error = dwg_decode_POLYLINE_3D (dat, obj);
+       if (dat->from_version >= R_2010 && error < DWG_ERR_CRITICAL)
+         check_POLYLINE_handles (obj);
+       break;
+     case DWG_TYPE_ARC:
+       error = dwg_decode_ARC (dat, obj);
+       break;
+     case DWG_TYPE_CIRCLE:
+       error = dwg_decode_CIRCLE (dat, obj);
+       break;
+     case DWG_TYPE_LINE:
+       error = dwg_decode_LINE (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_ORDINATE:
+       error = dwg_decode_DIMENSION_ORDINATE (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_LINEAR:
+       error = dwg_decode_DIMENSION_LINEAR (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_ALIGNED:
+       error = dwg_decode_DIMENSION_ALIGNED (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_ANG3PT:
+       error = dwg_decode_DIMENSION_ANG3PT (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_ANG2LN:
+       error = dwg_decode_DIMENSION_ANG2LN (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_RADIUS:
+       error = dwg_decode_DIMENSION_RADIUS (dat, obj);
+       break;
+     case DWG_TYPE_DIMENSION_DIAMETER:
+       error = dwg_decode_DIMENSION_DIAMETER (dat, obj);
+       break;
+     case DWG_TYPE_POINT:
+       error = dwg_decode_POINT (dat, obj);
+       break;
+     case DWG_TYPE__3DFACE:
+       error = dwg_decode__3DFACE (dat, obj);
+       break;
+     case DWG_TYPE_POLYLINE_PFACE:
+       error = dwg_decode_POLYLINE_PFACE (dat, obj);
+       if (dat->from_version >= R_2010 && error < DWG_ERR_CRITICAL)
+         check_POLYLINE_handles (obj);
+       break;
+     case DWG_TYPE_POLYLINE_MESH:
+       error = dwg_decode_POLYLINE_MESH (dat, obj);
+       if (dat->from_version >= R_2010)
+         check_POLYLINE_handles (obj);
+       break;
+     case DWG_TYPE_SOLID:
+       error = dwg_decode_SOLID (dat, obj);
+       break;
+     case DWG_TYPE_TRACE:
+       error = dwg_decode_TRACE (dat, obj);
+       break;
+     case DWG_TYPE_SHAPE:
+       error = dwg_decode_SHAPE (dat, obj);
+       break;
+     case DWG_TYPE_VIEWPORT:
+       error = dwg_decode_VIEWPORT (dat, obj);
+       break;
+     case DWG_TYPE_ELLIPSE:
+       error = dwg_decode_ELLIPSE (dat, obj);
+       break;
+     case DWG_TYPE_SPLINE:
+       error = dwg_decode_SPLINE (dat, obj);
+       break;
+     case DWG_TYPE_REGION:
+       error = dwg_decode_REGION (dat, obj);
+       break;
+     case DWG_TYPE__3DSOLID:
+       error = dwg_decode__3DSOLID (dat, obj);
+       break;
+     case DWG_TYPE_BODY:
+       error = dwg_decode_BODY (dat, obj);
+       break;
+     case DWG_TYPE_RAY:
+       error = dwg_decode_RAY (dat, obj);
+       break;
+     case DWG_TYPE_XLINE:
+       error = dwg_decode_XLINE (dat, obj);
+       break;
+     case DWG_TYPE_DICTIONARY:
+       error = dwg_decode_DICTIONARY (dat, obj);
+       break;
+     case DWG_TYPE_MTEXT:
+       error = dwg_decode_MTEXT (dat, obj);
+       break;
+     case DWG_TYPE_LEADER:
+       error = dwg_decode_LEADER (dat, obj);
+       break;
+     case DWG_TYPE_TOLERANCE:
+       error = dwg_decode_TOLERANCE (dat, obj);
+       break;
+     case DWG_TYPE_MLINE:
+       error = dwg_decode_MLINE (dat, obj);
+       break;
+     case DWG_TYPE_BLOCK_CONTROL:
+       error = dwg_decode_BLOCK_CONTROL (dat, obj);
+       if (!error && obj->tio.object->tio.BLOCK_CONTROL)
+         {
+           if (!dwg->block_control.parent) // only once
+             dwg->block_control = *obj->tio.object->tio.BLOCK_CONTROL;
+           else
+             LOG_WARN ("Second BLOCK_CONTROL object ignored");
+         }
+       break;
+     case DWG_TYPE_BLOCK_HEADER:
+       error = dwg_decode_BLOCK_HEADER (dat, obj);
+       /*
+        * We cannot cache dwg->*space_block here as dwg->objects might get
+        * realloc'ed. See dwg_model_space_object() and dwg_paper_space_object()
+        * instead.
+        */
+       break;
+     case DWG_TYPE_LAYER_CONTROL:
+       error = dwg_decode_LAYER_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_LAYER:
+       error = dwg_decode_LAYER (dat, obj);
+       break;
+     case DWG_TYPE_STYLE_CONTROL:
+       error = dwg_decode_STYLE_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_STYLE:
+       error = dwg_decode_STYLE (dat, obj);
+       break;
+     case DWG_TYPE_LTYPE_CONTROL:
+       error = dwg_decode_LTYPE_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_LTYPE:
+       error = dwg_decode_LTYPE (dat, obj);
+       break;
+     case DWG_TYPE_VIEW_CONTROL:
+       error = dwg_decode_VIEW_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_VIEW:
+       error = dwg_decode_VIEW (dat, obj);
+       break;
+     case DWG_TYPE_UCS_CONTROL:
+       error = dwg_decode_UCS_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_UCS:
+       error = dwg_decode_UCS (dat, obj);
+       break;
+     case DWG_TYPE_VPORT_CONTROL:
+       error = dwg_decode_VPORT_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_VPORT:
+       error = dwg_decode_VPORT (dat, obj);
+       break;
+     case DWG_TYPE_APPID_CONTROL:
+       error = dwg_decode_APPID_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_APPID:
+       error = dwg_decode_APPID (dat, obj);
+       break;
+     case DWG_TYPE_DIMSTYLE_CONTROL:
+       error = dwg_decode_DIMSTYLE_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_DIMSTYLE:
+       error = dwg_decode_DIMSTYLE (dat, obj);
+       break;
+     case DWG_TYPE_VX_CONTROL:
+       error = dwg_decode_VX_CONTROL (dat, obj);
+       break;
+     case DWG_TYPE_VX_TABLE_RECORD:
+       error = dwg_decode_VX_TABLE_RECORD (dat, obj);
+       break;
+     case DWG_TYPE_GROUP:
+       error = dwg_decode_GROUP (dat, obj);
+       break;
+     case DWG_TYPE_MLINESTYLE:
+       error = dwg_decode_MLINESTYLE (dat, obj);
+       break;
+     case DWG_TYPE_OLE2FRAME:
+       error = dwg_decode_OLE2FRAME (dat, obj);
+       break;
+     case DWG_TYPE_DUMMY:
+       error = dwg_decode_DUMMY (dat, obj);
+       break;
+     case DWG_TYPE_LONG_TRANSACTION:
+       error = dwg_decode_LONG_TRANSACTION (dat, obj);
+       break;
+     case DWG_TYPE_LWPOLYLINE:
+       error = dwg_decode_LWPOLYLINE (dat, obj);
+       break;
+     case DWG_TYPE_HATCH:
+       error = dwg_decode_HATCH (dat, obj);
+       break;
+     case DWG_TYPE_XRECORD:
+       error = dwg_decode_XRECORD (dat, obj);
+       break;
+     case DWG_TYPE_PLACEHOLDER:
+       error = dwg_decode_PLACEHOLDER (dat, obj);
+       break;
+     case DWG_TYPE_OLEFRAME:
+       error = dwg_decode_OLEFRAME (dat, obj);
+       break;
+     case DWG_TYPE_VBA_PROJECT:
+       //LOG_ERROR ("Unhandled Object VBA_PROJECT. Has its own section");
+       error = dwg_decode_VBA_PROJECT (dat, obj);
+       //error = DWG_ERR_UNHANDLEDCLASS;
+       break;
+     case DWG_TYPE_LAYOUT:
+       error = dwg_decode_LAYOUT (dat, obj);
+       break;
+     case DWG_TYPE_PROXY_ENTITY:
+       error = dwg_decode_PROXY_ENTITY (dat, obj);
+       break;
+     case DWG_TYPE_PROXY_OBJECT:
+       error = dwg_decode_PROXY_OBJECT (dat, obj);
+       break;
+     default:
+       if (obj->type == dwg->layout_type)
+         error = dwg_decode_LAYOUT (dat, obj);
+       /* > 500 */
+       else if ((error = dwg_decode_variable_type (dwg, dat, hdl_dat, obj))
+                & DWG_ERR_UNHANDLEDCLASS)
+         {
+           int is_entity = 0;
+           int i = obj->type - 500;
+           Dwg_Class *klass = NULL;
+ 
+           /* restart and read into the UNKNOWN_OBJ object */
+           /* the relative offset from type after common_entity_data */
+           // obj->common_size = bit_position(dat) - restartpos;
+           // LOG_HANDLE("common_size: %lu\n", obj->common_size); // needed for
+           // unknown
+           bit_set_position (dat, restartpos);
+ 
+           if (i >= 0 && i < (int)dwg->num_classes)
+             {
+               klass = &dwg->dwg_class[i];
+               is_entity = dwg_class_is_entity (klass);
+             }
+           else
+             {
+               if (i < 0)
+                 LOG_ERROR ("Invalid class index %d < 0", i)
+               else
+                 LOG_ERROR ("Invalid class index %d >= %d", i,
+                            (int)dwg->num_classes)
+               obj->type = 0;
+               *dat = abs_dat;
+               return error | DWG_ERR_VALUEOUTOFBOUNDS;
+             }
+ 
+           // properly dwg_decode_object/_entity for eed, reactors, xdic
+           if (is_entity)
++            {
++              //obj->type = DWG_TYPE_UNKNOWN_ENT;
+               error |= dwg_decode_UNKNOWN_ENT (dat, obj);
++            }
+           else
++            {
++              //obj->type = DWG_TYPE_UNKNOWN_OBJ;
+               error |= dwg_decode_UNKNOWN_OBJ (dat, obj);
++            }
+ 
+           if (!dat)
+             return error;
+           if (error >= DWG_ERR_CRITICAL)
+             *dat = abs_dat;
+         }
+     }
+ 
+   if (obj->handle.value)
+     { // empty only with UNKNOWN
+       LOG_HANDLE (" object_map{%lX} = %lu\n", obj->handle.value,
+                   (unsigned long)num);
+       hash_set (dwg->object_map, obj->handle.value, (uint32_t)num);
+     }
+ 
+   if (dat->byte > 8 * dat->size)
+     {
+       LOG_ERROR ("Invalid object address (overflow): %lu > %lu", dat->byte,
+                  8 * dat->size);
+       *dat = abs_dat;
+       return error | DWG_ERR_INVALIDDWG;
+     }
+ 
+   /* Restore the old absolute chain.
+      CRC needs to be calculated from address, which is before our 0 position.
+    */
+   restartpos = bit_position (dat);
+   *dat = abs_dat;
+   bit_set_position (dat, objpos + restartpos);
+ 
+   /* Now 1 padding bits until next byte, and then a RS CRC */
+   if (dat->bit)
+     {
+       unsigned char r = 8 - dat->bit;
+       LOG_HANDLE (" padding: %X/%X (%d bits)\n", dat->chain[dat->byte],
+                   dat->chain[dat->byte] & ((1 << r) - 1), r);
+       bit_advance_position (dat, r);
+     }
+   bit_set_position (dat, (obj->address + obj->size) * 8 - 2);
+   if (!bit_check_CRC (dat, address, 0xC0C1))
+     error |= DWG_ERR_WRONGCRC;
+ 
+   /* Reset to previous addresses for return */
+   *dat = abs_dat;
+ 
+   return realloced ? -1 : error; // re-alloced or not
+ }
+ 
+ /** dwg_decode_unknown
+    Container to hold a unknown class entity, see classes.inc
+    Every DEBUGGING class holds a bits array, a bitsize, and the handle
+    and string stream offsets.
+    It starts after the common_entity|object_data until and goes until the end
+    of final padding, to the CRC.
+    (obj->common_size/8 .. obj->size)
+  */
+diff --git a/src/out_dxf.c b/src/out_dxf.c
+index ef940d30..5ee33ee5 100644
+--- a/src/out_dxf.c
++++ b/src/out_dxf.c
+@@ -2392,116 +2392,119 @@ static int
+ dwg_dxf_variable_type (const Dwg_Data *restrict dwg, Bit_Chain *restrict dat,
+                        Dwg_Object *restrict obj)
+ {
+   int i;
+   Dwg_Class *klass;
+   int is_entity;
+ 
+   i = obj->type - 500;
+   if (i < 0 || i >= dwg->num_classes)
+     return DWG_ERR_INVALIDTYPE;
++  if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT
++      || obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++    return DWG_ERR_UNHANDLEDCLASS;
+ 
+   klass = &dwg->dwg_class[i];
+   if (!klass || !klass->dxfname)
+     return DWG_ERR_INTERNALERROR;
+   is_entity = dwg_class_is_entity (klass);
+   if (dat->version < R_2000)
+     {
+       // keep only: IMAGE, LWPOLYLINE, HATCH
+       if (is_entity &&
+           strNE (klass->dxfname, "IMAGE") &&
+           strNEc (klass->dxfname, "LWPOLYLINE") &&
+           strNEc (klass->dxfname, "HATCH"))
+         {
+           LOG_WARN ("Skip %s\n", klass->dxfname)
+           return DWG_ERR_UNHANDLEDCLASS;
+         }
+       // keep only: DICTIONARYVAR, MATERIAL, RASTERVARIABLES, IMAGEDEF_REACTOR, XRECORD, IDBUFFER
+       else if (!is_entity &&
+                strNEc (klass->dxfname, "DICTIONARYVAR") &&
+                strNEc (klass->dxfname, "MATERIAL") &&
+                strNEc (klass->dxfname, "RASTERVARIABLES") &&
+                strNEc (klass->dxfname, "IDBUFFER") &&
+                strNEc (klass->dxfname, "IMAGEDEF_REACTOR") &&
+                strNEc (klass->dxfname, "XRECORD"))
+         {
+           LOG_WARN ("Skip %s\n", klass->dxfname)
+           return DWG_ERR_UNHANDLEDCLASS;
+         }
+     }
+ 
+   // if (!is_entity)
+   //  fprintf(dat->fh, "  0\r\n%s\r\n", dxfname);
+ 
+   // clang-format off
+   #include "classes.inc"
+   // clang-format on
+ 
+   return DWG_ERR_UNHANDLEDCLASS;
+ }
+ 
+ /* process unsorted vertices until SEQEND */
+ #define decl_dxf_process_VERTEX(token)                                        \
+   static int dxf_process_VERTEX_##token (Bit_Chain *restrict dat,             \
+                                          const Dwg_Object *restrict obj,      \
+                                          int *restrict i)                     \
+   {                                                                           \
+     int error = 0;                                                            \
+     Dwg_Entity_POLYLINE_##token *_obj                                         \
+         = obj->tio.entity->tio.POLYLINE_##token;                              \
+                                                                               \
+     VERSIONS (R_13, R_2000)                                                   \
+     {                                                                         \
+       Dwg_Object *last_vertex = _obj->last_vertex ? _obj->last_vertex->obj : NULL; \
+       Dwg_Object *o = _obj->first_vertex ? _obj->first_vertex->obj : NULL;    \
+       if (!o || !last_vertex)                                                 \
+         return DWG_ERR_INVALIDHANDLE;                                         \
+       if (o->fixedtype == DWG_TYPE_VERTEX_##token)                            \
+         error |= dwg_dxf_VERTEX_##token (dat, o);                             \
+       *i = *i + 1;                                                            \
+       do                                                                      \
+         {                                                                     \
+           o = dwg_next_object (o);                                            \
+           if (!o)                                                             \
+             return DWG_ERR_INVALIDHANDLE;                                     \
+           if (strEQc (#token, "PFACE")                                        \
+               && o->fixedtype == DWG_TYPE_VERTEX_PFACE_FACE)                  \
+             {                                                                 \
+               error |= dwg_dxf_VERTEX_PFACE_FACE (dat, o);                    \
+             }                                                                 \
+           else if (o->fixedtype == DWG_TYPE_VERTEX_##token)                   \
+             {                                                                 \
+               error |= dwg_dxf_VERTEX_##token (dat, o);                       \
+             }                                                                 \
+           *i = *i + 1;                                                        \
+         }                                                                     \
+       while (o->fixedtype != DWG_TYPE_SEQEND && o != last_vertex);            \
+       o = _obj->seqend ? _obj->seqend->obj : NULL;                            \
+       if (o && o->fixedtype == DWG_TYPE_SEQEND)                               \
+         error |= dwg_dxf_SEQEND (dat, o);                                     \
+       *i = *i + 1;                                                            \
+     }                                                                         \
+     SINCE (R_2004)                                                            \
+     {                                                                         \
+       Dwg_Object *o;                                                          \
+       for (BITCODE_BL j = 0; j < _obj->num_owned; j++)                        \
+         {                                                                     \
+           o = _obj->vertex && _obj->vertex[j] ? _obj->vertex[j]->obj : NULL;  \
+           if (strEQc (#token, "PFACE") && o                                   \
+               && o->fixedtype == DWG_TYPE_VERTEX_PFACE_FACE)                  \
+             {                                                                 \
+               error |= dwg_dxf_VERTEX_PFACE_FACE (dat, o);                    \
+             }                                                                 \
+           else if (o && o->fixedtype == DWG_TYPE_VERTEX_##token)              \
+             {                                                                 \
+               error |= dwg_dxf_VERTEX_##token (dat, o);                       \
+             }                                                                 \
+         }                                                                     \
+       o = _obj->seqend ? _obj->seqend->obj : NULL;                            \
+       if (o && o->fixedtype == DWG_TYPE_SEQEND)                               \
+         error |= dwg_dxf_SEQEND (dat, o);                                     \
+       *i = *i + _obj->num_owned + 1;                                          \
+     }                                                                         \
+     return error;                                                             \
+   }
+ 
+ // clang-format off
+@@ -2574,214 +2577,224 @@ decl_dxf_process_INSERT (MINSERT)
+ static int dwg_dxf_object (Bit_Chain *restrict dat,
+                            const Dwg_Object *restrict obj,
+                            int *restrict i)
+ {
+   int error = 0;
+   int minimal;
+   unsigned int type;
+ 
+   if (!obj || !obj->parent)
+     return DWG_ERR_INTERNALERROR;
+   minimal = obj->parent->opts & DWG_OPTS_MINIMAL;
+-  type = dat->version < R_13 ? (unsigned int)obj->fixedtype : obj->type;
++  if (dat->version < R_13)
++    type = (unsigned int)obj->fixedtype;
++  else
++    {
++      type = obj->type;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT)
++        type = DWG_TYPE_UNKNOWN_ENT;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++        type = DWG_TYPE_UNKNOWN_OBJ;
++    }
+ 
+   switch (type)
+     {
+     case DWG_TYPE_TEXT:
+       return dwg_dxf_TEXT (dat, obj);
+     case DWG_TYPE_ATTDEF:
+       return dwg_dxf_ATTDEF (dat, obj);
+     case DWG_TYPE_BLOCK:
+       return dwg_dxf_BLOCK (dat, obj);
+     case DWG_TYPE_ENDBLK:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return 0; // dwg_dxf_ENDBLK(dat, obj);
+     case DWG_TYPE_SEQEND:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return 0; // dwg_dxf_SEQEND(dat, obj);
+ 
+     case DWG_TYPE_INSERT:
+       error = dwg_dxf_INSERT (dat, obj);
+       return error | dxf_process_INSERT (dat, obj, i);
+     case DWG_TYPE_MINSERT:
+       error = dwg_dxf_MINSERT (dat, obj);
+       return error | dxf_process_MINSERT (dat, obj, i);
+     case DWG_TYPE_POLYLINE_2D:
+       error = dwg_dxf_POLYLINE_2D (dat, obj);
+       return error | dxf_process_VERTEX_2D (dat, obj, i);
+     case DWG_TYPE_POLYLINE_3D:
+       error = dwg_dxf_POLYLINE_3D (dat, obj);
+       return error | dxf_process_VERTEX_3D (dat, obj, i);
+     case DWG_TYPE_POLYLINE_PFACE:
+       error = dwg_dxf_POLYLINE_PFACE (dat, obj);
+       return error | dxf_process_VERTEX_PFACE (dat, obj, i);
+     case DWG_TYPE_POLYLINE_MESH:
+       error = dwg_dxf_POLYLINE_MESH (dat, obj);
+       return error | dxf_process_VERTEX_MESH (dat, obj, i);
+ 
+     case DWG_TYPE_ATTRIB:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_ATTRIB (dat, obj);
+     case DWG_TYPE_VERTEX_2D:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_VERTEX_2D (dat, obj);
+     case DWG_TYPE_VERTEX_3D:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_VERTEX_3D (dat, obj);
+     case DWG_TYPE_VERTEX_MESH:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_VERTEX_MESH (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_VERTEX_PFACE (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE_FACE:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxf_VERTEX_PFACE_FACE (dat, obj);
+ 
+     case DWG_TYPE_ARC:
+       return dwg_dxf_ARC (dat, obj);
+     case DWG_TYPE_CIRCLE:
+       return dwg_dxf_CIRCLE (dat, obj);
+     case DWG_TYPE_LINE:
+       return dwg_dxf_LINE (dat, obj);
+     case DWG_TYPE_DIMENSION_ORDINATE:
+       return dwg_dxf_DIMENSION_ORDINATE (dat, obj);
+     case DWG_TYPE_DIMENSION_LINEAR:
+       return dwg_dxf_DIMENSION_LINEAR (dat, obj);
+     case DWG_TYPE_DIMENSION_ALIGNED:
+       return dwg_dxf_DIMENSION_ALIGNED (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG3PT:
+       return dwg_dxf_DIMENSION_ANG3PT (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG2LN:
+       return dwg_dxf_DIMENSION_ANG2LN (dat, obj);
+     case DWG_TYPE_DIMENSION_RADIUS:
+       return dwg_dxf_DIMENSION_RADIUS (dat, obj);
+     case DWG_TYPE_DIMENSION_DIAMETER:
+       return dwg_dxf_DIMENSION_DIAMETER (dat, obj);
+     case DWG_TYPE_POINT:
+       return dwg_dxf_POINT (dat, obj);
+     case DWG_TYPE__3DFACE:
+       return dwg_dxf__3DFACE (dat, obj);
+     case DWG_TYPE_SOLID:
+       return dwg_dxf_SOLID (dat, obj);
+     case DWG_TYPE_TRACE:
+       return dwg_dxf_TRACE (dat, obj);
+     case DWG_TYPE_SHAPE:
+       return dwg_dxf_SHAPE (dat, obj);
+     case DWG_TYPE_VIEWPORT:
+       return minimal ? 0 : dwg_dxf_VIEWPORT (dat, obj);
+     case DWG_TYPE_ELLIPSE:
+       return dwg_dxf_ELLIPSE (dat, obj);
+     case DWG_TYPE_SPLINE:
+       return dwg_dxf_SPLINE (dat, obj);
+     case DWG_TYPE_REGION:
+       return dwg_dxf_REGION (dat, obj);
+     case DWG_TYPE__3DSOLID:
+       return dwg_dxf__3DSOLID (dat, obj);
+     case DWG_TYPE_BODY:
+       return dwg_dxf_BODY (dat, obj);
+     case DWG_TYPE_RAY:
+       return dwg_dxf_RAY (dat, obj);
+     case DWG_TYPE_XLINE:
+       return dwg_dxf_XLINE (dat, obj);
+     case DWG_TYPE_DICTIONARY:
+       return minimal ? 0 : dwg_dxf_DICTIONARY (dat, obj);
+     case DWG_TYPE_MTEXT:
+       return dwg_dxf_MTEXT (dat, obj);
+     case DWG_TYPE_LEADER:
+       return dwg_dxf_LEADER (dat, obj);
+     case DWG_TYPE_TOLERANCE:
+       return dwg_dxf_TOLERANCE (dat, obj);
+     case DWG_TYPE_MLINE:
+ #if 1 || defined DEBUG_CLASSES
+       // TODO: looks good, but acad import crashes
+       return dwg_dxf_MLINE (dat, obj);
+ #else
+       LOG_WARN ("Unhandled Entity MLINE in out_dxf %u/%lX", obj->index,
+                 obj->handle.value)
+       if (0) dwg_dxf_MLINE (dat, obj);
+       return DWG_ERR_UNHANDLEDCLASS;
+ #endif
+     case DWG_TYPE_BLOCK_CONTROL:
+     case DWG_TYPE_BLOCK_HEADER:
+     case DWG_TYPE_LAYER_CONTROL:
+     case DWG_TYPE_LAYER:
+     case DWG_TYPE_STYLE_CONTROL:
+     case DWG_TYPE_STYLE:
+     case DWG_TYPE_LTYPE_CONTROL:
+     case DWG_TYPE_LTYPE:
+     case DWG_TYPE_VIEW_CONTROL:
+     case DWG_TYPE_VIEW:
+     case DWG_TYPE_UCS_CONTROL:
+     case DWG_TYPE_UCS:
+     case DWG_TYPE_VPORT_CONTROL:
+     case DWG_TYPE_VPORT:
+     case DWG_TYPE_APPID_CONTROL:
+     case DWG_TYPE_APPID:
+     case DWG_TYPE_DIMSTYLE_CONTROL:
+     case DWG_TYPE_DIMSTYLE:
+     case DWG_TYPE_VX_CONTROL:
+     case DWG_TYPE_VX_TABLE_RECORD:
+       break;
+     case DWG_TYPE_GROUP:
+       return dwg_dxf_GROUP (dat, obj);
+     case DWG_TYPE_MLINESTYLE:
+       return minimal ? 0 : dwg_dxf_MLINESTYLE (dat, obj);
+     case DWG_TYPE_OLE2FRAME:
+       return minimal ? 0 : dwg_dxf_OLE2FRAME (dat, obj);
+     case DWG_TYPE_DUMMY:
+       return 0;
+     case DWG_TYPE_LONG_TRANSACTION:
+       return minimal ? 0 : dwg_dxf_LONG_TRANSACTION (dat, obj);
+     case DWG_TYPE_LWPOLYLINE:
+       return dwg_dxf_LWPOLYLINE (dat, obj);
+     case DWG_TYPE_HATCH:
+       return dwg_dxf_HATCH (dat, obj);
+     case DWG_TYPE_XRECORD:
+       return minimal ? 0 : dwg_dxf_XRECORD (dat, obj);
+     case DWG_TYPE_PLACEHOLDER:
+       return minimal ? 0 : dwg_dxf_PLACEHOLDER (dat, obj);
+     case DWG_TYPE_PROXY_ENTITY:
+        // avoid unused warnings
+       error |= dwg_dxf_PROXY_ENTITY(dat, obj);
+       return DWG_ERR_UNHANDLEDCLASS;
+     case DWG_TYPE_OLEFRAME:
+       return minimal ? 0 : dwg_dxf_OLEFRAME (dat, obj);
+     case DWG_TYPE_VBA_PROJECT:
+       return minimal ? 0 : dwg_dxf_VBA_PROJECT (dat, obj);
+     case DWG_TYPE_LAYOUT:
+       return minimal ? 0 : dwg_dxf_LAYOUT (dat, obj);
+     case DWG_TYPE_REPEAT:
+       return dwg_dxf_REPEAT (dat, obj);
+     case DWG_TYPE_ENDREP:
+       return dwg_dxf_ENDREP (dat, obj);
+     case DWG_TYPE__3DLINE:
+       return dwg_dxf__3DLINE (dat, obj);
+     case DWG_TYPE_LOAD:
+       return dwg_dxf_LOAD (dat, obj);
+ 
+     default:
+       if (obj->type == obj->parent->layout_type)
+         {
+           return minimal ? 0 : dwg_dxf_LAYOUT (dat, obj);
+         }
+       /* > 500 */
+       else if ((error
+                 = dwg_dxf_variable_type (obj->parent, dat, (Dwg_Object *)obj))
+                & DWG_ERR_UNHANDLEDCLASS)
+         {
+           Dwg_Data *dwg = obj->parent;
+           int j = obj->type - 500;
+           Dwg_Class *klass = NULL;
+ 
+-          if (j >= 0 && j < (int)dwg->num_classes)
++          if (j >= 0 && j < (int)dwg->num_classes
++              && obj->fixedtype < DWG_TYPE_FREED)
+             klass = &dwg->dwg_class[j];
+           if (!klass)
+             {
+               LOG_WARN ("Unknown object, skipping eed/reactors/xdic");
+               return DWG_ERR_INVALIDTYPE;
+             }
+           return error;
+         }
+     }
+   return DWG_ERR_UNHANDLEDCLASS;
+ }
+diff --git a/src/out_dxfb.c b/src/out_dxfb.c
+index 595fb02b..2b162aa0 100644
+--- a/src/out_dxfb.c
++++ b/src/out_dxfb.c
+@@ -1369,114 +1369,117 @@ static int
+ dwg_dxfb_variable_type (const Dwg_Data *restrict dwg, Bit_Chain *restrict dat,
+                         Dwg_Object *restrict obj)
+ {
+   int i;
+   Dwg_Class *klass;
+   int is_entity;
+ 
+   i = obj->type - 500;
+   if (i < 0 || i >= dwg->num_classes)
+     return DWG_ERR_INVALIDTYPE;
++  if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT
++      || obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++    return DWG_ERR_UNHANDLEDCLASS;
+ 
+   klass = &dwg->dwg_class[i];
+   if (!klass || !klass->dxfname)
+     return DWG_ERR_INTERNALERROR;
+   // almost always false
+   is_entity = dwg_class_is_entity (klass);
+   if (dat->version < R_2000)
+     {
+       // keep only: IMAGE, LWPOLYLINE, HATCH
+       if (is_entity &&
+           strNE (klass->dxfname, "IMAGE") &&
+           strNEc (klass->dxfname, "LWPOLYLINE") &&
+           strNEc (klass->dxfname, "HATCH"))
+         {
+           LOG_WARN ("Skip %s\n", klass->dxfname)
+           return DWG_ERR_UNHANDLEDCLASS;
+         }
+       // keep only: DICTIONARYVAR, MATERIAL, RASTERVARIABLES, IMAGEDEF_REACTOR, XRECORD
+       else if (!is_entity &&
+                strNEc (klass->dxfname, "DICTIONARYVAR") &&
+                strNEc (klass->dxfname, "MATERIAL") &&
+                strNEc (klass->dxfname, "RASTERVARIABLES") &&
+                strNEc (klass->dxfname, "IDBUFFER") &&
+                strNEc (klass->dxfname, "IMAGEDEF_REACTOR") &&
+                strNEc (klass->dxfname, "XRECORD"))
+         {
+           LOG_WARN ("Skip %s\n", klass->dxfname)
+           return DWG_ERR_UNHANDLEDCLASS;
+         }
+     }
+ 
+   // clang-format off
+   #include "classes.inc"
+   // clang-format on
+ 
+   return DWG_ERR_UNHANDLEDCLASS;
+ }
+ 
+ /* process unsorted vertices */
+ #define decl_dxfb_process_VERTEX(token)                                       \
+   static int dxfb_process_VERTEX_##token (Bit_Chain *restrict dat,            \
+                                           const Dwg_Object *restrict obj,     \
+                                           int *restrict i)                    \
+   {                                                                           \
+     int error = 0;                                                            \
+     Dwg_Entity_POLYLINE_##token *_obj                                         \
+         = obj->tio.entity->tio.POLYLINE_##token;                              \
+                                                                               \
+     VERSIONS (R_13, R_2000)                                                   \
+     {                                                                         \
+       Dwg_Object *last_vertex = _obj->last_vertex ? _obj->last_vertex->obj : NULL; \
+       Dwg_Object *o = _obj->first_vertex ? _obj->first_vertex->obj : NULL;    \
+       if (!o || !last_vertex)                                                 \
+         return DWG_ERR_INVALIDHANDLE;                                         \
+       if (o->fixedtype == DWG_TYPE_VERTEX_##token)                            \
+         error |= dwg_dxfb_VERTEX_##token (dat, o);                            \
+       *i = *i + 1;                                                            \
+       do                                                                      \
+         {                                                                     \
+           o = dwg_next_object (o);                                            \
+           if (!o)                                                             \
+             return DWG_ERR_INVALIDHANDLE;                                     \
+           if (strEQc (#token, "PFACE")                                        \
+               && o->fixedtype == DWG_TYPE_VERTEX_PFACE_FACE)                  \
+             {                                                                 \
+               error |= dwg_dxfb_VERTEX_PFACE_FACE (dat, o);                   \
+             }                                                                 \
+           else if (o->fixedtype == DWG_TYPE_VERTEX_##token)                   \
+             {                                                                 \
+               error |= dwg_dxfb_VERTEX_##token (dat, o);                      \
+             }                                                                 \
+           *i = *i + 1;                                                        \
+         }                                                                     \
+       while (o->fixedtype != DWG_TYPE_SEQEND && o != last_vertex);            \
+       o = _obj->seqend ? _obj->seqend->obj : NULL;                            \
+       if (o && o->fixedtype == DWG_TYPE_SEQEND)                               \
+         error |= dwg_dxfb_SEQEND (dat, o);                                    \
+       *i = *i + 1;                                                            \
+     }                                                                         \
+     SINCE (R_2004)                                                            \
+     {                                                                         \
+       Dwg_Object *o;                                                          \
+       for (BITCODE_BL j = 0; j < _obj->num_owned; j++)                        \
+         {                                                                     \
+           o = _obj->vertex && _obj->vertex[j] ? _obj->vertex[j]->obj : NULL;  \
+           if (strEQc (#token, "PFACE") && o                                   \
+               && o->fixedtype == DWG_TYPE_VERTEX_PFACE_FACE)                  \
+             {                                                                 \
+               error |= dwg_dxfb_VERTEX_PFACE_FACE (dat, o);                   \
+             }                                                                 \
+           else if (o && o->fixedtype == DWG_TYPE_VERTEX_##token)              \
+             {                                                                 \
+               error |= dwg_dxfb_VERTEX_##token (dat, o);                      \
+             }                                                                 \
+         }                                                                     \
+       o = _obj->seqend ? _obj->seqend->obj : NULL;                            \
+       if (o && o->fixedtype == DWG_TYPE_SEQEND)                               \
+         error |= dwg_dxfb_SEQEND (dat, o);                                    \
+       *i = *i + _obj->num_owned + 1;                                          \
+     }                                                                         \
+     return error;                                                             \
+   }
+ 
+ // clang-format off
+@@ -1549,221 +1552,231 @@ decl_dxfb_process_INSERT (MINSERT)
+ static int dwg_dxfb_object (Bit_Chain *restrict dat,
+                             const Dwg_Object *restrict obj,
+                             int *restrict i)
+ {
+   int error = 0;
+   int minimal;
+   unsigned int type;
+ 
+   if (!obj || !obj->parent)
+     return DWG_ERR_INTERNALERROR;
+   minimal = obj->parent->opts & DWG_OPTS_MINIMAL;
+-  type = dat->version < R_13 ? (unsigned int)obj->fixedtype : obj->type;
++  if (dat->version < R_13)
++    type = (unsigned int)obj->fixedtype;
++  else
++    {
++      type = obj->type;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT)
++        type = DWG_TYPE_UNKNOWN_ENT;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++        type = DWG_TYPE_UNKNOWN_OBJ;
++    }
+ 
+   switch (type)
+     {
+     case DWG_TYPE_TEXT:
+       return dwg_dxfb_TEXT (dat, obj);
+     case DWG_TYPE_ATTDEF:
+       return dwg_dxfb_ATTDEF (dat, obj);
+     case DWG_TYPE_BLOCK:
+       return dwg_dxfb_BLOCK (dat, obj);
+     case DWG_TYPE_ENDBLK:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return 0; // dwg_dxfb_ENDBLK(dat, obj);
+     case DWG_TYPE_SEQEND:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return 0; // dwg_dxfb_SEQEND(dat, obj);
+ 
+     case DWG_TYPE_INSERT:
+       error = dwg_dxfb_INSERT (dat, obj);
+       return error | dxfb_process_INSERT (dat, obj, i);
+     case DWG_TYPE_MINSERT:
+       error = dwg_dxfb_MINSERT (dat, obj);
+       return error | dxfb_process_MINSERT (dat, obj, i);
+     case DWG_TYPE_POLYLINE_2D:
+       error = dwg_dxfb_POLYLINE_2D (dat, obj);
+       return error | dxfb_process_VERTEX_2D (dat, obj, i);
+     case DWG_TYPE_POLYLINE_3D:
+       error = dwg_dxfb_POLYLINE_3D (dat, obj);
+       return error | dxfb_process_VERTEX_3D (dat, obj, i);
+     case DWG_TYPE_POLYLINE_PFACE:
+       error = dwg_dxfb_POLYLINE_PFACE (dat, obj);
+       return error | dxfb_process_VERTEX_PFACE (dat, obj, i);
+     case DWG_TYPE_POLYLINE_MESH:
+       error = dwg_dxfb_POLYLINE_MESH (dat, obj);
+       return error | dxfb_process_VERTEX_MESH (dat, obj, i);
+ 
+     case DWG_TYPE_ATTRIB:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_ATTRIB (dat, obj);
+     case DWG_TYPE_VERTEX_2D:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_VERTEX_2D (dat, obj);
+     case DWG_TYPE_VERTEX_3D:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_VERTEX_3D (dat, obj);
+     case DWG_TYPE_VERTEX_MESH:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_VERTEX_MESH (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_VERTEX_PFACE (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE_FACE:
+       LOG_WARN ("stale %s subentity", obj->dxfname);
+       return dwg_dxfb_VERTEX_PFACE_FACE (dat, obj);
+ 
+     case DWG_TYPE_ARC:
+       return dwg_dxfb_ARC (dat, obj);
+     case DWG_TYPE_CIRCLE:
+       return dwg_dxfb_CIRCLE (dat, obj);
+     case DWG_TYPE_LINE:
+       return dwg_dxfb_LINE (dat, obj);
+     case DWG_TYPE_DIMENSION_ORDINATE:
+       return dwg_dxfb_DIMENSION_ORDINATE (dat, obj);
+     case DWG_TYPE_DIMENSION_LINEAR:
+       return dwg_dxfb_DIMENSION_LINEAR (dat, obj);
+     case DWG_TYPE_DIMENSION_ALIGNED:
+       return dwg_dxfb_DIMENSION_ALIGNED (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG3PT:
+       return dwg_dxfb_DIMENSION_ANG3PT (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG2LN:
+       return dwg_dxfb_DIMENSION_ANG2LN (dat, obj);
+     case DWG_TYPE_DIMENSION_RADIUS:
+       return dwg_dxfb_DIMENSION_RADIUS (dat, obj);
+     case DWG_TYPE_DIMENSION_DIAMETER:
+       return dwg_dxfb_DIMENSION_DIAMETER (dat, obj);
+     case DWG_TYPE_POINT:
+       return dwg_dxfb_POINT (dat, obj);
+     case DWG_TYPE__3DFACE:
+       return dwg_dxfb__3DFACE (dat, obj);
+     case DWG_TYPE_SOLID:
+       return dwg_dxfb_SOLID (dat, obj);
+     case DWG_TYPE_TRACE:
+       return dwg_dxfb_TRACE (dat, obj);
+     case DWG_TYPE_SHAPE:
+       return dwg_dxfb_SHAPE (dat, obj);
+     case DWG_TYPE_VIEWPORT:
+       return minimal ? 0 : dwg_dxfb_VIEWPORT (dat, obj);
+     case DWG_TYPE_ELLIPSE:
+       return dwg_dxfb_ELLIPSE (dat, obj);
+     case DWG_TYPE_SPLINE:
+       return dwg_dxfb_SPLINE (dat, obj);
+     case DWG_TYPE_REGION:
+       return dwg_dxfb_REGION (dat, obj);
+     case DWG_TYPE__3DSOLID:
+       return dwg_dxfb__3DSOLID (dat, obj);
+     case DWG_TYPE_BODY:
+       return dwg_dxfb_BODY (dat, obj);
+     case DWG_TYPE_RAY:
+       return dwg_dxfb_RAY (dat, obj);
+     case DWG_TYPE_XLINE:
+       return dwg_dxfb_XLINE (dat, obj);
+     case DWG_TYPE_DICTIONARY:
+       return minimal ? 0 : dwg_dxfb_DICTIONARY (dat, obj);
+     case DWG_TYPE_MTEXT:
+       return dwg_dxfb_MTEXT (dat, obj);
+     case DWG_TYPE_LEADER:
+       return dwg_dxfb_LEADER (dat, obj);
+     case DWG_TYPE_TOLERANCE:
+       return dwg_dxfb_TOLERANCE (dat, obj);
+     case DWG_TYPE_MLINE:
+ #ifdef DEBUG_CLASSES
+       // TODO: looks good, but acad import crashes
+       return dwg_dxfb_MLINE (dat, obj);
+ #else
+       LOG_WARN ("Unhandled Entity MLINE in out_dxfb %u/%lX", obj->index,
+                 obj->handle.value)
+       if (0)
+         {
+           // bypass -Wunused-function
+           dwg_dxfb_LOAD (dat, obj);
+           dwg_dxfb_MLINE (dat, obj);
+         }
+       return DWG_ERR_UNHANDLEDCLASS;
+ #endif
+     case DWG_TYPE_BLOCK_CONTROL:
+     case DWG_TYPE_BLOCK_HEADER:
+     case DWG_TYPE_LAYER_CONTROL:
+     case DWG_TYPE_LAYER:
+     case DWG_TYPE_STYLE_CONTROL:
+     case DWG_TYPE_STYLE:
+     case DWG_TYPE_LTYPE_CONTROL:
+     case DWG_TYPE_LTYPE:
+     case DWG_TYPE_VIEW_CONTROL:
+     case DWG_TYPE_VIEW:
+     case DWG_TYPE_UCS_CONTROL:
+     case DWG_TYPE_UCS:
+     case DWG_TYPE_VPORT_CONTROL:
+     case DWG_TYPE_VPORT:
+     case DWG_TYPE_APPID_CONTROL:
+     case DWG_TYPE_APPID:
+     case DWG_TYPE_DIMSTYLE_CONTROL:
+     case DWG_TYPE_DIMSTYLE:
+     case DWG_TYPE_VX_CONTROL:
+     case DWG_TYPE_VX_TABLE_RECORD:
+     /* preR13: no dxfb */
+     case DWG_TYPE_REPEAT:
+     case DWG_TYPE_ENDREP:
+     case DWG_TYPE__3DLINE:
+     case DWG_TYPE_LOAD:
+       LOG_INFO ("Skip unsupported object %s\n", obj->name);
+       break;
+ 
+     case DWG_TYPE_GROUP:
+       return dwg_dxfb_GROUP (dat, obj);
+     case DWG_TYPE_MLINESTYLE:
+       return minimal ? 0 : dwg_dxfb_MLINESTYLE (dat, obj);
+     case DWG_TYPE_OLE2FRAME:
+       return minimal ? 0 : dwg_dxfb_OLE2FRAME (dat, obj);
+     case DWG_TYPE_DUMMY:
+       return 0;
+     case DWG_TYPE_LONG_TRANSACTION:
+       return minimal ? 0 : dwg_dxfb_LONG_TRANSACTION (dat, obj);
+     case DWG_TYPE_LWPOLYLINE:
+       return dwg_dxfb_LWPOLYLINE (dat, obj);
+     case DWG_TYPE_HATCH:
+       return dwg_dxfb_HATCH (dat, obj);
+     case DWG_TYPE_XRECORD:
+       return minimal ? 0 : dwg_dxfb_XRECORD (dat, obj);
+     case DWG_TYPE_PLACEHOLDER:
+       return minimal ? 0 : dwg_dxfb_PLACEHOLDER (dat, obj);
+     case DWG_TYPE_PROXY_ENTITY:
+       return minimal ? 0 : dwg_dxfb_PROXY_ENTITY(dat, obj);
+     case DWG_TYPE_OLEFRAME:
+       return minimal ? 0 : dwg_dxfb_OLEFRAME (dat, obj);
+     case DWG_TYPE_VBA_PROJECT:
+       if (!minimal)
+         {
+           LOG_ERROR ("Unhandled Object VBA_PROJECT");
+           // dwg_dxfb_VBA_PROJECT(dat, obj);
+           return DWG_ERR_UNHANDLEDCLASS;
+         }
+       return 0;
+     case DWG_TYPE_LAYOUT:
+       return minimal ? 0 : dwg_dxfb_LAYOUT (dat, obj);
+     default:
+       if (obj->type == obj->parent->layout_type)
+         {
+           return minimal ? 0 : dwg_dxfb_LAYOUT (dat, obj);
+         }
+       /* > 500 */
+       else if (DWG_ERR_UNHANDLEDCLASS
+                & (error = dwg_dxfb_variable_type (obj->parent, dat,
+                                                   (Dwg_Object *)obj)))
+         {
+           Dwg_Data *dwg = obj->parent;
+           int j = obj->type - 500;
+           Dwg_Class *klass = NULL;
+ 
+-          if (j >= 0 && j < (int)dwg->num_classes)
++          if (j >= 0 && j < (int)dwg->num_classes
++              && obj->fixedtype < DWG_TYPE_FREED)
+             klass = &dwg->dwg_class[j];
+           if (!klass)
+             {
+               LOG_WARN ("Unknown object, skipping eed/reactors/xdic");
+               return DWG_ERR_INVALIDTYPE;
+             }
+           return error;
+         }
+     }
+   return DWG_ERR_UNHANDLEDCLASS;
+ }
+diff --git a/src/out_geojson.c b/src/out_geojson.c
+index 63e3cb08..a63792d9 100644
+--- a/src/out_geojson.c
++++ b/src/out_geojson.c
+@@ -612,55 +612,58 @@ static int
+ dwg_geojson_variable_type (Dwg_Data *restrict dwg, Bit_Chain *restrict dat,
+                            Dwg_Object *restrict obj, int is_last)
+ {
+   int i;
+   char *dxfname;
+   Dwg_Class *klass;
+   int is_entity;
+ 
+   i = obj->type - 500;
+   if (i < 0 || i >= (int)dwg->num_classes)
+     return 0;
++  if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT
++      || obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++    return DWG_ERR_UNHANDLEDCLASS;
+ 
+   klass = &dwg->dwg_class[i];
+   if (!klass || !klass->dxfname)
+     return DWG_ERR_INTERNALERROR;
+   dxfname = klass->dxfname;
+   // almost always false
+   is_entity = dwg_class_is_entity (klass);
+ 
+   if (strEQc (dxfname, "LWPOLYLINE"))
+     {
+       return dwg_geojson_LWPOLYLINE (dat, obj, is_last);
+     }
+   /*
+   if (strEQc (dxfname, "GEODATA"))
+     {
+       Dwg_Object_GEODATA *_obj = obj->tio.object->tio.GEODATA;
+       WARN_UNSTABLE_CLASS;
+       FEATURE (AcDbObject : AcDbGeoData, obj);
+       // which fields? transformation for the world-coordinates?
+       // crs links of type proj4, ogcwkt, esriwkt or such?
+       ENDFEATURE;
+       return 0;
+     }
+   */
+   if (strEQc (dxfname, "GEOPOSITIONMARKER"))
+     {
+       Dwg_Entity_GEOPOSITIONMARKER *_obj
+           = obj->tio.entity->tio.GEOPOSITIONMARKER;
+       WARN_UNSTABLE_CLASS;
+       // now even with text
+       FEATURE (AcDbEntity : AcDbGeoPositionMarker, obj);
+       GEOMETRY (Point);
+       KEY (coordinates);
+       if (fabs (_obj->position.z) > 0.000001)
+         VALUE_3DPOINT (_obj->position.x, _obj->position.y, _obj->position.z)
+       else
+         VALUE_2DPOINT (_obj->position.x, _obj->position.y);
+       ENDGEOMETRY;
+       ENDFEATURE;
+       return 1;
+     }
+ 
+   return 0;
+ }
+diff --git a/src/out_json.c b/src/out_json.c
+index d8e84fd5..cb0e9861 100644
+--- a/src/out_json.c
++++ b/src/out_json.c
+@@ -1518,22 +1518,25 @@ static int
+ dwg_json_variable_type (Dwg_Data *restrict dwg, Bit_Chain *restrict dat,
+                         Dwg_Object *restrict obj)
+ {
+   int i;
+   Dwg_Class *klass;
+   int is_entity;
+ 
+   i = obj->type - 500;
+   if (i < 0 || i >= (int)dwg->num_classes)
+     return DWG_ERR_INVALIDTYPE;
++  if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT
++      || obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++    return DWG_ERR_UNHANDLEDCLASS;
+ 
+   klass = &dwg->dwg_class[i];
+   if (!klass || !klass->dxfname)
+     return DWG_ERR_INTERNALERROR;
+   is_entity = dwg_class_is_entity (klass);
+ 
+   // clang-format off
+   #include "classes.inc"
+   // clang-format on
+ 
+   return DWG_ERR_UNHANDLEDCLASS;
+ }
+@@ -1542,240 +1545,254 @@ static int
+ dwg_json_object (Bit_Chain *restrict dat, Dwg_Object *restrict obj)
+ {
+   int error = 0;
+   unsigned int type;
+ 
+   if (!obj || !obj->parent)
+     return DWG_ERR_INTERNALERROR;
+-  type = dat->version < R_13 ? (unsigned int)obj->fixedtype : obj->type;
++  if (dat->version < R_13)
++    type = (unsigned int)obj->fixedtype;
++  else
++    {
++      type = obj->type;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT)
++        type = DWG_TYPE_UNKNOWN_ENT;
++      if (obj->fixedtype == DWG_TYPE_UNKNOWN_OBJ)
++        type = DWG_TYPE_UNKNOWN_OBJ;
++    }
++
+   switch (type)
+     {
+     case DWG_TYPE_TEXT:
+       return dwg_json_TEXT (dat, obj);
+     case DWG_TYPE_ATTRIB:
+       return dwg_json_ATTRIB (dat, obj);
+     case DWG_TYPE_ATTDEF:
+       return dwg_json_ATTDEF (dat, obj);
+     case DWG_TYPE_BLOCK:
+       return dwg_json_BLOCK (dat, obj);
+     case DWG_TYPE_ENDBLK:
+       return dwg_json_ENDBLK (dat, obj);
+     case DWG_TYPE_SEQEND:
+       return dwg_json_SEQEND (dat, obj);
+     case DWG_TYPE_INSERT:
+       return dwg_json_INSERT (dat, obj);
+     case DWG_TYPE_MINSERT:
+       return dwg_json_MINSERT (dat, obj);
+     case DWG_TYPE_VERTEX_2D:
+       return dwg_json_VERTEX_2D (dat, obj);
+     case DWG_TYPE_VERTEX_3D:
+       return dwg_json_VERTEX_3D (dat, obj);
+     case DWG_TYPE_VERTEX_MESH:
+       return dwg_json_VERTEX_MESH (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE:
+       return dwg_json_VERTEX_PFACE (dat, obj);
+     case DWG_TYPE_VERTEX_PFACE_FACE:
+       return dwg_json_VERTEX_PFACE_FACE (dat, obj);
+     case DWG_TYPE_POLYLINE_2D:
+       return dwg_json_POLYLINE_2D (dat, obj);
+     case DWG_TYPE_POLYLINE_3D:
+       return dwg_json_POLYLINE_3D (dat, obj);
+     case DWG_TYPE_ARC:
+       return dwg_json_ARC (dat, obj);
+     case DWG_TYPE_CIRCLE:
+       return dwg_json_CIRCLE (dat, obj);
+     case DWG_TYPE_LINE:
+       return dwg_json_LINE (dat, obj);
+     case DWG_TYPE_DIMENSION_ORDINATE:
+       return dwg_json_DIMENSION_ORDINATE (dat, obj);
+     case DWG_TYPE_DIMENSION_LINEAR:
+       return dwg_json_DIMENSION_LINEAR (dat, obj);
+     case DWG_TYPE_DIMENSION_ALIGNED:
+       return dwg_json_DIMENSION_ALIGNED (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG3PT:
+       return dwg_json_DIMENSION_ANG3PT (dat, obj);
+     case DWG_TYPE_DIMENSION_ANG2LN:
+       return dwg_json_DIMENSION_ANG2LN (dat, obj);
+     case DWG_TYPE_DIMENSION_RADIUS:
+       return dwg_json_DIMENSION_RADIUS (dat, obj);
+     case DWG_TYPE_DIMENSION_DIAMETER:
+       return dwg_json_DIMENSION_DIAMETER (dat, obj);
+     case DWG_TYPE_POINT:
+       return dwg_json_POINT (dat, obj);
+     case DWG_TYPE__3DFACE:
+       return dwg_json__3DFACE (dat, obj);
+     case DWG_TYPE_POLYLINE_PFACE:
+       return dwg_json_POLYLINE_PFACE (dat, obj);
+     case DWG_TYPE_POLYLINE_MESH:
+       return dwg_json_POLYLINE_MESH (dat, obj);
+     case DWG_TYPE_SOLID:
+       return dwg_json_SOLID (dat, obj);
+     case DWG_TYPE_TRACE:
+       return dwg_json_TRACE (dat, obj);
+     case DWG_TYPE_SHAPE:
+       return dwg_json_SHAPE (dat, obj);
+     case DWG_TYPE_VIEWPORT:
+       return dwg_json_VIEWPORT (dat, obj);
+     case DWG_TYPE_ELLIPSE:
+       return dwg_json_ELLIPSE (dat, obj);
+     case DWG_TYPE_SPLINE:
+       return dwg_json_SPLINE (dat, obj);
+     case DWG_TYPE_REGION:
+       return dwg_json_REGION (dat, obj);
+     case DWG_TYPE__3DSOLID:
+       return dwg_json__3DSOLID (dat, obj);
+     case DWG_TYPE_BODY:
+       return dwg_json_BODY (dat, obj);
+     case DWG_TYPE_RAY:
+       return dwg_json_RAY (dat, obj);
+     case DWG_TYPE_XLINE:
+       return dwg_json_XLINE (dat, obj);
+     case DWG_TYPE_DICTIONARY:
+       return dwg_json_DICTIONARY (dat, obj);
+     case DWG_TYPE_MTEXT:
+       return dwg_json_MTEXT (dat, obj);
+     case DWG_TYPE_LEADER:
+       return dwg_json_LEADER (dat, obj);
+     case DWG_TYPE_TOLERANCE:
+       return dwg_json_TOLERANCE (dat, obj);
+     case DWG_TYPE_MLINE:
+       return dwg_json_MLINE (dat, obj);
+     case DWG_TYPE_BLOCK_CONTROL:
+       return dwg_json_BLOCK_CONTROL (dat, obj);
+     case DWG_TYPE_BLOCK_HEADER:
+       return dwg_json_BLOCK_HEADER (dat, obj);
+     case DWG_TYPE_LAYER_CONTROL:
+       return dwg_json_LAYER_CONTROL (dat, obj);
+     case DWG_TYPE_LAYER:
+       return dwg_json_LAYER (dat, obj);
+     case DWG_TYPE_STYLE_CONTROL:
+       return dwg_json_STYLE_CONTROL (dat, obj);
+     case DWG_TYPE_STYLE:
+       return dwg_json_STYLE (dat, obj);
+     case DWG_TYPE_LTYPE_CONTROL:
+       return dwg_json_LTYPE_CONTROL (dat, obj);
+     case DWG_TYPE_LTYPE:
+       return dwg_json_LTYPE (dat, obj);
+     case DWG_TYPE_VIEW_CONTROL:
+       return dwg_json_VIEW_CONTROL (dat, obj);
+     case DWG_TYPE_VIEW:
+       return dwg_json_VIEW (dat, obj);
+     case DWG_TYPE_UCS_CONTROL:
+       return dwg_json_UCS_CONTROL (dat, obj);
+     case DWG_TYPE_UCS:
+       return dwg_json_UCS (dat, obj);
+     case DWG_TYPE_VPORT_CONTROL:
+       return dwg_json_VPORT_CONTROL (dat, obj);
+     case DWG_TYPE_VPORT:
+       return dwg_json_VPORT (dat, obj);
+     case DWG_TYPE_APPID_CONTROL:
+       return dwg_json_APPID_CONTROL (dat, obj);
+     case DWG_TYPE_APPID:
+       return dwg_json_APPID (dat, obj);
+     case DWG_TYPE_DIMSTYLE_CONTROL:
+       return dwg_json_DIMSTYLE_CONTROL (dat, obj);
+     case DWG_TYPE_DIMSTYLE:
+       return dwg_json_DIMSTYLE (dat, obj);
+     case DWG_TYPE_VX_CONTROL:
+       return dwg_json_VX_CONTROL (dat, obj);
+     case DWG_TYPE_VX_TABLE_RECORD:
+       return dwg_json_VX_TABLE_RECORD (dat, obj);
+     case DWG_TYPE_GROUP:
+       return dwg_json_GROUP (dat, obj);
+     case DWG_TYPE_MLINESTYLE:
+       return dwg_json_MLINESTYLE (dat, obj);
+     case DWG_TYPE_OLE2FRAME:
+       return dwg_json_OLE2FRAME (dat, obj);
+     case DWG_TYPE_DUMMY:
+       return dwg_json_DUMMY (dat, obj);
+     case DWG_TYPE_LONG_TRANSACTION:
+       return dwg_json_LONG_TRANSACTION (dat, obj);
+     case DWG_TYPE_LWPOLYLINE:
+       return dwg_json_LWPOLYLINE (dat, obj);
+     case DWG_TYPE_HATCH:
+       return dwg_json_HATCH (dat, obj);
+     case DWG_TYPE_XRECORD:
+       return dwg_json_XRECORD (dat, obj);
+     case DWG_TYPE_PLACEHOLDER:
+       return dwg_json_PLACEHOLDER (dat, obj);
+     case DWG_TYPE_PROXY_ENTITY:
+       return dwg_json_PROXY_ENTITY (dat, obj);
+     case DWG_TYPE_PROXY_OBJECT:
+       return dwg_json_PROXY_OBJECT (dat, obj);
+     case DWG_TYPE_OLEFRAME:
+       return dwg_json_OLEFRAME (dat, obj);
+     case DWG_TYPE_VBA_PROJECT:
+       LOG_ERROR ("Unhandled Object VBA_PROJECT. Has its own section\n");
+       // dwg_json_VBA_PROJECT(dat, obj);
+       break;
+     case DWG_TYPE_REPEAT:
+       return dwg_json_REPEAT (dat, obj);
+     case DWG_TYPE_ENDREP:
+       return dwg_json_ENDREP (dat, obj);
+     case DWG_TYPE__3DLINE:
+       return dwg_json__3DLINE (dat, obj);
+     case DWG_TYPE_LOAD:
+       return dwg_json_LOAD (dat, obj);
+     case DWG_TYPE_LAYOUT:
+       return dwg_json_LAYOUT (dat, obj);
+     default:
+       if (obj->type != 0 && obj->type == obj->parent->layout_type)
+         {
+           return dwg_json_LAYOUT (dat, obj);
+         }
+       /* > 500 */
+       else if (DWG_ERR_UNHANDLEDCLASS
+                & (error = dwg_json_variable_type (obj->parent, dat, obj)))
+         {
+           Dwg_Data *dwg = obj->parent;
+-          int is_entity;
++          int is_entity = 0;
+           int i = obj->type - 500;
+           Dwg_Class *klass = NULL;
+           int num_bytes = obj->num_unknown_bits / 8;
+           if (obj->num_unknown_bits & 8)
+             num_bytes++;
+ 
+-          if (i >= 0 && i < (int)dwg->num_classes)
++          if (obj->fixedtype == DWG_TYPE_FREED)
++              goto invalid_type;
++          if (i >= 0 && i < (int)dwg->num_classes
++              && obj->fixedtype < DWG_TYPE_FREED)
+             {
+               klass = &dwg->dwg_class[i];
+               is_entity = dwg_class_is_entity (klass);
+             }
++          else
++            {
++              if (obj->fixedtype == DWG_TYPE_UNKNOWN_ENT)
++                is_entity = 1;
++            }
+           // properly dwg_decode_object/_entity for eed, reactors, xdic
+-          if (klass && !is_entity)
++          if (!is_entity)
+             {
+               error |= dwg_json_UNKNOWN_OBJ (dat, obj);
+               KEY (num_unknown_bits);
+               VALUE_RL (obj->num_unknown_bits, 0);
+               KEY (unknown_bits);
+               VALUE_BINARY (obj->unknown_bits, num_bytes, 0);
+               return error;
+             }
+-          else if (klass)
++          else
+             {
+               error |= dwg_json_UNKNOWN_ENT (dat, obj);
+               KEY (num_unknown_bits);
+               VALUE_RL (obj->num_unknown_bits, 0);
+               KEY (unknown_bits);
+               VALUE_BINARY (obj->unknown_bits, num_bytes, 0);
+               return error;
+             }
+-          else // not a class
+-            {
+-              goto invalid_type;
+-            }
+         }
+       else
+         return 0;
+     }
+  invalid_type:
+   LOG_WARN ("Unknown object, skipping eed/reactors/xdic/...");
+   FIELD_TEXT (object, obj->name);
+   if (obj->dxfname && strNE (obj->dxfname, obj->name))
+     FIELD_TEXT (dxfname, obj->dxfname);
+   _FIELD (index, RL, 0);
+   _FIELD (type, RL, 0);
+   KEY (handle);
+   VALUE_H (obj->handle, 5);
+   _FIELD (size, RL, 0);
+   _FIELD (bitsize, BL, 0);
+   return DWG_ERR_INVALIDTYPE;
+ }

@@ -1,0 +1,149 @@
+commit 9eb9664516aafb821097f049717c70e576ac18a6
+Author: Nardi Ivan <nardi.ivan@gmail.com>
+Date:   Thu Feb 23 14:33:41 2023 +0100
+
+    SoftEther: fix invalid memory access
+    
+    We can't write `flow->protos` union until we are really sure about protocol
+    classification
+    
+    ```
+    ==28334==ERROR: AddressSanitizer: SEGV on unknown address (pc 0x558db5554512 bp 0x000000000000 sp 0x7ffcb22c2880 T0)
+    ==28334==The signal is caused by a READ memory access.
+    ==28334==Hint: this fault was caused by a dereference of a high value address (see register values below).  Disassemble the provided pc to learn which register was used.
+        #0 0x558db5554512 in __asan::Allocator::Deallocate(void*, unsigned long, unsigned long, __sanitizer::BufferedStackTrace*, __asan::AllocType) (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x48e512) (BuildId: 2f71e395637a7b748f36d5a04c7281f18b1128d7)
+        #1 0x558db55ea54b in __interceptor_free (/home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet+0x52454b) (BuildId: 2f71e395637a7b748f36d5a04c7281f18b1128d7)
+        #2 0x558db56977ca in ndpi_free /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:274:7
+        #3 0x558db56c20e3 in ndpi_free_flow_data /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:5175:2
+        #4 0x558db569783f in ndpi_free_flow /home/ivan/svnrepos/nDPI/src/lib/ndpi_main.c:8394:5
+        #5 0x558db5627936 in LLVMFuzzerTestOneInput /home/ivan/svnrepos/nDPI/fuzz/fuzz_process_packet.c:38:3
+    ```
+    
+    Found by oss-fuzz
+    See: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=56272
+
+diff --git a/src/lib/protocols/softether.c b/src/lib/protocols/softether.c
+index 5992ec32..3c90b0da 100644
+--- a/src/lib/protocols/softether.c
++++ b/src/lib/protocols/softether.c
+@@ -175,71 +175,77 @@ static size_t dissect_softether_tuples(u_int8_t const *payload, u_int16_t payloa
+ static int dissect_softether_host_fqdn(struct ndpi_flow_struct *flow,
+                                        struct ndpi_packet_struct const *packet) {
+   u_int8_t const *payload = packet->payload;
+   u_int16_t payload_len = packet->payload_packet_len;
+   u_int32_t tuple_count;
+-  size_t value_siz;
++  size_t value_siz, hostname_len, fqdn_len;
+   struct softether_value val1, val2;
+   uint8_t got_hostname = 0, got_fqdn = 0;
++  const char *hostname_ptr = NULL, *fqdn_ptr = NULL;
+ 
+   if(payload_len < 4)
+     return 1;
+ 
+   tuple_count = ntohl(get_u_int32_t(payload, 0));
+   if(tuple_count == 0 || tuple_count * 8 > payload_len)
+     return 1;
+ 
+   payload += 4;
+   payload_len -= 4;
+ 
+   value_siz = dissect_softether_type(VALUE_DATA, &val1, payload, payload_len);
+   if(value_siz == 0)
+     return 1;
+ 
+   payload += value_siz;
+   payload_len -= value_siz;
+ 
+   if(strncmp(val1.value.ptr.value_str, "host_name", value_siz) == 0)
+     got_hostname = 1;
+ 
+   for (; tuple_count > 0; --tuple_count) {
+     value_siz = dissect_softether_tuples(payload, payload_len, &val1, &val2);
+     if(value_siz == 0)
+       break;
+ 
+     if(got_hostname == 1) {
+       if(val1.type == VALUE_STR && val1.value_size > 0) {
+-	size_t len = ndpi_min(val1.value_size, sizeof(flow->protos.softether.hostname) - 1);
+-	      
+-	strncpy(flow->protos.softether.hostname, val1.value.ptr.value_str, len);
+-	flow->protos.softether.hostname[len] = '\0';
++	hostname_len = ndpi_min(val1.value_size, sizeof(flow->protos.softether.hostname) - 1);
++	hostname_ptr = val1.value.ptr.value_str;
+       }
+ 	  
+       got_hostname = 0;
+     }
+     if(got_fqdn == 1) {
+       if(val1.type == VALUE_STR && val1.value_size > 0)  {
+-	size_t len = ndpi_min(val1.value_size, sizeof(flow->protos.softether.fqdn) - 1);
+-	      
+-	strncpy(flow->protos.softether.fqdn, val1.value.ptr.value_str, len);
+-	flow->protos.softether.fqdn[len] = '\0';
++	fqdn_len = ndpi_min(val1.value_size, sizeof(flow->protos.softether.fqdn) - 1);
++	fqdn_ptr = val1.value.ptr.value_str;
+       }
+ 	  
+       got_fqdn = 0;
+     }
+ 
+     if(val2.type == VALUE_DATA && val2.value_size > 0 &&
+        strncmp(val2.value.ptr.value_str, "ddns_fqdn", val2.value_size) == 0)	{
+       got_fqdn = 1;
+     }
+ 
+     payload += value_siz;
+     payload_len -= value_siz;
+   }
+ 
+   if(payload_len != 0 || tuple_count != 0)
+     return 1;
+ 
++  /* Ok, write to `flow->protos.softether` */
++  if(hostname_ptr) {
++    strncpy(flow->protos.softether.hostname, hostname_ptr, hostname_len);
++    flow->protos.softether.hostname[hostname_len] = '\0';
++  }
++  if(fqdn_ptr) {
++    strncpy(flow->protos.softether.fqdn, fqdn_ptr, fqdn_len);
++    flow->protos.softether.fqdn[fqdn_len] = '\0';
++  }
+   return 0;
+ }
+ 
+ /* ***************************************************** */
+@@ -291,32 +297,32 @@ static int dissect_softether_ip_port(struct ndpi_flow_struct *flow,
+ static void ndpi_search_softether(struct ndpi_detection_module_struct *ndpi_struct,
+                                   struct ndpi_flow_struct *flow) {
+   struct ndpi_packet_struct const * const packet = &ndpi_struct->packet;
+ 
+   NDPI_LOG_DBG(ndpi_struct, "search softether\n");
+ 
+   if(packet->payload_packet_len == 1) {
+ 
+     if((packet->payload[0] != 0x41) || (flow->packet_counter > 2))	
+       NDPI_EXCLUDE_PROTO(ndpi_struct, flow);	
+ 
+     return;
+   }
+ 
+   if(packet->payload_packet_len > 9 && packet->payload_packet_len < 30) {
+     if(dissect_softether_ip_port(flow, packet) == 0) {
+       ndpi_int_softether_add_connection(ndpi_struct, flow);
+       return;
+     }
+   }
+-    
++
+   if(packet->payload_packet_len >= 99) {
+     if(dissect_softether_host_fqdn(flow, packet) == 0) {
+       ndpi_int_softether_add_connection(ndpi_struct, flow);
+       return;
+     }
+   }
+ 
+   NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+ }
+ 
+ /* ***************************************************** */

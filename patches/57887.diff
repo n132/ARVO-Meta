@@ -1,0 +1,258 @@
+commit 1729d9af3f690bece912ae0f625b312566d0ae25
+Author: David Anderson <davea42@linuxmail.org>
+Date:   Tue Apr 11 11:58:12 2023 -0700
+
+    DW202304-003  ossfuzz  57887
+    The fuzzed test case involved an index
+    that was so close to wrapping around
+    a 64bit unsigned that testing after
+    doing arithmetic would fail to catch the error.
+    Now doing much better checking in
+    _dwarf_extract_address_from_debug_addr().
+            modified:   dwarf_query.c
+
+diff --git a/src/lib/libdwarf/dwarf_query.c b/src/lib/libdwarf/dwarf_query.c
+index 557bbeca..c3c4fb97 100644
+--- a/src/lib/libdwarf/dwarf_query.c
++++ b/src/lib/libdwarf/dwarf_query.c
+@@ -945,67 +945,74 @@ static int
+ _dwarf_extract_address_from_debug_addr(Dwarf_Debug dbg,
+     Dwarf_CU_Context context,
+     Dwarf_Unsigned index_to_addr,
+     Dwarf_Addr *addr_out,
+     Dwarf_Error *error)
+ {
+     Dwarf_Unsigned address_base = 0;
+     Dwarf_Unsigned addrindex = index_to_addr;
+     Dwarf_Unsigned addr_offset = 0;
+     Dwarf_Unsigned ret_addr = 0;
+     int res = 0;
+     Dwarf_Byte_Ptr  sectionstart = 0;
+     Dwarf_Byte_Ptr  sectionend = 0;
+     Dwarf_Unsigned  sectionsize  = 0;
+ 
+     address_base = context->cc_addr_base;
+     res = _dwarf_load_section(dbg, &dbg->de_debug_addr,error);
+     if (res != DW_DLV_OK) {
+         /*  Ignore the inner error, report something meaningful */
+         if (res == DW_DLV_ERROR && error) {
+             dwarf_dealloc(dbg,*error, DW_DLA_ERROR);
+             *error = 0;
+         }
+         _dwarf_error(dbg,error,
+             DW_DLE_MISSING_NEEDED_DEBUG_ADDR_SECTION);
+         return DW_DLV_ERROR;
+     }
+     /*  DW_FORM_addrx has a base value from the CU die:
+         DW_AT_addr_base.  DW_OP_addrx and DW_OP_constx
+         rely on DW_AT_addr_base too. */
+     /*  DW_FORM_GNU_addr_index  relies on DW_AT_GNU_addr_base
+         which is in the CU die. */
+ 
+     sectionstart = dbg->de_debug_addr.dss_data;
+     addr_offset = address_base +
+         (addrindex * context->cc_address_size);
+     /*  The offsets table is a series of address-size entries
+         but with a base. */
+     sectionsize = dbg->de_debug_addr.dss_size;
+     sectionend = sectionstart + sectionsize;
+-    if (addr_offset > (sectionsize - context->cc_address_size)) {
++    /*  At this point we have a local .debug_addr table
++        Might get here on dbg or tied-dbg. Check either way
++        ASSERT: cc_address_size is sensible (small) */
++    if (addrindex >= sectionsize ||
++        (addrindex*context->cc_address_size) >= sectionsize ||
++        addr_offset > sectionsize ||
++        addr_offset > (sectionsize - context->cc_address_size)) {
+         dwarfstring m;
+ 
++        /* Was DW_DLE_ATTR_FORM_SIZE_BAD. Regression issue */
+         dwarfstring_constructor(&m);
+         dwarfstring_append_printf_u(&m,
+-            "DW_DLE_ATTR_FORM_SIZE_BAD: "
++            "DW_DLE_ATTR_FORM_OFFSET_BAD: "
+             "Extracting an address from .debug_addr fails"
+             "as the offset is  0x%x ",
+             addr_offset);
+         dwarfstring_append_printf_u(&m,
+             "but the object section is just 0x%x "
+             "bytes long so there not enough space"
+             " for an address.",
+             sectionsize);
+         _dwarf_error_string(dbg, error,
+-            DW_DLE_ATTR_FORM_SIZE_BAD,
++            DW_DLE_ATTR_FORM_OFFSET_BAD,
+             dwarfstring_string(&m));
+         dwarfstring_destructor(&m);
+         return DW_DLV_ERROR;
+     }
+     READ_UNALIGNED_CK(dbg,ret_addr,Dwarf_Addr,
+         sectionstart + addr_offset,
+         context->cc_address_size,
+         error,sectionend);
+     *addr_out = ret_addr;
+     return DW_DLV_OK;
+ }
+@@ -1014,34 +1021,35 @@ int
+ _dwarf_look_in_local_and_tied_by_index(
+     Dwarf_Debug dbg,
+     Dwarf_CU_Context context,
+     Dwarf_Unsigned index,
+     Dwarf_Addr *return_addr,
+     Dwarf_Error *error)
+ {
+     int res2 = 0;
+ 
+     res2 = _dwarf_extract_address_from_debug_addr(dbg,
+         context, index, return_addr, error);
+     if (res2 != DW_DLV_OK) {
+         if (res2 == DW_DLV_ERROR &&
+             error && dwarf_errno(*error) ==
+             DW_DLE_MISSING_NEEDED_DEBUG_ADDR_SECTION
+             && dbg->de_tied_data.td_tied_object) {
+             int res3 = 0;
+ 
+             /*  We do not want to leak error structs... */
+             /* *error safe */
+             dwarf_dealloc(dbg,*error,DW_DLA_ERROR);
+             *error = 0; /* *error safe */
+-            /* error is returned on dbg, not tieddbg. */
++            /*  Any error is returned on dbg,
++                not tieddbg. */
+             res3 = _dwarf_get_addr_from_tied(dbg,
+                 context,index,return_addr,error);
+             return res3;
+         }
+         return res2;
+     }
+     return DW_DLV_OK;
+ }
+ 
+ /*  The DIE here can be any DIE in the relevant CU.
+     index is an index into .debug_addr */
+@@ -1075,24 +1083,41 @@ int
+ _dwarf_look_in_local_and_tied(Dwarf_Half attr_form,
+     Dwarf_CU_Context context,
+     Dwarf_Small     *info_ptr,
+     Dwarf_Addr      *return_addr,
+     Dwarf_Error     *error)
+ {
+     int res2 = 0;
+     Dwarf_Unsigned index_to_addr = 0;
+     Dwarf_Debug dbg = 0;
++    Dwarf_Unsigned addrtabsize = 0;
+ 
+     /*  We get the index. It might apply here
+         or in tied object. Checking that next. */
+     dbg = context->cc_dbg;
+     res2 = _dwarf_get_addr_index_itself(attr_form,
+         info_ptr,dbg,context, &index_to_addr,error);
+     if (res2 != DW_DLV_OK) {
+         return res2;
+     }
++    addrtabsize = dbg->de_debug_addr.dss_size;
++#if 0
++    If there is  no .debug_addr the error here should
++    not be reported as will report that
++    via _dwarf_look_in_local_and_tied_by_index
++    if (!dbg->de_tied_data.td_tied_object &&
++        (index_to_addr > dbg->de_filesize ||
++        index_to_addr > addrtabsize ||
++        (index_to_addr*context->cc_address_size) > addrtabsize)) {
++        _dwarf_error_string(dbg,error,DW_DLE_ATTR_FORM_OFFSET_BAD,
++            "DW_DLE_ATTR_FORM_OFFSET_BAD "
++            "Looking for an index from an addr FORM "
++            "we find an impossibly large value. Corrupt DWARF");
++        return DW_DLV_ERROR;
++    }
++#endif
+     /* error is returned on dbg, not tieddbg. */
+     res2 = _dwarf_look_in_local_and_tied_by_index(
+         dbg,context,index_to_addr,return_addr,error);
+     return res2;
+ 
+ }
+@@ -1419,70 +1444,83 @@ int
+ _dwarf_get_addr_from_tied(Dwarf_Debug dbg,
+     Dwarf_CU_Context context,
+     Dwarf_Unsigned index,
+     Dwarf_Addr *addr_out,
+     Dwarf_Error*error)
+ {
+     Dwarf_Debug tieddbg = 0;
+     int res = 0;
+     Dwarf_Addr local_addr = 0;
+     Dwarf_CU_Context tiedcontext = 0;
++    Dwarf_Unsigned addrtabsize = 0;
+ 
+     if (!context->cc_signature_present) {
+         _dwarf_error(dbg, error, DW_DLE_NO_SIGNATURE_TO_LOOKUP);
+         return  DW_DLV_ERROR;
+     }
+     tieddbg = dbg->de_tied_data.td_tied_object;
+     if (!tieddbg) {
+         _dwarf_error(dbg, error, DW_DLE_NO_TIED_ADDR_AVAILABLE);
+         return  DW_DLV_ERROR;
+     }
+     if (!context->cc_addr_base_present) {
+         /*  Does not exist. */
+         return DW_DLV_NO_ENTRY;
+     }
+     res = _dwarf_search_for_signature(tieddbg,
+         context->cc_signature,
+         &tiedcontext,
+         error);
+     if (res == DW_DLV_ERROR) {
+         /* Associate the error with dbg, not tieddbg */
+         _dwarf_error_mv_s_to_t(tieddbg,error,dbg,error);
+         return res;
+     }
+     if ( res == DW_DLV_NO_ENTRY) {
+         return res;
+     }
++    /* We have .debug_addr */
++    addrtabsize = tieddbg->de_debug_addr.dss_size;
++    if ( (index > tieddbg->de_filesize ||
++        index > addrtabsize ||
++        (index*tiedcontext->cc_address_size) > addrtabsize)) {
++        _dwarf_error_string(dbg,error,DW_DLE_ATTR_FORM_OFFSET_BAD,
++            "DW_DLE_ATTR_FORM_OFFSET_BAD "
++            "Looking for an index from an addr FORM "
++            "we find an impossibly large index value for the tied "
++            "object. Corrupt DWARF");
++        return DW_DLV_ERROR;
++    }
+     res = _dwarf_extract_address_from_debug_addr(tieddbg,
+         tiedcontext,
+         index,
+         &local_addr,
+         error);
+     if ( res == DW_DLV_ERROR) {
+         /* Associate the error with dbg, not tidedbg */
+         _dwarf_error_mv_s_to_t(tieddbg,error,dbg,error);
+         return res;
+     }
+     if ( res == DW_DLV_NO_ENTRY) {
+         return res;
+     }
+     *addr_out = local_addr;
+     return DW_DLV_OK;
+ }
+ 
+ /*
+     Takes a die, an attribute attr, and checks if attr
+     occurs in die.  Attr is required to be an attribute
+     whose form is in the "constant" class.  If attr occurs
+     in die, the value is returned.
+ 
+     It does not really allow for a signed constant, and
+     DWARF does not always specify that only non-negative
+     values are allowed..
+ 
+     Returns DW_DLV_OK, DW_DLV_ERROR, or DW_DLV_NO_ENTRY as
+     appropriate. Sets the value thru the pointer return_val.
+ 
+     This function is meant to do all the
+     processing for dwarf_bytesize, dwarf_bitsize, dwarf_bitoffset,
+     and dwarf_srclang. And it helps in dwarf_highpc_with_form().
+ */

@@ -1,0 +1,400 @@
+commit 27dc05196fc43036a2efcea060ae3711b3209cf2
+Author: Julius Pfrommer <julius.pfrommer@web.de>
+Date:   Sun Sep 23 14:04:35 2018 +0200
+
+    SecureChannel: Split UA_SecureChannel_close and UA_SecureChannel_deleteMembers
+    
+    OSS-Fuzz uncovered an issue where we "unlinking" of the Session and
+    Connection was done in a delayed callback. But the "unlinking" needs to
+    be done right away.
+
+diff --git a/src/client/ua_client_connect.c b/src/client/ua_client_connect.c
+index 6320f2080..a1ba687d3 100644
+--- a/src/client/ua_client_connect.c
++++ b/src/client/ua_client_connect.c
+@@ -715,16 +715,17 @@ static void
+ sendCloseSecureChannel(UA_Client *client) {
+     UA_SecureChannel *channel = &client->channel;
+     UA_CloseSecureChannelRequest request;
+     UA_CloseSecureChannelRequest_init(&request);
+     request.requestHeader.requestHandle = ++client->requestHandle;
+     request.requestHeader.timestamp = UA_DateTime_now();
+     request.requestHeader.timeoutHint = 10000;
+     request.requestHeader.authenticationToken = client->authenticationToken;
+     UA_SecureChannel_sendSymmetricMessage(channel, ++client->requestId,
+                                           UA_MESSAGETYPE_CLO, &request,
+                                           &UA_TYPES[UA_TYPES_CLOSESECURECHANNELREQUEST]);
+     UA_CloseSecureChannelRequest_deleteMembers(&request);
+-    UA_SecureChannel_deleteMembersCleanup(&client->channel);
++    UA_SecureChannel_close(&client->channel);
++    UA_SecureChannel_deleteMembers(&client->channel);
+ }
+ 
+ UA_StatusCode
+diff --git a/src/client/ua_client_connect_async.c b/src/client/ua_client_connect_async.c
+index d97011227..3860d6d1d 100644
+--- a/src/client/ua_client_connect_async.c
++++ b/src/client/ua_client_connect_async.c
+@@ -645,19 +645,20 @@ static void
+ sendCloseSecureChannelAsync(UA_Client *client, void *userdata,
+                              UA_UInt32 requestId, void *response) {
+     UA_NodeId_deleteMembers (&client->authenticationToken);
+     client->requestHandle = 0;
+ 
+     UA_SecureChannel *channel = &client->channel;
+     UA_CloseSecureChannelRequest request;
+     UA_CloseSecureChannelRequest_init(&request);
+     request.requestHeader.requestHandle = ++client->requestHandle;
+     request.requestHeader.timestamp = UA_DateTime_now();
+     request.requestHeader.timeoutHint = 10000;
+     request.requestHeader.authenticationToken = client->authenticationToken;
+     UA_SecureChannel_sendSymmetricMessage(
+             channel, ++client->requestId, UA_MESSAGETYPE_CLO, &request,
+             &UA_TYPES[UA_TYPES_CLOSESECURECHANNELREQUEST]);
+-    UA_SecureChannel_deleteMembersCleanup(&client->channel);
++    UA_SecureChannel_close(&client->channel);
++    UA_SecureChannel_deleteMembers(&client->channel);
+ }
+ 
+ static void
+diff --git a/src/server/ua_securechannel_manager.c b/src/server/ua_securechannel_manager.c
+index f91a55e42..925aa3a67 100644
+--- a/src/server/ua_securechannel_manager.c
++++ b/src/server/ua_securechannel_manager.c
+@@ -33,29 +33,33 @@ void
+ UA_SecureChannelManager_deleteMembers(UA_SecureChannelManager *cm) {
+     channel_entry *entry, *temp;
+     TAILQ_FOREACH_SAFE(entry, &cm->channels, pointers, temp) {
+         TAILQ_REMOVE(&cm->channels, entry, pointers);
+-        UA_SecureChannel_deleteMembersCleanup(&entry->channel);
++        UA_SecureChannel_close(&entry->channel);
++        UA_SecureChannel_deleteMembers(&entry->channel);
+         UA_free(entry);
+     }
+ }
+ 
+ static void
+ removeSecureChannelCallback(void *_, channel_entry *entry) {
+-    UA_SecureChannel_deleteMembersCleanup(&entry->channel);
++    UA_SecureChannel_deleteMembers(&entry->channel);
+ }
+ 
+ static void
+ removeSecureChannel(UA_SecureChannelManager *cm, channel_entry *entry) {
++    /* Close the SecureChannel */
++    UA_SecureChannel_close(&entry->channel);
++
+     /* Detach the channel and make the capacity available */
+     TAILQ_REMOVE(&cm->channels, entry, pointers);
+     UA_atomic_subUInt32(&cm->currentChannelCount, 1);
+ 
+     /* Add a delayed callback to remove the channel when the currently
+      * scheduled jobs have completed */
+     entry->cleanupCallback.callback = (UA_ApplicationCallback)removeSecureChannelCallback;
+     entry->cleanupCallback.application = NULL;
+     entry->cleanupCallback.data = entry;
+     UA_WorkQueue_enqueueDelayed(&cm->server->workQueue, &entry->cleanupCallback);
+ }
+ 
+ /* remove channels that were not renewed or who have no connection attached */
+diff --git a/src/server/ua_server_binary.c b/src/server/ua_server_binary.c
+index 01a5b07e8..bba88c728 100644
+--- a/src/server/ua_server_binary.c
++++ b/src/server/ua_server_binary.c
+@@ -758,35 +758,39 @@ void
+ UA_Server_processBinaryMessage(UA_Server *server, UA_Connection *connection,
+                                UA_ByteString *message) {
+     UA_LOG_TRACE(server->config.logger, UA_LOGCATEGORY_NETWORK,
+                  "Connection %i | Received a packet.", connection->sockfd);
+ #ifdef UA_DEBUG_DUMP_PKGS
+     UA_dump_hex_pkg(message->data, message->length);
+ #endif
+ 
+     UA_StatusCode retval = UA_Connection_processChunks(connection, server,
+                                                        processCompleteChunk, message);
+     if(retval != UA_STATUSCODE_GOOD) {
+         UA_LOG_INFO(server->config.logger, UA_LOGCATEGORY_NETWORK,
+                     "Connection %i | Processing the message failed with "
+                     "error %s", connection->sockfd, UA_StatusCode_name(retval));
+         /* Send an ERR message and close the connection */
+         UA_TcpErrorMessage error;
+         error.error = retval;
+         error.reason = UA_STRING_NULL;
+         UA_Connection_sendError(connection, &error);
+         connection->close(connection);
+         return;
+     }
+ 
+-    if(!connection->channel)
++    UA_SecureChannel *channel = connection->channel;
++    if(!channel)
+         return;
+ 
+     /* Process complete messages */
+-    UA_SecureChannel_processCompleteMessages(connection->channel, server,
+-                                             processSecureChannelMessage);
++    UA_SecureChannel_processCompleteMessages(channel, server, processSecureChannelMessage);
++
++    /* Is the channel still open? */
++    if(channel->state == UA_SECURECHANNELSTATE_CLOSED)
++        return;
+ 
+-    /* Store unused chunks internally in the SecureChannel */
++    /* Store unused decoded chunks internally in the SecureChannel */
+     UA_SecureChannel_persistIncompleteMessages(connection->channel);
+ }
+ 
+ #ifdef UA_ENABLE_MULTITHREADING
+diff --git a/src/ua_securechannel.c b/src/ua_securechannel.c
+index 773e7d091..3736d4043 100644
+--- a/src/ua_securechannel.c
++++ b/src/ua_securechannel.c
+@@ -118,35 +118,42 @@ UA_SecureChannel_deleteMessages(UA_SecureChannel *channel) {
+ }
+ 
+ void
+-UA_SecureChannel_deleteMembersCleanup(UA_SecureChannel *channel) {
++UA_SecureChannel_deleteMembers(UA_SecureChannel *channel) {
+     /* Delete members */
+     UA_ByteString_deleteMembers(&channel->remoteCertificate);
+     UA_ByteString_deleteMembers(&channel->localNonce);
+     UA_ByteString_deleteMembers(&channel->remoteNonce);
+     UA_ChannelSecurityToken_deleteMembers(&channel->securityToken);
+     UA_ChannelSecurityToken_deleteMembers(&channel->nextSecurityToken);
+ 
+     /* Delete the channel context for the security policy */
+     if(channel->securityPolicy)
+         channel->securityPolicy->channelModule.deleteContext(channel->channelContext);
+ 
++
++    /* Remove the buffered messages */
++    UA_SecureChannel_deleteMessages(channel);
++}
++
++void
++UA_SecureChannel_close(UA_SecureChannel *channel) {
++    /* Set the status to closed */
++    channel->state = UA_SECURECHANNELSTATE_CLOSED;
++
+     /* Detach from the connection and close the connection */
+     if(channel->connection) {
+         if(channel->connection->state != UA_CONNECTION_CLOSED)
+             channel->connection->close(channel->connection);
+         UA_Connection_detachSecureChannel(channel->connection);
+     }
+ 
+     /* Remove session pointers (not the sessions) and NULL the pointers back to
+      * the SecureChannel in the Session */
+     UA_SessionHeader *sh, *temp;
+     LIST_FOREACH_SAFE(sh, &channel->sessions, pointers, temp) {
+         sh->channel = NULL;
+         LIST_REMOVE(sh, pointers);
+     }
+-
+-    /* Remove the buffered messages */
+-    UA_SecureChannel_deleteMessages(channel);
+ }
+ 
+ UA_StatusCode
+@@ -955,33 +962,37 @@ UA_StatusCode
+ UA_SecureChannel_processCompleteMessages(UA_SecureChannel *channel, void *application,
+                                          UA_ProcessMessageCallback callback) {
+     UA_Message *message, *tmp_message;
+     UA_StatusCode retval = UA_STATUSCODE_GOOD;
+     TAILQ_FOREACH_SAFE(message, &channel->messages, pointers, tmp_message) {
+         /* Stop at the first incomplete message */
+         if(!message->final)
+             break;
+ 
++        /* Has the channel been closed (during the last message)? */
++        if(channel->state == UA_SECURECHANNELSTATE_CLOSED)
++            break;
++
+         /* Remove the current message before processing */
+         TAILQ_REMOVE(&channel->messages, message, pointers);
+ 
+         /* Process */
+         retval = processMessage(channel, message, application, callback);
+         if(retval != UA_STATUSCODE_GOOD)
+             break;
+ 
+         /* Clean up the message */
+         UA_ChunkPayload *payload;
+         while((payload = SIMPLEQ_FIRST(&message->chunkPayloads))) {
+             if(payload->copied)
+                 UA_ByteString_deleteMembers(&payload->bytes);
+             SIMPLEQ_REMOVE_HEAD(&message->chunkPayloads, pointers);
+             UA_free(payload);
+         }
+         UA_free(message);
+     }
+     return retval;
+ }
+ 
+ /****************************/
+ /* Process a received Chunk */
+ /****************************/
+@@ -1190,31 +1201,31 @@ static UA_StatusCode
+ checkSymHeader(UA_SecureChannel *const channel,
+                const UA_UInt32 tokenId, UA_Boolean allowPreviousToken) {
+ 
+     if(tokenId == channel->securityToken.tokenId) {
+         if(channel->state == UA_SECURECHANNELSTATE_OPEN &&
+            (channel->securityToken.createdAt +
+             (channel->securityToken.revisedLifetime * UA_DATETIME_MSEC))
+            < UA_DateTime_nowMonotonic()) {
+-            UA_SecureChannel_deleteMembersCleanup(channel);
++            UA_SecureChannel_close(channel);
+             return UA_STATUSCODE_BADSECURECHANNELCLOSED;
+         }
+     }
+ 
+     if(tokenId != channel->securityToken.tokenId) {
+         if(tokenId != channel->nextSecurityToken.tokenId) {
+             if(allowPreviousToken)
+                 return checkPreviousToken(channel, tokenId);
+             else
+                 return UA_STATUSCODE_BADSECURECHANNELTOKENUNKNOWN;
+         }
+         return UA_SecureChannel_revolveTokens(channel);
+     }
+ 
+     if(channel->previousSecurityToken.tokenId != 0) {
+         UA_StatusCode retval = UA_SecureChannel_generateRemoteKeys(channel, channel->securityPolicy);
+         UA_ChannelSecurityToken_deleteMembers(&channel->previousSecurityToken);
+         return retval;
+     }
+ 
+     return UA_STATUSCODE_GOOD;
+ }
+@@ -1351,12 +1362,13 @@ UA_StatusCode
+ UA_SecureChannel_decryptAddChunk(UA_SecureChannel *channel, const UA_ByteString *chunk,
+                                  UA_Boolean allowPreviousToken) {
+     /* Has the SecureChannel timed out? */
+     if(channel->state == UA_SECURECHANNELSTATE_CLOSED)
+         return UA_STATUSCODE_BADSECURECHANNELCLOSED;
+ 
+     UA_StatusCode retval = decryptAddChunk(channel, chunk, allowPreviousToken);
+     if(retval != UA_STATUSCODE_GOOD)
+-        UA_SecureChannel_deleteMembersCleanup(channel);
++        UA_SecureChannel_close(channel);
++
+     return retval;
+ }
+ 
+@@ -1364,21 +1376,21 @@ UA_StatusCode
+ UA_SecureChannel_persistIncompleteMessages(UA_SecureChannel *channel) {
+     UA_Message *me;
+     TAILQ_FOREACH(me, &channel->messages, pointers) {
+         UA_ChunkPayload *cp;
+         SIMPLEQ_FOREACH(cp, &me->chunkPayloads, pointers) {
+             if(cp->copied)
+                 continue;
+             UA_ByteString copy;
+             UA_StatusCode retval = UA_ByteString_copy(&cp->bytes, &copy);
+             if(retval != UA_STATUSCODE_GOOD) {
+-                UA_SecureChannel_deleteMembersCleanup(channel);
++                UA_SecureChannel_close(channel);
+                 return retval;
+             }
+             cp->bytes = copy;
+             cp->copied = true;
+         }
+     }
+     return UA_STATUSCODE_GOOD;
+ }
+ 
+ /* Functionality used by both the SecureChannel and the SecurityPolicy */
+diff --git a/src/ua_securechannel.h b/src/ua_securechannel.h
+index fdd973dff..c1572dc04 100644
+--- a/src/ua_securechannel.h
++++ b/src/ua_securechannel.h
+@@ -106,6 +106,8 @@ struct UA_SecureChannel {
+ 
+ void UA_SecureChannel_init(UA_SecureChannel *channel);
+ 
++void UA_SecureChannel_close(UA_SecureChannel *channel);
++
+ UA_StatusCode
+ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
+                                    const UA_SecurityPolicy *securityPolicy,
+@@ -114,7 +116,7 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
+ /* Remove (partially) received unprocessed messages */
+ void UA_SecureChannel_deleteMessages(UA_SecureChannel *channel);
+ 
+-void UA_SecureChannel_deleteMembersCleanup(UA_SecureChannel *channel);
++void UA_SecureChannel_deleteMembers(UA_SecureChannel *channel);
+ 
+ /* Generates new keys and sets them in the channel context */
+ UA_StatusCode
+diff --git a/tests/check_securechannel.c b/tests/check_securechannel.c
+index e11a035e2..af8434dd2 100644
+--- a/tests/check_securechannel.c
++++ b/tests/check_securechannel.c
+@@ -54,7 +54,8 @@ setup_secureChannel(void) {
+ 
+ static void
+ teardown_secureChannel(void) {
+-    UA_SecureChannel_deleteMembersCleanup(&testChannel);
++    UA_SecureChannel_close(&testChannel);
++    UA_SecureChannel_deleteMembers(&testChannel);
+     dummyPolicy.deleteMembers(&dummyPolicy);
+     testingConnection.close(&testingConnection);
+ }
+@@ -95,20 +96,21 @@ teardown_key_sizes(void) {
+ START_TEST(SecureChannel_initAndDelete)
+     {
+         TestingPolicy(&dummyPolicy, dummyCertificate, &fCalled, &keySizes);
+         UA_StatusCode retval;
+ 
+         UA_SecureChannel channel;
+         UA_SecureChannel_init(&channel);
+         retval = UA_SecureChannel_setSecurityPolicy(&channel, &dummyPolicy, &dummyCertificate);
+ 
+         ck_assert_msg(retval == UA_STATUSCODE_GOOD, "Expected StatusCode to be good");
+         ck_assert_msg(channel.state == UA_SECURECHANNELSTATE_FRESH, "Expected state to be fresh");
+         ck_assert_msg(fCalled.newContext, "Expected newContext to have been called");
+         ck_assert_msg(fCalled.makeCertificateThumbprint, "Expected makeCertificateThumbprint to have been called");
+         ck_assert_msg(channel.securityPolicy == &dummyPolicy, "SecurityPolicy not set correctly");
+ 
+-        UA_SecureChannel_deleteMembersCleanup(&channel);
++        UA_SecureChannel_close(&channel);
++        UA_SecureChannel_deleteMembers(&channel);
+         ck_assert_msg(fCalled.deleteContext, "Expected deleteContext to have been called");
+ 
+         dummyPolicy.deleteMembers(&dummyPolicy);
+     }END_TEST
+diff --git a/tests/server/check_server_monitoringspeed.c b/tests/server/check_server_monitoringspeed.c
+index 9ff54a2c9..ef4ddb316 100644
+--- a/tests/server/check_server_monitoringspeed.c
++++ b/tests/server/check_server_monitoringspeed.c
+@@ -39,10 +39,11 @@ static void setup(void) {
+ }
+ 
+ static void teardown(void) {
+-    UA_SecureChannel_deleteMembersCleanup(&testChannel);
++    UA_SecureChannel_close(&testChannel);
++    UA_SecureChannel_deleteMembers(&testChannel);
+     dummyPolicy.deleteMembers(&dummyPolicy);
+     testingConnection.close(&testingConnection);
+ 
+     UA_Server_delete(server);
+     UA_ServerConfig_delete(config);
+ }
+diff --git a/tests/server/check_server_readspeed.c b/tests/server/check_server_readspeed.c
+index 8c0febccd..fc004896c 100644
+--- a/tests/server/check_server_readspeed.c
++++ b/tests/server/check_server_readspeed.c
+@@ -40,10 +40,11 @@ static void setup(void) {
+ }
+ 
+ static void teardown(void) {
+-    UA_SecureChannel_deleteMembersCleanup(&testChannel);
++    UA_SecureChannel_close(&testChannel);
++    UA_SecureChannel_deleteMembers(&testChannel);
+     dummyPolicy.deleteMembers(&dummyPolicy);
+     testingConnection.close(&testingConnection);
+ 
+     UA_Server_delete(server);
+     UA_ServerConfig_delete(config);
+ }

@@ -1,0 +1,168 @@
+commit 4407636943edb8acca4717e1e08d1f529027a8a5
+Author: Leon Scroggins III <scroggo@google.com>
+Date:   Fri Feb 15 13:56:44 2019 -0500
+
+    SkWuffsCodec: Initialize when incomplete part 3
+    
+    Bug: skia:8767
+    Bug: oss-fuzz:13020
+    
+    Follow on to https://skia-review.googlesource.com/c/skia/+/189866
+    Even if the dirty_rect is not empty, it's possible there is still some
+    memory we need to initialize. No need to look at the dirty_rect at all;
+    if the image is interlaced, the dirty_rect could fill the frame even if
+    it doesn't touch all rows.
+    
+    Restore the old location of dirty_rect. It is no longer needed this early.
+    
+    Change-Id: Ie571a80dda3b83f248d87188dbaf139f94c17252
+    Reviewed-on: https://skia-review.googlesource.com/c/193027
+    Auto-Submit: Leon Scroggins <scroggo@google.com>
+    Reviewed-by: Nigel Tao <nigeltao@google.com>
+    Commit-Queue: Leon Scroggins <scroggo@google.com>
+
+diff --git a/src/codec/SkWuffsCodec.cpp b/src/codec/SkWuffsCodec.cpp
+index 80125e44d1..682889924c 100644
+--- a/src/codec/SkWuffsCodec.cpp
++++ b/src/codec/SkWuffsCodec.cpp
+@@ -443,138 +443,138 @@ static void blend(uint32_t* dst, const uint32_t* src, int width) {
+ SkCodec::Result SkWuffsCodec::onIncrementalDecode(int* rowsDecoded) {
+     if (!fIncrDecDst) {
+         return SkCodec::kInternalError;
+     }
+ 
+     SkCodec::Result result = SkCodec::kSuccess;
+     const char*     status = this->decodeFrame();
+     const bool      independent = independent_frame(this, options().fFrameIndex);
+     if (status != nullptr) {
+         if (status == wuffs_base__suspension__short_read) {
+             result = SkCodec::kIncompleteInput;
+         } else {
+             SkCodecPrintf("decodeFrame: %s", status);
+             result = SkCodec::kErrorInInput;
+         }
+ 
+         if (!independent) {
+             // For a dependent frame, we cannot blend the partial result, since
+             // that will overwrite the contribution from prior frames.
+             return result;
+         }
+     }
+ 
+     uint32_t src_bits_per_pixel =
+         wuffs_base__pixel_format__bits_per_pixel(fPixelBuffer.pixcfg.pixel_format());
+     if ((src_bits_per_pixel == 0) || (src_bits_per_pixel % 8 != 0)) {
+         return SkCodec::kInternalError;
+     }
+     size_t src_bytes_per_pixel = src_bits_per_pixel / 8;
+ 
+     wuffs_base__rect_ie_u32 frame_rect = fFrameConfig.bounds();
+-    wuffs_base__rect_ie_u32 dirty_rect = fDecoder->frame_dirty_rect();
+     if (!fSwizzler) {
+         auto bounds = SkIRect::MakeLTRB(frame_rect.min_incl_x, frame_rect.min_incl_y,
+                                         frame_rect.max_excl_x, frame_rect.max_excl_y);
+         fSwizzler =
+             SkSwizzler::Make(this->getEncodedInfo(), nullptr, dstInfo(), this->options(), &bounds);
+         fSwizzler->setSampleX(fSpySampler.sampleX());
+         fSwizzler->setSampleY(fSpySampler.sampleY());
+         fScaledHeight = get_scaled_dimension(dstInfo().height(), fSpySampler.sampleY());
+ 
+         if (frame_rect.width() > (SIZE_MAX / src_bytes_per_pixel)) {
+             return SkCodec::kInternalError;
+         }
+ 
+         // If the frame rect does not fill the output, ensure that those pixels are not
+         // left uninitialized.
+-        if (independent && (bounds != this->bounds() || dirty_rect.is_empty())) {
++        if (independent && (bounds != this->bounds() || result != kSuccess)) {
+             auto fillInfo = dstInfo().makeWH(fSwizzler->fillWidth(), fScaledHeight);
+             SkSampler::Fill(fillInfo, fIncrDecDst, fIncrDecRowBytes, options().fZeroInitialized);
+         }
+     }
+     if (fScaledHeight == 0) {
+         return SkCodec::kInternalError;
+     }
+ 
+     // The semantics of *rowsDecoded is: say you have a 10 pixel high image
+     // (both the frame and the image). If you only decoded the first 3 rows,
+     // set this to 3, and then SkCodec (or the caller of incrementalDecode)
+     // would zero-initialize the remaining 7 (unless the memory was already
+     // zero-initialized).
+     //
+     // Now let's say that the image is still 10 pixels high, but the frame is
+     // from row 5 to 9. If you only decoded 3 rows, but you initialized the
+     // first 5, you could return 8, and the caller would zero-initialize the
+     // final 2. For GIF (where a frame can be smaller than the image and can be
+     // interlaced), we just zero-initialize all 10 rows ahead of time and
+     // return the height of the image, so the caller knows it doesn't need to
+     // do anything.
+     //
+     // Similarly, if the output is scaled, we zero-initialized all
+     // |fScaledHeight| rows (the scaled image height), so we inform the caller
+     // that it doesn't need to do anything.
+     if (rowsDecoded) {
+         *rowsDecoded = fScaledHeight;
+     }
+ 
+     // If the frame's dirty rect is empty, no need to swizzle.
++    wuffs_base__rect_ie_u32 dirty_rect = fDecoder->frame_dirty_rect();
+     if (!dirty_rect.is_empty()) {
+         std::unique_ptr<uint8_t[]> tmpBuffer;
+         if (!independent) {
+             tmpBuffer.reset(new uint8_t[dstInfo().minRowBytes()]);
+         }
+         wuffs_base__table_u8 pixels = fPixelBuffer.plane(0);
+         const int            sampleY = fSwizzler->sampleY();
+         for (uint32_t y = dirty_rect.min_incl_y; y < dirty_rect.max_excl_y; y++) {
+             int dstY = y;
+             if (sampleY != 1) {
+                 if (!fSwizzler->rowNeeded(y)) {
+                     continue;
+                 }
+                 dstY /= sampleY;
+                 if (dstY >= fScaledHeight) {
+                     break;
+                 }
+             }
+ 
+             // We don't adjust d by (frame_rect.min_incl_x * dst_bpp) as we
+             // have already accounted for that in swizzleRect, above.
+             uint8_t* d = fIncrDecDst + (dstY * fIncrDecRowBytes);
+ 
+             // The Wuffs model is that the dst buffer is the image, not the frame.
+             // The expectation is that you allocate the buffer once, but re-use it
+             // for the N frames, regardless of each frame's top-left co-ordinate.
+             //
+             // To get from the start (in the X-direction) of the image to the start
+             // of the frame, we adjust s by (frame_rect.min_incl_x *
+             // src_bytes_per_pixel).
+             //
+             // We adjust (in the X-direction) by the frame rect, not the dirty
+             // rect, because the swizzler (which operates on rows) was
+             // configured with the frame rect's X range.
+             uint8_t* s =
+                 pixels.ptr + (y * pixels.stride) + (frame_rect.min_incl_x * src_bytes_per_pixel);
+             if (independent) {
+                 fSwizzler->swizzle(d, s);
+             } else {
+                 SkASSERT(tmpBuffer.get());
+                 fSwizzler->swizzle(tmpBuffer.get(), s);
+                 d = SkTAddOffset<uint8_t>(d, fSwizzler->swizzleOffsetBytes());
+                 const auto* swizzled = SkTAddOffset<uint32_t>(tmpBuffer.get(),
+                                                               fSwizzler->swizzleOffsetBytes());
+                 blend(reinterpret_cast<uint32_t*>(d), swizzled, fSwizzler->swizzleWidth());
+             }
+         }
+     }
+ 
+     if (result == SkCodec::kSuccess) {
+         fSpySampler.reset();
+         fIncrDecDst = nullptr;
+         fIncrDecRowBytes = 0;
+         fSwizzler = nullptr;
+     } else {
+         // Make fSpySampler return whatever fSwizzler would have for fillWidth.
+         fSpySampler.fFillWidth = fSwizzler->fillWidth();
+     }
+     return result;
+ }

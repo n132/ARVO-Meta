@@ -1,0 +1,212 @@
+commit 80bd452152ec39b7d88bded3d9090fb20b1ba12f
+Author: Vishnu Teja Manyam <vishnu.teja@ittiam.com>
+Date:   Wed Apr 21 10:59:45 2021 +0530
+
+    Fix fuzz issues relevant to cdef_row_mt
+    
+    This CL fixes the cdef_row_mt structure memory allocation
+    if frame height is modified at run time. In such cases, the
+    structure is freed and reallocated for modified frame height.
+    
+    BUG=aomedia:3031
+    BUG=oss-fuzz:33470
+    BUG=oss-fuzz:33480
+    BUG=oss-fuzz:33505
+    
+    Change-Id: I434263cb44402d540c3c10ed7dc3c4c471365eae
+
+diff --git a/av1/common/alloccommon.c b/av1/common/alloccommon.c
+index 30ef7e3291..5c91efc624 100644
+--- a/av1/common/alloccommon.c
++++ b/av1/common/alloccommon.c
+@@ -62,44 +62,46 @@ static INLINE void free_cdef_bufs(uint16_t **colbuf, uint16_t **srcbuf) {
+   }
+ }
+ 
++static INLINE void free_cdef_row_sync(AV1CdefRowSync **cdef_row_mt,
++                                      const int num_mi_rows) {
++  if (*cdef_row_mt == NULL) return;
++#if CONFIG_MULTITHREAD
++  for (int row_idx = 0; row_idx < num_mi_rows; row_idx++) {
++    pthread_mutex_destroy((*cdef_row_mt)[row_idx].row_mutex_);
++    pthread_cond_destroy((*cdef_row_mt)[row_idx].row_cond_);
++    aom_free((*cdef_row_mt)[row_idx].row_mutex_);
++    aom_free((*cdef_row_mt)[row_idx].row_cond_);
++  }
++#else
++  (void)num_mi_rows;
++#endif  // CONFIG_MULTITHREAD
++  aom_free(*cdef_row_mt);
++  *cdef_row_mt = NULL;
++}
++
+ void av1_free_cdef_buffers(AV1_COMMON *const cm,
+                            AV1CdefWorkerData **cdef_worker,
+                            AV1CdefSync *cdef_sync, int num_workers) {
+   CdefInfo *cdef_info = &cm->cdef_info;
+   const int num_mi_rows = cdef_info->allocated_mi_rows;
+-  AV1CdefRowSync **cdef_row_mt = &cdef_sync->cdef_row_mt;
+ 
+   for (int plane = 0; plane < MAX_MB_PLANE; plane++) {
+     aom_free(cdef_info->linebuf[plane]);
+     cdef_info->linebuf[plane] = NULL;
+   }
+   // De-allocation of column buffer & source buffer (worker_0).
+   free_cdef_bufs(cdef_info->colbuf, &cdef_info->srcbuf);
+ 
+   if (num_workers < 2) return;
+   if (*cdef_worker != NULL) {
+     for (int idx = num_workers - 1; idx >= 1; idx--) {
+       // De-allocation of column buffer & source buffer for remaining workers.
+       free_cdef_bufs((*cdef_worker)[idx].colbuf, &(*cdef_worker)[idx].srcbuf);
+     }
+     aom_free(*cdef_worker);
+     *cdef_worker = NULL;
+   }
+-
+-  if (*cdef_row_mt != NULL) {
+-#if CONFIG_MULTITHREAD
+-    for (int row_idx = 0; row_idx < num_mi_rows; row_idx++) {
+-      pthread_mutex_destroy((*cdef_row_mt)[row_idx].row_mutex_);
+-      pthread_cond_destroy((*cdef_row_mt)[row_idx].row_cond_);
+-      aom_free((*cdef_row_mt)[row_idx].row_mutex_);
+-      aom_free((*cdef_row_mt)[row_idx].row_cond_);
+-    }
+-#else
+-    (void)num_mi_rows;
+-#endif  // CONFIG_MULTITHREAD
+-    aom_free(*cdef_row_mt);
+-    *cdef_row_mt = NULL;
+-  }
++  free_cdef_row_sync(&cdef_sync->cdef_row_mt, num_mi_rows);
+ }
+ 
+ static INLINE void alloc_cdef_bufs(AV1_COMMON *const cm, uint16_t **colbuf,
+@@ -120,99 +122,108 @@ static INLINE void alloc_cdef_bufs(AV1_COMMON *const cm, uint16_t **colbuf,
+   }
+ }
+ 
++static INLINE void alloc_cdef_row_sync(AV1_COMMON *const cm,
++                                       AV1CdefRowSync **cdef_row_mt,
++                                       const int num_mi_rows) {
++  if (*cdef_row_mt != NULL) return;
++
++  CHECK_MEM_ERROR(cm, *cdef_row_mt,
++                  aom_malloc(sizeof(**cdef_row_mt) * num_mi_rows));
++#if CONFIG_MULTITHREAD
++  for (int row_idx = 0; row_idx < num_mi_rows; row_idx++) {
++    CHECK_MEM_ERROR(cm, (*cdef_row_mt)[row_idx].row_mutex_,
++                    aom_malloc(sizeof(*(*cdef_row_mt)[row_idx].row_mutex_)));
++    pthread_mutex_init((*cdef_row_mt)[row_idx].row_mutex_, NULL);
++
++    CHECK_MEM_ERROR(cm, (*cdef_row_mt)[row_idx].row_cond_,
++                    aom_malloc(sizeof(*(*cdef_row_mt)[row_idx].row_cond_)));
++    pthread_cond_init((*cdef_row_mt)[row_idx].row_cond_, NULL);
++
++    (*cdef_row_mt)[row_idx].is_row_done = 0;
++  }
++#endif  // CONFIG_MULTITHREAD
++}
++
+ void av1_alloc_cdef_buffers(AV1_COMMON *const cm,
+                             AV1CdefWorkerData **cdef_worker,
+                             AV1CdefSync *cdef_sync, int num_workers) {
+   const int num_planes = av1_num_planes(cm);
+   const int luma_stride =
+       ALIGN_POWER_OF_TWO(cm->mi_params.mi_cols << MI_SIZE_LOG2, 4);
+   CdefInfo *cdef_info = &cm->cdef_info;
+-  AV1CdefRowSync **cdef_row_mt = &cdef_sync->cdef_row_mt;
+   // Check for configuration change
+   const int is_sub_sampling_changed =
+       (cdef_info->allocated_subsampling_x != cm->seq_params.subsampling_x ||
+        cdef_info->allocated_subsampling_y != cm->seq_params.subsampling_y);
+   const int is_frame_scaled =
+       cdef_info->allocated_mi_cols != cm->mi_params.mi_cols;
+   const int is_cdef_flag_changed =
+       cdef_info->prev_cdef_enable_flag != cm->seq_params.enable_cdef;
+   const int is_large_scale_tile_changed =
+       cdef_info->prev_large_scale_tile_flag != cm->tiles.large_scale;
+   const int is_num_planes_changed = cdef_info->prev_num_planes != num_planes;
+   const int num_mi_rows =
+       (cm->mi_params.mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;
+   const int is_num_workers_changed =
+       cdef_info->allocated_num_workers != num_workers;
+   // num-bufs=3 represents ping-pong buffers for top linebuf,
+   // followed by bottom linebuf.
+   // ping-pong is to avoid top linebuf over-write by consecutive row.
+   int num_bufs = 3;
+   if (num_workers > 1)
+     num_bufs = (cm->mi_params.mi_rows + MI_SIZE_64X64 - 1) / MI_SIZE_64X64;
+ 
+   // TODO(vishnu): Simplify the below conditional logic based on linebuf_size.
+   if (is_frame_scaled || is_sub_sampling_changed || is_cdef_flag_changed ||
+       is_large_scale_tile_changed || is_num_planes_changed ||
+-      is_num_workers_changed)
++      is_num_workers_changed) {
+     av1_free_cdef_buffers(cm, cdef_worker, cdef_sync,
+                           cdef_info->allocated_num_workers);
++  } else if (cdef_info->allocated_mi_rows != num_mi_rows) {
++    free_cdef_row_sync(&cdef_sync->cdef_row_mt, cdef_info->allocated_mi_rows);
++  }
+ 
+   // Store configuration to check change in configuration
+   cdef_info->allocated_mi_cols = cm->mi_params.mi_cols;
+   cdef_info->allocated_mi_rows = num_mi_rows;
+   cdef_info->allocated_subsampling_x = cm->seq_params.subsampling_x;
+   cdef_info->allocated_subsampling_y = cm->seq_params.subsampling_y;
+   cdef_info->prev_cdef_enable_flag = cm->seq_params.enable_cdef;
+   cdef_info->prev_large_scale_tile_flag = cm->tiles.large_scale;
+   cdef_info->prev_num_planes = num_planes;
+   cdef_info->allocated_num_workers = num_workers;
+ 
+   if (!cm->seq_params.enable_cdef && cm->tiles.large_scale) return;
+ 
+   for (int plane = 0; plane < num_planes; plane++) {
+     if (cdef_info->linebuf[plane] == NULL) {
+       const int stride =
+           luma_stride >>
+           (plane == AOM_PLANE_Y ? 0 : cm->seq_params.subsampling_x);
+       CHECK_MEM_ERROR(cm, cdef_info->linebuf[plane],
+                       aom_malloc(sizeof(*cdef_info->linebuf) * num_bufs *
+                                  (CDEF_VBORDER << 1) * stride));
+     }
+   }
+ 
+   // Memory allocation of column buffer & source buffer (worker_0).
+   alloc_cdef_bufs(cm, cdef_info->colbuf, &cdef_info->srcbuf, num_planes);
+ 
+   if (num_workers < 2) return;
+ 
+   if (*cdef_worker == NULL)
+     CHECK_MEM_ERROR(cm, *cdef_worker,
+                     aom_calloc(num_workers, sizeof(**cdef_worker)));
+ 
+   for (int idx = num_workers - 1; idx >= 1; idx--) {
+     // Memory allocation of column buffer & source buffer for remaining workers.
+     alloc_cdef_bufs(cm, (*cdef_worker)[idx].colbuf, &(*cdef_worker)[idx].srcbuf,
+                     num_planes);
+   }
+ 
+-  if (*cdef_row_mt == NULL) {
+-    CHECK_MEM_ERROR(cm, *cdef_row_mt,
+-                    aom_malloc(sizeof(**cdef_row_mt) * num_mi_rows));
+-#if CONFIG_MULTITHREAD
+-    for (int row_idx = 0; row_idx < num_mi_rows; row_idx++) {
+-      CHECK_MEM_ERROR(cm, (*cdef_row_mt)[row_idx].row_mutex_,
+-                      aom_malloc(sizeof(*(*cdef_row_mt)[row_idx].row_mutex_)));
+-      pthread_mutex_init((*cdef_row_mt)[row_idx].row_mutex_, NULL);
+-
+-      CHECK_MEM_ERROR(cm, (*cdef_row_mt)[row_idx].row_cond_,
+-                      aom_malloc(sizeof(*(*cdef_row_mt)[row_idx].row_cond_)));
+-      pthread_cond_init((*cdef_row_mt)[row_idx].row_cond_, NULL);
+-
+-      (*cdef_row_mt)[row_idx].is_row_done = 0;
+-    }
+-#endif  // CONFIG_MULTITHREAD
+-  }
++  alloc_cdef_row_sync(cm, &cdef_sync->cdef_row_mt,
++                      cdef_info->allocated_mi_rows);
+ }
+ 
+ #if !CONFIG_REALTIME_ONLY
+ // Assumes cm->rst_info[p].restoration_unit_size is already initialized

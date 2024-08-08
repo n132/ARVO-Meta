@@ -1,0 +1,168 @@
+commit 2caecd2a430fc83f2227ef3e0b1cc70b560198ff
+Author: Brian Osman <brianosman@google.com>
+Date:   Wed Sep 25 14:02:26 2019 -0400
+
+    In AAConvexPathRenderer, don't assume that path direction can be computed
+    
+    With a perspective view matrix, we transform the path, which can
+    collapse it down and cause CheapComputeFirstDirection to fail. In that
+    case, just skip drawing the path, rather than asserting.
+    
+    Change-Id: I59ee3c74d02d41913136626a653c64f825a9d56a
+    Bug: https://bugs.fuchsia.dev/p/fuchsia/issues/detail?id=37330
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/244298
+    Reviewed-by: Robert Phillips <robertphillips@google.com>
+    Commit-Queue: Brian Osman <brianosman@google.com>
+
+diff --git a/src/gpu/ops/GrAAConvexPathRenderer.cpp b/src/gpu/ops/GrAAConvexPathRenderer.cpp
+index 4aa860f218..59a087145e 100644
+--- a/src/gpu/ops/GrAAConvexPathRenderer.cpp
++++ b/src/gpu/ops/GrAAConvexPathRenderer.cpp
+@@ -219,21 +219,25 @@ static void update_degenerate_test(DegenerateTestData* data, const SkPoint& pt)
+     }
+ }
+ 
+-static inline SkPathPriv::FirstDirection get_direction(const SkPath& path, const SkMatrix& m) {
++static inline bool get_direction(const SkPath& path, const SkMatrix& m,
++                                 SkPathPriv::FirstDirection* dir) {
+     // At this point, we've already returned true from canDraw(), which checked that the path's
+     // direction could be determined, so this should just be fetching the cached direction.
+-    SkPathPriv::FirstDirection dir;
+-    SkAssertResult(SkPathPriv::CheapComputeFirstDirection(path, &dir));
++    // However, if perspective is involved, we're operating on a transformed path, which may no
++    // longer have a computable direction.
++    if (!SkPathPriv::CheapComputeFirstDirection(path, dir)) {
++        return false;
++    }
+ 
+     // check whether m reverses the orientation
+     SkASSERT(!m.hasPerspective());
+     SkScalar det2x2 = m.get(SkMatrix::kMScaleX) * m.get(SkMatrix::kMScaleY) -
+                       m.get(SkMatrix::kMSkewX)  * m.get(SkMatrix::kMSkewY);
+     if (det2x2 < 0) {
+-        dir = SkPathPriv::OppositeFirstDirection(dir);
++        *dir = SkPathPriv::OppositeFirstDirection(*dir);
+     }
+ 
+-    return dir;
++    return true;
+ }
+ 
+ static inline void add_line_to_segment(const SkPoint& pt,
+@@ -271,76 +275,79 @@ static inline void add_cubic_segments(const SkPoint pts[4],
+ static bool get_segments(const SkPath& path,
+                          const SkMatrix& m,
+                          SegmentArray* segments,
+                          SkPoint* fanPt,
+                          int* vCount,
+                          int* iCount) {
+     SkPath::Iter iter(path, true);
+     // This renderer over-emphasizes very thin path regions. We use the distance
+     // to the path from the sample to compute coverage. Every pixel intersected
+     // by the path will be hit and the maximum distance is sqrt(2)/2. We don't
+     // notice that the sample may be close to a very thin area of the path and
+     // thus should be very light. This is particularly egregious for degenerate
+     // line paths. We detect paths that are very close to a line (zero area) and
+     // draw nothing.
+     DegenerateTestData degenerateData;
+-    SkPathPriv::FirstDirection dir = get_direction(path, m);
++    SkPathPriv::FirstDirection dir;
++    if (!get_direction(path, m, &dir)) {
++        return false;
++    }
+ 
+     for (;;) {
+         SkPoint pts[4];
+         SkPath::Verb verb = iter.next(pts);
+         switch (verb) {
+             case SkPath::kMove_Verb:
+                 m.mapPoints(pts, 1);
+                 update_degenerate_test(&degenerateData, pts[0]);
+                 break;
+             case SkPath::kLine_Verb: {
+                 if (!SkPathPriv::AllPointsEq(pts, 2)) {
+                     m.mapPoints(&pts[1], 1);
+                     update_degenerate_test(&degenerateData, pts[1]);
+                     add_line_to_segment(pts[1], segments);
+                 }
+                 break;
+             }
+             case SkPath::kQuad_Verb:
+                 if (!SkPathPriv::AllPointsEq(pts, 3)) {
+                     m.mapPoints(pts, 3);
+                     update_degenerate_test(&degenerateData, pts[1]);
+                     update_degenerate_test(&degenerateData, pts[2]);
+                     add_quad_segment(pts, segments);
+                 }
+                 break;
+             case SkPath::kConic_Verb: {
+                 if (!SkPathPriv::AllPointsEq(pts, 3)) {
+                     m.mapPoints(pts, 3);
+                     SkScalar weight = iter.conicWeight();
+                     SkAutoConicToQuads converter;
+                     const SkPoint* quadPts = converter.computeQuads(pts, weight, 0.25f);
+                     for (int i = 0; i < converter.countQuads(); ++i) {
+                         update_degenerate_test(&degenerateData, quadPts[2*i + 1]);
+                         update_degenerate_test(&degenerateData, quadPts[2*i + 2]);
+                         add_quad_segment(quadPts + 2*i, segments);
+                     }
+                 }
+                 break;
+             }
+             case SkPath::kCubic_Verb: {
+                 if (!SkPathPriv::AllPointsEq(pts, 4)) {
+                     m.mapPoints(pts, 4);
+                     update_degenerate_test(&degenerateData, pts[1]);
+                     update_degenerate_test(&degenerateData, pts[2]);
+                     update_degenerate_test(&degenerateData, pts[3]);
+                     add_cubic_segments(pts, dir, segments);
+                 }
+                 break;
+             }
+             case SkPath::kDone_Verb:
+                 if (degenerateData.isDegenerate()) {
+                     return false;
+                 } else {
+                     return compute_vectors(segments, fanPt, dir, vCount, iCount);
+                 }
+             default:
+                 break;
+         }
+     }
+ }
+diff --git a/tests/GpuDrawPathTest.cpp b/tests/GpuDrawPathTest.cpp
+index d650d84c5b..22fecd7a58 100644
+--- a/tests/GpuDrawPathTest.cpp
++++ b/tests/GpuDrawPathTest.cpp
+@@ -89,6 +89,31 @@ DEF_GPUTEST_FOR_ALL_GL_CONTEXTS(GpuDrawPath, reporter, ctxInfo) {
+     }
+ }
+ 
++DEF_GPUTEST_FOR_ALL_CONTEXTS(GrDrawCollapsedPath, reporter, ctxInfo) {
++    // From https://bugs.fuchsia.dev/p/fuchsia/issues/detail?id=37330, it's possible for a convex
++    // path to be accepted by AAConvexPathRenderer, then be transformed to something without a
++    // computable first direction by a perspective matrix.
++    SkImageInfo info = SkImageInfo::MakeN32Premul(100, 100);
++    auto surface(SkSurface::MakeRenderTarget(ctxInfo.grContext(), SkBudgeted::kNo, info));
++
++    SkPaint paint;
++    paint.setAntiAlias(true);
++
++    SkPath path;
++    path.moveTo(0, 0);
++    path.lineTo(50, 0);
++    path.lineTo(0, 50);
++    path.close();
++
++    SkMatrix m;
++    m.setAll( 0.966006875f   , -0.125156224f  , 72.0899811f,
++             -0.00885376986f , -0.112347461f  , 64.7121124f,
++             -8.94321693e-06f, -0.00173384184f, 0.998692870f);
++    surface->getCanvas()->setMatrix(m);
++    surface->getCanvas()->drawPath(path, paint);
++    surface->flush();
++}
++
+ DEF_GPUTEST(GrPathKeys, reporter, /* options */) {
+     SkPaint strokePaint;
+     strokePaint.setStyle(SkPaint::kStroke_Style);

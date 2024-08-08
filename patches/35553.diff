@@ -1,0 +1,499 @@
+commit 9af91692416d01814f4b2ac22e39d3b57993af4f
+Author: James Carter <jwcart2@gmail.com>
+Date:   Wed Jun 30 15:12:16 2021 -0400
+
+    libsepol/cil: Improve checking for bad inheritance patterns
+    
+    commits 37863b0b1444c85a1ddc6c333c8bfea0c678c592 (libsepol/cil:
+    Improve degenerate inheritance check) and
+    74d00a8decebf940d95064ff60042dcb2cbcc2c0 (libsepol/cil: Detect
+    degenerate inheritance and exit with an error) attempted to detect
+    and exit with an error when compiling policies that have degenerate
+    inheritances. These policies result in the exponential growth of memory
+    usage while copying the blocks that are inherited.
+    
+    There were two problems with the previous attempts to detect this
+    bad inheritance problem. The first is that the quick check using
+    cil_possible_degenerate_inheritance() did not detect all patterns
+    of degenerate inheritance. The second problem is that the detection
+    of inheritance loops during the CIL_PASS_BLKIN_LINK pass did not
+    detect all inheritance loops which made it possible for the full
+    degenerate inheritance checking done with
+    cil_check_for_degenerate_inheritance() to have a stack overflow
+    when encountering the inheritance loops. Both the degenerate and
+    loop inheritance checks need to be done at the same time and done
+    after the CIL_PASS_BLKIN_LINK pass. Otherwise, if loops are being
+    detected first, then a degenerate policy can cause the consumption
+    of all system memory and if degenerate policy is being detected
+    first, then an inheritance loop can cause a stack overflow.
+    
+    With the new approach, the quick check is eliminated and the full
+    check is always done after the CIL_PASS_BLKIN_LINK pass. Because
+    of this the "inheritance_check" field in struct cil_resolve_args
+    is not needed and removed and the functions
+    cil_print_recursive_blockinherit(), cil_check_recursive_blockinherit(),
+    and cil_possible_degenerate_inheritance() have been deleted. The
+    function cil_count_potential() is renamed cil_check_inheritances()
+    and has checks for both degenerate inheritance and inheritance loops.
+    The inheritance checking is improved and uses an approach similar
+    to commit c28525a26fa145cb5fd911fd2a3b9125a275677f (libsepol/cil:
+    Properly check for loops in sets).
+    
+    As has been the case with these degenerate inheritance patches,
+    these issues were discovered by the secilc-fuzzer.
+    
+    Signed-off-by: James Carter <jwcart2@gmail.com>
+
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 9a02e386..145d4e74 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -51,20 +51,19 @@
+ struct cil_args_resolve {
+ 	struct cil_db *db;
+ 	enum cil_pass pass;
+ 	uint32_t *changed;
+ 	struct cil_list *to_destroy;
+ 	struct cil_tree_node *block;
+ 	struct cil_tree_node *macro;
+ 	struct cil_tree_node *optional;
+ 	struct cil_tree_node *boolif;
+ 	struct cil_list *sidorder_lists;
+ 	struct cil_list *classorder_lists;
+ 	struct cil_list *unordered_classorder_lists;
+ 	struct cil_list *catorder_lists;
+ 	struct cil_list *sensitivityorder_lists;
+ 	struct cil_list *in_list;
+ 	struct cil_stack *disabled_optionals;
+-	int *inheritance_check;
+ };
+ 
+ static struct cil_name * __cil_insert_name(struct cil_db *db, hashtab_key_t key, struct cil_tree_node *ast_node)
+@@ -2309,134 +2308,33 @@ exit:
+ 	return rc;
+ }
+ 
+-static void cil_print_recursive_blockinherit(struct cil_tree_node *bi_node, struct cil_tree_node *terminating_node)
+-{
+-	struct cil_list *trace = NULL;
+-	struct cil_list_item *item = NULL;
+-	struct cil_tree_node *curr = NULL;
+-
+-	cil_list_init(&trace, CIL_NODE);
+-
+-	for (curr = bi_node; curr != terminating_node; curr = curr->parent) {
+-		if (curr->flavor == CIL_BLOCK) {
+-			cil_list_prepend(trace, CIL_NODE, curr);
+-		} else if (curr->flavor == CIL_BLOCKINHERIT) {
+-			if (curr != bi_node) {
+-				cil_list_prepend(trace, CIL_NODE, NODE(((struct cil_blockinherit *)curr->data)->block));
+-			}
+-			cil_list_prepend(trace, CIL_NODE, curr);
+-		} else {
+-			cil_list_prepend(trace, CIL_NODE, curr);
+-		}
+-	}
+-	cil_list_prepend(trace, CIL_NODE, terminating_node);
+-
+-	cil_list_for_each(item, trace) {
+-		curr = item->data;
+-		if (curr->flavor == CIL_BLOCK) {
+-			cil_tree_log(curr, CIL_ERR, "block %s", DATUM(curr->data)->name);
+-		} else if (curr->flavor == CIL_BLOCKINHERIT) {
+-			cil_tree_log(curr, CIL_ERR, "blockinherit %s", ((struct cil_blockinherit *)curr->data)->block_str);
+-		} else if (curr->flavor == CIL_OPTIONAL) {
+-			cil_tree_log(curr, CIL_ERR, "optional %s", DATUM(curr->data)->name);
+-		} else {
+-			cil_tree_log(curr, CIL_ERR, "%s", cil_node_to_string(curr));
+-		}
+-	}
+-
+-	cil_list_destroy(&trace, CIL_FALSE);
+-}
+-
+-static int cil_check_recursive_blockinherit(struct cil_tree_node *bi_node)
+-{
+-	struct cil_tree_node *curr = NULL;
+-	struct cil_blockinherit *bi = NULL;
+-	struct cil_block *block = NULL;
+-	int rc = SEPOL_ERR;
+-
+-	bi = bi_node->data;
+-
+-	for (curr = bi_node->parent; curr != NULL; curr = curr->parent) {
+-		if (curr->flavor != CIL_BLOCK) {
+-			continue;
+-		}
+-
+-		block = curr->data;
+-
+-		if (block != bi->block) {
+-			continue;
+-		}
+-
+-		cil_log(CIL_ERR, "Recursive blockinherit found:\n");
+-		cil_print_recursive_blockinherit(bi_node, curr);
+-
+-		rc = SEPOL_ERR;
+-		goto exit;
+-	}
+-
+-	rc = SEPOL_OK;
+-
+-exit:
+-	return rc;
+-}
+-
+-static int cil_possible_degenerate_inheritance(struct cil_tree_node *node)
+-{
+-	unsigned depth = 1;
+-
+-	node = node->parent;
+-	while (node && node->flavor != CIL_ROOT) {
+-		if (node->flavor == CIL_BLOCK) {
+-			if (((struct cil_block *)(node->data))->bi_nodes != NULL) {
+-				depth++;
+-				if (depth >= CIL_DEGENERATE_INHERITANCE_DEPTH) {
+-					return CIL_TRUE;
+-				}
+-			}
+-		}
+-		node = node->parent;
+-	}
+-
+-	return CIL_FALSE;
+-}
+-
+ int cil_resolve_blockinherit_link(struct cil_tree_node *current, void *extra_args)
+ {
+-	struct cil_args_resolve *args = extra_args;
+ 	struct cil_blockinherit *inherit = current->data;
+ 	struct cil_symtab_datum *block_datum = NULL;
+ 	struct cil_tree_node *node = NULL;
+ 	int rc = SEPOL_ERR;
+ 
+ 	rc = cil_resolve_name(current, inherit->block_str, CIL_SYM_BLOCKS, extra_args, &block_datum);
+ 	if (rc != SEPOL_OK) {
+ 		goto exit;
+ 	}
+ 
+ 	node = NODE(block_datum);
+ 
+ 	if (node->flavor != CIL_BLOCK) {
+ 		cil_log(CIL_ERR, "%s is not a block\n", cil_node_to_string(node));
+ 		rc = SEPOL_ERR;
+ 		goto exit;
+ 	}
+ 
+ 	inherit->block = (struct cil_block *)block_datum;
+ 
+-	rc = cil_check_recursive_blockinherit(current);
+-	if (rc != SEPOL_OK) {
+-			goto exit;
+-	}
+-
+ 	if (inherit->block->bi_nodes == NULL) {
+ 		cil_list_init(&inherit->block->bi_nodes, CIL_NODE);
+ 	}
+ 	cil_list_append(inherit->block->bi_nodes, CIL_NODE, current);
+ 
+-	if (*(args->inheritance_check) == CIL_FALSE) {
+-		*(args->inheritance_check) = cil_possible_degenerate_inheritance(node);
+-	}
+-
+ 	return SEPOL_OK;
+ 
+ exit:
+@@ -2446,36 +2344,31 @@ exit:
+ int cil_resolve_blockinherit_copy(struct cil_tree_node *current, void *extra_args)
+ {
+ 	struct cil_block *block = current->data;
+ 	struct cil_args_resolve *args = extra_args;
+ 	struct cil_db *db = NULL;
+ 	struct cil_list_item *item = NULL;
+ 	int rc = SEPOL_ERR;
+ 
+ 	// This block is not inherited
+ 	if (block->bi_nodes == NULL) {
+ 		rc = SEPOL_OK;
+ 		goto exit;
+ 	}
+ 
+ 	db = args->db;
+ 
+ 	// Make sure this is the original block and not a merged block from a blockinherit
+ 	if (current != block->datum.nodes->head->data) {
+ 		rc = SEPOL_OK;
+ 		goto exit;
+ 	}
+ 
+ 	cil_list_for_each(item, block->bi_nodes) {
+-		rc = cil_check_recursive_blockinherit(item->data);
+-		if (rc != SEPOL_OK) {
+-			goto exit;
+-		}
+-
+ 		rc = cil_copy_ast(db, current, item->data);
+ 		if (rc != SEPOL_OK) {
+ 			cil_log(CIL_ERR, "Failed to copy block contents into blockinherit\n");
+ 			goto exit;
+ 		}
+ 	}
+ 
+ 	return SEPOL_OK;
+@@ -3611,49 +3504,71 @@ static unsigned cil_count_actual(struct cil_tree_node *node)
+ 	return count;
+ }
+ 
+-static unsigned cil_count_potential(struct cil_tree_node *node, unsigned max)
++static int cil_check_inheritances(struct cil_tree_node *node, unsigned max, unsigned *count, struct cil_stack *stack, unsigned *loop)
+ {
+-	unsigned count = 0;
++	int rc;
+ 
+ 	if (node->flavor == CIL_BLOCKINHERIT) {
+ 		struct cil_blockinherit *bi = node->data;
+-		count += 1;
++		*count += 1;
++		if (*count > max) {
++			cil_tree_log(node, CIL_ERR, "Degenerate inheritance detected");
++			return SEPOL_ERR;
++		}
+ 		if (bi->block) {
+-			count += cil_count_potential(NODE(bi->block), max);
+-			if (count > max) {
+-				return count;
++			struct cil_tree_node *block_node = NODE(bi->block);
++			struct cil_stack_item *item;
++			int i = 0;
++			cil_stack_for_each(stack, i, item) {
++				if (block_node == (struct cil_tree_node *)item->data) {
++					*loop = CIL_TRUE;
++					cil_tree_log(block_node, CIL_ERR, "Block inheritance loop found");
++					cil_tree_log(node, CIL_ERR, "  blockinherit");
++					return SEPOL_ERR;
++				}
++			}
++			cil_stack_push(stack, CIL_BLOCK, block_node);
++			rc = cil_check_inheritances(block_node, max, count, stack, loop);
++			cil_stack_pop(stack);
++			if (rc != SEPOL_OK) {
++				if (*loop == CIL_TRUE) {
++					cil_tree_log(node, CIL_ERR, "  blockinherit");
++				}
++				return SEPOL_ERR;
+ 			}
+ 		}
+ 	}
+ 
+ 	for (node = node->cl_head; node; node = node->next) {
+-		count += cil_count_potential(node, max);
+-		if (count > max) {
+-			return count;
++		rc = cil_check_inheritances(node, max, count, stack, loop);
++		if (rc != SEPOL_OK) {
++			return SEPOL_ERR;
+ 		}
+ 	}
+ 
+-	return count;
++	return SEPOL_OK;
+ }
+ 
+-static int cil_check_for_degenerate_inheritance(struct cil_tree_node *node)
++static int cil_check_for_bad_inheritance(struct cil_tree_node *node)
+ {
+-	uint64_t num_actual, num_potential, max;
++	unsigned num_actual, max;
++	unsigned num_potential = 0;
++	unsigned loop = CIL_FALSE;
++	struct cil_stack *stack;
++	int rc;
+ 
+ 	num_actual = cil_count_actual(node);
+ 
+ 	max = num_actual * CIL_DEGENERATE_INHERITANCE_GROWTH;
+ 	if (max < CIL_DEGENERATE_INHERITANCE_MINIMUM) {
+ 		max = CIL_DEGENERATE_INHERITANCE_MINIMUM;
+ 	}
+ 
+-	num_potential = cil_count_potential(node, max);
++	cil_stack_init(&stack);
++	rc = cil_check_inheritances(node, max, &num_potential, stack, &loop);
++	cil_stack_destroy(&stack);
+ 
+-	if (num_potential > max) {
+-		return SEPOL_ERR;
+-	}
+-
+-	return SEPOL_OK;
++	return rc;
+ }
+ 
+ int __cil_resolve_ast_node(struct cil_tree_node *node, void *extra_args)
+@@ -4124,163 +4039,160 @@ exit:
+ int cil_resolve_ast(struct cil_db *db, struct cil_tree_node *current)
+ {
+ 	int rc = SEPOL_ERR;
+ 	struct cil_args_resolve extra_args;
+ 	enum cil_pass pass = CIL_PASS_TIF;
+ 	uint32_t changed = 0;
+-	int inheritance_check = 0;
+ 
+ 	if (db == NULL || current == NULL) {
+ 		return rc;
+ 	}
+ 
+ 	extra_args.db = db;
+ 	extra_args.pass = pass;
+ 	extra_args.changed = &changed;
+ 	extra_args.block = NULL;
+ 	extra_args.macro = NULL;
+ 	extra_args.optional = NULL;
+ 	extra_args.boolif= NULL;
+ 	extra_args.sidorder_lists = NULL;
+ 	extra_args.classorder_lists = NULL;
+ 	extra_args.unordered_classorder_lists = NULL;
+ 	extra_args.catorder_lists = NULL;
+ 	extra_args.sensitivityorder_lists = NULL;
+ 	extra_args.in_list = NULL;
+ 	extra_args.disabled_optionals = NULL;
+-	extra_args.inheritance_check = &inheritance_check;
+ 
+ 	cil_list_init(&extra_args.to_destroy, CIL_NODE);
+ 	cil_list_init(&extra_args.sidorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.classorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.unordered_classorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.catorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.sensitivityorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.in_list, CIL_IN);
+ 	cil_stack_init(&extra_args.disabled_optionals);
+ 
+ 	for (pass = CIL_PASS_TIF; pass < CIL_PASS_NUM; pass++) {
+ 		extra_args.pass = pass;
+ 		rc = cil_tree_walk(current, __cil_resolve_ast_node_helper, __cil_resolve_ast_first_child_helper, __cil_resolve_ast_last_child_helper, &extra_args);
+ 		if (rc != SEPOL_OK) {
+ 			cil_log(CIL_INFO, "Pass %i of resolution failed\n", pass);
+ 			goto exit;
+ 		}
+ 
+ 		if (pass == CIL_PASS_IN) {
+ 			rc = cil_resolve_in_list(&extra_args);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 			cil_list_destroy(&extra_args.in_list, CIL_FALSE);
+ 		}
+ 
+-		if (pass == CIL_PASS_BLKIN_LINK && inheritance_check == CIL_TRUE) {
+-			rc = cil_check_for_degenerate_inheritance(current);
++		if (pass == CIL_PASS_BLKIN_LINK) {
++			rc = cil_check_for_bad_inheritance(current);
+ 			if (rc != SEPOL_OK) {
+-				cil_log(CIL_ERR, "Degenerate inheritance detected\n");
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 		}
+ 
+ 		if (pass == CIL_PASS_MISC1) {
+ 			db->sidorder = __cil_ordered_lists_merge_all(&extra_args.sidorder_lists, NULL);
+ 			if (db->sidorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			db->classorder = __cil_ordered_lists_merge_all(&extra_args.classorder_lists, &extra_args.unordered_classorder_lists);
+ 			if (db->classorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			db->catorder = __cil_ordered_lists_merge_all(&extra_args.catorder_lists, NULL);
+ 			if (db->catorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			cil_set_cat_values(db->catorder, db);
+ 			db->sensitivityorder = __cil_ordered_lists_merge_all(&extra_args.sensitivityorder_lists, NULL);
+ 			if (db->sensitivityorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_SID);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_CLASS);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_CAT);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_SENS);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 		}
+ 
+ 		if (changed) {
+ 			struct cil_list_item *item;
+ 			if (pass > CIL_PASS_CALL1) {
+ 				int has_decls = CIL_FALSE;
+ 
+ 				cil_list_for_each(item, extra_args.to_destroy) {
+ 					has_decls = cil_tree_subtree_has_decl(item->data);
+ 					if (has_decls) {
+ 						break;
+ 					}
+ 				}
+ 
+ 				if (has_decls) {
+ 					/* Need to re-resolve because an optional was disabled that
+ 					 * contained one or more declarations.
+ 					 * Everything that needs to be reset comes after the
+ 					 * CIL_PASS_CALL2 pass. We set pass to CIL_PASS_CALL1 because
+ 					 * the pass++ will increment it to CIL_PASS_CALL2
+ 					 */
+ 					cil_log(CIL_INFO, "Resetting declarations\n");
+ 
+ 					if (pass >= CIL_PASS_MISC1) {
+ 						__cil_ordered_lists_reset(&extra_args.sidorder_lists);
+ 						__cil_ordered_lists_reset(&extra_args.classorder_lists);
+ 						__cil_ordered_lists_reset(&extra_args.unordered_classorder_lists);
+ 						__cil_ordered_lists_reset(&extra_args.catorder_lists);
+ 						__cil_ordered_lists_reset(&extra_args.sensitivityorder_lists);
+ 						cil_list_destroy(&db->sidorder, CIL_FALSE);
+ 						cil_list_destroy(&db->classorder, CIL_FALSE);
+ 						cil_list_destroy(&db->catorder, CIL_FALSE);
+ 						cil_list_destroy(&db->sensitivityorder, CIL_FALSE);
+ 					}
+ 
+ 					pass = CIL_PASS_CALL1;
+ 
+ 					rc = cil_reset_ast(current);
+ 					if (rc != SEPOL_OK) {
+ 						cil_log(CIL_ERR, "Failed to reset declarations\n");
+ 						goto exit;
+ 					}
+ 				}
+ 			}
+ 			cil_list_for_each(item, extra_args.to_destroy) {
+ 				cil_tree_children_destroy(item->data);
+ 			}
+ 			cil_list_destroy(&extra_args.to_destroy, CIL_FALSE);
+ 			cil_list_init(&extra_args.to_destroy, CIL_NODE);
+ 			changed = 0;
+ 		}
+ 	}
+ 
+ 	rc = __cil_verify_initsids(db->sidorder);
+ 	if (rc != SEPOL_OK) {
+ 		goto exit;
+ 	}
+ 
+ 	rc = SEPOL_OK;

@@ -1,0 +1,441 @@
+commit 97ab1bb013b4e20a758e034ca16c34cbe0bc8c43
+Merge: 92a4e30b6 5cf7e1782
+Author: David Garske <david@wolfssl.com>
+Date:   Thu Jun 24 09:28:22 2021 -0700
+
+    Merge pull request #4154 from SparkiDev/hmac_update_ct
+    
+    TLS hmac: handle truncated mac in Hmac_UpdateFinal_CT()
+
+diff --git a/src/internal.c b/src/internal.c
+index 47d5b5014..a0a2e1500 100644
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -15423,31 +15423,31 @@ static byte MaskMac(const byte* data, int sz, int macSz, byte* expMac)
+ /* timing resistant pad/verify check, return 0 on success */
+ int TimingPadVerify(WOLFSSL* ssl, const byte* input, int padLen, int macSz,
+                     int pLen, int content)
+ {
+     byte verify[WC_MAX_DIGEST_SIZE];
+     byte good;
+     int  ret = 0;
+ 
+     good = MaskPadding(input, pLen, macSz);
+     /* 4th argument has potential to underflow, ssl->hmac function should
+      * either increment the size by (macSz + padLen + 1) before use or check on
+      * the size to make sure is valid. */
+     ret = ssl->hmac(ssl, verify, input, pLen - macSz - padLen - 1, padLen,
+-                                                                    content, 1, PEER_ORDER);
++                                                        content, 1, PEER_ORDER);
+     good |= MaskMac(input, pLen, ssl->specs.hash_size, verify);
+ 
+     /* Non-zero on failure. */
+     good = (byte)~(word32)good;
+     good &= good >> 4;
+     good &= good >> 2;
+     good &= good >> 1;
+     /* Make ret negative on masking failure. */
+     ret -= 1 - good;
+ 
+     /* Treat any failure as verify MAC error. */
+     if (ret != 0)
+         ret = VERIFY_MAC_ERROR;
+ 
+     return ret;
+ }
+ #endif
+diff --git a/src/tls.c b/src/tls.c
+index 0986fa24d..4829fd294 100644
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -862,173 +862,169 @@ static int Hmac_OuterHash(Hmac* hmac, unsigned char* mac)
+ /* Calculate the HMAC of the header + message data.
+  * Constant time implementation using wc_Sha*FinalRaw().
+  *
+  * hmac    HMAC object.
+  * digest  MAC result.
+  * in      Message data.
+  * sz      Size of the message data.
+  * header  Constructed record header with length of handshake data.
+  * returns 0 on success, otherwise failure.
+  */
+ static int Hmac_UpdateFinal_CT(Hmac* hmac, byte* digest, const byte* in,
+-                               word32 sz, byte* header)
++                               word32 sz, int macLen, byte* header)
+ {
+     byte         lenBytes[8];
+     int          i, j;
+     unsigned int k;
+     int          blockBits, blockMask;
+-    int          lastBlockLen, macLen, extraLen, eocIndex;
++    int          lastBlockLen, extraLen, eocIndex;
+     int          blocks, safeBlocks, lenBlock, eocBlock;
+     unsigned int maxLen;
+     int          blockSz, padSz;
+     int          ret;
+     word32       realLen;
+     byte         extraBlock;
+ 
+     switch (hmac->macType) {
+     #ifndef NO_SHA
+         case WC_SHA:
+             blockSz = WC_SHA_BLOCK_SIZE;
+             blockBits = 6;
+-            macLen = WC_SHA_DIGEST_SIZE;
+             padSz = WC_SHA_BLOCK_SIZE - WC_SHA_PAD_SIZE + 1;
+             break;
+     #endif /* !NO_SHA */
+ 
+     #ifndef NO_SHA256
+         case WC_SHA256:
+             blockSz = WC_SHA256_BLOCK_SIZE;
+             blockBits = 6;
+-            macLen = WC_SHA256_DIGEST_SIZE;
+             padSz = WC_SHA256_BLOCK_SIZE - WC_SHA256_PAD_SIZE + 1;
+             break;
+     #endif /* !NO_SHA256 */
+ 
+     #ifdef WOLFSSL_SHA384
+         case WC_SHA384:
+             blockSz = WC_SHA384_BLOCK_SIZE;
+             blockBits = 7;
+-            macLen = WC_SHA384_DIGEST_SIZE;
+             padSz = WC_SHA384_BLOCK_SIZE - WC_SHA384_PAD_SIZE + 1;
+             break;
+     #endif /* WOLFSSL_SHA384 */
+ 
+     #ifdef WOLFSSL_SHA512
+         case WC_SHA512:
+             blockSz = WC_SHA512_BLOCK_SIZE;
+             blockBits = 7;
+-            macLen = WC_SHA512_DIGEST_SIZE;
+             padSz = WC_SHA512_BLOCK_SIZE - WC_SHA512_PAD_SIZE + 1;
+             break;
+     #endif /* WOLFSSL_SHA512 */
+ 
+         default:
+             return BAD_FUNC_ARG;
+     }
+     blockMask = blockSz - 1;
+ 
+     /* Size of data to HMAC if padding length byte is zero. */
+     maxLen = WOLFSSL_TLS_HMAC_INNER_SZ + sz - 1 - macLen;
+     /* Complete data (including padding) has block for EOC and/or length. */
+     extraBlock = ctSetLTE((maxLen + padSz) & blockMask, padSz);
+     /* Total number of blocks for data including padding. */
+     blocks = ((maxLen + blockSz - 1) >> blockBits) + extraBlock;
+     /* Up to last 6 blocks can be hashed safely. */
+     safeBlocks = blocks - 6;
+ 
+     /* Length of message data. */
+     realLen = maxLen - in[sz - 1];
+     /* Number of message bytes in last block. */
+     lastBlockLen = realLen & blockMask;
+     /* Number of padding bytes in last block. */
+     extraLen = ((blockSz * 2 - padSz - lastBlockLen) & blockMask) + 1;
+     /* Number of blocks to create for hash. */
+     lenBlock = (realLen + extraLen) >> blockBits;
+     /* Block containing EOC byte. */
+     eocBlock = realLen >> blockBits;
+     /* Index of EOC byte in block. */
+     eocIndex = realLen & blockMask;
+ 
+     /* Add length of hmac's ipad to total length. */
+     realLen += blockSz;
+     /* Length as bits - 8 bytes bigendian. */
+     c32toa(realLen >> ((sizeof(word32) * 8) - 3), lenBytes);
+     c32toa(realLen << 3, lenBytes + sizeof(word32));
+ 
+     ret = Hmac_HashUpdate(hmac, (unsigned char*)hmac->ipad, blockSz);
+     if (ret != 0)
+         return ret;
+ 
+     XMEMSET(hmac->innerHash, 0, macLen);
+ 
+     if (safeBlocks > 0) {
+         ret = Hmac_HashUpdate(hmac, header, WOLFSSL_TLS_HMAC_INNER_SZ);
+         if (ret != 0)
+             return ret;
+         ret = Hmac_HashUpdate(hmac, in, safeBlocks * blockSz -
+                                                      WOLFSSL_TLS_HMAC_INNER_SZ);
+         if (ret != 0)
+             return ret;
+     }
+     else
+         safeBlocks = 0;
+ 
+     XMEMSET(digest, 0, macLen);
+     k = safeBlocks * blockSz;
+     for (i = safeBlocks; i < blocks; i++) {
+         unsigned char hashBlock[WC_MAX_BLOCK_SIZE];
+         unsigned char isEocBlock = ctMaskEq(i, eocBlock);
+         unsigned char isOutBlock = ctMaskEq(i, lenBlock);
+ 
+         for (j = 0; j < blockSz; j++) {
+             unsigned char atEoc = ctMaskEq(j, eocIndex) & isEocBlock;
+             unsigned char pastEoc = ctMaskGT(j, eocIndex) & isEocBlock;
+             unsigned char b = 0;
+ 
+             if (k < WOLFSSL_TLS_HMAC_INNER_SZ)
+                 b = header[k];
+             else if (k < maxLen)
+                 b = in[k - WOLFSSL_TLS_HMAC_INNER_SZ];
+             k++;
+ 
+             b = ctMaskSel(atEoc, 0x80, b);
+             b &= (unsigned char)~(word32)pastEoc;
+             b &= ((unsigned char)~(word32)isOutBlock) | isEocBlock;
+ 
+             if (j >= blockSz - 8) {
+                 b = ctMaskSel(isOutBlock, lenBytes[j - (blockSz - 8)], b);
+             }
+ 
+             hashBlock[j] = b;
+         }
+ 
+         ret = Hmac_HashUpdate(hmac, hashBlock, blockSz);
+         if (ret != 0)
+             return ret;
+         ret = Hmac_HashFinalRaw(hmac, hashBlock);
+         if (ret != 0)
+             return ret;
+         for (j = 0; j < macLen; j++)
+             ((unsigned char*)hmac->innerHash)[j] |= hashBlock[j] & isOutBlock;
+     }
+ 
+     ret = Hmac_OuterHash(hmac, digest);
+ 
+     return ret;
+ }
+ 
+ #endif
+ 
+ #if defined(WOLFSSL_NO_HASH_RAW) || defined(HAVE_FIPS) || \
+     defined(HAVE_SELFTEST) || defined(HAVE_BLAKE2)
+ 
+ /* Calculate the HMAC of the header + message data.
+  * Constant time implementation using normal hashing operations.
+  * Update-Final need to be constant time.
+  *
+  * hmac    HMAC object.
+  * digest  MAC result.
+  * in      Message data.
+  * sz      Size of the message data.
+  * header  Constructed record header with length of handshake data.
+  * returns 0 on success, otherwise failure.
+  */
+@@ -1146,135 +1142,135 @@ static int Hmac_UpdateFinal(Hmac* hmac, byte* digest, const byte* in,
+ int TLS_hmac(WOLFSSL* ssl, byte* digest, const byte* in, word32 sz, int padSz,
+              int content, int verify, int epochOrder)
+ {
+     Hmac   hmac;
+     byte   myInner[WOLFSSL_TLS_HMAC_INNER_SZ];
+     int    ret = 0;
+     const byte* macSecret = NULL;
+     word32 hashSz = 0;
+ 
+     if (ssl == NULL)
+         return BAD_FUNC_ARG;
+ 
+ #ifdef HAVE_TRUNCATED_HMAC
+     hashSz = ssl->truncated_hmac ? (byte)TRUNCATED_HMAC_SZ
+                                         : ssl->specs.hash_size;
+ #else
+     hashSz = ssl->specs.hash_size;
+ #endif
+ 
+ #ifdef HAVE_FUZZER
+     /* Fuzz "in" buffer with sz to be used in HMAC algorithm */
+     if (ssl->fuzzerCb) {
+         if (verify && padSz >= 0) {
+             ssl->fuzzerCb(ssl, in, sz + hashSz + padSz + 1, FUZZ_HMAC,
+                           ssl->fuzzerCtx);
+         }
+         else {
+             ssl->fuzzerCb(ssl, in, sz, FUZZ_HMAC, ssl->fuzzerCtx);
+         }
+     }
+ #endif
+ 
+     if (!ssl->options.dtls)
+         wolfSSL_SetTlsHmacInner(ssl, myInner, sz, content, verify);
+     else
+         wolfSSL_SetTlsHmacInner(ssl, myInner, sz, content, epochOrder);
+ #if defined(WOLFSSL_RENESAS_TSIP_TLS) && \
+     !defined(NO_WOLFSSL_RENESAS_TSIP_TLS_SESSION)
+     if (tsip_useable(ssl)) {
+         if (ssl->specs.hash_size == WC_SHA_DIGEST_SIZE)
+             ret = tsip_Sha1Hmac(ssl, myInner, WOLFSSL_TLS_HMAC_INNER_SZ,
+                                                         in, sz, digest, verify);
+         else if (ssl->specs.hash_size == WC_SHA256_DIGEST_SIZE)
+             ret = tsip_Sha256Hmac(ssl, myInner, WOLFSSL_TLS_HMAC_INNER_SZ,
+                                                         in, sz, digest, verify);
+         else
+             ret = TSIP_MAC_DIGSZ_E;
+ 
+         return ret;
+     }
+ #endif
+     ret = wc_HmacInit(&hmac, ssl->heap, ssl->devId);
+     if (ret != 0)
+         return ret;
+ 
+ 
+ #ifdef WOLFSSL_DTLS
+     if (ssl->options.dtls)
+         macSecret = wolfSSL_GetDtlsMacSecret(ssl, verify, epochOrder);
+     else
+         macSecret = wolfSSL_GetMacSecret(ssl, verify);
+ #else
+     macSecret = wolfSSL_GetMacSecret(ssl, verify);
+ #endif
+     ret = wc_HmacSetKey(&hmac, wolfSSL_GetHmacType(ssl),
+                                               macSecret,
+                                               ssl->specs.hash_size);
+ 
+     if (ret == 0) {
+         /* Constant time verification required. */
+         if (verify && padSz >= 0) {
+ #if !defined(WOLFSSL_NO_HASH_RAW) && !defined(HAVE_FIPS) && \
+     !defined(HAVE_SELFTEST)
+     #ifdef HAVE_BLAKE2
+             if (wolfSSL_GetHmacType(ssl) == WC_HASH_TYPE_BLAKE2B) {
+                 ret = Hmac_UpdateFinal(&hmac, digest, in,
+                                               sz + hashSz + padSz + 1, myInner);
+             }
+             else
+     #endif
+             {
+                 ret = Hmac_UpdateFinal_CT(&hmac, digest, in,
+-                                              sz + hashSz + padSz + 1, myInner);
++                                      sz + hashSz + padSz + 1, hashSz, myInner);
+             }
+ #else
+             ret = Hmac_UpdateFinal(&hmac, digest, in, sz + hashSz + padSz + 1,
+                                                                        myInner);
+ #endif
+         }
+         else {
+             ret = wc_HmacUpdate(&hmac, myInner, sizeof(myInner));
+             if (ret == 0)
+                 ret = wc_HmacUpdate(&hmac, in, sz);                /* content */
+             if (ret == 0)
+                 ret = wc_HmacFinal(&hmac, digest);
+         }
+     }
+ 
+     wc_HmacFree(&hmac);
+ 
+     return ret;
+ }
+ #endif /* WOLFSSL_AEAD_ONLY */
+ 
+ #endif /* !WOLFSSL_NO_TLS12 */
+ 
+ #ifdef HAVE_TLS_EXTENSIONS
+ 
+ /**
+  * The TLSX semaphore is used to calculate the size of the extensions to be sent
+  * from one peer to another.
+  */
+ 
+ /** Supports up to 64 flags. Increase as needed. */
+ #define SEMAPHORE_SIZE 8
+ 
+ /**
+  * Converts the extension type (id) to an index in the semaphore.
+  *
+  * Official reference for TLS extension types:
+  *   http://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xml
+  *
+  * Motivation:
+  *   Previously, we used the extension type itself as the index of that
+  *   extension in the semaphore as the extension types were declared
+  *   sequentially, but maintain a semaphore as big as the number of available
+  *   extensions is no longer an option since the release of renegotiation_info.
+  *
+  * How to update:
+  *   Assign extension types that extrapolate the number of available semaphores
+  *   to the first available index going backwards in the semaphore array.
+  *   When adding a new extension type that don't extrapolate the number of
+  *   available semaphores, check for a possible collision with with a
+  *   'remapped' extension type.
+  */
+diff --git a/wolfssl/test.h b/wolfssl/test.h
+index 920cd65de..de61e144c 100644
+--- a/wolfssl/test.h
++++ b/wolfssl/test.h
+@@ -2012,38 +2012,38 @@ static WC_INLINE unsigned int my_psk_client_cb(WOLFSSL* ssl, const char* hint,
+ static WC_INLINE unsigned int my_psk_server_cb(WOLFSSL* ssl, const char* identity,
+         unsigned char* key, unsigned int key_max_len)
+ {
+     (void)ssl;
+     (void)key_max_len;
+ 
+     /* see internal.h MAX_PSK_ID_LEN for PSK identity limit */
+     if (XSTRNCMP(identity, kIdentityStr, XSTRLEN(kIdentityStr)) != 0)
+         return 0;
+ 
+     if (wolfSSL_GetVersion(ssl) < WOLFSSL_TLSV1_3) {
+         /* test key in hex is 0x1a2b3c4d , in decimal 439,041,101 , we're using
+            unsigned binary */
+         key[0] = 0x1a;
+         key[1] = 0x2b;
+         key[2] = 0x3c;
+         key[3] = 0x4d;
+ 
+         return 4;   /* length of key in octets or 0 for error */
+     }
+     else {
+         int i;
+         int b = 0x01;
+ 
+         for (i = 0; i < 32; i++, b += 0x22) {
+             if (b >= 0x100)
+                 b = 0x01;
+             key[i] = b;
+         }
+ 
+         return 32;   /* length of key in octets or 0 for error */
+     }
+ }
+ 
+-
++#ifdef WOLFSSL_TLS13
+ static WC_INLINE unsigned int my_psk_client_tls13_cb(WOLFSSL* ssl,
+         const char* hint, char* identity, unsigned int id_max_len,
+         unsigned char* key, unsigned int key_max_len, const char** ciphersuite)
+@@ -2074,32 +2074,33 @@ static WC_INLINE unsigned int my_psk_client_tls13_cb(WOLFSSL* ssl,
+ static WC_INLINE unsigned int my_psk_server_tls13_cb(WOLFSSL* ssl,
+         const char* identity, unsigned char* key, unsigned int key_max_len,
+         const char** ciphersuite)
+ {
+     int i;
+     int b = 0x01;
+     int kIdLen = (int)XSTRLEN(kIdentityStr);
+     const char* userCipher = (const char*)wolfSSL_get_psk_callback_ctx(ssl);
+ 
+     (void)ssl;
+     (void)key_max_len;
+ 
+     /* see internal.h MAX_PSK_ID_LEN for PSK identity limit */
+     if (XSTRNCMP(identity, kIdentityStr, kIdLen) != 0)
+         return 0;
+     if (identity[kIdLen] != '\0') {
+         userCipher = wolfSSL_get_cipher_name_by_hash(ssl, identity + kIdLen);
+     }
+ 
+     for (i = 0; i < 32; i++, b += 0x22) {
+         if (b >= 0x100)
+             b = 0x01;
+         key[i] = b;
+     }
+ 
+     *ciphersuite = userCipher ? userCipher : "TLS13-AES128-GCM-SHA256";
+ 
+     return 32;   /* length of key in octets or 0 for error */
+ }
++#endif
+ 
+ #if defined(OPENSSL_ALL) && !defined(NO_CERTS) && \
+        !defined(NO_FILESYSTEM)

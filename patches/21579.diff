@@ -1,0 +1,201 @@
+commit 08de3581e8bc1ca855cf96061583363b8570215e
+Author: Alex Rebert <alexandre.rebert@gmail.com>
+Date:   Mon Jan 3 21:01:41 2022 -0500
+
+    ucl_parse_value: fix out-of-bounds read
+    
+    If the string ends with a Multiline terminator without a newline, the
+    function tried to read the next character to check for a newline without
+    checking if the pointer was past the end of the buffer. This commit adds
+    a bounds check and return early with an error in case of missing
+    newline.
+    
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=21579
+
+diff --git a/src/ucl_parser.c b/src/ucl_parser.c
+index c2a51ad..abfcc3d 100644
+--- a/src/ucl_parser.c
++++ b/src/ucl_parser.c
+@@ -1687,177 +1687,182 @@ static bool
+ ucl_parse_value (struct ucl_parser *parser, struct ucl_chunk *chunk)
+ {
+ 	const unsigned char *p, *c;
+ 	ucl_object_t *obj = NULL;
+ 	unsigned int stripped_spaces;
+ 	ssize_t str_len;
+ 	bool need_unescape = false, ucl_escape = false, var_expand = false;
+ 
+ 	p = chunk->pos;
+ 
+ 	/* Skip any spaces and comments */
+ 	if (ucl_test_character (*p, UCL_CHARACTER_WHITESPACE_UNSAFE) ||
+ 			(chunk->remain >= 2 && ucl_lex_is_comment (p[0], p[1]))) {
+ 		while (p < chunk->end && ucl_test_character (*p, UCL_CHARACTER_WHITESPACE_UNSAFE)) {
+ 			ucl_chunk_skipc (chunk, p);
+ 		}
+ 		if (!ucl_skip_comments (parser)) {
+ 			return false;
+ 		}
+ 		p = chunk->pos;
+ 	}
+ 
+ 	while (p < chunk->end) {
+ 		c = p;
+ 		switch (*p) {
+ 		case '"':
+ 			ucl_chunk_skipc (chunk, p);
+ 
+ 			if (!ucl_lex_json_string (parser, chunk, &need_unescape, &ucl_escape,
+ 					&var_expand)) {
+ 				return false;
+ 			}
+ 
+ 			obj = ucl_parser_get_container (parser);
+ 			if (!obj) {
+ 				return false;
+ 			}
+ 
+ 			str_len = chunk->pos - c - 2;
+ 			obj->type = UCL_STRING;
+ 			if ((str_len = ucl_copy_or_store_ptr (parser, c + 1,
+ 					&obj->trash_stack[UCL_TRASH_VALUE],
+ 					&obj->value.sv, str_len, need_unescape, false,
+ 					var_expand, false)) == -1) {
+ 				return false;
+ 			}
+ 
+ 			obj->len = str_len;
+ 			parser->state = UCL_STATE_AFTER_VALUE;
+ 
+ 			return true;
+ 			break;
+ 		case '\'':
+ 			ucl_chunk_skipc (chunk, p);
+ 
+ 			if (!ucl_lex_squoted_string (parser, chunk, &need_unescape)) {
+ 				return false;
+ 			}
+ 
+ 			obj = ucl_parser_get_container (parser);
+ 			if (!obj) {
+ 				return false;
+ 			}
+ 
+ 			str_len = chunk->pos - c - 2;
+ 			obj->type = UCL_STRING;
+ 			obj->flags |= UCL_OBJECT_SQUOTED;
+ 
+ 			if ((str_len = ucl_copy_or_store_ptr (parser, c + 1,
+ 					&obj->trash_stack[UCL_TRASH_VALUE],
+ 					&obj->value.sv, str_len, need_unescape, false,
+ 					var_expand, true)) == -1) {
+ 				return false;
+ 			}
+ 
+ 			obj->len = str_len;
+ 
+ 			parser->state = UCL_STATE_AFTER_VALUE;
+ 
+ 			return true;
+ 			break;
+ 		case '{':
+ 			obj = ucl_parser_get_container (parser);
+ 			if (obj == NULL) {
+ 				return false;
+ 			}
+ 			/* We have a new object */
+ 			if (parser->stack) {
+ 				obj = ucl_parser_add_container (obj, parser, false,
+ 						parser->stack->e.params.level, true);
+ 			}
+ 			else {
+ 				return false;
+ 			}
+ 			if (obj == NULL) {
+ 				return false;
+ 			}
+ 
+ 			ucl_chunk_skipc (chunk, p);
+ 
+ 			return true;
+ 			break;
+ 		case '[':
+ 			obj = ucl_parser_get_container (parser);
+ 			if (obj == NULL) {
+ 				return false;
+ 			}
+ 			/* We have a new array */
+ 			if (parser->stack) {
+ 				obj = ucl_parser_add_container (obj, parser, true,
+ 						parser->stack->e.params.level, true);
+ 			}
+ 			else {
+ 				return false;
+ 			}
+ 
+ 			if (obj == NULL) {
+ 				return false;
+ 			}
+ 
+ 			ucl_chunk_skipc (chunk, p);
+ 
+ 			return true;
+ 			break;
+ 		case ']':
+ 			/* We have the array ending */
+ 			if (parser->stack && parser->stack->obj->type == UCL_ARRAY) {
+ 				parser->state = UCL_STATE_AFTER_VALUE;
+ 				return true;
+ 			}
+ 			else {
+ 				goto parse_string;
+ 			}
+ 			break;
+ 		case '<':
+ 			obj = ucl_parser_get_container (parser);
+ 			/* We have something like multiline value, which must be <<[A-Z]+\n */
+ 			if (chunk->end - p > 3) {
+ 				if (memcmp (p, "<<", 2) == 0) {
+ 					p += 2;
+ 					/* We allow only uppercase characters in multiline definitions */
+ 					while (p < chunk->end && *p >= 'A' && *p <= 'Z') {
+ 						p ++;
+ 					}
++					if(p == chunk->end) {
++						ucl_set_err (parser, UCL_ESYNTAX,
++								"unterminated multiline value", &parser->err);
++						return false;
++					}
+ 					if (*p =='\n') {
+ 						/* Set chunk positions and start multiline parsing */
+ 						chunk->remain -= p - c + 1;
+ 						c += 2;
+ 						chunk->pos = p + 1;
+ 						chunk->column = 0;
+ 						chunk->line ++;
+ 						if ((str_len = ucl_parse_multiline_string (parser, chunk, c,
+ 								p - c, &c, &var_expand)) == 0) {
+ 							ucl_set_err (parser, UCL_ESYNTAX,
+ 									"unterminated multiline value", &parser->err);
+ 							return false;
+ 						}
+ 
+ 						obj->type = UCL_STRING;
+ 						obj->flags |= UCL_OBJECT_MULTILINE;
+ 						if ((str_len = ucl_copy_or_store_ptr (parser, c,
+ 								&obj->trash_stack[UCL_TRASH_VALUE],
+ 								&obj->value.sv, str_len - 1, false,
+ 								false, var_expand, false)) == -1) {
+ 							return false;
+ 						}
+ 						obj->len = str_len;
+ 
+ 						parser->state = UCL_STATE_AFTER_VALUE;
+ 
+ 						return true;
+ 					}
+ 				}
+ 			}
+ 			/* Fallback to ordinary strings */
+ 			/* FALLTHRU */
+ 		default:

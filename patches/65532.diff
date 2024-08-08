@@ -1,0 +1,785 @@
+commit c0e40da2ab6f072ceaff780308756b1e9e1fb6a2
+Author: John Reiser <jreiser@BitWagon.com>
+Date:   Sat Jan 27 14:16:53 2024 -0800
+
+    more checking of Mach_header when unpacking for MachOS
+    
+    https://github.com/upx/upx/issues/783
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=65532
+            modified:   p_mach.cpp
+
+diff --git a/src/p_mach.cpp b/src/p_mach.cpp
+index c6fc1779..34fbb43b 100644
+--- a/src/p_mach.cpp
++++ b/src/p_mach.cpp
+@@ -1468,162 +1468,164 @@ umin(unsigned a, unsigned b)
+     return (a <= b) ? a : b;
+ }
+ 
++#define MAX_N_CMDS 256
++
+ template <class T>
+ void PackMachBase<T>::unpack(OutputFile *fo)
+ {
+     unsigned const lc_seg = lc_seg_info[sizeof(Addr)>>3].segment_cmd;
+     fi->seek(0, SEEK_SET);
+     fi->readx(&mhdri, sizeof(mhdri));
+     if ((MH_MAGIC + (sizeof(Addr)>>3)) != mhdri.magic
+     &&  Mach_fat_header::FAT_MAGIC != mhdri.magic) {
+         throwCantUnpack("file header corrupted");
+     }
+     unsigned const sz_cmds = mhdri.sizeofcmds;
+     if ((sizeof(mhdri) + sz_cmds) > (size_t)fi->st_size()) {
+         throwCantUnpack("file header corrupted");
+     }
+     rawmseg_buf.dealloc();  // discard "same" contents from ::canUnpack()
+     rawmseg_buf.alloc(sz_cmds);
+     rawmseg = (Mach_segment_command *)rawmseg_buf.getVoidPtr();
+     fi->readx(rawmseg, mhdri.sizeofcmds);
+ 
+     // FIXME forgot space left for LC_CODE_SIGNATURE;
+     // but canUnpack() sets overlay_offset anyway.
+     //overlay_offset = sizeof(mhdri) + mhdri.sizeofcmds + sizeof(linfo);
+ 
+     fi->seek(overlay_offset, SEEK_SET);
+     p_info hbuf;
+     fi->readx(&hbuf, sizeof(hbuf));
+     unsigned const orig_file_size = get_te32(&hbuf.p_filesize);
+     blocksize = get_te32(&hbuf.p_blocksize);  // emacs-21.2.1 was 0x01d47e6c (== 30703212)
+     if (blocksize > orig_file_size || blocksize > UPX_RSIZE_MAX_MEM)
+         throwCantUnpack("file header corrupted");
+     if (file_size > (off_t)orig_file_size) {
+         opt->info_mode += !opt->info_mode ? 1 : 0;  // make visible
+         opt->backup = 1;
+         infoWarning("packed size too big; discarding appended data, keeping backup");
+     }
+ 
+     ibuf.alloc(blocksize + OVERHEAD);
+     b_info bhdr; memset(&bhdr, 0, sizeof(bhdr));
+     fi->readx(&bhdr, sizeof(bhdr));
+     ph.u_len = get_te32(&bhdr.sz_unc);
+     ph.c_len = get_te32(&bhdr.sz_cpr);
+     if ((unsigned)file_size < ph.c_len || ph.c_len == 0 || ph.u_len == 0)
+         throwCantUnpack("file header corrupted");
+     ph.method = bhdr.b_method;
+     if (ph.method < M_NRV2B_LE32
+     ||  ph.method > M_BZIP2)
+         throwCantUnpack("file header bad method");
+     ph.filter = bhdr.b_ftid;
+     ph.filter_cto = bhdr.b_cto8;
+ 
+     // Uncompress Macho headers
+     fi->readx(ibuf, ph.c_len);
+     MemBuffer mhdr_buf(ph.u_len);
+     Mach_header *const mhdr = (Mach_header *)mhdr_buf.getVoidPtr();
+     decompress(ibuf, (upx_byte *)mhdr, false);
+     if (mhdri.magic      != mhdr->magic
+     ||  mhdri.cputype    != mhdr->cputype
+     ||  mhdri.cpusubtype != mhdr->cpusubtype
+     ||  mhdri.filetype   != mhdr->filetype)
+         throwCantUnpack("file header corrupted");
+     unsigned const ncmds = mhdr->ncmds;
+-    if (!ncmds || 256 < ncmds) { // arbitrary limit
++    if (!ncmds || MAX_N_CMDS < ncmds) { // arbitrary limit
+         char msg[40]; snprintf(msg, sizeof(msg),
+             "bad Mach_header.ncmds = %d", ncmds);
+         throwCantUnpack(msg);
+     }
+ 
+     msegcmd_buf.alloc(sizeof(Mach_segment_command) * ncmds);
+     msegcmd = (Mach_segment_command *)msegcmd_buf.getVoidPtr();
+     unsigned char const *ptr = (unsigned char const *)(1+mhdr);
+     unsigned headway = mhdr_buf.getSize() - sizeof(*mhdr);
+     for (unsigned j= 0; j < ncmds; ++j) {
+         unsigned cmdsize = ((Mach_command const *)ptr)->cmdsize;
+         if (is_bad_linker_command( ((Mach_command const *)ptr)->cmd, cmdsize,
+                 headway, lc_seg, sizeof(Addr))) {
+             char msg[50]; snprintf(msg, sizeof(msg),
+                 "bad packed Mach load_command @%#x", ptr_udiff_bytes(ptr, mhdr));
+             throwCantUnpack(msg);
+         }
+         memcpy(&msegcmd[j], ptr, umin(sizeof(Mach_segment_command), cmdsize));
+         headway -= cmdsize;
+         ptr     += cmdsize;
+     }
+ 
+     // Put LC_SEGMENT together at the beginning
+     upx_qsort(msegcmd, ncmds, sizeof(*msegcmd), compare_segment_command);
+     n_segment = 0;
+     for (unsigned j= 0; j < ncmds; ++j) {
+         n_segment += (lc_seg==msegcmd[j].cmd);
+     }
+ 
+     total_in = 0;
+     total_out = 0;
+     unsigned c_adler = upx_adler32(nullptr, 0);
+     unsigned u_adler = upx_adler32(nullptr, 0);
+ 
+     fi->seek(- (off_t)(sizeof(bhdr) + ph.c_len), SEEK_CUR);
+     for (unsigned k = 0; k < ncmds; ++k) {
+         if (msegcmd[k].cmd==lc_seg && msegcmd[k].filesize!=0) {
+             if (!strcmp("__TEXT", msegcmd[k].segname)) {
+                 segTEXT = msegcmd[k];
+             }
+             if (fo)
+                 fo->seek(msegcmd[k].fileoff, SEEK_SET);
+             unpackExtent(msegcmd[k].filesize, fo,
+                 c_adler, u_adler, false, sizeof(bhdr));
+             if (my_filetype==Mach_header::MH_DYLIB) {
+                 break;  // only the first lc_seg when MH_DYLIB
+             }
+         }
+     }
+     Mach_segment_command const *sc = (Mach_segment_command const *)(void *)(1+ mhdr);
+     if (my_filetype==Mach_header::MH_DYLIB) { // rest of lc_seg are not compressed
+         upx_uint64_t cpr_mod_init_func(0);
+                 TE32 unc_mod_init_func; *(int *)&unc_mod_init_func = 0;
+         Mach_segment_command const *rc = rawmseg;
+         rc = (Mach_segment_command const *)(rc->cmdsize + (char const *)rc);
+         sc = (Mach_segment_command const *)(sc->cmdsize + (char const *)sc);
+         for (
+             unsigned k=1;  // skip first lc_seg, which was uncompressed above
+             k < ncmds;
+             (++k), (sc = (Mach_segment_command const *)(sc->cmdsize + (char const *)sc)),
+                    (rc = (Mach_segment_command const *)(rc->cmdsize + (char const *)rc))
+         ) {
+             if (lc_seg==rc->cmd
+             &&  0!=rc->filesize ) {
+                 if (!strcmp("__DATA", rc->segname)) {
+                     cpr_mod_init_func = get_mod_init_func(rc);
+                     fi->seek(cpr_mod_init_func - 4*sizeof(TE32), SEEK_SET);
+                     fi->readx(&unc_mod_init_func, sizeof(unc_mod_init_func));
+                 }
+                 fi->seek(rc->fileoff, SEEK_SET);
+                 if (fo)
+                     fo->seek(sc->fileoff, SEEK_SET);
+                 unsigned const len = rc->filesize;
+                 MemBuffer data(len);
+                 fi->readx(data, len);
+                 if (!strcmp("__DATA", rc->segname)) {
+                     set_te32(&data[o__mod_init_func - rc->fileoff], unc_mod_init_func);
+                 }
+                 if (fo)
+                     fo->write(data, len);
+             }
+         }
+     }
+     else
+     for (unsigned j = 0; j < ncmds; ++j) {
+         unsigned const size = find_SEGMENT_gap(j, orig_file_size);
+         if (size) {
+             unsigned const where = msegcmd[j].fileoff +msegcmd[j].filesize;
+             if (fo)
+                 fo->seek(where, SEEK_SET);
+             unpackExtent(size, fo,
+                 c_adler, u_adler, false, sizeof(bhdr));
+         }
+     }
+ }
+ 
+ // The prize is the value of overlay_offset: the offset of compressed data
+@@ -1631,291 +1633,296 @@ template <class T>
+ tribool PackMachBase<T>::canUnpack()
+ {
+     unsigned const lc_seg = lc_seg_info[sizeof(Addr)>>3].segment_cmd;
+     fi->seek(0, SEEK_SET);
+     fi->readx(&mhdri, sizeof(mhdri));
+ 
+     if (((unsigned) Mach_header::MH_MAGIC + (sizeof(Addr)>>3)) !=mhdri.magic
+     ||  my_cputype   !=mhdri.cputype
+     ||  my_filetype  !=mhdri.filetype
+     )
+         return false;
+     my_cpusubtype = mhdri.cpusubtype;
+ 
+     unsigned const ncmds = mhdri.ncmds;
+     int headway = (int)mhdri.sizeofcmds;
++    if (!ncmds || MAX_N_CMDS < ncmds || file_size < headway) {
++        char msg[80]; snprintf(msg, sizeof(msg),
++            "bad Mach_header ncmds=%d  sizeofcmds=0x%x", ncmds, headway);
++        throwCantUnpack(msg);
++    }
+     // old style:   LC_SEGMENT + LC_UNIXTHREAD  [smaller, varies by $ARCH]
+     // new style: 3*LC_SEGMENT + LC_MAIN        [larger]
+     if ((2 == ncmds
+         && headway < (int)(sizeof(Mach_segment_command) + 4*4))
+     ||  (3 <= ncmds
+         && headway < (int)(3 * sizeof(Mach_segment_command)
+                     + sizeof(Mach_main_command)))) {
+         infoWarning("Mach_header.sizeofcmds = %d too small", headway);
+         throwCantUnpack("file corrupted");
+     }
+     sz_mach_headers = headway + sizeof(mhdri);
+     if (2048 < headway) {
+         infoWarning("Mach_header.sizeofcmds(%d) > 2048", headway);
+     }
+     if (!headway) {
+         throwCantPack("Mach_header.sizeofcmds == 0");
+     }
+     rawmseg_buf.alloc(mhdri.sizeofcmds);
+     rawmseg = (Mach_segment_command *)rawmseg_buf.getVoidPtr();
+     fi->readx(rawmseg, mhdri.sizeofcmds);
+ 
+     Mach_segment_command const *ptrTEXT = nullptr;
+     upx_uint64_t rip = 0;
+     unsigned style = 0;
+     off_t offLINK = 0;
+     unsigned pos_next = 0;
+     unsigned nseg = 0;
+     Mach_command const *ptr = (Mach_command const *)rawmseg;
+     for (unsigned j= 0; j < ncmds;
+             ptr = (Mach_command const *)(ptr->cmdsize + (char const *)ptr), ++j) {
+         unsigned const cmd = ptr->cmd;
+         unsigned const cmdsize = ptr->cmdsize;
+         if (is_bad_linker_command(cmd, cmdsize, headway, lc_seg, sizeof(Addr))) {
+                 opt->info_mode += 1;
+                 infoWarning("bad Mach_command[%u]{@0x%zx,+0x%x}=0x%x: file_size=0x%lx  cmdsize=0x%lx",
+                     j, (sizeof(mhdri) + ((char const *)ptr - (char const *)rawmseg)), headway,
+                     cmd, (unsigned long) file_size, (unsigned long)ptr->cmdsize);
+                 opt->info_mode -= 1;
+                 throwCantUnpack("file corrupted");
+         }
+         headway -= cmdsize;
+         if (headway < 0) {
+             infoWarning("Mach_command[%u]{@%lu}.cmdsize = %u", j,
+                 (unsigned long) (sizeof(mhdri) + mhdri.sizeofcmds - (headway + ptr->cmdsize)),
+                 (unsigned)ptr->cmdsize);
+             throwCantUnpack("sum(.cmdsize) exceeds .sizeofcmds");
+         }
+         if (lc_seg == ptr->cmd) {
+             Mach_segment_command const *const segptr = (Mach_segment_command const *)ptr;
+             if ((unsigned long)file_size < segptr->filesize
+             ||  (unsigned long)file_size < segptr->fileoff
+             ||  (unsigned long)file_size < (segptr->filesize + segptr->fileoff)) {
+                 infoWarning("bad Mach_segment_command[%u]{@0x%zx,+0x%x}: file_size=0x%lx  cmdsize=0x%lx"
+                       "  filesize=0x%lx  fileoff=0x%lx",
+                     j, (sizeof(mhdri) + ((char const *)ptr - (char const *)rawmseg)), headway,
+                     (unsigned long) file_size, (unsigned long)ptr->cmdsize,
+                     (unsigned long)segptr->filesize, (unsigned long)segptr->fileoff);
+                 throwCantUnpack("file corrupted");
+             }
+             ++nseg;
+             if (!strcmp("__XHDR", segptr->segname)) {
+                 // PackHeader precedes __LINKEDIT (pre-Sierra MacOS 10.12)
+                 style = 391;  // UPX 3.91
+             }
+             if (!strcmp("__TEXT", segptr->segname)) {
+                 ptrTEXT = segptr;
+                 style = 391;  // UPX 3.91
+             }
+             if (!strcmp("UPX_DATA", segptr->segname)) {
+                 // PackHeader follows loader at __LINKEDIT (Sierra MacOS 10.12)
+                 style = 392;  // UPX 3.92
+             }
+             if (!strcmp("__LINKEDIT", segptr->segname)) {
+                 offLINK = segptr->fileoff;
+                 if (segptr->filesize == blankLINK) {
+                     style = 395;
+                 }
+                 if (offLINK < (off_t) pos_next) {
+                     offLINK = pos_next;
+                 }
+             }
+             pos_next = segptr->filesize + segptr->fileoff;
+         }
+         else if (Mach_command::LC_UNIXTHREAD==ptr->cmd) {
+             rip = entryVMA = threadc_getPC(ptr);
+         }
+     }
+     if (3==nseg && 395 != style) { // __PAGEZERO, __TEXT, __LINKEDIT;  no __XHDR, no UPX_DATA
+         style = 392;
+     }
+     if (391==style && 0==offLINK && 2==ncmds && ptrTEXT) { // pre-3.91 ?
+         offLINK = ptrTEXT->fileoff + ptrTEXT->filesize;  // fake __LINKEDIT at EOF
+     }
+     if (0 == style || 0 == offLINK) {
+         return false;
+     }
+ 
+     int const small = 32 + sizeof(overlay_offset);
+     unsigned bufsize = my_page_size + sizeof(PackHeader) + sizeof(overlay_offset);
+     if (391 == style) { // PackHeader precedes __LINKEDIT
+         fi->seek(offLINK - bufsize, SEEK_SET);
+     } else
+     if (392 == style) {
+         if (MH_DYLIB == my_filetype) {
+             fi->seek(fi->st_size() - bufsize, SEEK_SET);
+         }
+         else { // PackHeader follows loader at __LINKEDIT
+             if ((off_t)bufsize > (fi->st_size() - offLINK)) {
+                 bufsize = fi->st_size() - offLINK;
+             }
+             fi->seek(offLINK, SEEK_SET);
+         }
+     } else
+     if (395 == style) {
+         fi->seek(offLINK - bufsize, SEEK_SET);
+     }
+     MemBuffer buf(bufsize);
+     MemBuffer buf3(bufsize);
+ 
+     fi->readx(buf, bufsize);
+     // Do not overwrite buf[]; For scratch space, then use buf3 instead.
+ 
+     int i = bufsize;
+     while (i > small && 0 == buf[--i]) { } // why is this search so slow?
+     i -= small;
+     // allow incompressible extents
+     if (i < 1 || !getPackHeader(buf + i, bufsize - i, true)) {
+         // Breadcrumbs failed.
+         // Pirates might overwrite the UPX! marker.  Try harder.
+         upx_uint64_t const rip_off = ptrTEXT ? (rip - ptrTEXT->vmaddr) : 0;
+         if (ptrTEXT && rip && rip_off < ptrTEXT->vmsize) {
+             fi->seek(ptrTEXT->fileoff + rip_off, SEEK_SET);
+             fi->readx(buf3, bufsize);
+             unsigned char const *b = &buf3[0];
+             unsigned disp = *(TE32 const *)&b[1];
+             if (CPU_TYPE_X86_64 == my_cputype) { // Emulate the code
+                 if (0xe8==b[0] && disp < bufsize
+                     // This has been obsoleted by amd64-darwin.macho-entry.S
+                     // searching for "executable_path=" etc.
+                 &&  0x5d==b[5+disp] && 0xe8==b[6+disp]) {
+                     unsigned disp2 = 0u - *(TE32 const *)&b[7+disp];
+                     if (disp2 < (12+disp) && 0x5b==b[11+disp-disp2]) {
+                         struct b_info const *bptr = (struct b_info const *)&b[11+disp];
+                         // This is the folded stub.
+                         // FIXME: check b_method?
+                         if (bptr->sz_cpr < bptr->sz_unc && bptr->sz_unc < 0x1000) {
+                             b = bptr->sz_cpr + (unsigned char const *)(1+ bptr);
+                             // FIXME: check PackHeader::putPackHeader(), packhead.cpp
+                             overlay_offset = *(TE32 const *)(32 + b);
+                             if (overlay_offset < 0x1000) {
+                                 return true;  // success
+                             }
+                             overlay_offset = 0;  // failure
+                         }
+                     }
+                 }
+             }
+             if (395 == style) { // Desperation
+                 infoWarning("file corrupted: %s", fi->getName());
+                 fi->seek(file_size - bufsize, SEEK_SET);
+                 fi->readx(buf3, bufsize);
+                 unsigned const *p = (unsigned const *)&buf3[bufsize];
+                 for (; buf3 < (void const *)--p; ) {
+                     unsigned x = *p;
+                     if (x) {
+                         if (!(3& x) && x < bufsize) {
+                             fi->seek(0, SEEK_SET);
+                             fi->readx(buf3, bufsize);
+                             p = (unsigned const *)&buf3[x];
+                             if (0 == p[0] && 0 != p[1] && p[1] == p[2]  // p_info
+                             &&  sz_mach_headers < p[3] && p[4] < p[3]  // b_info
+                             ) {
+                                 overlay_offset = x;
+                                 infoWarning("attempting recovery, overlay_offset = %#x",
+                                     overlay_offset);
+                                 return true;
+                             }
+                         }
+                         break;
+                     }
+                 }
+             }
+         }
+         if (391==style) {
+             TE32 const *uptr = (TE32 const *)&buf[bufsize];
+             while (0==*--uptr) /*empty*/ ;
+             overlay_offset = *uptr;
+             if (mhdri.sizeofcmds <= overlay_offset && overlay_offset < 0x1000) {
+                 return true;  // success
+             }
+             overlay_offset = 0;
+             return false;
+         }
+         if (392==style) {
+             overlay_offset = 0x100c;  // (l_info precedes;) p_info; b_info; cpr_data
+             // p_info isn't used for execution, so it has less value for checking:
+             //      0== .p_progid
+             //      .p_filesize == .p_blocksize
+             fi->seek(overlay_offset, SEEK_SET);
+             fi->readx(buf3, bufsize);
+             struct p_info const *const p_ptr = (struct p_info const *)&buf3[0];
+             struct b_info const *const b_ptr = (struct b_info const *)(1+ p_ptr);
+             TE32 const *uptr = (TE32 const *)(1+ b_ptr);
+             if (b_ptr->sz_unc < 0x4000
+             &&  b_ptr->sz_cpr < b_ptr->sz_unc ) {
+                 unsigned const method = b_ptr->b_method;
+                 if ((M_NRV2B_LE32 == method || M_NRV2E_LE32 == method)
+                 &&  (0xff>>2)==(uptr[0] >> (2+ 24))  // 1st 6 bytes are unique literals
+                 &&  (Mach_header::MH_MAGIC + (sizeof(Addr)>>3)) == uptr[1]) {
+                     return true;
+                 }
+                 unsigned const magic = get_te32(&uptr[1]);  // FIXME:  probable bug
+                 if ((M_NRV2B_8 == method || M_NRV2E_8 == method)
+                 && 0xfc==(0xfc & uptr[0])
+                 &&  (Mach_header::MH_MAGIC + (sizeof(Addr)>>3)) == magic) {
+                     return true;
+                 }
+                 // FIXME: M_LZMA
+             }
+ 
+             overlay_offset = 0;
+             // The first non-zero word scanning backwards from __LINKEDIT.fileoff
+             // is the total length of compressed data which precedes it
+             //(distance to l_info), so that's another method.
+             fi->seek(offLINK - 0x1000, SEEK_SET);
+             fi->readx(buf3, 0x1000);
+             unsigned const *const lo = (unsigned const *)&buf3[0];
+             unsigned const *p;
+             for (p = (unsigned const *)&buf3[0x1000]; p > lo; ) if (*--p) {
+                 overlay_offset  = *(TE32 const *)p;
+                 if ((off_t)overlay_offset < offLINK) {
+                     overlay_offset = ((char const *)p - (char const *)lo) +
+                         (offLINK - 0x1000) - overlay_offset + sizeof(l_info);
+                     fi->seek(overlay_offset, SEEK_SET);
+                     fi->readx(buf3, bufsize);
+                     if (b_ptr->sz_unc < 0x4000
+                     &&  b_ptr->sz_cpr < b_ptr->sz_unc ) {
+                         return true;
+                     }
+                 }
+             }
+         }
+     }
+ 
+     overlay_offset = 0;  // impossible value
+     int l = ph.buf_offset + ph.getPackHeaderSize();
+     if (0 <= l && (unsigned)(l + sizeof(TE32)) <=bufsize) {
+         overlay_offset = get_te32(buf + i + l);
+     }
+     if (       overlay_offset < sz_mach_headers
+     ||  (off_t)overlay_offset >= file_size) {
+         infoWarning("file corrupted: %s", fi->getName());
+         MemBuffer buf2(umin(1<<14, file_size));
+         fi->seek(sz_mach_headers, SEEK_SET);
+         fi->readx(buf2, buf2.getSize());
+         unsigned const *p = (unsigned const *)&buf2[0];
+         unsigned const *const e_buf2 = (unsigned const *)&buf2[buf2.getSize() - 4*sizeof(*p)];
+         for (; p <= e_buf2; ++p)
+         if (   0==p[0]  // p_info.p_progid
+         &&     0!=p[1]  // p_info.p_filesize
+         &&  p[2]==p[1]  // p_info.p_blocksize == p_info.p_filesize
+         &&  (unsigned)file_size < get_te32(&p[1])  // compression was worthwhile
+         &&  sz_mach_headers==get_te32(&p[3])  // b_info.sz_unc
+         ) {
+             overlay_offset = ((char const *)p - (char const *)&buf2[0]) + sz_mach_headers;
+             if (!(3&overlay_offset  // not word aligned
+                     ||        overlay_offset < sz_mach_headers
+                     || (off_t)overlay_offset >= file_size)) {
+                 infoWarning("attempting recovery, overlay_offset = %#x", overlay_offset);
+                 return true;
+             }
+         }
+         throwCantUnpack("file corrupted");
+     }
+     return true;
+ }
+@@ -1943,305 +1950,305 @@ template <class T>
+ tribool PackMachBase<T>::canPack()
+ {
+     unsigned const lc_seg = lc_seg_info[sizeof(Addr)>>3].segment_cmd;
+     fi->seek(0, SEEK_SET);
+     fi->readx(&mhdri, sizeof(mhdri));
+ 
+     if (((unsigned) Mach_header::MH_MAGIC + (sizeof(Addr)>>3)) !=mhdri.magic
+     ||  my_cputype   !=mhdri.cputype
+     ||  my_filetype  !=mhdri.filetype
+     )
+         return false;
+     my_cpusubtype = mhdri.cpusubtype;
+ 
+     unsigned const ncmds = mhdri.ncmds;
+-    if (!ncmds || 256 < ncmds) { // arbitrary, but guard against garbage
+-        throwCantPack("256 < Mach_header.ncmds");
++    if (!ncmds || MAX_N_CMDS < ncmds) { // arbitrary, but guard against garbage
++        throwCantPack("%d < Mach_header.ncmds", MAX_N_CMDS);
+     }
+     unsigned const sz_mhcmds = (unsigned)mhdri.sizeofcmds;
+     unsigned headway = umin(sz_mhcmds, file_size - sizeof(mhdri));
+     if (headway < sz_mhcmds) {
+         char buf[32]; snprintf(buf, sizeof(buf), "bad sizeofcmds %d", sz_mhcmds);
+         throwCantPack(buf);
+     }
+     if (!sz_mhcmds
+     ||  32768 < sz_mhcmds) { // somewhat arbitrary, but *-darwin.macho-upxmain.c
+         throwCantPack("32768 < Mach_header.sizeofcmds (or ==0)");
+     }
+     rawmseg_buf.alloc(headway);
+     rawmseg = (Mach_segment_command *)(void *)rawmseg_buf;
+     fi->readx(rawmseg, mhdri.sizeofcmds);
+ 
+     msegcmd_buf.alloc(sizeof(Mach_segment_command) * ncmds);
+     msegcmd = (Mach_segment_command *)msegcmd_buf.getVoidPtr();
+     unsigned char const *ptr = (unsigned char const *)rawmseg;
+     for (unsigned j= 0; j < ncmds; ++j) {
+         Mach_segment_command const *segptr = (Mach_segment_command const *)ptr;
+         unsigned const cmd     = segptr->cmd &~ LC_REQ_DYLD;
+         unsigned const cmdsize = segptr->cmdsize;
+         if (is_bad_linker_command(cmd, cmdsize, headway, lc_seg, sizeof(Addr))) {
+             char buf[200]; snprintf(buf, sizeof(buf),
+                 "bad Mach_command[%u]{@0x%zx,+0x%x}=0x%x: file_size=0x%lx  cmdsize=0x%x",
+                     j, (sizeof(mhdri) + ((char const *)segptr - (char const *)rawmseg)), headway,
+                     cmd, (unsigned long) file_size, cmdsize);
+             throwCantPack(buf);
+         }
+         headway -= cmdsize;
+         if (lc_seg == cmd) {
+             msegcmd[j] = *segptr;
+             if (!strcmp("__TEXT", segptr->segname)) {
+                 Mach_section_command const *secp =
+                     (Mach_section_command const *)(const void*)(const char*)(1+ segptr);
+                 unsigned const offset = secp->offset;
+                 if (offset < file_size) {
+                     struct l_info h;
+                     fi->seek(offset, SEEK_SET);
+                     fi->readx(&h, sizeof(h));
+                     checkAlreadyPacked(&h, sizeof(h));
+                 }
+             }
+             if (!strcmp("__DATA", segptr->segname)) {
+                 prev_mod_init_func = get_mod_init_func(segptr);
+             }
+         }
+         else {
+             memcpy(&msegcmd[j], ptr, 2*sizeof(unsigned)); // cmd and cmdsize
+         }
+         switch (((Mach_uuid_command const *)ptr)->cmd) {
+         default: break;
+         case Mach_command::LC_UUID: {
+             memcpy(&cmdUUID, ptr, sizeof(cmdUUID));  // remember the UUID
+             // Set output UUID to be 1 more than the input UUID.
+             for (unsigned k = 0; k < sizeof(cmdUUID.uuid); ++k) {
+                 if (0 != ++cmdUUID.uuid[k]) { // no Carry
+                     break;
+                 }
+             }
+         } break;
+         case Mach_command::LC_VERSION_MIN_MACOSX: {
+             memcpy(&cmdVERMIN, ptr, sizeof(cmdVERMIN));
+         } break;
+         case Mach_command::LC_SOURCE_VERSION: {
+             memcpy(&cmdSRCVER, ptr, sizeof(cmdSRCVER));
+         } break;
+         }
+         ptr += (unsigned) ((Mach_command const *)ptr)->cmdsize;
+     }
+     if (Mach_header::MH_DYLIB==my_filetype && 0==o__mod_init_func) {
+         infoWarning("missing -init function");
+         return false;
+     }
+ 
+     // Put LC_SEGMENT together at the beginning
+     upx_qsort(msegcmd, ncmds, sizeof(*msegcmd), compare_segment_command);
+ 
+     if (lc_seg==msegcmd[0].cmd && 0==msegcmd[0].vmaddr
+     &&  !strcmp("__PAGEZERO", msegcmd[0].segname)) {
+         pagezero_vmsize = msegcmd[0].vmsize;
+     }
+ 
+     // Check alignment of non-null LC_SEGMENT.
+     vma_max = 0;
+     for (unsigned j= 0; j < ncmds; ++j) {
+         if (lc_seg==msegcmd[j].cmd) {
+             ++n_segment;
+             if (~my_page_mask & (msegcmd[j].fileoff | msegcmd[j].vmaddr)) {
+                 return false;
+             }
+             upx_uint64_t t = msegcmd[j].vmsize + msegcmd[j].vmaddr;
+             if (vma_max < t) {
+                 vma_max = t;
+             }
+             // Segments need not be contiguous (esp. "rust"/"go")
+             sz_segment = msegcmd[j].filesize + msegcmd[j].fileoff - msegcmd[0].fileoff;
+         }
+     }
+     vma_max = my_page_mask & (~my_page_mask + vma_max);
+ 
+     // info: currently the header is 36 (32+4) bytes before EOF
+     unsigned char buf[256];
+     fi->seek(-(off_t)sizeof(buf), SEEK_END);
+     fi->readx(buf, sizeof(buf));
+     checkAlreadyPacked(buf, sizeof(buf));
+ 
+     // set options
+     opt->o_unix.blocksize = file_size;
+     if (!n_segment) {
+         return false;
+     }
+     static struct {
+         unsigned cputype;
+         unsigned short filetype;
+         unsigned short sz_stub_entry;
+         unsigned short sz_stub_fold;
+         unsigned short sz_stub_main;
+         upx_byte const *stub_entry;
+         upx_byte const *stub_fold;
+         upx_byte const *stub_main;
+     } const stub_list[] = {
+         {CPU_TYPE_I386, MH_EXECUTE,
+             sizeof(stub_i386_darwin_macho_entry),
+             sizeof(stub_i386_darwin_macho_fold),
+             sizeof(stub_i386_darwin_macho_upxmain_exe),
+                    stub_i386_darwin_macho_entry,
+                    stub_i386_darwin_macho_fold,
+                    stub_i386_darwin_macho_upxmain_exe
+         },
+         {CPU_TYPE_I386, MH_DYLIB,
+             sizeof(stub_i386_darwin_dylib_entry), 0, 0,
+                    stub_i386_darwin_dylib_entry,  nullptr, nullptr
+         },
+         {CPU_TYPE_X86_64, MH_EXECUTE,
+             sizeof(stub_amd64_darwin_macho_entry),
+             sizeof(stub_amd64_darwin_macho_fold),
+             0, //sizeof(stub_amd64_darwin_macho_upxmain_exe),
+                    stub_amd64_darwin_macho_entry,
+                    stub_amd64_darwin_macho_fold,
+                    nullptr // stub_amd64_darwin_macho_upxmain_exe
+         },
+         {CPU_TYPE_X86_64, MH_DYLIB,
+             sizeof(stub_amd64_darwin_dylib_entry), 0, 0,
+                    stub_amd64_darwin_dylib_entry,  nullptr, nullptr
+         },
+         {CPU_TYPE_ARM, MH_EXECUTE,
+             sizeof(stub_arm_v5a_darwin_macho_entry),
+             sizeof(stub_arm_v5a_darwin_macho_fold),
+             0,
+                    stub_arm_v5a_darwin_macho_entry,
+                    stub_arm_v5a_darwin_macho_fold,
+                    nullptr
+         },
+         {CPU_TYPE_ARM64, MH_EXECUTE,
+             sizeof(stub_arm64_darwin_macho_entry),
+             sizeof(stub_arm64_darwin_macho_fold),
+             0,
+                    stub_arm64_darwin_macho_entry,
+                    stub_arm64_darwin_macho_fold,
+                    nullptr
+         },
+         {CPU_TYPE_POWERPC, MH_EXECUTE,
+             sizeof(stub_powerpc_darwin_macho_entry),
+             sizeof(stub_powerpc_darwin_macho_fold),
+             sizeof(stub_powerpc_darwin_macho_upxmain_exe),
+                    stub_powerpc_darwin_macho_entry,
+                    stub_powerpc_darwin_macho_fold,
+                    stub_powerpc_darwin_macho_upxmain_exe
+         },
+         {CPU_TYPE_POWERPC, MH_DYLIB,
+             sizeof(stub_powerpc_darwin_dylib_entry), 0, 0,
+                    stub_powerpc_darwin_dylib_entry,  nullptr, nullptr
+         },
+         {CPU_TYPE_POWERPC64, MH_EXECUTE,
+             sizeof(stub_powerpc64_darwin_macho_entry),
+             sizeof(stub_powerpc64_darwin_macho_fold),
+             0,
+                    stub_powerpc64_darwin_macho_entry,
+                    stub_powerpc64_darwin_macho_fold,
+                    nullptr
+         },
+         {CPU_TYPE_POWERPC64, MH_DYLIB,
+             sizeof(stub_powerpc64_darwin_dylib_entry), 0, 0,
+                    stub_powerpc64_darwin_dylib_entry,  nullptr, nullptr
+         },
+         {0,0, 0,0,0, nullptr,nullptr,nullptr}
+     };
+     for (unsigned j = 0; stub_list[j].cputype; ++j) {
+         if (stub_list[j].cputype  == my_cputype
+         &&  stub_list[j].filetype == my_filetype) {
+             sz_stub_entry = stub_list[j].sz_stub_entry;
+                stub_entry = stub_list[j].stub_entry;
+             sz_stub_fold  = stub_list[j].sz_stub_fold;
+                stub_fold  = stub_list[j].stub_fold;
+             sz_stub_main  = stub_list[j].sz_stub_main;
+                stub_main  = stub_list[j].stub_main;
+             if (!stub_main) { // development stub
+                 static struct {
+                     Mach_header mhdri;
+                     Mach_segment_command segZERO;
+                     Mach_segment_command segTEXT;
+                     Mach_section_command secTEXT;
+                     Mach_segment_command segLINK;
+                     Mach_version_min_command cmdVERMIN;
+                     Mach_source_version_command cmdSRCVER;
+                 } fsm;  // fake_stub_main
+                 fsm.mhdri = mhdri;
+                 fsm.mhdri.ncmds = 5;
+                 fsm.mhdri.sizeofcmds = sizeof(fsm) - sizeof(fsm.mhdri);
+                 fsm.mhdri.flags = MH_NOUNDEFS | MH_PIE;
+ 
+                 fsm.segZERO.cmd = LC_SEGMENT + (fsm.mhdri.cputype >> 24)
+                     * (LC_SEGMENT_64 - LC_SEGMENT);
+                 fsm.segZERO.cmdsize = sizeof(Mach_segment_command);
+                 strncpy(fsm.segZERO.segname, "__PAGEZERO", sizeof(fsm.segZERO.segname));
+                 fsm.segZERO.vmaddr = 0;
+                 fsm.segZERO.vmsize = (4<<16);
+                 if __acc_cte(8==sizeof(void *)) fsm.segZERO.vmsize <<= (32 - 18);
+                 fsm.segZERO.fileoff = 0;
+                 fsm.segZERO.filesize = 0;
+                 fsm.segZERO.maxprot = 0;
+                 fsm.segZERO.initprot = 0;
+                 fsm.segZERO.nsects = 0;
+                 fsm.segZERO.flags = 0;
+ 
+                 unsigned const slop = 400;
+                 fsm.segTEXT.cmd = fsm.segZERO.cmd;
+                 fsm.segTEXT.cmdsize = sizeof(Mach_segment_command)
+                     + sizeof(Mach_section_command);
+                 strncpy(fsm.segTEXT.segname, "__TEXT", sizeof(fsm.segTEXT.segname));
+                 fsm.segTEXT.vmaddr = fsm.segZERO.vmsize;
+                 fsm.segTEXT.vmsize = slop + threado_size() + sizeof(fsm);  // dummy
+                 fsm.segTEXT.fileoff = 0;
+                 fsm.segTEXT.filesize = fsm.segTEXT.vmsize;  // dummy
+                 fsm.segTEXT.maxprot = VM_PROT_EXECUTE | VM_PROT_READ;
+                 fsm.segTEXT.initprot = VM_PROT_EXECUTE | VM_PROT_READ;
+                 fsm.segTEXT.nsects = 1;
+                 fsm.segTEXT.flags = 0;
+ 
+                 strncpy(fsm.secTEXT.sectname, "__text", sizeof(fsm.secTEXT.sectname));
+                 memcpy(fsm.secTEXT.segname, fsm.segTEXT.segname, sizeof(fsm.secTEXT.segname));
+                 unsigned const d = slop + fsm.mhdri.sizeofcmds;
+                 fsm.secTEXT.addr = fsm.segTEXT.vmaddr + d;  // dummy
+                 fsm.secTEXT.size = fsm.segTEXT.vmsize - d;  // dummy
+                 fsm.secTEXT.offset = d;  // dummy
+                 fsm.secTEXT.align = 3;  // (1<<2)
+                 fsm.secTEXT.reloff = 0;
+                 fsm.secTEXT.nreloc = 0;
+                 fsm.secTEXT.flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+                 fsm.secTEXT.reserved1 = 0;
+                 fsm.secTEXT.reserved2 = 0;
+ 
+                 fsm.segLINK = fsm.segTEXT;
+                 fsm.segLINK.cmdsize = sizeof(Mach_segment_command);
+                 strncpy(fsm.segLINK.segname, "__LINKEDIT", sizeof(fsm.segLINK.segname));
+                 fsm.segLINK.vmaddr = fsm.segTEXT.vmaddr + fsm.segTEXT.vmsize;  // dummy
+                 fsm.segLINK.vmsize = 0x1000;  // dummy
+                 fsm.segLINK.fileoff = fsm.segTEXT.fileoff + fsm.segTEXT.filesize;
+                 fsm.segLINK.filesize = fsm.segLINK.vmsize;
+                 fsm.segLINK.maxprot = VM_PROT_READ;
+                 fsm.segLINK.initprot = VM_PROT_READ;
+                 fsm.segLINK.nsects = 0;
+ 
+                 fsm.cmdVERMIN.cmd = LC_VERSION_MIN_MACOSX;  // LC_VERSION_MIN_IPHONEOS
+                 fsm.cmdVERMIN.cmdsize = 4*4;
+                 fsm.cmdVERMIN.version = (10<<16)|(12<<8);
+                 fsm.cmdVERMIN.sdk = fsm.cmdVERMIN.version;
+ 
+                 fsm.cmdSRCVER.cmd = LC_SOURCE_VERSION;
+                 fsm.cmdSRCVER.cmdsize = 4*4;
+                 fsm.cmdSRCVER.version = 0;
+                 fsm.cmdSRCVER.__pad = 0;
+ 
+                 sz_stub_main  = sizeof(fsm);
+                    stub_main  = (unsigned char const *)&fsm;
+             }
+             break;
+         }
+     }
+ #if !defined(DEBUG)
+     // disable macOS packing in Release builds until we do support macOS 13+
+     //   https://github.com/upx/upx/issues/612
+     if (my_cputype == CPU_TYPE_X86_64 || my_cputype == CPU_TYPE_ARM64)
+         if (!opt->darwin_macho.force_macos)
+             throwCantPack("macOS is currently not supported (try --force-macos)");
+ #endif
+     return true;
+ }

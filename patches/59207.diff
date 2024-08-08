@@ -1,0 +1,344 @@
+commit 608e9e9a4ec4d2013faf1b8f9ecec09e90f131f2
+Author: Robin Watts <Robin.Watts@artifex.com>
+Date:   Mon May 29 15:32:07 2023 +0100
+
+    Bug 706738: OSS Fuzz 59207. Avoid using invalid pdf_xref_entry.
+    
+    The problem here is that we end up accessing a pdf_xref_entry
+    that has just been freed due to an intervening operation
+    (an xref solidification).
+    
+    The bug report notes that this has only happened since
+    https://git.ghostscript.com/?p=mupdf.git;a=commitdiff;h=27a069e786d36bc9d22d2fe9c02493612d2f5ef8
+    
+    In the code before that bug, the solidification would happen
+    earlier and hence we were getting away with it. This is really
+    a separate issue.
+    
+    Essentially, any call to pdf_cache_object can cause a
+    solidification (or repair). Similarly, any call to
+    pdf_get_xref_entry (or pdf_get_xref_entry_no_null, but not
+    pdf_get_xref_entry_no_change) can similarly causes changes.
+    
+    pdf_load_object (and pdf_load_obj_stm) call pdf_cache_object, so
+    the same limitations apply to that.
+    
+    As such, we must not hold pdf_xref_entry pointers over such
+    calls.
+    
+    We were breaking this rule in pdf_cache_object itself (where it
+    recurses to handle object streams), and in pdf_load_obj_stm
+    where it would call pdf_get_xref_entry_no_null.
+    
+    Fix both those cases here, and add some comments to try to
+    avoid this happening again in future.
+
+diff --git a/include/mupdf/pdf/xref.h b/include/mupdf/pdf/xref.h
+index 24eb223a8..ad7bba286 100644
+--- a/include/mupdf/pdf/xref.h
++++ b/include/mupdf/pdf/xref.h
+@@ -93,11 +93,34 @@ struct pdf_xref
+ 	int64_t end_ofs; /* file offset to end of xref */
+ };
+ 
++/**
++	Retrieve the pdf_xref_entry for a given object.
++
++	This can cause xref reorganisations (solidifications etc) due to
++	repairs, so all held pdf_xref_entries should be considered
++	invalid after this call (other than the returned one).
++*/
+ pdf_xref_entry *pdf_cache_object(fz_context *ctx, pdf_document *doc, int num);
+ 
+ int pdf_count_objects(fz_context *ctx, pdf_document *doc);
++
++/**
++	Resolve an indirect object (or chain of objects).
++
++	This can cause xref reorganisations (solidifications etc) due to
++	repairs, so all held pdf_xref_entries should be considered
++	invalid after this call (other than the returned one).
++*/
+ pdf_obj *pdf_resolve_indirect(fz_context *ctx, pdf_obj *ref);
+ pdf_obj *pdf_resolve_indirect_chain(fz_context *ctx, pdf_obj *ref);
++
++/**
++	Load a given object.
++
++	This can cause xref reorganisations (solidifications etc) due to
++	repairs, so all held pdf_xref_entries should be considered
++	invalid after this call (other than the returned one).
++*/
+ pdf_obj *pdf_load_object(fz_context *ctx, pdf_document *doc, int num);
+ pdf_obj *pdf_load_unencrypted_object(fz_context *ctx, pdf_document *doc, int num);
+ 
+@@ -163,18 +186,20 @@ pdf_xref_entry *pdf_get_xref_entry(fz_context *ctx, pdf_document *doc, int i);
+ /*
+ 	Map a function across all xref entries in a document.
+ */
+ void pdf_xref_entry_map(fz_context *ctx, pdf_document *doc, void (*fn)(fz_context *, pdf_xref_entry *, int i, pdf_document *doc, void *), void *arg);
+ 
+ 
+ /*
+ 	Used after loading a document to access entries.
+ 
+ 	This will never throw anything, or return NULL if it is
+ 	only asked to return objects in range within a 'solid'
+ 	xref.
+ 
+ 	This will never "solidify" the xref, so no entry may be found
+ 	(NULL will be returned) for free entries.
++
++	Called with a valid i, this will never try/catch or throw.
+ */
+ pdf_xref_entry *pdf_get_xref_entry_no_change(fz_context *ctx, pdf_document *doc, int i);
+ pdf_xref_entry *pdf_get_xref_entry_no_null(fz_context *ctx, pdf_document *doc, int i);
+diff --git a/source/pdf/pdf-xref.c b/source/pdf/pdf-xref.c
+index 27f5213f9..0d8f9a6ed 100644
+--- a/source/pdf/pdf-xref.c
++++ b/source/pdf/pdf-xref.c
+@@ -312,6 +312,8 @@ pdf_xref_entry *pdf_get_populating_xref_entry(fz_context *ctx, pdf_document *doc
+ 	return &sub->table[num-sub->start];
+ }
+ 
++/* It is vital that pdf_get_xref_entry_aux called with !solidify_if_needed
++ * and a value object number, does NOT try/catch or throw. */
+ static
+ pdf_xref_entry *pdf_get_xref_entry_aux(fz_context *ctx, pdf_document *doc, int i, int solidify_if_needed)
+ {
+@@ -2019,147 +2021,159 @@ pdf_keep_document(fz_context *ctx, pdf_document *doc)
+  * compressed object streams
+  */
+ 
++/*
++	Do not hold pdf_xref_entry's over call to this function as they
++	may be invalidated!
++*/
+ static pdf_xref_entry *
+ pdf_load_obj_stm(fz_context *ctx, pdf_document *doc, int num, pdf_lexbuf *buf, int target)
+ {
+ 	fz_stream *stm = NULL;
+ 	pdf_obj *objstm = NULL;
+ 	int *numbuf = NULL;
+ 	int64_t *ofsbuf = NULL;
+ 
+ 	pdf_obj *obj;
+ 	int64_t first;
+ 	int count;
+ 	int i;
+ 	pdf_token tok;
+ 	pdf_xref_entry *ret_entry = NULL;
++	int ret_idx;
+ 	int xref_len;
+ 	int found;
+ 	fz_stream *sub = NULL;
+ 
+ 	fz_var(numbuf);
+ 	fz_var(ofsbuf);
+ 	fz_var(objstm);
+ 	fz_var(stm);
+ 	fz_var(sub);
+ 
+ 	fz_try(ctx)
+ 	{
+ 		objstm = pdf_load_object(ctx, doc, num);
+ 
+ 		if (pdf_obj_marked(ctx, objstm))
+ 			fz_throw(ctx, FZ_ERROR_GENERIC, "recursive object stream lookup");
+ 	}
+ 	fz_catch(ctx)
+ 	{
+ 		pdf_drop_obj(ctx, objstm);
+ 		fz_rethrow(ctx);
+ 	}
+ 
+ 	fz_try(ctx)
+ 	{
+ 		(void)pdf_mark_obj(ctx, objstm);
+ 
+ 		count = pdf_dict_get_int(ctx, objstm, PDF_NAME(N));
+ 		first = pdf_dict_get_int(ctx, objstm, PDF_NAME(First));
+ 
+ 		validate_object_number_range(ctx, first, count, "object stream");
+ 
+ 		numbuf = fz_calloc(ctx, count, sizeof(*numbuf));
+ 		ofsbuf = fz_calloc(ctx, count, sizeof(*ofsbuf));
+ 
+ 		xref_len = pdf_xref_len(ctx, doc);
+ 
+ 		found = 0;
+ 
+ 		stm = pdf_open_stream_number(ctx, doc, num);
+ 		for (i = 0; i < count; i++)
+ 		{
+ 			tok = pdf_lex(ctx, stm, buf);
+ 			if (tok != PDF_TOK_INT)
+ 				fz_throw(ctx, FZ_ERROR_GENERIC, "corrupt object stream (%d 0 R)", num);
+ 			numbuf[found] = buf->i;
+ 
+ 			tok = pdf_lex(ctx, stm, buf);
+ 			if (tok != PDF_TOK_INT)
+ 				fz_throw(ctx, FZ_ERROR_GENERIC, "corrupt object stream (%d 0 R)", num);
+ 			ofsbuf[found] = buf->i;
+ 
+ 			if (numbuf[found] <= 0 || numbuf[found] >= xref_len)
+ 				fz_warn(ctx, "object stream object out of range, skipping");
+ 			else
+ 				found++;
+ 		}
+ 
++		ret_idx = -1;
+ 		for (i = 0; i < found; i++)
+ 		{
+ 			pdf_xref_entry *entry;
+ 			uint64_t length;
+ 			int64_t offset;
+ 
+ 			offset = first + ofsbuf[i];
+ 			if (i+1 < found)
+ 				length = ofsbuf[i+1] - ofsbuf[i];
+ 			else
+ 				length = UINT64_MAX;
+ 
+ 			sub = fz_open_null_filter(ctx, stm, length, offset);
+ 
+ 			obj = pdf_parse_stm_obj(ctx, doc, sub, buf);
+ 			fz_drop_stream(ctx, sub);
+ 			sub = NULL;
+ 
+ 			entry = pdf_get_xref_entry_no_null(ctx, doc, numbuf[i]);
+ 
+ 			pdf_set_obj_parent(ctx, obj, numbuf[i]);
+ 
+ 			/* We may have set entry->type to be 'O' from being 'o' to avoid nasty
+ 			 * recursions in pdf_cache_object. Accept the type being 'O' here. */
+ 			if ((entry->type == 'o' || entry->type == 'O') && entry->ofs == num)
+ 			{
+ 				/* If we already have an entry for this object,
+ 				 * we'd like to drop it and use the new one -
+ 				 * but this means that anyone currently holding
+ 				 * a pointer to the old one will be left with a
+ 				 * stale pointer. Instead, we drop the new one
+ 				 * and trust that the old one is correct. */
+ 				if (entry->obj)
+ 				{
+ 					if (pdf_objcmp(ctx, entry->obj, obj))
+ 						fz_warn(ctx, "Encountered new definition for object %d - keeping the original one", numbuf[i]);
+ 					pdf_drop_obj(ctx, obj);
+ 				}
+ 				else
+ 				{
+ 					entry->obj = obj;
+ 					fz_drop_buffer(ctx, entry->stm_buf);
+ 					entry->stm_buf = NULL;
+ 				}
+ 				if (numbuf[i] == target)
+-					ret_entry = entry;
++					ret_idx = i;
+ 			}
+ 			else
+ 			{
+ 				pdf_drop_obj(ctx, obj);
+ 			}
+ 		}
++		/* Parsing our way through the stream can cause the xref to be
++		 * solidified, which will move an entry. We therefore can't
++		 * read the entry for returning until no more parsing is to be
++		 * done. Thus we end up reading this entry twice. */
++		if (ret_idx >= 0)
++			ret_entry = pdf_get_xref_entry_no_null(ctx, doc, numbuf[ret_idx]);
+ 	}
+ 	fz_always(ctx)
+ 	{
+ 		fz_drop_stream(ctx, stm);
+ 		fz_drop_stream(ctx, sub);
+ 		fz_free(ctx, ofsbuf);
+ 		fz_free(ctx, numbuf);
+ 		pdf_unmark_obj(ctx, objstm);
+ 		pdf_drop_obj(ctx, objstm);
+ 	}
+ 	fz_catch(ctx)
+ 	{
+ 		fz_rethrow(ctx);
+ 	}
+ 	return ret_entry;
+ }
+ 
+ /*
+  * object loading
+  */
+@@ -2470,65 +2484,72 @@ object_updated:
+ 		if (try_repair)
+ 		{
+ perform_repair:
+ 			fz_try(ctx)
+ 			{
+ 				pdf_repair_xref(ctx, doc);
+ 				pdf_prime_xref_index(ctx, doc);
+ 				pdf_repair_obj_stms(ctx, doc);
+ 				pdf_repair_trailer(ctx, doc);
+ 			}
+ 			fz_catch(ctx)
+ 			{
+ 				fz_rethrow_if(ctx, FZ_ERROR_TRYLATER);
+ 				fz_rethrow_if(ctx, FZ_ERROR_REPAIRED);
+ 				if (rnum == num)
+ 					fz_throw(ctx, FZ_ERROR_GENERIC, "cannot parse object (%d 0 R)", num);
+ 				else
+ 					fz_throw(ctx, FZ_ERROR_GENERIC, "found object (%d 0 R) instead of (%d 0 R)", rnum, num);
+ 			}
+ 			goto object_updated;
+ 		}
+ 
+ 		if (doc->crypt)
+ 			pdf_crypt_obj(ctx, doc->crypt, x->obj, x->num, x->gen);
+ 	}
+ 	else if (x->type == 'o')
+ 	{
+ 		if (!x->obj)
+ 		{
+ 			pdf_xref_entry *orig_x = x;
++			pdf_xref_entry *ox = x; /* This init is unused, but it shuts warnings up. */
+ 			orig_x->type = 'O'; /* Mark this node so we know we're recursing. */
+ 			fz_try(ctx)
+ 				x = pdf_load_obj_stm(ctx, doc, x->ofs, &doc->lexbuf.base, num);
+ 			fz_always(ctx)
+-				orig_x->type = 'o'; /* Not recursing any more. */
++			{
++				/* Most of the time ox == orig_x, but if pdf_load_obj_stm performed a
++				 * repair, it may not be. It is safe to call pdf_get_xref_entry_no_change
++				 * here, as it does not try/catch. */
++				ox = pdf_get_xref_entry_no_change(ctx, doc, num);
++				ox->type = 'o'; /* Not recursing any more. */
++			}
+ 			fz_catch(ctx)
+ 				fz_rethrow(ctx);
+ 			if (x == NULL)
+ 				fz_throw(ctx, FZ_ERROR_GENERIC, "cannot load object stream containing object (%d 0 R)", num);
+ 			if (!x->obj)
+ 			{
+ 				x->type = 'f';
+-				orig_x->type = 'f';
++				ox->type = 'f';
+ 				if (doc->repair_attempted)
+ 					fz_throw(ctx, FZ_ERROR_GENERIC, "object (%d 0 R) was not found in its object stream", num);
+ 				goto perform_repair;
+ 			}
+ 		}
+ 	}
+ 	else if (doc->hint_obj_offsets && read_hinted_object(ctx, doc, num))
+ 	{
+ 		goto object_updated;
+ 	}
+ 	else if (doc->file_length && doc->linear_pos < doc->file_length)
+ 	{
+ 		fz_throw(ctx, FZ_ERROR_TRYLATER, "cannot find object in xref (%d 0 R) - not loaded yet?", num);
+ 	}
+ 	else
+ 	{
+ 		fz_throw(ctx, FZ_ERROR_GENERIC, "cannot find object in xref (%d 0 R)", num);
+ 	}
+ 
+ 	pdf_set_obj_parent(ctx, x->obj, num);
+ 	return x;
+ }

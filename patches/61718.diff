@@ -1,0 +1,497 @@
+commit 6c4016fd3d944a8903bdd3e6be8fcdd1bc73ca79
+Author: Dirk Farin <dirk.farin@gmail.com>
+Date:   Tue Oct 3 14:05:41 2023 +0200
+
+    detect invalid mask region image reference (fixes clusterfuzz issue 60359)
+
+diff --git a/libheif/context.cc b/libheif/context.cc
+index 359a5b7..ca1dfd9 100644
+--- a/libheif/context.cc
++++ b/libheif/context.cc
+@@ -534,470 +534,483 @@ void HeifContext::remove_top_level_image(const std::shared_ptr<Image>& image)
+ Error HeifContext::interpret_heif_file()
+ {
+   m_all_images.clear();
+   m_top_level_images.clear();
+   m_primary_image.reset();
+ 
+ 
+   // --- reference all non-hidden images
+ 
+   std::vector<heif_item_id> image_IDs = m_heif_file->get_item_IDs();
+ 
+   for (heif_item_id id : image_IDs) {
+     auto infe_box = m_heif_file->get_infe_box(id);
+     if (!infe_box) {
+       // TODO(farindk): Should we return an error instead of skipping the invalid id?
+       continue;
+     }
+ 
+     if (item_type_is_image(infe_box->get_item_type(), infe_box->get_content_type())) {
+       auto image = std::make_shared<Image>(this, id);
+       m_all_images.insert(std::make_pair(id, image));
+ 
+       if (!infe_box->is_hidden_item()) {
+         if (id == m_heif_file->get_primary_image_ID()) {
+           image->set_primary(true);
+           m_primary_image = image;
+         }
+ 
+         m_top_level_images.push_back(image);
+       }
+     }
+   }
+ 
+   if (!m_primary_image) {
+     return Error(heif_error_Invalid_input,
+                  heif_suberror_Nonexisting_item_referenced,
+                  "'pitm' box references a non-existing image");
+   }
+ 
+ 
+   // --- read through properties for each image and extract image resolutions
+   // Note: this has to be executed before assigning the auxiliary images below because we will only
+   // merge the alpha image with the main image when their resolutions are the same.
+ 
+   for (auto& pair : m_all_images) {
+     auto& image = pair.second;
+ 
+     std::vector<std::shared_ptr<Box>> properties;
+ 
+     Error err = m_heif_file->get_properties(pair.first, properties);
+     if (err) {
+       return err;
+     }
+ 
+     bool ispe_read = false;
+     for (const auto& prop : properties) {
+       auto ispe = std::dynamic_pointer_cast<Box_ispe>(prop);
+       if (ispe) {
+         uint32_t width = ispe->get_width();
+         uint32_t height = ispe->get_height();
+ 
+ 
+         // --- check whether the image size is "too large"
+ 
+         if (width > m_maximum_image_width_limit ||
+             height > m_maximum_image_height_limit) {
+           std::stringstream sstr;
+           sstr << "Image size " << width << "x" << height << " exceeds the maximum image size "
+                << m_maximum_image_width_limit << "x" << m_maximum_image_height_limit << "\n";
+ 
+           return Error(heif_error_Memory_allocation_error,
+                        heif_suberror_Security_limit_exceeded,
+                        sstr.str());
+         }
+ 
+         image->set_resolution(width, height);
+         ispe_read = true;
+       }
+ 
+       if (ispe_read) {
+         auto clap = std::dynamic_pointer_cast<Box_clap>(prop);
+         if (clap) {
+           image->set_resolution(clap->get_width_rounded(),
+                                 clap->get_height_rounded());
+         }
+ 
+         auto irot = std::dynamic_pointer_cast<Box_irot>(prop);
+         if (irot) {
+           if (irot->get_rotation() == 90 ||
+               irot->get_rotation() == 270) {
+             // swap width and height
+             image->set_resolution(image->get_height(),
+                                   image->get_width());
+           }
+         }
+       }
+ 
+       auto colr = std::dynamic_pointer_cast<Box_colr>(prop);
+       if (colr) {
+         auto profile = colr->get_color_profile();
+         image->set_color_profile(profile);
+       }
+     }
+   }
+ 
+ 
+   // --- remove auxiliary from top-level images and assign to their respective image
+ 
+   auto iref_box = m_heif_file->get_iref_box();
+   if (iref_box) {
+     // m_top_level_images.clear();
+ 
+     for (auto& pair : m_all_images) {
+       auto& image = pair.second;
+ 
+       std::vector<Box_iref::Reference> references = iref_box->get_references_from(image->get_id());
+ 
+       for (const Box_iref::Reference& ref : references) {
+         uint32_t type = ref.header.get_short_type();
+ 
+         if (type == fourcc("thmb")) {
+           // --- this is a thumbnail image, attach to the main image
+ 
+           std::vector<heif_item_id> refs = ref.to_item_ID;
+           if (refs.size() != 1) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Unspecified,
+                          "Too many thumbnail references");
+           }
+ 
+           image->set_is_thumbnail_of(refs[0]);
+ 
+           auto master_iter = m_all_images.find(refs[0]);
+           if (master_iter == m_all_images.end()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Thumbnail references a non-existing image");
+           }
+ 
+           if (master_iter->second->is_thumbnail()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Thumbnail references another thumbnail");
+           }
+ 
+           if (image.get() == master_iter->second.get()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Recursive thumbnail image detected");
+           }
+           master_iter->second->add_thumbnail(image);
+ 
+           remove_top_level_image(image);
+         }
+         else if (type == fourcc("auxl")) {
+ 
+           // --- this is an auxiliary image
+           //     check whether it is an alpha channel and attach to the main image if yes
+ 
+           std::vector<std::shared_ptr<Box>> properties;
+           Error err = m_heif_file->get_properties(image->get_id(), properties);
+           if (err) {
+             return err;
+           }
+ 
+           std::shared_ptr<Box_auxC> auxC_property;
+           for (const auto& property : properties) {
+             auto auxC = std::dynamic_pointer_cast<Box_auxC>(property);
+             if (auxC) {
+               auxC_property = auxC;
+             }
+           }
+ 
+           if (!auxC_property) {
+             std::stringstream sstr;
+             sstr << "No auxC property for image " << image->get_id();
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Auxiliary_image_type_unspecified,
+                          sstr.str());
+           }
+ 
+           std::vector<heif_item_id> refs = ref.to_item_ID;
+           if (refs.size() != 1) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Unspecified,
+                          "Too many auxiliary image references");
+           }
+ 
+ 
+           // alpha channel
+ 
+           if (auxC_property->get_aux_type() == "urn:mpeg:avc:2015:auxid:1" ||   // HEIF (avc)
+               auxC_property->get_aux_type() == "urn:mpeg:hevc:2015:auxid:1" ||  // HEIF (h265)
+               auxC_property->get_aux_type() == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha") { // MIAF
+ 
+             auto master_iter = m_all_images.find(refs[0]);
+             if (master_iter == m_all_images.end()) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Nonexisting_item_referenced,
+                            "Non-existing alpha image referenced");
+             }
+ 
+             auto master_img = master_iter->second;
+ 
+             if (image.get() == master_img.get()) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Nonexisting_item_referenced,
+                            "Recursive alpha image detected");
+             }
+ 
+ 
+             if (image->get_width() == master_img->get_width() &&
+                 image->get_height() == master_img->get_height()) {
+ 
+               image->set_is_alpha_channel_of(refs[0], true);
+               master_img->set_alpha_channel(image);
+             }
+           }
+ 
+ 
+           // depth channel
+ 
+           if (auxC_property->get_aux_type() == "urn:mpeg:hevc:2015:auxid:2" || // HEIF
+               auxC_property->get_aux_type() == "urn:mpeg:mpegB:cicp:systems:auxiliary:depth") { // AVIF
+             image->set_is_depth_channel_of(refs[0]);
+ 
+             auto master_iter = m_all_images.find(refs[0]);
+             if (master_iter == m_all_images.end()) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Nonexisting_item_referenced,
+                            "Non-existing depth image referenced");
+             }
+             if (image.get() == master_iter->second.get()) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Nonexisting_item_referenced,
+                            "Recursive depth image detected");
+             }
+             master_iter->second->set_depth_channel(image);
+ 
+             auto subtypes = auxC_property->get_subtypes();
+ 
+             std::vector<std::shared_ptr<SEIMessage>> sei_messages;
+             err = decode_hevc_aux_sei_messages(subtypes, sei_messages);
+ 
+             for (auto& msg : sei_messages) {
+               auto depth_msg = std::dynamic_pointer_cast<SEIMessage_depth_representation_info>(msg);
+               if (depth_msg) {
+                 image->set_depth_representation_info(*depth_msg);
+               }
+             }
+           }
+ 
+ 
+           // --- generic aux image
+ 
+           image->set_is_aux_image_of(refs[0], auxC_property->get_aux_type());
+ 
+           auto master_iter = m_all_images.find(refs[0]);
+           if (master_iter == m_all_images.end()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Non-existing aux image referenced");
+           }
+           if (image.get() == master_iter->second.get()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Recursive aux image detected");
+           }
+ 
+           master_iter->second->add_aux_image(image);
+ 
+           remove_top_level_image(image);
+         }
+         else {
+           // 'image' is a normal image, keep it as a top-level image
+         }
+       }
+     }
+   }
+ 
+ 
+   // --- check that HEVC images have an hvcC property
+ 
+   for (auto& pair : m_all_images) {
+     auto& image = pair.second;
+ 
+     std::shared_ptr<Box_infe> infe = m_heif_file->get_infe_box(image->get_id());
+     if (infe->get_item_type() == "hvc1") {
+ 
+       auto ipma = m_heif_file->get_ipma_box();
+       auto ipco = m_heif_file->get_ipco_box();
+ 
+       if (!ipco->get_property_for_item_ID(image->get_id(), ipma, fourcc("hvcC"))) {
+         return Error(heif_error_Invalid_input,
+                      heif_suberror_No_hvcC_box,
+                      "No hvcC property in hvc1 type image");
+       }
+     }
+   }
+ 
+ 
+   // --- assign color profile from grid tiles to main image when main image has no profile assigned
+ 
+   for (auto& pair : m_all_images) {
+     auto& image = pair.second;
+     auto id = pair.first;
+ 
+     auto infe_box = m_heif_file->get_infe_box(id);
+     if (!infe_box) {
+       continue;
+     }
+ 
+     if (!iref_box) {
+       break;
+     }
+ 
+     if (infe_box->get_item_type() == "grid") {
+       std::vector<heif_item_id> image_references = iref_box->get_references(id, fourcc("dimg"));
+ 
+       if (image_references.empty()) {
+         continue; // TODO: can this every happen?
+       }
+ 
+       auto tileId = image_references.front();
+ 
+       auto iter = m_all_images.find(tileId);
+       if (iter == m_all_images.end()) {
+         continue; // invalid grid entry
+       }
+ 
+       auto tile_img = iter->second;
+       if (image->get_color_profile_icc() == nullptr && tile_img->get_color_profile_icc()) {
+         image->set_color_profile(tile_img->get_color_profile_icc());
+       }
+ 
+       if (image->get_color_profile_nclx() == nullptr && tile_img->get_color_profile_nclx()) {
+         image->set_color_profile(tile_img->get_color_profile_nclx());
+       }
+     }
+   }
+ 
+ 
+   // --- read metadata and assign to image
+ 
+   for (heif_item_id id : image_IDs) {
+     std::string item_type = m_heif_file->get_item_type(id);
+     // skip region annotations, handled next
+     if (item_type == "rgan") {
+       continue;
+     }
+     std::string content_type = m_heif_file->get_content_type(id);
+ 
+     // we now assign all kinds of metadata to the image, not only 'Exif' and 'XMP'
+ 
+     std::shared_ptr<ImageMetadata> metadata = std::make_shared<ImageMetadata>();
+     metadata->item_id = id;
+     metadata->item_type = item_type;
+     metadata->content_type = content_type;
+ 
+     Error err = m_heif_file->get_compressed_image_data(id, &(metadata->m_data));
+     if (err) {
+       return err;
+     }
+ 
+     //std::cerr.write((const char*)data.data(), data.size());
+ 
+ 
+     // --- assign metadata to the image
+ 
+     if (iref_box) {
+       std::vector<Box_iref::Reference> references = iref_box->get_references_from(id);
+       for (const auto& ref : references) {
+         if (ref.header.get_short_type() == fourcc("cdsc")) {
+           std::vector<uint32_t> refs = ref.to_item_ID;
+           if (refs.size() != 1) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Unspecified,
+                          "Metadata not correctly assigned to image");
+           }
+ 
+           uint32_t exif_image_id = refs[0];
+           auto img_iter = m_all_images.find(exif_image_id);
+           if (img_iter == m_all_images.end()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "Metadata assigned to non-existing image");
+           }
+ 
+           img_iter->second->add_metadata(metadata);
+         }
+         else if (ref.header.get_short_type() == fourcc("prem")) {
+           uint32_t color_image_id = ref.from_item_ID;
+           auto img_iter = m_all_images.find(color_image_id);
+           if (img_iter == m_all_images.end()) {
+             return Error(heif_error_Invalid_input,
+                          heif_suberror_Nonexisting_item_referenced,
+                          "`prem` link assigned to non-existing image");
+           }
+ 
+           img_iter->second->set_is_premultiplied_alpha(true);;
+         }
+       }
+     }
+   }
+ 
+   // --- read region item and assign to image(s)
+ 
+   for (heif_item_id id : image_IDs) {
+     std::string item_type = m_heif_file->get_item_type(id);
+     if (item_type == "rgan") {
+       std::shared_ptr<RegionItem> region_item = std::make_shared<RegionItem>();
+       region_item->item_id = id;
+       std::vector<uint8_t> region_data;
+       Error err = m_heif_file->get_compressed_image_data(id, &(region_data));
+       if (err) {
+         return err;
+       }
+       region_item->parse(region_data);
+       if (iref_box) {
+         std::vector<Box_iref::Reference> references = iref_box->get_references_from(id);
+         for (const auto& ref : references) {
+           if (ref.header.get_short_type() == fourcc("cdsc")) {
+             std::vector<uint32_t> refs = ref.to_item_ID;
+             if (refs.size() != 1) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Unspecified,
+                            "Region item not correctly assigned to image");
+             }
+             uint32_t image_id = refs[0];
+             auto img_iter = m_all_images.find(image_id);
+             if (img_iter == m_all_images.end()) {
+               return Error(heif_error_Invalid_input,
+                            heif_suberror_Nonexisting_item_referenced,
+                            "Region item assigned to non-existing image");
+             }
+             img_iter->second->add_region_item_id(id);
+             m_region_items.push_back(region_item);
+           }
++
+           /* When the geometry 'mask' of a region is represented by a mask stored in
+           * another image item the image item containing the mask shall be identified
+           * by an item reference of type 'mask' from the region item to the image item
+           * containing the mask. */
+           if (ref.header.get_short_type() == fourcc("mask")) {
+             std::vector<uint32_t> refs = ref.to_item_ID;
+-            int mask_index = 0;
++            size_t mask_index = 0;
+             for (int j = 0; j < region_item->get_number_of_regions(); j++) {
+               if (region_item->get_regions()[j]->getRegionType() == heif_region_type_referenced_mask) {
+                 std::shared_ptr<RegionGeometry_ReferencedMask> mask_geometry = std::dynamic_pointer_cast<RegionGeometry_ReferencedMask>(region_item->get_regions()[j]);
++
++                if (mask_index >= refs.size()) {
++                  return Error(heif_error_Invalid_input,
++                               heif_suberror_Unspecified,
++                               "Region mask reference with non-existing mask image reference");
++                }
++
+                 uint32_t mask_image_id = refs[mask_index];
+-                assert(is_image(mask_image_id));
+-                mask_geometry->referenced_item = mask_image_id;
++                if (!is_image(mask_image_id)) {
++                  return Error(heif_error_Invalid_input,
++                               heif_suberror_Unspecified,
++                               "Region mask referenced item is not an image");
++                }
++
+                 auto mask_image = m_all_images.find(mask_image_id)->second;
++                mask_geometry->referenced_item = mask_image_id;
+                 if (mask_geometry->width == 0) {
+                   mask_geometry->width = mask_image->get_ispe_width();
+                 }
+                 if (mask_geometry->height == 0) {
+                   mask_geometry->height = mask_image->get_ispe_height();
+                 }
+                 mask_index += 1;
+                 remove_top_level_image(mask_image);
+               }
+             }
+           }
+         }
+       }
+     }
+   }
+ 
+   return Error::Ok;
+ }

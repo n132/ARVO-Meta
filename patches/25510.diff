@@ -1,0 +1,776 @@
+commit 52161ce8cec0512de4158c95fdc01c8e39f7938c
+Author: Adi (Suissa) Peleg <adip@google.com>
+Date:   Wed Sep 30 09:41:26 2020 -0400
+
+    [test] Http2Frame support for client and general stream ids (#13310)
+    
+    * [test] Http2Frame support both client and non-client stream ids in Http2Frame
+    
+    Signed-off-by: Adi Suissa-Peleg <adip@google.com>
+
+diff --git a/test/common/http/http2/codec_impl_test.cc b/test/common/http/http2/codec_impl_test.cc
+index 4922328d50..1003b2c95e 100644
+--- a/test/common/http/http2/codec_impl_test.cc
++++ b/test/common/http/http2/codec_impl_test.cc
+@@ -281,63 +281,63 @@ public:
+ protected:
+   void priorityFlood() {
+     initialize();
+ 
+     TestRequestHeaderMapImpl request_headers;
+     HttpTestUtility::addDefaultHeaders(request_headers, "POST");
+     EXPECT_CALL(request_decoder_, decodeHeaders_(_, false));
+     request_encoder_->encodeHeaders(request_headers, false);
+ 
+     nghttp2_priority_spec spec = {0, 10, 0};
+     // HTTP/2 codec adds 1 to the number of active streams when computing PRIORITY frames limit
+     constexpr uint32_t max_allowed =
+         2 * CommonUtility::OptionsLimits::DEFAULT_MAX_INBOUND_PRIORITY_FRAMES_PER_STREAM;
+     for (uint32_t i = 0; i < max_allowed + 1; ++i) {
+       EXPECT_EQ(0, nghttp2_submit_priority(client_->session(), NGHTTP2_FLAG_NONE, 1, &spec));
+     }
+   }
+ 
+   void windowUpdateFlood() {
+     initialize();
+ 
+     TestRequestHeaderMapImpl request_headers;
+     HttpTestUtility::addDefaultHeaders(request_headers);
+     EXPECT_CALL(request_decoder_, decodeHeaders_(_, true));
+     request_encoder_->encodeHeaders(request_headers, true);
+ 
+     // Send one DATA frame back
+     EXPECT_CALL(response_decoder_, decodeHeaders_(_, false));
+     EXPECT_CALL(response_decoder_, decodeData(_, false));
+     TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+     response_encoder_->encodeHeaders(response_headers, false);
+     Buffer::OwnedImpl data("0");
+     EXPECT_NO_THROW(response_encoder_->encodeData(data, false));
+ 
+     // See the limit formula in the
+     // `Envoy::Http::Http2::ServerConnectionImpl::checkInboundFrameLimits()' method.
+     constexpr uint32_t max_allowed =
+         1 + 2 * (CommonUtility::OptionsLimits::
+                      DEFAULT_MAX_INBOUND_WINDOW_UPDATE_FRAMES_PER_DATA_FRAME_SENT +
+                  1);
+     for (uint32_t i = 0; i < max_allowed + 1; ++i) {
+       EXPECT_EQ(0, nghttp2_submit_window_update(client_->session(), NGHTTP2_FLAG_NONE, 1, 1));
+     }
+   }
+ 
+   void emptyDataFlood(Buffer::OwnedImpl& data) {
+     initialize();
+ 
+     TestRequestHeaderMapImpl request_headers;
+     HttpTestUtility::addDefaultHeaders(request_headers, "POST");
+     EXPECT_CALL(request_decoder_, decodeHeaders_(_, false));
+     request_encoder_->encodeHeaders(request_headers, false);
+ 
+     // HTTP/2 codec does not send empty DATA frames with no END_STREAM flag.
+     // To make this work, send raw bytes representing empty DATA frames bypassing client codec.
+-    Http2Frame emptyDataFrame = Http2Frame::makeEmptyDataFrame(0);
++    Http2Frame emptyDataFrame = Http2Frame::makeEmptyDataFrame(Http2Frame::makeClientStreamId(0));
+     constexpr uint32_t max_allowed =
+         CommonUtility::OptionsLimits::DEFAULT_MAX_CONSECUTIVE_INBOUND_FRAMES_WITH_EMPTY_PAYLOAD;
+     for (uint32_t i = 0; i < max_allowed + 1; ++i) {
+       data.add(emptyDataFrame.data(), emptyDataFrame.size());
+     }
+   }
+ };
+diff --git a/test/common/http/http2/http2_frame.cc b/test/common/http/http2/http2_frame.cc
+index 142e353f28..b29956144b 100644
+--- a/test/common/http/http2/http2_frame.cc
++++ b/test/common/http/http2/http2_frame.cc
+@@ -10,8 +10,8 @@
+ 
+ namespace {
+ 
+-// Make request stream ID in the network byte order
+-uint32_t makeRequestStreamId(uint32_t stream_id) { return htonl((stream_id << 1) | 1); }
++// Converts stream ID to the network byte order. Supports all values in the range [0, 2^30).
++uint32_t makeNetworkOrderStreamId(uint32_t stream_id) { return htonl(stream_id); }
+ 
+ // All this templatized stuff is for the typesafe constexpr bitwise ORing of the "enum class" values
+ template <typename First, typename... Rest> struct FirstArgType {
+@@ -147,29 +147,31 @@ Http2Frame Http2Frame::makeEmptySettingsFrame(SettingsFlags flags) {
+ Http2Frame Http2Frame::makeEmptyHeadersFrame(uint32_t stream_index, HeadersFlags flags) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Headers, 0, static_cast<uint8_t>(flags),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   return frame;
+ }
+ 
+ Http2Frame Http2Frame::makeEmptyContinuationFrame(uint32_t stream_index, HeadersFlags flags) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Continuation, 0, static_cast<uint8_t>(flags),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   return frame;
+ }
+ 
+ Http2Frame Http2Frame::makeEmptyDataFrame(uint32_t stream_index, DataFlags flags) {
+   Http2Frame frame;
+-  frame.buildHeader(Type::Data, 0, static_cast<uint8_t>(flags), makeRequestStreamId(stream_index));
++  frame.buildHeader(Type::Data, 0, static_cast<uint8_t>(flags),
++                    makeNetworkOrderStreamId(stream_index));
+   return frame;
+ }
+ 
+ Http2Frame Http2Frame::makePriorityFrame(uint32_t stream_index, uint32_t dependent_index) {
+   static constexpr size_t kPriorityPayloadSize = 5;
+   Http2Frame frame;
+-  frame.buildHeader(Type::Priority, kPriorityPayloadSize, 0, makeRequestStreamId(stream_index));
+-  const uint32_t dependent_net = makeRequestStreamId(dependent_index);
++  frame.buildHeader(Type::Priority, kPriorityPayloadSize, 0,
++                    makeNetworkOrderStreamId(stream_index));
++  const uint32_t dependent_net = makeNetworkOrderStreamId(dependent_index);
+   ASSERT(frame.data_.capacity() >= HeaderSize + sizeof(uint32_t));
+   memcpy(&frame.data_[HeaderSize], reinterpret_cast<const void*>(&dependent_net), sizeof(uint32_t));
+   return frame;
+ }
+@@ -177,13 +179,13 @@ Http2Frame Http2Frame::makePriorityFrame(uint32_t stream_index, uint32_t depende
+ Http2Frame Http2Frame::makeEmptyPushPromiseFrame(uint32_t stream_index,
+                                                  uint32_t promised_stream_index,
+                                                  HeadersFlags flags) {
+   static constexpr size_t kEmptyPushPromisePayloadSize = 4;
+   Http2Frame frame;
+   frame.buildHeader(Type::PushPromise, kEmptyPushPromisePayloadSize, static_cast<uint8_t>(flags),
+-                    makeRequestStreamId(stream_index));
+-  const uint32_t promised_stream_id = makeRequestStreamId(promised_stream_index);
++                    makeNetworkOrderStreamId(stream_index));
++  const uint32_t promised_stream_id = makeNetworkOrderStreamId(promised_stream_index);
+   ASSERT(frame.data_.capacity() >= HeaderSize + sizeof(uint32_t));
+   memcpy(&frame.data_[HeaderSize], reinterpret_cast<const void*>(&promised_stream_id),
+          sizeof(uint32_t));
+   return frame;
+ }
+@@ -191,9 +193,10 @@ Http2Frame Http2Frame::makeEmptyPushPromiseFrame(uint32_t stream_index,
+ Http2Frame Http2Frame::makeResetStreamFrame(uint32_t stream_index, ErrorCode error_code) {
+   static constexpr size_t kResetStreamPayloadSize = 4;
+   Http2Frame frame;
+-  frame.buildHeader(Type::RstStream, kResetStreamPayloadSize, 0, makeRequestStreamId(stream_index));
++  frame.buildHeader(Type::RstStream, kResetStreamPayloadSize, 0,
++                    makeNetworkOrderStreamId(stream_index));
+   const uint32_t error = static_cast<uint32_t>(error_code);
+   ASSERT(frame.data_.capacity() >= HeaderSize + sizeof(uint32_t));
+   memcpy(&frame.data_[HeaderSize], reinterpret_cast<const void*>(&error), sizeof(uint32_t));
+   return frame;
+ }
+@@ -201,12 +204,12 @@ Http2Frame Http2Frame::makeResetStreamFrame(uint32_t stream_index, ErrorCode err
+ Http2Frame Http2Frame::makeEmptyGoAwayFrame(uint32_t last_stream_index, ErrorCode error_code) {
+   static constexpr size_t kEmptyGoAwayPayloadSize = 8;
+   Http2Frame frame;
+-  frame.buildHeader(Type::GoAway, kEmptyGoAwayPayloadSize, 0, makeRequestStreamId(0));
+-  const uint32_t last_stream_id = makeRequestStreamId(last_stream_index);
++  frame.buildHeader(Type::GoAway, kEmptyGoAwayPayloadSize, 0);
++  const uint32_t last_stream_id = makeNetworkOrderStreamId(last_stream_index);
+   ASSERT(frame.data_.capacity() >= HeaderSize + 4 + sizeof(uint32_t));
+   memcpy(&frame.data_[HeaderSize], reinterpret_cast<const void*>(&last_stream_id),
+          sizeof(uint32_t));
+   const uint32_t error = static_cast<uint32_t>(error_code);
+   memcpy(&frame.data_[HeaderSize + 4], reinterpret_cast<const void*>(&error), sizeof(uint32_t));
+   return frame;
+ }
+@@ -214,47 +217,47 @@ Http2Frame Http2Frame::makeEmptyGoAwayFrame(uint32_t last_stream_index, ErrorCod
+ Http2Frame Http2Frame::makeWindowUpdateFrame(uint32_t stream_index, uint32_t increment) {
+   static constexpr size_t kWindowUpdatePayloadSize = 4;
+   Http2Frame frame;
+   frame.buildHeader(Type::WindowUpdate, kWindowUpdatePayloadSize, 0,
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   const uint32_t increment_net = htonl(increment);
+   ASSERT(frame.data_.capacity() >= HeaderSize + sizeof(uint32_t));
+   memcpy(&frame.data_[HeaderSize], reinterpret_cast<const void*>(&increment_net), sizeof(uint32_t));
+   return frame;
+ }
+ 
+ // Note: encoder in codebase persists multiple maps, with each map representing an individual frame.
+ Http2Frame Http2Frame::makeMetadataFrameFromMetadataMap(uint32_t stream_index,
+                                                         MetadataMap& metadata_map,
+                                                         MetadataFlags flags) {
+   const int numberOfNameValuePairs = metadata_map.size();
+   absl::FixedArray<nghttp2_nv> nameValues(numberOfNameValuePairs);
+   absl::FixedArray<nghttp2_nv>::iterator iterator = nameValues.begin();
+   for (const auto& metadata : metadata_map) {
+     *iterator = {const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(metadata.first.data())),
+                  const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(metadata.second.data())),
+                  metadata.first.size(), metadata.second.size(), NGHTTP2_NV_FLAG_NO_INDEX};
+     ++iterator;
+   }
+ 
+   nghttp2_hd_deflater* deflater;
+   // Note: this has no effect, as metadata frames do not add onto Dynamic table.
+   const int maxDynamicTableSize = 4096;
+   nghttp2_hd_deflate_new(&deflater, maxDynamicTableSize);
+ 
+   const size_t upperBoundBufferLength =
+       nghttp2_hd_deflate_bound(deflater, nameValues.begin(), numberOfNameValuePairs);
+ 
+   uint8_t* buffer = new uint8_t[upperBoundBufferLength];
+ 
+   const size_t numberOfBytesInMetadataPayload = nghttp2_hd_deflate_hd(
+       deflater, buffer, upperBoundBufferLength, nameValues.begin(), numberOfNameValuePairs);
+ 
+   Http2Frame frame;
+   frame.buildHeader(Type::Metadata, numberOfBytesInMetadataPayload, static_cast<uint8_t>(flags),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   std::vector<uint8_t> bufferVector(buffer, buffer + numberOfBytesInMetadataPayload);
+   frame.appendDataAfterHeaders(bufferVector);
+   delete[] buffer;
+   nghttp2_hd_deflate_del(deflater);
+   return frame;
+ }
+@@ -262,9 +265,9 @@ Http2Frame Http2Frame::makeMetadataFrameFromMetadataMap(uint32_t stream_index,
+ Http2Frame Http2Frame::makeMalformedRequest(uint32_t stream_index) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Headers, 0, orFlags(HeadersFlags::EndStream, HeadersFlags::EndHeaders),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   frame.appendStaticHeader(
+       StaticHeaderIndex::Status200); // send :status as request header, which is invalid
+   frame.adjustPayloadSize();
+   return frame;
+ }
+@@ -272,14 +275,14 @@ Http2Frame Http2Frame::makeMalformedRequest(uint32_t stream_index) {
+ Http2Frame Http2Frame::makeMalformedRequestWithZerolenHeader(uint32_t stream_index,
+                                                              absl::string_view host,
+                                                              absl::string_view path) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Headers, 0, orFlags(HeadersFlags::EndStream, HeadersFlags::EndHeaders),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   frame.appendStaticHeader(StaticHeaderIndex::MethodGet);
+   frame.appendStaticHeader(StaticHeaderIndex::SchemeHttps);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Path, path);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Host, host);
+   frame.appendEmptyHeader();
+   frame.adjustPayloadSize();
+   return frame;
+ }
+@@ -287,12 +290,12 @@ Http2Frame Http2Frame::makeMalformedRequestWithZerolenHeader(uint32_t stream_ind
+ Http2Frame Http2Frame::makeRequest(uint32_t stream_index, absl::string_view host,
+                                    absl::string_view path) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Headers, 0, orFlags(HeadersFlags::EndStream, HeadersFlags::EndHeaders),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   frame.appendStaticHeader(StaticHeaderIndex::MethodGet);
+   frame.appendStaticHeader(StaticHeaderIndex::SchemeHttps);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Path, path);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Host, host);
+   frame.adjustPayloadSize();
+   return frame;
+ }
+@@ -311,12 +314,12 @@ Http2Frame Http2Frame::makeRequest(uint32_t stream_index, absl::string_view host
+ Http2Frame Http2Frame::makePostRequest(uint32_t stream_index, absl::string_view host,
+                                        absl::string_view path) {
+   Http2Frame frame;
+   frame.buildHeader(Type::Headers, 0, orFlags(HeadersFlags::EndHeaders),
+-                    makeRequestStreamId(stream_index));
++                    makeNetworkOrderStreamId(stream_index));
+   frame.appendStaticHeader(StaticHeaderIndex::MethodPost);
+   frame.appendStaticHeader(StaticHeaderIndex::SchemeHttps);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Path, path);
+   frame.appendHeaderWithoutIndexing(StaticHeaderIndex::Host, host);
+   frame.adjustPayloadSize();
+   return frame;
+ }
+diff --git a/test/common/http/http2/http2_frame.h b/test/common/http/http2/http2_frame.h
+index 43225793a5..fc585815d8 100644
+--- a/test/common/http/http2/http2_frame.h
++++ b/test/common/http/http2/http2_frame.h
+@@ -21,148 +21,157 @@ class Http2Frame {
+ public:
+   Http2Frame() = default;
+ 
+   using Iterator = DataContainer::iterator;
+   using ConstIterator = DataContainer::const_iterator;
+ 
+   static constexpr size_t HeaderSize = 9;
+   static const char Preamble[25];
+ 
+   enum class Type : uint8_t {
+     Data = 0,
+     Headers,
+     Priority,
+     RstStream,
+     Settings,
+     PushPromise,
+     Ping,
+     GoAway,
+     WindowUpdate,
+     Continuation,
+     Metadata = 77,
+   };
+ 
+   enum class SettingsFlags : uint8_t {
+     None = 0,
+     Ack = 1,
+   };
+ 
+   enum class HeadersFlags : uint8_t {
+     None = 0,
+     EndStream = 1,
+     EndHeaders = 4,
+   };
+ 
+   enum class DataFlags : uint8_t {
+     None = 0,
+     EndStream = 1,
+   };
+ 
+   enum class MetadataFlags : uint8_t {
+     None = 0,
+     EndMetadata = 4,
+   };
+ 
+   // See https://tools.ietf.org/html/rfc7541#appendix-A for static header indexes
+   enum class StaticHeaderIndex : uint8_t {
+     Unknown,
+     MethodGet = 2,
+     MethodPost = 3,
+     Path = 4,
+     Status200 = 8,
+     Status404 = 13,
+     SchemeHttps = 7,
+     Host = 38,
+   };
+ 
+   enum class ErrorCode : uint8_t {
+     NoError = 0,
+     ProtocolError,
+     InternalError,
+     FlowControlError,
+     SettingsTimeout,
+     StreamClosed,
+     FrameSizeError,
+     RefusedStream,
+     Cancel,
+     CompressionError,
+     ConnectError,
+     EnhanceYourCalm,
+     InadequateSecurity,
+     Http11Required
+   };
+ 
+   enum class ResponseStatus { Unknown, Ok, NotFound };
+ 
+   struct Header {
+     Header(absl::string_view key, absl::string_view value) : key_(key), value_(value) {}
+     std::string key_;
+     std::string value_;
+   };
+ 
++  /**
++   * Make client stream ID out of the given ID in the host byte order, ensuring that the stream id
++   * is odd as required by https://tools.ietf.org/html/rfc7540#section-5.1.1
++   * Use this function to create client stream ids for methods creating HTTP/2 frames.
++   * @param stream_id some stream id that will be used to create the client stream id.
++   * @return an odd number client stream id.
++   */
++  static uint32_t makeClientStreamId(uint32_t stream_id) { return (stream_id << 1) | 1; }
++
+   // Methods for creating HTTP2 frames
+   static Http2Frame makePingFrame(absl::string_view data = {});
+   static Http2Frame makeEmptySettingsFrame(SettingsFlags flags = SettingsFlags::None);
+   static Http2Frame makeEmptyHeadersFrame(uint32_t stream_index,
+                                           HeadersFlags flags = HeadersFlags::None);
+   static Http2Frame makeEmptyContinuationFrame(uint32_t stream_index,
+                                                HeadersFlags flags = HeadersFlags::None);
+   static Http2Frame makeEmptyDataFrame(uint32_t stream_index, DataFlags flags = DataFlags::None);
+   static Http2Frame makePriorityFrame(uint32_t stream_index, uint32_t dependent_index);
+ 
+   static Http2Frame makeEmptyPushPromiseFrame(uint32_t stream_index, uint32_t promised_stream_index,
+                                               HeadersFlags flags = HeadersFlags::None);
+   static Http2Frame makeResetStreamFrame(uint32_t stream_index, ErrorCode error_code);
+   static Http2Frame makeEmptyGoAwayFrame(uint32_t last_stream_index, ErrorCode error_code);
+ 
+   static Http2Frame makeWindowUpdateFrame(uint32_t stream_index, uint32_t increment);
+   static Http2Frame makeMetadataFrameFromMetadataMap(uint32_t stream_index,
+                                                      MetadataMap& metadata_map,
+                                                      MetadataFlags flags);
+ 
+   static Http2Frame makeMalformedRequest(uint32_t stream_index);
+   static Http2Frame makeMalformedRequestWithZerolenHeader(uint32_t stream_index,
+                                                           absl::string_view host,
+                                                           absl::string_view path);
+   static Http2Frame makeRequest(uint32_t stream_index, absl::string_view host,
+                                 absl::string_view path);
+   static Http2Frame makeRequest(uint32_t stream_index, absl::string_view host,
+                                 absl::string_view path, const std::vector<Header> extra_headers);
+   static Http2Frame makePostRequest(uint32_t stream_index, absl::string_view host,
+                                     absl::string_view path);
+   /**
+    * Creates a frame with the given contents. This frame can be
+    * malformed/invalid depending on the given contents.
+    * @param contents the contents of the newly created frame.
+    * @return an Http2Frame that is comprised of the given contents.
+    */
+   static Http2Frame makeGenericFrame(absl::string_view contents);
+   static Http2Frame makeGenericFrameFromHexDump(absl::string_view contents);
+ 
+   Type type() const { return static_cast<Type>(data_[3]); }
+   ResponseStatus responseStatus() const;
+ 
+   // Copy HTTP2 header. The `header` parameter must at least be HeaderSize long.
+   // Allocates payload size based on the value in the header.
+   void setHeader(absl::string_view header);
+ 
+   // Copy payloadSize() bytes from the `payload`. The `payload` must be at least payloadSize() long.
+   void setPayload(absl::string_view payload);
+ 
+   // Convert to `std::string` for convenience.
+   explicit operator std::string() const {
+     if (data_.empty()) {
+       return {};
+     }
+     return std::string(reinterpret_cast<const char*>(data()), size());
+   }
+ 
+   uint32_t payloadSize() const;
+   // Total size of the frame
+   size_t size() const { return data_.size(); }
+   // Access to the raw frame bytes
+   const uint8_t* data() const { return data_.data(); }
+   Iterator begin() { return data_.begin(); }
+   Iterator end() { return data_.end(); }
+   ConstIterator begin() const { return data_.begin(); }
+   ConstIterator end() const { return data_.end(); }
+   bool empty() const { return data_.empty(); }
+diff --git a/test/common/http/http2/http2_frame_test.cc b/test/common/http/http2/http2_frame_test.cc
+index ac409d8767..7de8769d8c 100644
+--- a/test/common/http/http2/http2_frame_test.cc
++++ b/test/common/http/http2/http2_frame_test.cc
+@@ -14,15 +14,15 @@ namespace Http2 {
+ // From metadata map
+ TEST(EqualityMetadataFrame, Http2FrameTest) {
+   MetadataMap metadataMap = {{"Connections", "15"}, {"Timeout Seconds", "10"}};
+   Http2Frame http2FrameFromUtility = Http2Frame::makeMetadataFrameFromMetadataMap(
+       1, metadataMap, Http2Frame::MetadataFlags::EndMetadata);
+   std::string payloadFromHttp2Frame(http2FrameFromUtility);
+   // Note: the actual encoding of the metadata map is non-deterministic and flaky. This is okay!
+   ASSERT_EQ(static_cast<int>(http2FrameFromUtility.type()), 0x4D); // type
+   ASSERT_EQ(payloadFromHttp2Frame[4], 4);                          // flags
+   ASSERT_EQ(std::to_string(payloadFromHttp2Frame[8]),
+-            std::to_string(3)); // stream_id (extra bit at the end)
++            std::to_string(1)); // stream_id
+ }
+ } // namespace Http2
+ } // namespace Http
+-} // namespace Envoy
+\ No newline at end of file
++} // namespace Envoy
+diff --git a/test/integration/http2_integration_test.cc b/test/integration/http2_integration_test.cc
+index a2346e429f..29e559228e 100644
+--- a/test/integration/http2_integration_test.cc
++++ b/test/integration/http2_integration_test.cc
+@@ -1700,22 +1700,22 @@ void Http2FloodMitigationTest::floodServer(const Http2Frame& frame, const std::s
+ // Verify that the server detects the flood using specified request parameters.
+ void Http2FloodMitigationTest::floodServer(absl::string_view host, absl::string_view path,
+                                            Http2Frame::ResponseStatus expected_http_status,
+                                            const std::string& flood_stat, uint32_t num_frames) {
+   uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeRequest(request_idx, host, path);
++  auto request = Http2Frame::makeRequest(Http2Frame::makeClientStreamId(request_idx), host, path);
+   sendFrame(request);
+   auto frame = readFrame();
+   EXPECT_EQ(Http2Frame::Type::Headers, frame.type());
+   EXPECT_EQ(expected_http_status, frame.responseStatus());
+   writev_matcher_->setWritevReturnsEgain();
+   for (uint32_t frame = 0; frame < num_frames; ++frame) {
+-    request = Http2Frame::makeRequest(++request_idx, host, path);
++    request = Http2Frame::makeRequest(Http2Frame::makeClientStreamId(++request_idx), host, path);
+     sendFrame(request);
+   }
+   tcp_client_->waitForDisconnect();
+   if (!flood_stat.empty()) {
+     EXPECT_EQ(1, test_server_->counter(flood_stat)->value());
+   }
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+@@ -1754,75 +1754,77 @@ TEST_P(Http2FloodMitigationTest, 404) {
+ // Verify that the server can detect flood of response DATA frames
+ TEST_P(Http2FloodMitigationTest, Data) {
+   // Set large buffer limits so the test is not affected by the flow control.
+   config_helper_.setBufferLimits(1024 * 1024 * 1024, 1024 * 1024 * 1024);
+   autonomous_upstream_ = true;
+   autonomous_allow_incomplete_streams_ = true;
+   beginSession();
+ 
+   // Do not read from the socket and send request that causes autonomous upstream
+   // to respond with 1000 DATA frames. The Http2FloodMitigationTest::beginSession()
+   // sets 1000 flood limit for all frame types. Including 1 HEADERS response frame
+   // 1000 DATA frames should trigger flood protection.
+   // Simulate TCP push back on the Envoy's downstream network socket, so that outbound frames start
+   // to accumulate in the transport socket buffer.
+   writev_matcher_->setWritevReturnsEgain();
+ 
+-  auto request = Http2Frame::makeRequest(0, "host", "/test/long/url",
+-                                         {Http2Frame::Header("response_data_blocks", "1000")});
++  const auto request = Http2Frame::makeRequest(
++      1, "host", "/test/long/url", {Http2Frame::Header("response_data_blocks", "1000")});
+   sendFrame(request);
+ 
+   // Wait for 19077 bytes to arrive from upstream (1K DATA frames of size 10 + HEADERS frame)
+   test_server_->waitForCounterGe("cluster.cluster_0.upstream_cx_rx_bytes_total", 19077);
+ 
+   // If the server codec incorrectly thrown an exception on flood detection it would cause
+   // the entire upstream to be disconnected. Verify it is still active, and there are no destroyed
+   // connections.
+   ASSERT_EQ(1, test_server_->gauge("cluster.cluster_0.upstream_cx_active")->value());
+   ASSERT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_destroy")->value());
+ 
+   // Server codec should be flooded. However it is not disconnected until client sends it
+   // some bytes. Verify that it is still connected and send 1 byte. Flood detection
+   // happens before data is parsed so it does not matter what is being sent.
+   ASSERT_TRUE(tcp_client_->connected());
+   ASSERT_TRUE(tcp_client_->write(std::string("a"), false, false));
+   // Now wait for client to be disconnected and verify it is due to flood checks.
+   tcp_client_->waitForDisconnect();
+   EXPECT_EQ(1, test_server_->counter("http2.outbound_flood")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+ 
+ // Verify that the server can detect flood of RST_STREAM frames.
+ TEST_P(Http2FloodMitigationTest, RST_STREAM) {
+   // Use invalid HTTP headers to trigger sending RST_STREAM frames.
+   config_helper_.addConfigModifier(
+       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+         hcm.mutable_http2_protocol_options()
+             ->mutable_override_stream_error_on_invalid_http_message()
+             ->set_value(true);
+       });
+   beginSession();
+ 
+   uint32_t stream_index = 0;
+-  auto request = Http::Http2::Http2Frame::makeMalformedRequest(stream_index);
++  auto request =
++      Http::Http2::Http2Frame::makeMalformedRequest(Http2Frame::makeClientStreamId(stream_index));
+   sendFrame(request);
+   auto response = readFrame();
+   // Make sure we've got RST_STREAM from the server
+   EXPECT_EQ(Http2Frame::Type::RstStream, response.type());
+ 
+   // Simulate TCP push back on the Envoy's downstream network socket, so that outbound frames start
+   // to accumulate in the transport socket buffer.
+   writev_matcher_->setWritevReturnsEgain();
+ 
+   for (++stream_index; stream_index < ControlFrameFloodLimit + 2; ++stream_index) {
+-    request = Http::Http2::Http2Frame::makeMalformedRequest(stream_index);
++    request =
++        Http::Http2::Http2Frame::makeMalformedRequest(Http2Frame::makeClientStreamId(stream_index));
+     sendFrame(request);
+   }
+   tcp_client_->waitForDisconnect();
+   EXPECT_EQ(1, test_server_->counter("http2.outbound_control_flood")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+ 
+ // Verify that the server stop reading downstream connection on protocol error.
+@@ -1848,20 +1850,19 @@ TEST_P(Http2FloodMitigationTest, TooManyStreams) {
+ TEST_P(Http2FloodMitigationTest, EmptyHeaders) {
+   config_helper_.addConfigModifier(
+       [&](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+               hcm) -> void {
+         hcm.mutable_http2_protocol_options()
+             ->mutable_max_consecutive_inbound_frames_with_empty_payload()
+             ->set_value(0);
+       });
+   beginSession();
+ 
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeEmptyHeadersFrame(request_idx);
++  const auto request = Http2Frame::makeEmptyHeadersFrame(Http2Frame::makeClientStreamId(0));
+   sendFrame(request);
+ 
+   tcp_client_->waitForDisconnect();
+ 
+   EXPECT_EQ(1, test_server_->counter("http2.inbound_empty_frames_flood")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+@@ -1869,20 +1870,20 @@ TEST_P(Http2FloodMitigationTest, EmptyHeaders) {
+ TEST_P(Http2FloodMitigationTest, EmptyHeadersContinuation) {
+   useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%");
+   beginSession();
+ 
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeEmptyHeadersFrame(request_idx);
++  const uint32_t request_stream_id = Http2Frame::makeClientStreamId(0);
++  auto request = Http2Frame::makeEmptyHeadersFrame(request_stream_id);
+   sendFrame(request);
+ 
+   for (int i = 0; i < 2; i++) {
+-    request = Http2Frame::makeEmptyContinuationFrame(request_idx);
++    request = Http2Frame::makeEmptyContinuationFrame(request_stream_id);
+     sendFrame(request);
+   }
+ 
+   tcp_client_->waitForDisconnect();
+ 
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("http2.inbound_empty_frames_flood"));
+   EXPECT_EQ(1, test_server_->counter("http2.inbound_empty_frames_flood")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+@@ -1890,20 +1891,20 @@ TEST_P(Http2FloodMitigationTest, EmptyHeadersContinuation) {
+ TEST_P(Http2FloodMitigationTest, EmptyData) {
+   useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%");
+   beginSession();
+ 
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makePostRequest(request_idx, "host", "/");
++  const uint32_t request_stream_id = Http2Frame::makeClientStreamId(0);
++  auto request = Http2Frame::makePostRequest(request_stream_id, "host", "/");
+   sendFrame(request);
+ 
+   for (int i = 0; i < 2; i++) {
+-    request = Http2Frame::makeEmptyDataFrame(request_idx);
++    request = Http2Frame::makeEmptyDataFrame(request_stream_id);
+     sendFrame(request);
+   }
+ 
+   tcp_client_->waitForDisconnect();
+ 
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("http2.inbound_empty_frames_flood"));
+   EXPECT_EQ(1, test_server_->counter("http2.inbound_empty_frames_flood")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+ }
+@@ -1911,20 +1912,22 @@ TEST_P(Http2FloodMitigationTest, EmptyData) {
+ TEST_P(Http2FloodMitigationTest, PriorityIdleStream) {
+   beginSession();
+ 
+-  floodServer(Http2Frame::makePriorityFrame(0, 1), "http2.inbound_priority_frames_flood",
++  floodServer(Http2Frame::makePriorityFrame(Http2Frame::makeClientStreamId(0),
++                                            Http2Frame::makeClientStreamId(1)),
++              "http2.inbound_priority_frames_flood",
+               Http2::Utility::OptionsLimits::DEFAULT_MAX_INBOUND_PRIORITY_FRAMES_PER_STREAM + 1);
+ }
+ 
+ TEST_P(Http2FloodMitigationTest, PriorityOpenStream) {
+   beginSession();
+ 
+   // Open stream.
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeRequest(request_idx, "host", "/");
++  const uint32_t request_stream_id = Http2Frame::makeClientStreamId(0);
++  const auto request = Http2Frame::makeRequest(request_stream_id, "host", "/");
+   sendFrame(request);
+ 
+-  floodServer(Http2Frame::makePriorityFrame(request_idx, request_idx + 1),
++  floodServer(Http2Frame::makePriorityFrame(request_stream_id, Http2Frame::makeClientStreamId(1)),
+               "http2.inbound_priority_frames_flood",
+               Http2::Utility::OptionsLimits::DEFAULT_MAX_INBOUND_PRIORITY_FRAMES_PER_STREAM * 2 +
+                   1);
+ }
+@@ -1932,17 +1935,17 @@ TEST_P(Http2FloodMitigationTest, PriorityOpenStream) {
+ TEST_P(Http2FloodMitigationTest, PriorityClosedStream) {
+   autonomous_upstream_ = true;
+   beginSession();
+ 
+   // Open stream.
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeRequest(request_idx, "host", "/");
++  const uint32_t request_stream_id = Http2Frame::makeClientStreamId(0);
++  const auto request = Http2Frame::makeRequest(request_stream_id, "host", "/");
+   sendFrame(request);
+   // Reading response marks this stream as closed in nghttp2.
+   auto frame = readFrame();
+   EXPECT_EQ(Http2Frame::Type::Headers, frame.type());
+ 
+-  floodServer(Http2Frame::makePriorityFrame(request_idx, request_idx + 1),
++  floodServer(Http2Frame::makePriorityFrame(request_stream_id, Http2Frame::makeClientStreamId(1)),
+               "http2.inbound_priority_frames_flood",
+               Http2::Utility::OptionsLimits::DEFAULT_MAX_INBOUND_PRIORITY_FRAMES_PER_STREAM * 2 +
+                   1);
+ }
+@@ -1950,74 +1953,75 @@ TEST_P(Http2FloodMitigationTest, PriorityClosedStream) {
+ TEST_P(Http2FloodMitigationTest, WindowUpdate) {
+   beginSession();
+ 
+   // Open stream.
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeRequest(request_idx, "host", "/");
++  const uint32_t request_stream_id = Http2Frame::makeClientStreamId(0);
++  const auto request = Http2Frame::makeRequest(request_stream_id, "host", "/");
+   sendFrame(request);
+ 
+   // Since we do not send any DATA frames, only 4 sequential WINDOW_UPDATE frames should
+   // trigger flood protection.
+-  floodServer(Http2Frame::makeWindowUpdateFrame(request_idx, 1),
++  floodServer(Http2Frame::makeWindowUpdateFrame(request_stream_id, 1),
+               "http2.inbound_window_update_frames_flood", 4);
+ }
+ 
+ // Verify that the HTTP/2 connection is terminated upon receiving invalid HEADERS frame.
+ TEST_P(Http2FloodMitigationTest, ZerolenHeader) {
+   useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%");
+   beginSession();
+ 
+   // Send invalid request.
+-  uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeMalformedRequestWithZerolenHeader(request_idx, "host", "/");
++  const auto request = Http2Frame::makeMalformedRequestWithZerolenHeader(
++      Http2Frame::makeClientStreamId(0), "host", "/");
+   sendFrame(request);
+ 
+   tcp_client_->waitForDisconnect();
+ 
+   EXPECT_EQ(1, test_server_->counter("http2.rx_messaging_error")->value());
+   EXPECT_EQ(1,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("http2.invalid.header.field"));
+   // expect a downstream protocol error.
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("DPE"));
+ }
+ 
+ // Verify that only the offending stream is terminated upon receiving invalid HEADERS frame.
+ TEST_P(Http2FloodMitigationTest, ZerolenHeaderAllowed) {
+   useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE_DETAILS%");
+   config_helper_.addConfigModifier(
+       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+              hcm) -> void {
+         hcm.mutable_http2_protocol_options()
+             ->mutable_override_stream_error_on_invalid_http_message()
+             ->set_value(true);
+       });
+   autonomous_upstream_ = true;
+   beginSession();
+ 
+   // Send invalid request.
+   uint32_t request_idx = 0;
+-  auto request = Http2Frame::makeMalformedRequestWithZerolenHeader(request_idx, "host", "/");
++  auto request = Http2Frame::makeMalformedRequestWithZerolenHeader(
++      Http2Frame::makeClientStreamId(request_idx), "host", "/");
+   sendFrame(request);
+   // Make sure we've got RST_STREAM from the server.
+   auto response = readFrame();
+   EXPECT_EQ(Http2Frame::Type::RstStream, response.type());
+ 
+   // Send valid request using the same connection.
+   request_idx++;
+-  request = Http2Frame::makeRequest(request_idx, "host", "/");
++  request = Http2Frame::makeRequest(Http2Frame::makeClientStreamId(request_idx), "host", "/");
+   sendFrame(request);
+   response = readFrame();
+   EXPECT_EQ(Http2Frame::Type::Headers, response.type());
+   EXPECT_EQ(Http2Frame::ResponseStatus::Ok, response.responseStatus());
+ 
+   tcp_client_->close();
+ 
+   EXPECT_EQ(1, test_server_->counter("http2.rx_messaging_error")->value());
+   EXPECT_EQ(0,
+             test_server_->counter("http.config_test.downstream_cx_delayed_close_timeout")->value());
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("http2.invalid.header.field"));
+   // expect Downstream Protocol Error
+   EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("DPE"));
+ }
+ 
+ } // namespace Envoy

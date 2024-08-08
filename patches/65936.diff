@@ -1,0 +1,1422 @@
+commit bd0130e7867937dec472afff0ad4a7b40a6f04b7
+Author: birenroy <birenroy@google.com>
+Date:   Mon Mar 11 10:14:13 2024 -0400
+
+    http2: deprecates use of CallbackVisitor in CodecImpl (#32378)
+    
+    This change removes an unnecessary layer of abstraction by implementing Http2VisitorInterface directly, rather than passing HTTP/2 codec events through the QUICHE CallbackVisitor and nghttp2-style callbacks.
+    
+    When the reloadable feature is removed, CodecImpl can be significantly simplified.
+    
+    $ bazel test //test/common/http/http2/... //test/integration/...
+    INFO: Invocation ID: 76f7aa9f-e507-4798-892a-6e58df6deb7e
+    INFO: Analyzed 397 targets (0 packages loaded, 0 targets configured).
+    INFO: Found 295 targets and 102 test targets...
+    INFO: Elapsed time: 745.010s, Critical Path: 744.00s
+    INFO: 399 processes: 11 remote cache hit, 389 remote.
+    INFO: Build completed successfully, 399 total actions
+    
+    Executed 98 out of 102 tests: 102 tests pass.
+    Commit Message: http2: deprecates use of CallbackVisitor in CodecImpl
+    Additional Description:
+    Risk Level: medium, affects handling of HTTP/2 codec events
+    Testing: ran unit and integration tests both with and without the feature enabled.
+    Docs Changes:
+    Release Notes:
+    Platform Specific Features:
+    Runtime guard: envoy.reloadable_features.http2_skip_callback_visitor
+    
+    Signed-off-by: Biren Roy <birenroy@google.com>
+
+diff --git a/changelogs/current.yaml b/changelogs/current.yaml
+index 0fb271b76c..e77a0bfda1 100644
+--- a/changelogs/current.yaml
++++ b/changelogs/current.yaml
+@@ -20,50 +20,54 @@ behavior_changes:
+ minor_behavior_changes:
+ # *Changes that may cause incompatibilities for some users, but should not for most*
+ - area: sockets
+   change: |
+     Failure to create an upstream socket should now result in clean connection failure rather than failing a release assert. This behavior
+     can be temporarily reverted by setting runtime feature ``envoy.restart_features_.allow_client_socket_creation_failure`` to false.
+ - area: adaptive concurrency filter stats
+   change: |
+     Multiply the gradient value stat by 1000 to make it more granular (values will range between 500 and 2000).
+ - area: quic
+   change: |
+     :ref:`Server preferred address <envoy_v3_api_field_config.listener.v3.QuicProtocolOptions.server_preferred_address_config>` is
+     now sent to non-quiche quic clients when configured. This behavior can be disabled with runtime flag
+     ``envoy.reloadable_features.quic_send_server_preferred_address_to_all_clients``.
+ - area: dns
+   change: |
+     Allowing <envoy_v3_api_field_extensions.common.dynamic_forward_proxy.v3.DnsCacheConfig.dns_min_refresh_rate>` to go as low as 1s.
+ - area: upstream
+   change: |
+     Upstream now excludes hosts set to ``DRAINING`` state via EDS from load balancing and panic routing
+     threshold calculation. This feature can be disabled by setting
+     ``envoy.reloadable_features.exclude_host_in_eds_status_draining`` to false.
+ - area: golang
+   change: |
+     Change ``RegisterHttpFilterConfigFactoryAndParser`` to ``RegisterHttpFilterFactoryAndConfigParser``.
+ - area: QUIC
+   change: |
+     Port migration is default turned off. QUIC client connections will no longer attempt to migrate to a new port when connections
+     is degrading. Can be manually turned on via
+     :ref:`port_migration <envoy_v3_api_field_config.core.v3.QuicProtocolOptions.num_timeouts_to_trigger_port_migration>`.
+ - area: QUIC
+   change: |
+     Make each upstream connection to read as many as 32 packets in each event loop. This feature can be disabled by setting
+     ``envoy.reloadable_features.quic_upstream_reads_fixed_number_packets`` to false.
+ - area: aws
+   change: |
+     AWS region string is now retrieved from environment and profile consistently within aws_request_signer and
+     grpc_credentials/aws_iam extensions. Region field in aws_request_signer is now optional, explicitly configured
+     xDS region will take preference. aws_request_signer documentation now reflects the region chain.
+ - area: http
+   change: |
+     Enable obsolete line folding in BalsaParser (for behavior parity with http-parser, the
+     previously used HTTP/1 parser).
+ - area: proxy status
+   change: |
+     Add more conversion in the proxy status utility. It can be disabled by the runtime guard
+     ``envoy.reloadable_features.proxy_status_mapping_more_core_response_flags``.
++- area: http2
++  change: |
++    Simplifies integration with the codec by removing translation between nghttp2 callbacks and Http2VisitorInterface events.
++    Guarded by ``envoy.reloadable_features.http2_skip_callback_visitor``.
+ 
+ bug_fixes:
+ # *Changes expected to improve the state of the world and are unlikely to have negative effects*
+diff --git a/source/common/http/http2/codec_impl.cc b/source/common/http/http2/codec_impl.cc
+index c0e4f569d1..b2ae2e444a 100644
+--- a/source/common/http/http2/codec_impl.cc
++++ b/source/common/http/http2/codec_impl.cc
+@@ -1,35 +1,36 @@
+ #include "source/common/http/http2/codec_impl.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
+ #include <memory>
+ #include <ostream>
+ #include <vector>
+ 
+ #include "envoy/event/dispatcher.h"
+ #include "envoy/http/codes.h"
+ #include "envoy/http/header_map.h"
+ #include "envoy/network/connection.h"
+ 
+ #include "source/common/common/assert.h"
+ #include "source/common/common/cleanup.h"
+ #include "source/common/common/dump_state_utils.h"
+ #include "source/common/common/enum_to_int.h"
+ #include "source/common/common/fmt.h"
+ #include "source/common/common/safe_memcpy.h"
+ #include "source/common/common/scope_tracker.h"
+ #include "source/common/common/utility.h"
+ #include "source/common/http/codes.h"
+ #include "source/common/http/exception.h"
+ #include "source/common/http/header_utility.h"
+ #include "source/common/http/headers.h"
+ #include "source/common/http/http2/codec_stats.h"
+ #include "source/common/http/utility.h"
+ #include "source/common/network/common_connection_filter_states.h"
+ #include "source/common/runtime/runtime_features.h"
+ 
+ #include "absl/cleanup/cleanup.h"
+ #include "absl/container/fixed_array.h"
++#include "quiche/common/quiche_endian.h"
+ #include "quiche/http2/adapter/callback_visitor.h"
+ #include "quiche/http2/adapter/nghttp2_adapter.h"
+ #include "quiche/http2/adapter/oghttp2_adapter.h"
+@@ -118,10 +119,15 @@ std::unique_ptr<http2::adapter::Http2Adapter>
+ ProdNghttp2SessionFactory::create(const nghttp2_session_callbacks* callbacks,
+                                   ConnectionImpl* connection,
+                                   const http2::adapter::OgHttp2Adapter::Options& options) {
+-  auto visitor = std::make_unique<http2::adapter::CallbackVisitor>(
+-      http2::adapter::Perspective::kClient, *callbacks, connection);
++  std::unique_ptr<http2::adapter::Http2VisitorInterface> visitor;
++  if (connection->skipCallbackVisitor()) {
++    visitor = std::make_unique<ConnectionImpl::Http2Visitor>(connection);
++  } else {
++    visitor = std::make_unique<http2::adapter::CallbackVisitor>(
++        http2::adapter::Perspective::kClient, *callbacks, connection);
++  }
+   std::unique_ptr<http2::adapter::Http2Adapter> adapter =
+       http2::adapter::OgHttp2Adapter::Create(*visitor, options);
+   connection->setVisitor(std::move(visitor));
+   return adapter;
+ }
+@@ -129,15 +135,26 @@ ProdNghttp2SessionFactory::create(const nghttp2_session_callbacks* callbacks,
+ std::unique_ptr<http2::adapter::Http2Adapter>
+ ProdNghttp2SessionFactory::create(const nghttp2_session_callbacks* callbacks,
+                                   ConnectionImpl* connection, const nghttp2_option* options) {
+-  auto visitor = std::make_unique<http2::adapter::CallbackVisitor>(
+-      http2::adapter::Perspective::kClient, *callbacks, connection);
+-  auto adapter = http2::adapter::NgHttp2Adapter::CreateClientAdapter(*visitor, options);
+-  auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
+-    p->RemoveStream(stream_id);
+-  };
+-  visitor->set_stream_close_listener(std::move(stream_close_listener));
+-  connection->setVisitor(std::move(visitor));
+-  return adapter;
++  if (connection->skipCallbackVisitor()) {
++    auto visitor = std::make_unique<ConnectionImpl::Http2Visitor>(connection);
++    auto adapter = http2::adapter::NgHttp2Adapter::CreateClientAdapter(*visitor, options);
++    auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
++      p->RemoveStream(stream_id);
++    };
++    visitor->setStreamCloseListener(std::move(stream_close_listener));
++    connection->setVisitor(std::move(visitor));
++    return adapter;
++  } else {
++    auto visitor = std::make_unique<http2::adapter::CallbackVisitor>(
++        http2::adapter::Perspective::kClient, *callbacks, connection);
++    auto adapter = http2::adapter::NgHttp2Adapter::CreateClientAdapter(*visitor, options);
++    auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
++      p->RemoveStream(stream_id);
++    };
++    visitor->set_stream_close_listener(std::move(stream_close_listener));
++    connection->setVisitor(std::move(visitor));
++    return adapter;
++  }
+ }
+ 
+ void ProdNghttp2SessionFactory::init(ConnectionImpl* connection,
+@@ -1748,119 +1765,311 @@ void ConnectionImpl::onUnderlyingConnectionBelowWriteBufferLowWatermark() {
+ ConnectionImpl::Http2Callbacks::Http2Callbacks() {
+   nghttp2_session_callbacks_new(&callbacks_);
+   nghttp2_session_callbacks_set_send_callback(
+       callbacks_,
+       [](nghttp2_session*, const uint8_t* data, size_t length, int, void* user_data) -> ssize_t {
+         return static_cast<ConnectionImpl*>(user_data)->onSend(data, length);
+       });
+ 
+   nghttp2_session_callbacks_set_on_begin_headers_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame* frame, void* user_data) -> int {
+-        auto status = static_cast<ConnectionImpl*>(user_data)->onBeginHeaders(frame->hd.stream_id);
++        Status status =
++            static_cast<ConnectionImpl*>(user_data)->onBeginHeaders(frame->hd.stream_id);
+         return static_cast<ConnectionImpl*>(user_data)->setAndCheckCodecCallbackStatus(
+             std::move(status));
+       });
+ 
+   nghttp2_session_callbacks_set_on_header_callback(
+       callbacks_,
+       [](nghttp2_session*, const nghttp2_frame* frame, const uint8_t* raw_name, size_t name_length,
+          const uint8_t* raw_value, size_t value_length, uint8_t, void* user_data) -> int {
+         // TODO PERF: Can reference count here to avoid copies.
+         HeaderString name;
+         name.setCopy(reinterpret_cast<const char*>(raw_name), name_length);
+         HeaderString value;
+         value.setCopy(reinterpret_cast<const char*>(raw_value), value_length);
+         return static_cast<ConnectionImpl*>(user_data)->onHeader(frame->hd.stream_id,
+                                                                  std::move(name), std::move(value));
+       });
+ 
+   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
+       callbacks_,
+       [](nghttp2_session*, uint8_t, int32_t stream_id, const uint8_t* data, size_t len,
+          void* user_data) -> int {
+         return static_cast<ConnectionImpl*>(user_data)->onData(stream_id, data, len);
+       });
+ 
+   nghttp2_session_callbacks_set_on_begin_frame_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame_hd* hd, void* user_data) -> int {
+-        auto status = static_cast<ConnectionImpl*>(user_data)->onBeforeFrameReceived(
++        Status status = static_cast<ConnectionImpl*>(user_data)->onBeforeFrameReceived(
+             hd->stream_id, hd->length, hd->type, hd->flags);
+         return static_cast<ConnectionImpl*>(user_data)->setAndCheckCodecCallbackStatus(
+             std::move(status));
+       });
+ 
+   nghttp2_session_callbacks_set_on_frame_recv_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame* frame, void* user_data) -> int {
+-        auto status = static_cast<ConnectionImpl*>(user_data)->onFrameReceived(frame);
+-        return static_cast<ConnectionImpl*>(user_data)->setAndCheckCodecCallbackStatus(
+-            std::move(status));
++        auto* conn = static_cast<ConnectionImpl*>(user_data);
++        RELEASE_ASSERT(!conn->skipCallbackVisitor(), "Unexpected use of nghttp2 callback!");
++        Status status = conn->onFrameReceived(frame);
++        return conn->setAndCheckCodecCallbackStatus(std::move(status));
+       });
+ 
+   nghttp2_session_callbacks_set_on_stream_close_callback(
+       callbacks_,
+       [](nghttp2_session*, int32_t stream_id, uint32_t error_code, void* user_data) -> int {
+-        auto status = static_cast<ConnectionImpl*>(user_data)->onStreamClose(stream_id, error_code);
++        Status status =
++            static_cast<ConnectionImpl*>(user_data)->onStreamClose(stream_id, error_code);
+         return static_cast<ConnectionImpl*>(user_data)->setAndCheckCodecCallbackStatus(
+             std::move(status));
+       });
+ 
+   nghttp2_session_callbacks_set_on_frame_send_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame* frame, void* user_data) -> int {
+         uint32_t error_code = 0;
+         switch (frame->hd.type) {
+         case NGHTTP2_GOAWAY:
+           error_code = frame->goaway.error_code;
+           break;
+         case NGHTTP2_RST_STREAM:
+           error_code = frame->rst_stream.error_code;
+           break;
+         }
+-        return static_cast<ConnectionImpl*>(user_data)->onFrameSend(
+-            frame->hd.stream_id, frame->hd.length, frame->hd.type, frame->hd.flags, error_code);
++        auto* conn = static_cast<ConnectionImpl*>(user_data);
++        RELEASE_ASSERT(!conn->skipCallbackVisitor(), "Unexpected use of nghttp2 callback!");
++        return conn->onFrameSend(frame->hd.stream_id, frame->hd.length, frame->hd.type,
++                                 frame->hd.flags, error_code);
+       });
+ 
+   nghttp2_session_callbacks_set_before_frame_send_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame* frame, void* user_data) -> int {
+         return static_cast<ConnectionImpl*>(user_data)->onBeforeFrameSend(
+             frame->hd.stream_id, frame->hd.length, frame->hd.type, frame->hd.flags);
+       });
+ 
+   nghttp2_session_callbacks_set_on_frame_not_send_callback(
+       callbacks_, [](nghttp2_session*, const nghttp2_frame*, int, void*) -> int {
+         // We used to always return failure here but it looks now this can get called if the other
+         // side sends GOAWAY and we are trying to send a SETTINGS ACK. Just ignore this for now.
+         return 0;
+       });
+ 
+   nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(
+       callbacks_,
+       [](nghttp2_session*, const nghttp2_frame* frame, int error_code, void* user_data) -> int {
+         return static_cast<ConnectionImpl*>(user_data)->onInvalidFrame(frame->hd.stream_id,
+                                                                        error_code);
+       });
+ 
+   nghttp2_session_callbacks_set_on_extension_chunk_recv_callback(
+       callbacks_,
+       [](nghttp2_session*, const nghttp2_frame_hd* hd, const uint8_t* data, size_t len,
+          void* user_data) -> int {
+         ASSERT(hd->length >= len);
+         return static_cast<ConnectionImpl*>(user_data)->onMetadataReceived(hd->stream_id, data,
+                                                                            len);
+       });
+ 
+   nghttp2_session_callbacks_set_unpack_extension_callback(
+       callbacks_, [](nghttp2_session*, void**, const nghttp2_frame_hd* hd, void* user_data) -> int {
+         return static_cast<ConnectionImpl*>(user_data)->onMetadataFrameComplete(
+             hd->stream_id, hd->flags == END_METADATA_FLAG);
+       });
+ 
+   nghttp2_session_callbacks_set_error_callback2(
+       callbacks_, [](nghttp2_session*, int, const char* msg, size_t len, void* user_data) -> int {
+         return static_cast<ConnectionImpl*>(user_data)->onError(absl::string_view(msg, len));
+       });
+ }
+ 
+ ConnectionImpl::Http2Callbacks::~Http2Callbacks() { nghttp2_session_callbacks_del(callbacks_); }
+ 
++ConnectionImpl::Http2Visitor::Http2Visitor(ConnectionImpl* connection) : connection_(connection) {}
++
++int64_t ConnectionImpl::Http2Visitor::OnReadyToSend(absl::string_view serialized) {
++  RELEASE_ASSERT(connection_->skipCallbackVisitor(), "Unexpected use of Http2Visitor!");
++  return connection_->onSend(reinterpret_cast<const uint8_t*>(serialized.data()),
++                             serialized.size());
++}
++
++bool ConnectionImpl::Http2Visitor::OnFrameHeader(Http2StreamId stream_id, size_t length,
++                                                 uint8_t type, uint8_t flags) {
++  RELEASE_ASSERT(connection_->skipCallbackVisitor(), "Unexpected use of Http2Visitor!");
++  ENVOY_CONN_LOG(debug, "Http2Visitor::OnFrameHeader({}, {}, {}, {})", connection_->connection_,
++                 stream_id, length, int(type), int(flags));
++
++  if (type == NGHTTP2_CONTINUATION) {
++    if (current_frame_.stream_id != stream_id) {
++      return false;
++    }
++    current_frame_.length += length;
++    current_frame_.flags |= flags;
++  } else {
++    current_frame_ = {stream_id, length, type, flags};
++    padding_length_ = 0;
++    remaining_data_payload_ = 0;
++  }
++  Status status = connection_->onBeforeFrameReceived(stream_id, length, type, flags);
++  return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++bool ConnectionImpl::Http2Visitor::OnBeginHeadersForStream(Http2StreamId stream_id) {
++  Status status = connection_->onBeginHeaders(stream_id);
++  return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++http2::adapter::Http2VisitorInterface::OnHeaderResult
++ConnectionImpl::Http2Visitor::OnHeaderForStream(Http2StreamId stream_id,
++                                                absl::string_view name_view,
++                                                absl::string_view value_view) {
++  // TODO PERF: Can reference count here to avoid copies.
++  HeaderString name;
++  name.setCopy(name_view.data(), name_view.size());
++  HeaderString value;
++  value.setCopy(value_view.data(), value_view.size());
++  const int result = connection_->onHeader(stream_id, std::move(name), std::move(value));
++  switch (result) {
++  case 0:
++    return HEADER_OK;
++  case NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE:
++    return HEADER_RST_STREAM;
++  default:
++    return HEADER_CONNECTION_ERROR;
++  }
++}
++
++bool ConnectionImpl::Http2Visitor::OnEndHeadersForStream(Http2StreamId stream_id) {
++  ENVOY_CONN_LOG(debug, "Http2Visitor::OnEndHeadersForStream({})", connection_->connection_,
++                 stream_id);
++  Status status = connection_->onHeaders(stream_id, current_frame_.length, current_frame_.flags);
++  return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++bool ConnectionImpl::Http2Visitor::OnBeginDataForStream(Http2StreamId stream_id,
++                                                        size_t payload_length) {
++  ENVOY_CONN_LOG(debug, "Http2Visitor::OnBeginDataForStream({}, {})", connection_->connection_,
++                 stream_id, payload_length);
++  remaining_data_payload_ = payload_length;
++  padding_length_ = 0;
++  if (remaining_data_payload_ == 0 && (current_frame_.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
++    ENVOY_CONN_LOG(debug, "Http2Visitor dispatching DATA for stream {}", connection_->connection_,
++                   stream_id);
++    Status status = connection_->onBeginData(stream_id, current_frame_.length, current_frame_.flags,
++                                             padding_length_);
++    return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++  }
++  ENVOY_CONN_LOG(debug, "Http2Visitor: remaining data payload: {}, end_stream: {}",
++                 connection_->connection_, remaining_data_payload_,
++                 bool(current_frame_.flags & NGHTTP2_FLAG_END_STREAM));
++  return true;
++}
++
++bool ConnectionImpl::Http2Visitor::OnDataPaddingLength(Http2StreamId stream_id,
++                                                       size_t padding_length) {
++  padding_length_ = padding_length;
++  remaining_data_payload_ -= padding_length;
++  if (remaining_data_payload_ == 0 && (current_frame_.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
++    ENVOY_CONN_LOG(debug, "Http2Visitor dispatching DATA for stream {}", connection_->connection_,
++                   stream_id);
++    Status status = connection_->onBeginData(stream_id, current_frame_.length, current_frame_.flags,
++                                             padding_length_);
++    return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++  }
++  ENVOY_CONN_LOG(debug, "Http2Visitor: remaining data payload: {}, end_stream: {}",
++                 connection_->connection_, remaining_data_payload_,
++                 bool(current_frame_.flags & NGHTTP2_FLAG_END_STREAM));
++  return true;
++}
++
++bool ConnectionImpl::Http2Visitor::OnDataForStream(Http2StreamId stream_id,
++                                                   absl::string_view data) {
++  const int result =
++      connection_->onData(stream_id, reinterpret_cast<const uint8_t*>(data.data()), data.size());
++  remaining_data_payload_ -= data.size();
++  if (result == 0 && remaining_data_payload_ == 0 &&
++      (current_frame_.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
++    ENVOY_CONN_LOG(debug, "Http2Visitor dispatching DATA for stream {}", connection_->connection_,
++                   stream_id);
++    Status status = connection_->onBeginData(stream_id, current_frame_.length, current_frame_.flags,
++                                             padding_length_);
++    return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++  }
++  ENVOY_CONN_LOG(debug, "Http2Visitor: remaining data payload: {}, end_stream: {}",
++                 connection_->connection_, remaining_data_payload_,
++                 bool(current_frame_.flags & NGHTTP2_FLAG_END_STREAM));
++  return result == 0;
++}
++
++bool ConnectionImpl::Http2Visitor::OnEndStream(Http2StreamId stream_id) {
++  ENVOY_CONN_LOG(debug, "Http2Visitor::OnEndStream({})", connection_->connection_, stream_id);
++  if (current_frame_.type == NGHTTP2_DATA) {
++    // `onBeginData` is invoked here to ensure that the connection has successfully validated and
++    // processed the entire DATA frame.
++    ENVOY_CONN_LOG(debug, "Http2Visitor dispatching DATA for stream {}", connection_->connection_,
++                   stream_id);
++    Status status = connection_->onBeginData(stream_id, current_frame_.length, current_frame_.flags,
++                                             padding_length_);
++    return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++  }
++  return true;
++}
++
++void ConnectionImpl::Http2Visitor::OnRstStream(Http2StreamId stream_id, Http2ErrorCode error_code) {
++  (void)connection_->onRstStream(stream_id, static_cast<uint32_t>(error_code));
++}
++
++bool ConnectionImpl::Http2Visitor::OnCloseStream(Http2StreamId stream_id,
++                                                 Http2ErrorCode error_code) {
++  Status status = connection_->onStreamClose(stream_id, static_cast<uint32_t>(error_code));
++  if (stream_close_listener_) {
++    ENVOY_CONN_LOG(debug, "Http2Visitor invoking stream close listener for {}",
++                   connection_->connection_, stream_id);
++    stream_close_listener_(stream_id);
++  }
++  return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++void ConnectionImpl::Http2Visitor::OnPing(Http2PingId ping_id, bool is_ack) {
++  const uint64_t network_order_opaque_data = quiche::QuicheEndian::HostToNet64(ping_id);
++  Status status = connection_->onPing(network_order_opaque_data, is_ack);
++  connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++bool ConnectionImpl::Http2Visitor::OnGoAway(Http2StreamId /*last_accepted_stream_id*/,
++                                            Http2ErrorCode error_code,
++                                            absl::string_view /*opaque_data*/) {
++  Status status = connection_->onGoAway(static_cast<uint32_t>(error_code));
++  return 0 == connection_->setAndCheckCodecCallbackStatus(std::move(status));
++}
++
++int ConnectionImpl::Http2Visitor::OnBeforeFrameSent(uint8_t frame_type, Http2StreamId stream_id,
++                                                    size_t length, uint8_t flags) {
++  return connection_->onBeforeFrameSend(stream_id, length, frame_type, flags);
++}
++
++int ConnectionImpl::Http2Visitor::OnFrameSent(uint8_t frame_type, Http2StreamId stream_id,
++                                              size_t length, uint8_t flags, uint32_t error_code) {
++  return connection_->onFrameSend(stream_id, length, frame_type, flags, error_code);
++}
++
++bool ConnectionImpl::Http2Visitor::OnInvalidFrame(Http2StreamId stream_id,
++                                                  InvalidFrameError error) {
++  return 0 == connection_->onInvalidFrame(stream_id, http2::adapter::ToNgHttp2ErrorCode(error));
++}
++
++bool ConnectionImpl::Http2Visitor::OnMetadataForStream(Http2StreamId stream_id,
++                                                       absl::string_view metadata) {
++  return 0 == connection_->onMetadataReceived(
++                  stream_id, reinterpret_cast<const uint8_t*>(metadata.data()), metadata.size());
++}
++
++bool ConnectionImpl::Http2Visitor::OnMetadataEndForStream(Http2StreamId stream_id) {
++  return 0 == connection_->onMetadataFrameComplete(stream_id, true);
++}
++
++void ConnectionImpl::Http2Visitor::OnErrorDebug(absl::string_view message) {
++  connection_->onError(message);
++}
++
+ ConnectionImpl::Http2Options::Http2Options(
+     const envoy::config::core::v3::Http2ProtocolOptions& http2_options, uint32_t max_headers_kb) {
+   og_options_.perspective = http2::adapter::Perspective::kServer;
+@@ -2112,36 +2321,53 @@ StreamResetReason ClientConnectionImpl::getMessagingErrorResetReason() const {
+ ServerConnectionImpl::ServerConnectionImpl(
+     Network::Connection& connection, Http::ServerConnectionCallbacks& callbacks, CodecStats& stats,
+     Random::RandomGenerator& random_generator,
+     const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
+     const uint32_t max_request_headers_kb, const uint32_t max_request_headers_count,
+     envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+         headers_with_underscores_action,
+     Server::OverloadManager& overload_manager)
+     : ConnectionImpl(connection, stats, random_generator, http2_options, max_request_headers_kb,
+                      max_request_headers_count),
+       callbacks_(callbacks), headers_with_underscores_action_(headers_with_underscores_action),
+       should_send_go_away_on_dispatch_(overload_manager.getLoadShedPoint(
+           Server::LoadShedPointName::get().H2ServerGoAwayOnDispatch)) {
+   ENVOY_LOG_ONCE_IF(trace, should_send_go_away_on_dispatch_ == nullptr,
+                     "LoadShedPoint envoy.load_shed_points.http2_server_go_away_on_dispatch is not "
+                     "found. Is it configured?");
+   Http2Options h2_options(http2_options, max_request_headers_kb);
+ 
+-  auto visitor = std::make_unique<http2::adapter::CallbackVisitor>(
++  auto callback_visitor = std::make_unique<http2::adapter::CallbackVisitor>(
+       http2::adapter::Perspective::kServer, *http2_callbacks_.callbacks(), base());
++  auto direct_visitor = std::make_unique<Http2Visitor>(this);
++
+   if (use_oghttp2_library_) {
+-    visitor_ = std::move(visitor);
++    if (skipCallbackVisitor()) {
++      visitor_ = std::move(direct_visitor);
++    } else {
++      visitor_ = std::move(callback_visitor);
++    }
+     adapter_ = http2::adapter::OgHttp2Adapter::Create(*visitor_, h2_options.ogOptions());
+   } else {
+-    auto adapter =
+-        http2::adapter::NgHttp2Adapter::CreateServerAdapter(*visitor, h2_options.options());
+-    auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
+-      p->RemoveStream(stream_id);
+-    };
+-    visitor->set_stream_close_listener(std::move(stream_close_listener));
+-    visitor_ = std::move(visitor);
+-    adapter_ = std::move(adapter);
++    if (skipCallbackVisitor()) {
++      auto adapter = http2::adapter::NgHttp2Adapter::CreateServerAdapter(*direct_visitor,
++                                                                         h2_options.options());
++      auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
++        p->RemoveStream(stream_id);
++      };
++      direct_visitor->setStreamCloseListener(std::move(stream_close_listener));
++      visitor_ = std::move(direct_visitor);
++      adapter_ = std::move(adapter);
++    } else {
++      auto adapter = http2::adapter::NgHttp2Adapter::CreateServerAdapter(*callback_visitor,
++                                                                         h2_options.options());
++      auto stream_close_listener = [p = adapter.get()](http2::adapter::Http2StreamId stream_id) {
++        p->RemoveStream(stream_id);
++      };
++      callback_visitor->set_stream_close_listener(std::move(stream_close_listener));
++      visitor_ = std::move(callback_visitor);
++      adapter_ = std::move(adapter);
++    }
+   }
+   sendSettings(http2_options, false);
+   allow_metadata_ = http2_options.allow_metadata();
+ }
+diff --git a/source/common/http/http2/codec_impl.h b/source/common/http/http2/codec_impl.h
+index 50e9411eaa..25bd21fc27 100644
+--- a/source/common/http/http2/codec_impl.h
++++ b/source/common/http/http2/codec_impl.h
+@@ -159,543 +159,616 @@ public:
+   ExecutionContext* executionContext() const override;
+   void dumpState(std::ostream& os, int indent_level) const override;
+ 
++  bool skipCallbackVisitor() const { return skip_callback_visitor_; }
++
+ protected:
+   friend class ProdNghttp2SessionFactory;
+ 
+   /**
+    * Wrapper for static nghttp2 callback dispatchers.
+    */
++  // TODO: remove when removing `envoy.reloadable_features.http2_skip_callback_visitor`.
+   class Http2Callbacks {
+   public:
+     Http2Callbacks();
+     ~Http2Callbacks();
+ 
+     const nghttp2_session_callbacks* callbacks() { return callbacks_; }
+ 
+   private:
+     nghttp2_session_callbacks* callbacks_;
+   };
+ 
++  /**
++   * This class handles protocol events from the codec layer.
++   */
++  class Http2Visitor : public http2::adapter::Http2VisitorInterface {
++  public:
++    using Http2ErrorCode = http2::adapter::Http2ErrorCode;
++    using Http2PingId = http2::adapter::Http2PingId;
++    using Http2Setting = http2::adapter::Http2Setting;
++    using Http2StreamId = http2::adapter::Http2StreamId;
++
++    explicit Http2Visitor(ConnectionImpl* connection);
++
++    void setStreamCloseListener(std::function<void(Http2StreamId)> f) {
++      stream_close_listener_ = std::move(f);
++    }
++    int64_t OnReadyToSend(absl::string_view serialized) override;
++    void OnConnectionError(ConnectionError /*error*/) override {}
++    bool OnFrameHeader(Http2StreamId stream_id, size_t length, uint8_t type,
++                       uint8_t flags) override;
++    void OnSettingsStart() override { settings_.clear(); }
++    void OnSetting(Http2Setting setting) override { settings_.push_back(setting); }
++    void OnSettingsEnd() override { connection_->onSettings(settings_); }
++    void OnSettingsAck() override {}
++    bool OnBeginHeadersForStream(Http2StreamId stream_id) override;
++    OnHeaderResult OnHeaderForStream(Http2StreamId stream_id, absl::string_view name_view,
++                                     absl::string_view value_view) override;
++    bool OnEndHeadersForStream(Http2StreamId stream_id) override;
++    bool OnDataPaddingLength(Http2StreamId stream_id, size_t padding_length) override;
++    bool OnBeginDataForStream(Http2StreamId stream_id, size_t payload_length) override;
++    bool OnDataForStream(Http2StreamId stream_id, absl::string_view data) override;
++    bool OnEndStream(Http2StreamId stream_id) override;
++    void OnRstStream(Http2StreamId stream_id, Http2ErrorCode error_code) override;
++    bool OnCloseStream(Http2StreamId stream_id, Http2ErrorCode error_code) override;
++    void OnPriorityForStream(Http2StreamId /*stream_id*/, Http2StreamId /*parent_stream_id*/,
++                             int /*weight*/, bool /*exclusive*/) override {}
++    void OnPing(Http2PingId ping_id, bool is_ack) override;
++    void OnPushPromiseForStream(Http2StreamId /*stream_id*/,
++                                Http2StreamId /*promised_stream_id*/) override {}
++    bool OnGoAway(Http2StreamId last_accepted_stream_id, Http2ErrorCode error_code,
++                  absl::string_view opaque_data) override;
++    void OnWindowUpdate(Http2StreamId /*stream_id*/, int /*window_increment*/) override {}
++    int OnBeforeFrameSent(uint8_t frame_type, Http2StreamId stream_id, size_t length,
++                          uint8_t flags) override;
++    int OnFrameSent(uint8_t frame_type, Http2StreamId stream_id, size_t length, uint8_t flags,
++                    uint32_t error_code) override;
++    bool OnInvalidFrame(Http2StreamId stream_id, InvalidFrameError error) override;
++    void OnBeginMetadataForStream(Http2StreamId /*stream_id*/, size_t /*payload_length*/) override {
++    }
++    bool OnMetadataForStream(Http2StreamId stream_id, absl::string_view metadata) override;
++    bool OnMetadataEndForStream(Http2StreamId stream_id) override;
++    void OnErrorDebug(absl::string_view message) override;
++
++  private:
++    ConnectionImpl* const connection_;
++    std::vector<http2::adapter::Http2Setting> settings_;
++    struct FrameHeaderInfo {
++      Http2StreamId stream_id;
++      size_t length;
++      uint8_t type;
++      uint8_t flags;
++    };
++    FrameHeaderInfo current_frame_ = {};
++    size_t padding_length_ = 0;
++    size_t remaining_data_payload_ = 0;
++    // TODO: remove when removing `envoy.reloadable_features.http2_use_oghttp2`.
++    std::function<void(Http2StreamId)> stream_close_listener_;
++  };
++
+   /**
+    * Wrapper for static nghttp2 session options.
+    */
+   class Http2Options {
+   public:
+     Http2Options(const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
+                  uint32_t max_headers_kb);
+     ~Http2Options();
+ 
+     const nghttp2_option* options() { return options_; }
+     const http2::adapter::OgHttp2Adapter::Options& ogOptions() { return og_options_; }
+ 
+   protected:
+     nghttp2_option* options_;
+     http2::adapter::OgHttp2Adapter::Options og_options_;
+   };
+ 
+   class ClientHttp2Options : public Http2Options {
+   public:
+     ClientHttp2Options(const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
+                        uint32_t max_headers_kb);
+   };
+ 
+   /**
+    * Base class for client and server side streams.
+    */
+   struct StreamImpl : public virtual StreamEncoder,
+                       public LinkedObject<StreamImpl>,
+                       public Event::DeferredDeletable,
+                       public Http::MultiplexedStreamImplBase,
+                       public ScopeTrackedObject {
+     enum class HeadersState {
+       Request,
+       Response,
+       Headers, // Signifies additional headers after the initial request/response set.
+     };
+ 
+     StreamImpl(ConnectionImpl& parent, uint32_t buffer_limit);
+ 
+     // Http::MultiplexedStreamImplBase
+     void destroy() override;
+     void onPendingFlushTimer() override;
+     CodecEventCallbacks*
+     registerCodecEventCallbacks(CodecEventCallbacks* codec_callbacks) override {
+       extend_stream_lifetime_flag_ = true;
+       return MultiplexedStreamImplBase::registerCodecEventCallbacks(codec_callbacks);
+     }
+ 
+     StreamImpl* base() { return this; }
+     void resetStreamWorker(StreamResetReason reason);
+     static std::vector<http2::adapter::Header> buildHeaders(const HeaderMap& headers);
+     virtual Status onBeginHeaders() PURE;
+     virtual void advanceHeadersState() PURE;
+     virtual HeadersState headersState() const PURE;
+     void saveHeader(HeaderString&& name, HeaderString&& value);
+     void encodeHeadersBase(const HeaderMap& headers, bool end_stream);
+     virtual void submitHeaders(const HeaderMap& headers, bool end_stream) PURE;
+     void encodeTrailersBase(const HeaderMap& headers);
+     void submitTrailers(const HeaderMap& trailers);
+     // Returns true if the stream should defer the local reset stream until after the next call to
+     // sendPendingFrames so pending outbound frames have one final chance to be flushed. If we
+     // submit a reset, nghttp2 will cancel outbound frames that have not yet been sent.
+     virtual bool useDeferredReset() const PURE;
+     virtual StreamDecoder& decoder() PURE;
+     virtual HeaderMap& headers() PURE;
+     virtual void allocTrailers() PURE;
+     virtual HeaderMapPtr cloneTrailers(const HeaderMap& trailers) PURE;
+ 
+     // Http::StreamEncoder
+     void encodeData(Buffer::Instance& data, bool end_stream) override;
+     Stream& getStream() override { return *this; }
+     void encodeMetadata(const MetadataMapVector& metadata_map_vector) override;
+     Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override { return absl::nullopt; }
+ 
+     // Http::Stream
+     void addCallbacks(StreamCallbacks& callbacks) override { addCallbacksHelper(callbacks); }
+     void removeCallbacks(StreamCallbacks& callbacks) override { removeCallbacksHelper(callbacks); }
+     void resetStream(StreamResetReason reason) override;
+     void readDisable(bool disable) override;
+     uint32_t bufferLimit() const override { return pending_recv_data_->highWatermark(); }
+     const Network::ConnectionInfoProvider& connectionInfoProvider() override {
+       return parent_.connection_.connectionInfoProvider();
+     }
+     absl::string_view responseDetails() override { return details_; }
+     Buffer::BufferMemoryAccountSharedPtr account() const override { return buffer_memory_account_; }
+     void setAccount(Buffer::BufferMemoryAccountSharedPtr account) override;
+ 
+     // ScopeTrackedObject
+     void dumpState(std::ostream& os, int indent_level) const override;
+ 
+     // This code assumes that details is a static string, so that we
+     // can avoid copying it.
+     void setDetails(absl::string_view details) {
+       // TODO(asraa): In some cases nghttp2's error handling may cause processing of multiple
+       // invalid frames for a single stream. If a temporal stream error is returned from a callback,
+       // remaining frames in the buffer will still be partially processed. For example, remaining
+       // frames will still parse through nghttp2's push promise error handling and in
+       // onBeforeFrame(Send/Received) callbacks, which may return invalid frame errors and attempt
+       // to set details again. In these cases, we simply do not overwrite details. When internal
+       // error latching is implemented in the codec for exception removal, we should prevent calling
+       // setDetails in an error state.
+       if (details_.empty()) {
+         details_ = details;
+       }
+     }
+ 
+     void setWriteBufferWatermarks(uint32_t high_watermark) {
+       pending_recv_data_->setWatermarks(high_watermark);
+       pending_send_data_->setWatermarks(high_watermark);
+     }
+ 
+     // If the receive buffer encounters watermark callbacks, enable/disable reads on this stream.
+     void pendingRecvBufferHighWatermark();
+     void pendingRecvBufferLowWatermark();
+ 
+     // If the send buffer encounters watermark callbacks, propagate this information to the streams.
+     // The router and connection manager will propagate them on as appropriate.
+     void pendingSendBufferHighWatermark();
+     void pendingSendBufferLowWatermark();
+ 
+     // Does any necessary WebSocket/Upgrade conversion, then passes the headers
+     // to the decoder_.
+     virtual void decodeHeaders() PURE;
+     virtual void decodeTrailers() PURE;
+     bool maybeDeferDecodeTrailers();
+     // Consumes any decoded data, buffering if backed up.
+     void decodeData();
+ 
+     // Get MetadataEncoder for this stream.
+     NewMetadataEncoder& getMetadataEncoder();
+     // Get MetadataDecoder for this stream.
+     MetadataDecoder& getMetadataDecoder();
+     // Callback function for MetadataDecoder.
+     void onMetadataDecoded(MetadataMapPtr&& metadata_map_ptr);
+ 
+     bool buffersOverrun() const { return read_disable_count_ > 0; }
+     bool shouldAllowPeerAdditionalStreamWindow() const {
+       return !buffersOverrun() && !pending_recv_data_->highWatermarkTriggered();
+     }
+ 
+     void encodeDataHelper(Buffer::Instance& data, bool end_stream,
+                           bool skip_encoding_empty_trailers);
+     // Called from either process_buffered_data_callback_.
+     void processBufferedData();
+ 
+     // Called when the frame with END_STREAM is sent for this stream.
+     void onEndStreamEncoded() {
+       if (codec_callbacks_) {
+         codec_callbacks_->onCodecEncodeComplete();
+       }
+     }
+ 
+     const StreamInfo::BytesMeterSharedPtr& bytesMeter() override { return bytes_meter_; }
+     ConnectionImpl& parent_;
+     int32_t stream_id_{-1};
+     uint32_t unconsumed_bytes_{0};
+     uint32_t read_disable_count_{0};
+     StreamInfo::BytesMeterSharedPtr bytes_meter_{std::make_shared<StreamInfo::BytesMeter>()};
+ 
+     Buffer::BufferMemoryAccountSharedPtr buffer_memory_account_;
+     // Note that in current implementation the watermark callbacks of the pending_recv_data_ are
+     // never called. The watermark value is set to the size of the stream window. As a result this
+     // watermark can never overflow because the peer can never send more bytes than the stream
+     // window without triggering protocol error. This buffer is drained after each DATA frame was
+     // dispatched through the filter chain unless
+     // envoy.reloadable_features.defer_processing_backedup_streams is enabled,
+     // in which case this buffer may accumulate data.
+     // See source/docs/flow_control.md for more information.
+     Buffer::InstancePtr pending_recv_data_;
+     Buffer::InstancePtr pending_send_data_;
+     HeaderMapPtr pending_trailers_to_encode_;
+     std::unique_ptr<MetadataDecoder> metadata_decoder_;
+     std::unique_ptr<NewMetadataEncoder> metadata_encoder_;
+     absl::optional<StreamResetReason> deferred_reset_;
+     // Holds the reset reason for this stream. Useful if we have buffered data
+     // to determine whether we should continue processing that data.
+     absl::optional<StreamResetReason> reset_reason_;
+     HeaderString cookies_;
+     bool local_end_stream_sent_ : 1;
+     bool remote_end_stream_ : 1;
+     bool remote_rst_ : 1;
+     bool data_deferred_ : 1;
+     bool received_noninformational_headers_ : 1;
+     bool pending_receive_buffer_high_watermark_called_ : 1;
+     bool pending_send_buffer_high_watermark_called_ : 1;
+     bool reset_due_to_messaging_error_ : 1;
+     bool defer_processing_backedup_streams_ : 1;
+     // Latch whether this stream is operating with this flag.
+     bool extend_stream_lifetime_flag_ : 1;
+     absl::string_view details_;
+ 
+     /**
+      * Tracks buffering that may occur for a stream if it is backed up.
+      */
+     struct BufferedStreamManager {
+       bool body_buffered_{false};
+       bool trailers_buffered_{false};
+ 
+       // We received a call to onStreamClose for the stream, but deferred it
+       // as the stream had pending data to process and the stream was not reset.
+       bool buffered_on_stream_close_{false};
+ 
+       // Segment size for processing body data. Defaults to the value of high
+       // watermark of the *pending_recv_data_* buffer.
+       // If 0, we will process all buffered data.
+       uint32_t defer_processing_segment_size_{0};
+ 
+       bool decodeAsChunks() const { return defer_processing_segment_size_ > 0; }
+       bool hasBufferedBodyOrTrailers() const { return body_buffered_ || trailers_buffered_; }
+     };
+ 
+     BufferedStreamManager stream_manager_;
+     Event::SchedulableCallbackPtr process_buffered_data_callback_;
+ 
+   protected:
+     // Http::MultiplexedStreamImplBase
+     bool hasPendingData() override {
+       return pending_send_data_->length() > 0 || pending_trailers_to_encode_ != nullptr;
+     }
+     bool continueProcessingBufferedData() const {
+       // We should stop processing buffered data if either
+       // 1) Buffers become overrun
+       // 2) The stream ends up getting reset
+       // Both of these can end up changing as a result of processing buffered data.
+       return !buffersOverrun() && !reset_reason_.has_value();
+     }
+ 
+     // Avoid inversion in the case where we saw trailers, acquiring the
+     // remote_end_stream_ being set to true, but the trailers ended up being
+     // buffered.
+     // All buffered body must be consumed before we send end stream.
+     bool sendEndStream() const {
+       return remote_end_stream_ && !stream_manager_.trailers_buffered_ &&
+              !stream_manager_.body_buffered_;
+     }
+ 
+     // Schedules a callback either in the current or next iteration to process
+     // buffered data.
+     void scheduleProcessingOfBufferedData(bool schedule_next_iteration);
+ 
+     // Marks data consumed by the stream, granting the peer additional stream
+     // window.
+     void grantPeerAdditionalStreamWindow();
+   };
+ 
+   // Encapsulates the logic for sending DATA frames on a given stream.
+   class StreamDataFrameSource : public http2::adapter::DataFrameSource {
+   public:
+     explicit StreamDataFrameSource(StreamImpl& stream) : stream_(stream) {}
+ 
+     // Returns a pair of the next payload length, and whether that payload is the end of the data
+     // for this stream.
+     std::pair<int64_t, bool> SelectPayloadLength(size_t max_length) override;
+     // Queues the frame header and a DATA frame payload of the specified length for writing.
+     bool Send(absl::string_view frame_header, size_t payload_length) override;
+     // Whether the codec should send the END_STREAM flag on the final DATA frame.
+     bool send_fin() const override { return send_fin_; }
+ 
+   private:
+     StreamImpl& stream_;
+     bool send_fin_ = false;
+   };
+ 
+   using StreamImplPtr = std::unique_ptr<StreamImpl>;
+ 
+   /**
+    * Client side stream (request).
+    */
+   struct ClientStreamImpl : public StreamImpl, public RequestEncoder {
+     ClientStreamImpl(ConnectionImpl& parent, uint32_t buffer_limit,
+                      ResponseDecoder& response_decoder)
+         : StreamImpl(parent, buffer_limit), response_decoder_(response_decoder),
+           headers_or_trailers_(
+               ResponseHeaderMapImpl::create(parent_.max_headers_kb_, parent_.max_headers_count_)) {}
+ 
+     // Http::MultiplexedStreamImplBase
+     // Client streams do not need a flush timer because we currently assume that any failure
+     // to flush would be covered by a request/stream/etc. timeout.
+     void setFlushTimeout(std::chrono::milliseconds /*timeout*/) override {}
+     CodecEventCallbacks* registerCodecEventCallbacks(CodecEventCallbacks*) override {
+       ENVOY_BUG(false, "CodecEventCallbacks for HTTP2 client stream unimplemented.");
+       return nullptr;
+     }
+     // StreamImpl
+     void submitHeaders(const HeaderMap& headers, bool end_stream) override;
+     Status onBeginHeaders() override;
+     void advanceHeadersState() override;
+     HeadersState headersState() const override { return headers_state_; }
+     // Do not use deferred reset on upstream connections.
+     bool useDeferredReset() const override { return false; }
+     StreamDecoder& decoder() override { return response_decoder_; }
+     void decodeHeaders() override;
+     void decodeTrailers() override;
+     HeaderMap& headers() override {
+       if (absl::holds_alternative<ResponseHeaderMapPtr>(headers_or_trailers_)) {
+         return *absl::get<ResponseHeaderMapPtr>(headers_or_trailers_);
+       } else {
+         return *absl::get<ResponseTrailerMapPtr>(headers_or_trailers_);
+       }
+     }
+     void allocTrailers() override {
+       // If we are waiting for informational headers, make a new response header map, otherwise
+       // we are about to receive trailers. The codec makes sure this is the only valid sequence.
+       if (received_noninformational_headers_) {
+         headers_or_trailers_.emplace<ResponseTrailerMapPtr>(
+             ResponseTrailerMapImpl::create(parent_.max_headers_kb_, parent_.max_headers_count_));
+       } else {
+         headers_or_trailers_.emplace<ResponseHeaderMapPtr>(
+             ResponseHeaderMapImpl::create(parent_.max_headers_kb_, parent_.max_headers_count_));
+       }
+     }
+     HeaderMapPtr cloneTrailers(const HeaderMap& trailers) override {
+       return createHeaderMap<RequestTrailerMapImpl>(trailers);
+     }
+ 
+     // RequestEncoder
+     Status encodeHeaders(const RequestHeaderMap& headers, bool end_stream) override;
+     void encodeTrailers(const RequestTrailerMap& trailers) override {
+       encodeTrailersBase(trailers);
+     }
+     void enableTcpTunneling() override {}
+ 
+     // ScopeTrackedObject
+     void dumpState(std::ostream& os, int indent_level) const override;
+ 
+     ResponseDecoder& response_decoder_;
+     absl::variant<ResponseHeaderMapPtr, ResponseTrailerMapPtr> headers_or_trailers_;
+     std::string upgrade_type_;
+     HeadersState headers_state_ = HeadersState::Response;
+   };
+ 
+   using ClientStreamImplPtr = std::unique_ptr<ClientStreamImpl>;
+ 
+   /**
+    * Server side stream (response).
+    */
+   struct ServerStreamImpl : public StreamImpl, public ResponseEncoder {
+     ServerStreamImpl(ConnectionImpl& parent, uint32_t buffer_limit)
+         : StreamImpl(parent, buffer_limit),
+           headers_or_trailers_(
+               RequestHeaderMapImpl::create(parent_.max_headers_kb_, parent_.max_headers_count_)) {}
+ 
+     // StreamImpl
+     void destroy() override;
+     void submitHeaders(const HeaderMap& headers, bool end_stream) override;
+     Status onBeginHeaders() override;
+     void advanceHeadersState() override;
+     HeadersState headersState() const override { return headers_state_; }
+     // Enable deferred reset on downstream connections so outbound HTTP internal error replies are
+     // written out before force resetting the stream, assuming there is enough H2 connection flow
+     // control window is available.
+     bool useDeferredReset() const override { return true; }
+     StreamDecoder& decoder() override { return *request_decoder_; }
+     void decodeHeaders() override;
+     void decodeTrailers() override;
+     HeaderMap& headers() override {
+       if (absl::holds_alternative<RequestHeaderMapSharedPtr>(headers_or_trailers_)) {
+         return *absl::get<RequestHeaderMapSharedPtr>(headers_or_trailers_);
+       } else {
+         return *absl::get<RequestTrailerMapPtr>(headers_or_trailers_);
+       }
+     }
+     void allocTrailers() override {
+       headers_or_trailers_.emplace<RequestTrailerMapPtr>(
+           RequestTrailerMapImpl::create(parent_.max_headers_kb_, parent_.max_headers_count_));
+     }
+     HeaderMapPtr cloneTrailers(const HeaderMap& trailers) override {
+       return createHeaderMap<ResponseTrailerMapImpl>(trailers);
+     }
+     void resetStream(StreamResetReason reason) override;
+ 
+     // ResponseEncoder
+     void encode1xxHeaders(const ResponseHeaderMap& headers) override;
+     void encodeHeaders(const ResponseHeaderMap& headers, bool end_stream) override;
+     void encodeTrailers(const ResponseTrailerMap& trailers) override {
+       encodeTrailersBase(trailers);
+     }
+     void setRequestDecoder(Http::RequestDecoder& decoder) override { request_decoder_ = &decoder; }
+     void setDeferredLoggingHeadersAndTrailers(Http::RequestHeaderMapConstSharedPtr,
+                                               Http::ResponseHeaderMapConstSharedPtr,
+                                               Http::ResponseTrailerMapConstSharedPtr,
+                                               StreamInfo::StreamInfo&) override {}
+ 
+     // ScopeTrackedObject
+     void dumpState(std::ostream& os, int indent_level) const override;
+ 
+     absl::variant<RequestHeaderMapSharedPtr, RequestTrailerMapPtr> headers_or_trailers_;
+ 
+     bool streamErrorOnInvalidHttpMessage() const override {
+       return parent_.stream_error_on_invalid_http_messaging_;
+     }
+ 
+   private:
+     RequestDecoder* request_decoder_{};
+     HeadersState headers_state_ = HeadersState::Request;
+   };
+ 
+   using ServerStreamImplPtr = std::unique_ptr<ServerStreamImpl>;
+ 
+   ConnectionImpl* base() { return this; }
+   // NOTE: Always use non debug nullptr checks against the return value of this function. There are
+   // edge cases (such as for METADATA frames) where nghttp2 will issue a callback for a stream_id
+   // that is not associated with an existing stream.
+   const StreamImpl* getStream(int32_t stream_id) const;
+   StreamImpl* getStream(int32_t stream_id);
+   // Same as getStream, but without the ASSERT.
+   const StreamImpl* getStreamUnchecked(int32_t stream_id) const;
+   StreamImpl* getStreamUnchecked(int32_t stream_id);
+   int saveHeader(int32_t stream_id, HeaderString&& name, HeaderString&& value);
+ 
+   /**
+    * Copies any frames pending internally by nghttp2 into outbound buffer.
+    * The `sendPendingFrames()` can be called in 3 different contexts:
+    * 1. dispatching_ == true, aka the dispatching context. The `sendPendingFrames()` is no-op and
+    *    always returns success to avoid reentering nghttp2 library.
+    * 2. Server codec only. dispatching_ == false.
+    *    The `sendPendingFrames()` returns the status of the protocol constraint checks. Outbound
+    *    frame accounting is performed.
+    * 3. dispatching_ == false. The `sendPendingFrames()` always returns success. No outbound
+    *    frame accounting.
+    *
+    * TODO(yanavlasov): harmonize behavior for cases 2, 3.
+    */
+   Status sendPendingFrames();
+ 
+   /**
+    * Call the sendPendingFrames() method and schedule disconnect callback when
+    * sendPendingFrames() returns an error.
+    * Return true if the disconnect callback has been scheduled.
+    */
+   bool sendPendingFramesAndHandleError();
+   void sendSettings(const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
+                     bool disable_push);
+   void sendSettingsHelper(const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
+                           bool disable_push);
+   // Callback triggered when the peer's SETTINGS frame is received.
+   virtual void onSettings(absl::Span<const http2::adapter::Http2Setting> settings) {
+     ReceivedSettingsImpl received_settings(settings);
+     callbacks().onSettings(received_settings);
+   }
+ 
+   /**
+    * Check if header name contains underscore character.
+    * Underscore character is allowed in header names by the RFC-7230 and this check is implemented
+    * as a security measure due to systems that treat '_' and '-' as interchangeable.
+    * The ServerConnectionImpl may drop header or reject request based on the
+    * `common_http_protocol_options.headers_with_underscores_action` configuration option in the
+    * HttpConnectionManager.
+    */
+   virtual absl::optional<int> checkHeaderNameForUnderscores(absl::string_view /* header_name */) {
+     return absl::nullopt;
+   }
+ 
+   /**
+    * Save `status` into codec_callback_status_.
+    * Return codec callback return code corresponding to `status`.
+    */
+   int setAndCheckCodecCallbackStatus(Status&& status);
+ 
+   /**
+    * Callback for terminating connection when protocol constrain has been violated
+    * outside of the dispatch context.
+    */
+   void scheduleProtocolConstraintViolationCallback();
+   void onProtocolConstraintViolation();
+ 
+   // Whether to use the new HTTP/2 library.
+   bool use_oghttp2_library_;
++
++  // TODO: remove when removing `envoy.reloadable_features.http2_skip_callback_visitor`.
+   static Http2Callbacks http2_callbacks_;
+ 
+   // If deferred processing, the streams will be in LRU order based on when the
+   // stream encoded to the http2 connection. The LRU property is used when
+   // raising low watermark on the http2 connection to prioritize how streams get
+   // notified, prefering those that haven't recently written.
+   std::list<StreamImplPtr> active_streams_;
+ 
+   // Tracks the stream id of the current stream we're processing.
+   // This should only be set while we're in the context of dispatching to nghttp2.
+   absl::optional<int32_t> current_stream_id_;
+   std::unique_ptr<http2::adapter::Http2VisitorInterface> visitor_;
+   std::unique_ptr<http2::adapter::Http2Adapter> adapter_;
+ 
+   CodecStats& stats_;
+   Network::Connection& connection_;
+   const uint32_t max_headers_kb_;
+   const uint32_t max_headers_count_;
+   uint32_t per_stream_buffer_limit_;
+   bool allow_metadata_;
+   const bool stream_error_on_invalid_http_messaging_;
+ 
+   // Status for any errors encountered by the nghttp2 callbacks.
+   // nghttp2 library uses single return code to indicate callback failure and
+   // `codec_callback_status_` is used to save right error information returned by a callback. The
+   // `codec_callback_status_` is valid iff nghttp call returned NGHTTP2_ERR_CALLBACK_FAILURE.
+   Status codec_callback_status_;
+ 
+   // Set if the type of frame that is about to be sent is PING or SETTINGS with the ACK flag set, or
+   // RST_STREAM.
+   bool is_outbound_flood_monitored_control_frame_ = 0;
+   ProtocolConstraints protocol_constraints_;
+ 
+   // For the flood mitigation to work the onSend callback must be called once for each outbound
+   // frame. This is what the nghttp2 library is doing, however this is not documented. The
+   // Http2FloodMitigationTest.* tests in test/integration/http2_integration_test.cc will break if
+   // this changes in the future. Also it is important that onSend does not do partial writes, as the
+   // nghttp2 library will keep calling this callback to write the rest of the frame.
+   ssize_t onSend(const uint8_t* data, size_t length);
+ 
+   // Called when a stream encodes to the http2 connection which enables us to
+   // keep the active_streams list in LRU if deferred processing.
+   void updateActiveStreamsOnEncode(StreamImpl& stream) {
+     if (stream.defer_processing_backedup_streams_) {
+       LinkedList::moveIntoList(stream.removeFromList(active_streams_), active_streams_);
+     }
+   }
+ 
+   // dumpState helper method.
+   virtual void dumpStreams(std::ostream& os, int indent_level) const;
+ 
+   // Send a keepalive ping, and set the idle timer for ping timeout.
+   void sendKeepalive();
+ 
+   const MonotonicTime& lastReceivedDataTime() { return last_received_data_time_; }
+@@ -703,58 +776,61 @@ protected:
+ private:
+   friend class Http2CodecImplTestFixture;
+ 
+   virtual ConnectionCallbacks& callbacks() PURE;
+   virtual Status onBeginHeaders(int32_t stream_id) PURE;
+   int onData(int32_t stream_id, const uint8_t* data, size_t len);
+   Status onBeforeFrameReceived(int32_t stream_id, size_t length, uint8_t type, uint8_t flags);
+   Status onPing(uint64_t opaque_data, bool is_ack);
+   Status onBeginData(int32_t stream_id, size_t length, uint8_t flags, size_t padding);
+   Status onGoAway(uint32_t error_code);
+   Status onHeaders(int32_t stream_id, size_t length, uint8_t flags);
+   Status onRstStream(int32_t stream_id, uint32_t error_code);
+   Status onFrameReceived(const nghttp2_frame* frame);
+   int onBeforeFrameSend(int32_t stream_id, size_t length, uint8_t type, uint8_t flags);
+   int onFrameSend(int32_t stream_id, size_t length, uint8_t type, uint8_t flags,
+                   uint32_t error_code);
+   int onError(absl::string_view error);
+   virtual int onHeader(int32_t stream_id, HeaderString&& name, HeaderString&& value) PURE;
+   int onInvalidFrame(int32_t stream_id, int error_code);
+   // Pass through invoking with the actual stream.
+   Status onStreamClose(int32_t stream_id, uint32_t error_code);
+   // Should be invoked directly in buffered onStreamClose scenarios
+   // where nghttp2 might have already forgotten about the stream.
+   Status onStreamClose(StreamImpl* stream, uint32_t error_code);
+   int onMetadataReceived(int32_t stream_id, const uint8_t* data, size_t len);
+   int onMetadataFrameComplete(int32_t stream_id, bool end_metadata);
+ 
+   // Adds buffer fragment for a new outbound frame to the supplied Buffer::OwnedImpl.
+   void addOutboundFrameFragment(Buffer::OwnedImpl& output, const uint8_t* data, size_t length);
+   Status trackInboundFrames(int32_t stream_id, size_t length, uint8_t type, uint8_t flags,
+                             uint32_t padding_length);
+   void onKeepaliveResponse();
+   void onKeepaliveResponseTimeout();
+   bool slowContainsStreamId(int32_t stream_id) const;
+   virtual StreamResetReason getMessagingErrorResetReason() const PURE;
+ 
+   // Tracks the current slice we're processing in the dispatch loop.
+   const Buffer::RawSlice* current_slice_ = nullptr;
+   // Streams that are pending deferred reset. Using an ordered map provides determinism in the rare
+   // case where there are multiple streams waiting for deferred reset. The stream id is also used to
+   // remove streams from the map when they are closed in order to avoid calls to resetStreamWorker
+   // after the stream has been removed from the active list.
+   std::map<int32_t, StreamImpl*> pending_deferred_reset_streams_;
+   bool dispatching_ : 1;
+   bool raised_goaway_ : 1;
+   Event::SchedulableCallbackPtr protocol_constraint_violation_callback_;
+   Random::RandomGenerator& random_;
+   MonotonicTime last_received_data_time_{};
+   Event::TimerPtr keepalive_send_timer_;
+   Event::TimerPtr keepalive_timeout_timer_;
+   std::chrono::milliseconds keepalive_interval_;
+   std::chrono::milliseconds keepalive_timeout_;
+   uint32_t keepalive_interval_jitter_percent_;
++
++  const bool skip_callback_visitor_ =
++      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http2_skip_callback_visitor");
+ };
+ 
+ /**
+  * HTTP/2 client connection codec.
+  */
+diff --git a/source/common/runtime/runtime_features.cc b/source/common/runtime/runtime_features.cc
+index bb6d471e71..0f2f5862ca 100644
+--- a/source/common/runtime/runtime_features.cc
++++ b/source/common/runtime/runtime_features.cc
+@@ -57,6 +57,7 @@ RUNTIME_GUARD(envoy_reloadable_features_http1_connection_close_header_in_redirec
+ RUNTIME_GUARD(envoy_reloadable_features_http1_use_balsa_parser);
+ RUNTIME_GUARD(envoy_reloadable_features_http2_decode_metadata_with_quiche);
+ RUNTIME_GUARD(envoy_reloadable_features_http2_discard_host_header);
++RUNTIME_GUARD(envoy_reloadable_features_http2_skip_callback_visitor);
+ RUNTIME_GUARD(envoy_reloadable_features_http2_validate_authority_with_quiche);
+ RUNTIME_GUARD(envoy_reloadable_features_http_allow_partial_urls_in_referer);
+ RUNTIME_GUARD(envoy_reloadable_features_http_filter_avoid_reentrant_local_reply);
+diff --git a/test/integration/http_protocol_integration.cc b/test/integration/http_protocol_integration.cc
+index 9ea5174638..50f79fdf63 100644
+--- a/test/integration/http_protocol_integration.cc
++++ b/test/integration/http_protocol_integration.cc
+@@ -6,52 +6,55 @@ namespace Envoy {
+ std::vector<HttpProtocolTestParams> HttpProtocolIntegrationTest::getProtocolTestParams(
+     const std::vector<Http::CodecType>& downstream_protocols,
+     const std::vector<Http::CodecType>& upstream_protocols) {
+   std::vector<HttpProtocolTestParams> ret;
+ 
+   for (auto ip_version : TestEnvironment::getIpVersionsForTest()) {
+     for (auto downstream_protocol : downstream_protocols) {
+       for (auto upstream_protocol : upstream_protocols) {
+ #ifndef ENVOY_ENABLE_QUIC
+         if (downstream_protocol == Http::CodecType::HTTP3 ||
+             upstream_protocol == Http::CodecType::HTTP3) {
+           ENVOY_LOG_MISC(warn, "Skipping HTTP/3 as support is compiled out");
+           continue;
+         }
+ #endif
+ 
+         std::vector<Http1ParserImpl> http1_implementations = {Http1ParserImpl::HttpParser};
+         if (downstream_protocol == Http::CodecType::HTTP1 ||
+             upstream_protocol == Http::CodecType::HTTP1) {
+           http1_implementations.push_back(Http1ParserImpl::BalsaParser);
+         }
+ 
+         std::vector<Http2Impl> http2_implementations = {Http2Impl::Nghttp2};
+-        std::vector<bool> defer_processing_values = {false};
++        std::vector<bool> http2_bool_values = {false};
+         if (downstream_protocol == Http::CodecType::HTTP2 ||
+             upstream_protocol == Http::CodecType::HTTP2) {
+           http2_implementations.push_back(Http2Impl::Oghttp2);
+-          defer_processing_values.push_back(true);
++          http2_bool_values.push_back(true);
+         }
+ 
+         std::vector<bool> use_header_validator_values;
+ #ifdef ENVOY_ENABLE_UHV
+         use_header_validator_values.push_back(true);
+ #else
+         use_header_validator_values.push_back(false);
+ #endif
+         for (Http1ParserImpl http1_implementation : http1_implementations) {
+           for (Http2Impl http2_implementation : http2_implementations) {
+-            for (bool defer_processing : defer_processing_values) {
+-              for (bool use_header_validator : use_header_validator_values) {
+-                ret.push_back(HttpProtocolTestParams{
+-                    ip_version, downstream_protocol, upstream_protocol, http1_implementation,
+-                    http2_implementation, defer_processing, use_header_validator});
++            for (bool defer_processing : http2_bool_values) {
++              for (bool deprecate_callback_visitor : http2_bool_values) {
++                for (bool use_header_validator : use_header_validator_values) {
++                  ret.push_back(HttpProtocolTestParams{
++                      ip_version, downstream_protocol, upstream_protocol, http1_implementation,
++                      http2_implementation, defer_processing, use_header_validator,
++                      deprecate_callback_visitor});
++                }
+               }
+             }
+           }
+         }
+       }
+     }
+   }
+   return ret;
+ }
+@@ -93,12 +96,14 @@ absl::string_view http2ImplementationToString(Http2Impl impl) {
+ std::string HttpProtocolIntegrationTest::protocolTestParamsToString(
+     const ::testing::TestParamInfo<HttpProtocolTestParams>& params) {
+   return absl::StrCat((params.param.version == Network::Address::IpVersion::v4 ? "IPv4_" : "IPv6_"),
+                       downstreamToString(params.param.downstream_protocol),
+                       upstreamToString(params.param.upstream_protocol),
+                       TestUtility::http1ParserImplToString(params.param.http1_implementation),
+                       http2ImplementationToString(params.param.http2_implementation),
+                       params.param.defer_processing_backedup_streams ? "WithDeferredProcessing"
+                                                                      : "NoDeferredProcessing",
++                      params.param.deprecate_callback_visitor ? "WithCallbackVisitor"
++                                                              : "NoCallbackVisitor",
+                       params.param.use_universal_header_validator ? "Uhv" : "Legacy");
+ }
+ 
+diff --git a/test/integration/http_protocol_integration.h b/test/integration/http_protocol_integration.h
+index 5988e1ecc0..0c0dd6c1bb 100644
+--- a/test/integration/http_protocol_integration.h
++++ b/test/integration/http_protocol_integration.h
+@@ -10,11 +10,12 @@ namespace Envoy {
+ struct HttpProtocolTestParams {
+   Network::Address::IpVersion version;
+   Http::CodecType downstream_protocol;
+   Http::CodecType upstream_protocol;
+   Http1ParserImpl http1_implementation;
+   Http2Impl http2_implementation;
+   bool defer_processing_backedup_streams;
+   bool use_universal_header_validator;
++  bool deprecate_callback_visitor;
+ };
+ 
+ absl::string_view http2ImplementationToString(Http2Impl impl);
+@@ -38,57 +39,59 @@ class HttpProtocolIntegrationTest : public testing::TestWithParam<HttpProtocolTe
+                                     public HttpIntegrationTest {
+ public:
+   // By default returns 8 combinations of
+   // [HTTP  upstream / HTTP  downstream] x [Ipv4, IPv6]
+   // [HTTP  upstream / HTTP2 downstream] x [IPv4, Ipv6]
+   // [HTTP2 upstream / HTTP  downstream] x [Ipv4, IPv6]
+   // [HTTP2 upstream / HTTP2 downstream] x [IPv4, Ipv6]
+   //
+   // Upstream and downstream protocols may be changed via the input vectors.
+   // Address combinations are propagated from TestEnvironment::getIpVersionsForTest()
+   static std::vector<HttpProtocolTestParams>
+   getProtocolTestParams(const std::vector<Http::CodecType>& downstream_protocols =
+                             {
+                                 Http::CodecType::HTTP1,
+                                 Http::CodecType::HTTP2,
+                                 Http::CodecType::HTTP3,
+                             },
+                         const std::vector<Http::CodecType>& upstream_protocols = {
+                             Http::CodecType::HTTP1,
+                             Http::CodecType::HTTP2,
+                             Http::CodecType::HTTP3,
+                         });
+ 
+   static std::vector<HttpProtocolTestParams> getProtocolTestParamsWithoutHTTP3() {
+     return getProtocolTestParams(
+         /*downstream_protocols = */ {Http::CodecType::HTTP1, Http::CodecType::HTTP2},
+         /*upstream_protocols = */ {Http::CodecType::HTTP1, Http::CodecType::HTTP2});
+   }
+ 
+   // Allows pretty printed test names of the form
+   // FooTestCase.BarInstance/IPv4_Http2Downstream_HttpUpstream
+   static std::string
+   protocolTestParamsToString(const ::testing::TestParamInfo<HttpProtocolTestParams>& p);
+ 
+   HttpProtocolIntegrationTest()
+       : HttpProtocolIntegrationTest(ConfigHelper::httpProxyConfig(
+             /*downstream_is_quic=*/GetParam().downstream_protocol == Http::CodecType::HTTP3)) {}
+ 
+   HttpProtocolIntegrationTest(const std::string config)
+       : HttpIntegrationTest(GetParam().downstream_protocol, GetParam().version, config),
+         use_universal_header_validator_(GetParam().use_universal_header_validator) {
+     setupHttp1ImplOverrides(GetParam().http1_implementation);
+     setupHttp2ImplOverrides(GetParam().http2_implementation);
+     config_helper_.addRuntimeOverride(Runtime::defer_processing_backedup_streams,
+                                       GetParam().defer_processing_backedup_streams ? "true"
+                                                                                    : "false");
++    config_helper_.addRuntimeOverride("envoy.reloadable_features.http2_skip_callback_visitor",
++                                      GetParam().deprecate_callback_visitor ? "true" : "false");
+     config_helper_.addRuntimeOverride("envoy.reloadable_features.enable_universal_header_validator",
+                                       GetParam().use_universal_header_validator ? "true" : "false");
+   }
+ 
+   void SetUp() override {
+     setDownstreamProtocol(GetParam().downstream_protocol);
+     setUpstreamProtocol(GetParam().upstream_protocol);
+   }
+ 
+   void setDownstreamOverrideStreamErrorOnInvalidHttpMessage();
+   void setUpstreamOverrideStreamErrorOnInvalidHttpMessage();

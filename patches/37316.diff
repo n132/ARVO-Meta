@@ -1,0 +1,174 @@
+commit e37d86c260d95eae53326b14d496ffa85e9e5934
+Author: Michael Hanselmann <public@hansmi.ch>
+Date:   Sun Aug 22 21:07:36 2021 +0200
+
+    Skip empty write buffers when unserializing parser
+    
+    At commit 8490a7ac101d the following `fuzzing/usbredirparserfuzz` input causes
+    the instantiation of empty write buffers:
+    
+    $ base64 -d <<'EOF' > testcase6474540506021888
+    QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAG
+    AAAAAN7/AAAACAA=
+    EOF
+    
+    Empty write buffers trigger all kinds of issues, in part because they cause
+    calls to write(2) with a zero length.
+    
+    Signed-off-by: Michael Hanselmann <public@hansmi.ch>
+
+diff --git a/usbredirparser/usbredirparser.c b/usbredirparser/usbredirparser.c
+index 383b77f..054a3d8 100644
+--- a/usbredirparser/usbredirparser.c
++++ b/usbredirparser/usbredirparser.c
+@@ -1734,128 +1734,146 @@ USBREDIR_VISIBLE
+ int usbredirparser_unserialize(struct usbredirparser *parser_pub,
+                                uint8_t *state, int len)
+ {
+     struct usbredirparser_priv *parser =
+         (struct usbredirparser_priv *)parser_pub;
+     struct usbredirparser_buf *wbuf, **next;
+     uint32_t orig_caps[USB_REDIR_CAPS_SIZE];
+     uint8_t *data;
+     uint32_t i, l, header_len, remain = len;
+ 
+     if (unserialize_int(parser, &state, &remain, &i, "magic"))
+         return -1;
+     if (i != USBREDIRPARSER_SERIALIZE_MAGIC) {
+         ERROR("error unserialize magic mismatch");
+         return -1;
+     }
+ 
++    if (parser->write_buf_count != 0 || parser->write_buf != NULL ||
++        parser->data != NULL) {
++        ERROR("unserialization must use a pristine parser");
++        return -1;
++    }
++
+     if (unserialize_int(parser, &state, &remain, &i, "length"))
+         return -1;
+     if (i != len) {
+         ERROR("error unserialize length mismatch");
+         return -1;
+     }
+ 
+     data = (uint8_t *)parser->our_caps;
+     i = USB_REDIR_CAPS_SIZE * sizeof(int32_t);
+     memcpy(orig_caps, parser->our_caps, i);
+     if (unserialize_data(parser, &state, &remain, &data, &i, "our_caps"))
+         return -1;
+     for (i =0; i < USB_REDIR_CAPS_SIZE; i++) {
+         if (parser->our_caps[i] != orig_caps[i]) {
+             /* orig_caps is our original settings
+              * parser->our_caps is off the wire.
+              * We want to allow reception from an older
+              * usbredir that doesn't have all our features.
+              */
+             if (parser->our_caps[i] & ~orig_caps[i]) {
+                 /* Source has a cap we don't */
+                 ERROR("error unserialize caps mismatch ours: %x recv: %x",
+                       orig_caps[i], parser->our_caps[i]);
+                 return -1;
+             } else {
+                 /* We've got a cap the source doesn't - that's OK */
+                 WARNING("unserialize missing some caps; ours: %x recv: %x",
+                       orig_caps[i], parser->our_caps[i]);
+             }
+         }
+     }
+ 
+     data = (uint8_t *)parser->peer_caps;
+     i = USB_REDIR_CAPS_SIZE * sizeof(int32_t);
+     if (unserialize_data(parser, &state, &remain, &data, &i, "peer_caps"))
+         return -1;
+     if (i)
+         parser->have_peer_caps = 1;
+ 
+     if (unserialize_int(parser, &state, &remain, &i, "skip"))
+         return -1;
+     parser->to_skip = i;
+ 
+     header_len = usbredirparser_get_header_len(parser_pub);
+     data = (uint8_t *)&parser->header;
+     i = header_len;
+     if (unserialize_data(parser, &state, &remain, &data, &i, "header"))
+         return -1;
+     parser->header_read = i;
+ 
+     /* Set various length field froms the header (if we've a header) */
+     if (parser->header_read == header_len) {
+                 int type_header_len =
+                     usbredirparser_get_type_header_len(parser_pub,
+                                                        parser->header.type, 0);
+                 if (type_header_len < 0 ||
+                     type_header_len > sizeof(parser->type_header) ||
+                     parser->header.length < type_header_len ||
+                     (parser->header.length > type_header_len &&
+                      !usbredirparser_expect_extra_data(parser))) {
+                     ERROR("error unserialize packet header invalid");
+                     return -1;
+                 }
+                 parser->type_header_len = type_header_len;
+                 parser->data_len = parser->header.length - type_header_len;
+     }
+ 
+     data = parser->type_header;
+     i = parser->type_header_len;
+     if (unserialize_data(parser, &state, &remain, &data, &i, "type_header"))
+         return -1;
+     parser->type_header_read = i;
+ 
+     if (parser->data_len) {
+         parser->data = malloc(parser->data_len);
+         if (!parser->data) {
+             ERROR("Out of memory allocating unserialize buffer");
+             return -1;
+         }
+     }
+     i = parser->data_len;
+     if (unserialize_data(parser, &state, &remain, &parser->data, &i, "data"))
+         return -1;
+     parser->data_read = i;
+ 
+     /* Get the write buffer count and the write buffers */
+     if (unserialize_int(parser, &state, &remain, &i, "write_buf_count"))
+         return -1;
+     next = &parser->write_buf;
+     while (i) {
++        uint8_t *buf = NULL;
++
++        l = 0;
++        if (unserialize_data(parser, &state, &remain, &buf, &l, "wbuf")) {
++            return -1;
++        }
++
++        if (l == 0) {
++            free(buf);
++            ERROR("write buffer %d is empty", i);
++            return -1;
++        }
++
+         wbuf = calloc(1, sizeof(*wbuf));
+         if (!wbuf) {
++            free(buf);
+             ERROR("Out of memory allocating unserialize buffer");
+             return -1;
+         }
+-        *next = wbuf;
+-        l = 0;
+-        if (unserialize_data(parser, &state, &remain, &wbuf->buf, &l, "wbuf"))
+-            return -1;
++        wbuf->buf = buf;
+         wbuf->len = l;
++        *next = wbuf;
+         next = &wbuf->next;
+         i--;
+     }
+ 
+     if (remain) {
+         ERROR("error unserialize %d bytes of extraneous state data", remain);
+         return -1;
+     }
+ 
+     return 0;
+ }

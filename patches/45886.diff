@@ -1,0 +1,177 @@
+commit 9f6772c1292022dee6576b2f3d0c258e523af834
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Mon Mar 21 11:10:42 2022 +0000
+
+    OSS-fuzz 45886 - validate funtion parameters for transfer functions
+    
+    This was causing a buffer overrun when evaluating a transfer function
+    because the code assumed it would be a 1-in one-out function, whereas
+    the supplied function is a 1-in 3-out function, causing it to overrun
+    the output buffer.
+    
+    This commit checks that the function is a 1-in, 1-out function and
+    returns an error if it isn't.
+    
+    Similar fix applied for colour transfers, and a C++ commented out line
+    removed as it seemed to be entirely spurious.
+
+diff --git a/pdf/pdf_gstate.c b/pdf/pdf_gstate.c
+index 7801ee681..c1444b4b5 100644
+--- a/pdf/pdf_gstate.c
++++ b/pdf/pdf_gstate.c
+@@ -834,113 +834,117 @@ typedef enum {
+ /* We use this for both TR and TR2, is_TR is true if this is a TR, in which case we don't want
+  * to permit /Default names for fucntions.
+  */
+ static int pdfi_set_all_transfers(pdf_context *ctx, pdf_array *a, pdf_dict *page_dict, bool is_TR)
+ {
+     int code = 0, i, j;
+     pdf_obj *o = NULL;
+     int proc_types[4];
+     gs_mapping_proc map_procs[4];
+     gs_function_t *pfn[4];
+ 
+     memset(pfn, 0x00, 4 * sizeof(gs_function_t *));
+     memset(map_procs, 0x00, 4 * sizeof(gs_mapping_proc *));
+ 
+     /* Two passes, the first one is to find the appropriate transfer procedures
+      * and do the majorty of the error checking;
+      */
+     for (i = 0; i < 4; i++) {
+         code = pdfi_array_get(ctx, a, (uint64_t)i, &o);
+         if (code < 0)
+             goto exit;
+         if (o->type == PDF_NAME) {
+             if (pdfi_name_is((const pdf_name *)o, "Identity")) {
+                 proc_types[i] = E_IDENTITY;
+                 map_procs[i] = gs_identity_transfer;
+             } else {
+                 if (!is_TR && pdfi_name_is((const pdf_name *)o, "Default")) {
+                     proc_types[i] = E_DEFAULT;
+                     map_procs[i] = ctx->page.DefaultTransfers[i].proc;
+                 } else {
+                     pdfi_countdown(o);
+                     code = gs_note_error(gs_error_typecheck);
+                     goto exit;
+                 }
+             }
+         } else {
+             if (o->type == PDF_STREAM || o->type == PDF_DICT) {
+                 proc_types[i] = E_FUNCTION;
+                 map_procs[i] = gs_mapped_transfer;
+                 code = pdfi_build_function(ctx, &pfn[i], NULL, 1, o, page_dict);
+                 if (code < 0) {
+                     pdfi_countdown(o);
+                     goto exit;
+                 }
++                if (pfn[i]->params.m != 1 || pfn[i]->params.n != 1) {
++                    pdfi_countdown(o);
++                    code = gs_note_error(gs_error_rangecheck);
++                    goto exit;
++                }
+             } else {
+                 pdfi_countdown(o);
+                 code = gs_note_error(gs_error_typecheck);
+                 goto exit;
+             }
+         }
+         pdfi_countdown(o);
+     }
+     code = gs_setcolortransfer_remap(ctx->pgs, map_procs[0], map_procs[1], map_procs[2], map_procs[3], false);
+     if (code < 0)
+         goto exit;
+ 
+     /* Second pass is to evaluate and set the transfer maps */
+     for (j = 0; j < 4; j++) {
+         if (proc_types[j] == E_DEFAULT) {
+             switch(j) {
+                 case 0:
+                     memcpy(ctx->pgs->set_transfer.red->values, ctx->page.DefaultTransfers[j].values, transfer_map_size * sizeof(frac));
+                     break;
+                 case 1:
+                     memcpy(ctx->pgs->set_transfer.green->values, ctx->page.DefaultTransfers[j].values, transfer_map_size * sizeof(frac));
+                     break;
+                 case 2:
+                     memcpy(ctx->pgs->set_transfer.blue->values, ctx->page.DefaultTransfers[j].values, transfer_map_size * sizeof(frac));
+                     break;
+                 case 3:
+                     memcpy(ctx->pgs->set_transfer.gray->values, ctx->page.DefaultTransfers[j].values, transfer_map_size * sizeof(frac));
+                     break;
+             }
+         }
+         if (proc_types[j] == E_FUNCTION) {
+             for (i = 0; i < transfer_map_size; i++) {
+                 float v, f;
+                 frac value;
+ 
+                 f = (1.0f / (transfer_map_size - 1)) * i;
+ 
+                 code = gs_function_evaluate(pfn[j], (const float *)&f, &v);
+                 if (code < 0)
+                     goto exit;
+ 
+                 value =
+                     (v < 0.0 ? float2frac(0.0) :
+                      v >= 1.0 ? frac_1 :
+                      float2frac(v));
+                 switch(j) {
+                     case 0:
+                         ctx->pgs->set_transfer.red->values[i] = value;
+                         break;
+                     case 1:
+                         ctx->pgs->set_transfer.green->values[i] = value;
+                         break;
+                     case 2:
+                         ctx->pgs->set_transfer.blue->values[i] = value;
+                         break;
+                     case 3:
+                         ctx->pgs->set_transfer.gray->values[i] = value;
+                         break;
+                 }
+             }
+         }
+     }
+  exit:
+-//    (void)pdfi_seek(ctx, ctx->main_stream, saved_stream_offset, SEEK_SET);
+     for (i = 0; i < 4; i++) {
+         pdfi_free_function(ctx, pfn[i]);
+     }
+     return code;
+ }
+@@ -948,31 +952,36 @@ static int pdfi_set_all_transfers(pdf_context *ctx, pdf_array *a, pdf_dict *page
+ static int pdfi_set_gray_transfer(pdf_context *ctx, pdf_obj *tr_obj, pdf_dict *page_dict)
+ {
+     int code = 0, i;
+     gs_function_t *pfn;
+ 
+     if (tr_obj->type != PDF_DICT && tr_obj->type != PDF_STREAM)
+         return_error(gs_error_typecheck);
+ 
+     code = pdfi_build_function(ctx, &pfn, NULL, 1, tr_obj, page_dict);
+     if (code < 0)
+         return code;
+ 
++    if (pfn->params.m != 1 || pfn->params.n != 1) {
++        (void)pdfi_free_function(ctx, pfn);
++        return_error(gs_error_rangecheck);
++    }
++
+     gs_settransfer_remap(ctx->pgs, gs_mapped_transfer, false);
+     for (i = 0; i < transfer_map_size; i++) {
+         float v, f;
+ 
+         f = (1.0f / (transfer_map_size - 1)) * i;
+ 
+         code = gs_function_evaluate(pfn, (const float *)&f, &v);
+         if (code < 0) {
+             pdfi_free_function(ctx, pfn);
+             return code;
+         }
+ 
+         ctx->pgs->set_transfer.gray->values[i] =
+             (v < 0.0 ? float2frac(0.0) :
+              v >= 1.0 ? frac_1 :
+              float2frac(v));
+     }
+     return pdfi_free_function(ctx, pfn);
+ }

@@ -1,0 +1,737 @@
+commit b6749e529b3677850aebd508afd2e01f2877ec9a
+Author: jeanlf <jeanlf@gpac.io>
+Date:   Mon Jan 22 12:22:09 2024 +0100
+
+    fixed heap overflow when dumping corrupted naluff extractors
+
+diff --git a/src/filters/inspect.c b/src/filters/inspect.c
+index d078c1531..a968f654b 100644
+--- a/src/filters/inspect.c
++++ b/src/filters/inspect.c
+@@ -726,49 +726,53 @@ static void dump_avc_pic_timing(FILE *dump, GF_BitStream *bs, AVCState *avc)
+ static void dump_sei(FILE *dump, GF_BitStream *bs, AVCState *avc, HEVCState *hevc, VVCState *vvc)
+ {
+ 	gf_bs_enable_emulation_byte_removal(bs, GF_TRUE);
+ 
+ 	//skip nal header
+ 	gf_bs_read_int(bs, avc ? 8 : 16);
+ 
+ 	while (gf_bs_available(bs) ) {
+ 		u32 sei_type = 0;
+ 		u32 sei_size = 0;
+ 		u32 sei_pos;
+ 		while (gf_bs_peek_bits(bs, 8, 0) == 0xFF) {
+ 			sei_type += 255;
+ 			gf_bs_read_int(bs, 8);
+ 		}
+ 		sei_type += gf_bs_read_int(bs, 8);
+ 		while (gf_bs_peek_bits(bs, 8, 0) == 0xFF) {
+ 			sei_size += 255;
+ 			gf_bs_read_int(bs, 8);
+ 		}
+ 		sei_size += gf_bs_read_int(bs, 8);
+ 		sei_pos = (u32) gf_bs_get_position(bs);
+ 
+ 		inspect_printf(dump, "    <SEIMessage ptype=\"%u\" psize=\"%u\" type=\"%s\"", sei_type, sei_size, get_sei_name(sei_type) );
+ 		if (sei_type == 144) {
+ 			dump_clli(dump, bs);
+ 		} else if (sei_type == 137) {
+ 			dump_mdcv(dump, bs, GF_TRUE);
+ 		} else if (sei_type == 1 && avc) {
+ 			dump_avc_pic_timing(dump, bs, avc);
+ 		} else if (sei_type == 136) {
+ 			dump_time_code_hevc(dump, bs);
+ 		} else if (sei_type == 4) {
+ 			dump_t35(dump, bs, sei_size);
+ 		}
++		else if (avc && (sei_type==6)) {
++			u32 frame_cnt = gf_bs_read_ue(bs);
++			inspect_printf(dump, " frame_count=\"%u\"", frame_cnt);
++		}
+ 		inspect_printf(dump, "/>\n");
+ 
+ 		//don't trust sei parsers, force jumping to next - use byte-per-byte read for EPB removal
+ 		gf_bs_seek(bs, sei_pos);
+ 		while (sei_size) {
+ 			gf_bs_read_u8(bs);
+ 			sei_size--;
+ 		}
+ 
+ 		if (gf_bs_peek_bits(bs, 8, 0) == 0x80) {
+ 			break;
+ 		}
+ 	}
+ }
+@@ -777,668 +781,671 @@ static void dump_sei(FILE *dump, GF_BitStream *bs, AVCState *avc, HEVCState *hev
+ static void gf_inspect_dump_nalu_internal(FILE *dump, u8 *ptr, u32 ptr_size, Bool is_svc, HEVCState *hevc, AVCState *avc, VVCState *vvc, u32 nalh_size, Bool dump_crc, Bool is_encrypted, u32 full_bs_dump, PidCtx *pctx)
+ {
+ 	s32 res = 0;
+ 	u8 type, nal_ref_idc;
+ 	u8 dependency_id, quality_id, temporal_id;
+ 	u8 track_ref_index;
+ 	s8 sample_offset;
+ 	u32 data_offset, data_size;
+ 	s32 idx;
+ 	InspectLogCbk lcbk;
+ 	GF_BitStream *bs = NULL;
+ 	const char *nal_name;
+ 
+ 	if (full_bs_dump<INSPECT_ANALYZE_BS)
+ 		full_bs_dump = 0;
+ 	else {
+ 		lcbk.dump = dump;
+ 		lcbk.dump_bits = full_bs_dump==INSPECT_ANALYZE_BS_BITS ? GF_TRUE : GF_FALSE;
+ 	}
+ 
+ 	if (!ptr_size) {
+ 		inspect_printf(dump, "error=\"invalid nal size 0\"/>\n");
+ 		return;
+ 	}
+ 
+ 	if (dump_crc) inspect_printf(dump, "crc=\"%u\" ", gf_crc_32(ptr, ptr_size) );
+ 
+ 	if (hevc) {
+ 		if (ptr_size<=1) {
+ 			inspect_printf(dump, "error=\"invalid nal size 1\"/>\n");
+ 			return;
+ 		}
+ 
+ 		if (full_bs_dump) {
+ 			if (pctx) {
+ 				if (!pctx->bs)
+ 					pctx->bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 				else
+ 					gf_bs_reassign_buffer(pctx->bs, ptr, ptr_size);
+ 				bs = pctx->bs;
+ 			} else {
+ 				bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 			}
+ 			gf_bs_set_logger(bs, regular_bs_log, &lcbk);
+ 			hevc->full_slice_header_parse = GF_TRUE;
+ 			res = gf_hevc_parse_nalu_bs(bs, hevc, &type, &temporal_id, &quality_id);
+ 		} else {
+ 			bs = NULL;
+ 			res = gf_hevc_parse_nalu(ptr, ptr_size, hevc, &type, &temporal_id, &quality_id);
+ 			inspect_printf(dump, "code=\"%d\"", type);
+ 		}
+ 
+ 		if (res==-1) {
+ 			inspect_printf(dump, " status=\"error parsing\"", type);
+ 		}
+ 		inspect_printf(dump, " type=\"", type);
+ 		nal_name = get_hevc_nal_name(type);
+ 		if (nal_name)
+ 			gf_fputs(nal_name, dump);
+ 		else
+ 			inspect_printf(dump, "UNKNOWN (parsing return %d)", res);
+ 
+ 		//specific dump
+ 		switch (type) {
+ 		case GF_HEVC_NALU_VID_PARAM:
+ 			if (full_bs_dump) break;
+ 			idx = gf_hevc_read_vps(ptr, ptr_size, hevc);
+ 			if (idx<0) inspect_printf(dump, "\" vps_id=\"PARSING FAILURE");
+ 			else inspect_printf(dump, "\" vps_id=\"%d", idx);
+ 			break;
+ 		case GF_HEVC_NALU_SEQ_PARAM:
+ 			if (full_bs_dump) break;
+ 			idx = gf_hevc_read_sps(ptr, ptr_size, hevc);
+ 			if (idx<0) {
+ 				inspect_printf(dump, "\" sps_id=\"PARSING FAILURE");
+ 				break;
+ 			}
+ 			{
+ 			HEVC_SPS *sps= &hevc->sps[idx];
+ 			inspect_printf(dump, "\" sps_id=\"%d", idx);
+ 
+ 			inspect_printf(dump, "\" aspect_ratio_info_present_flag=\"%d", sps->aspect_ratio_info_present_flag);
+ 			inspect_printf(dump, "\" bit_depth_chroma=\"%d", sps->bit_depth_chroma);
+ 			inspect_printf(dump, "\" bit_depth_luma=\"%d", sps->bit_depth_luma);
+ 			inspect_printf(dump, "\" chroma_format_idc=\"%d", sps->chroma_format_idc);
+ 			inspect_printf(dump, "\" colour_description_present_flag=\"%d", sps->colour_description_present_flag);
+ 			inspect_printf(dump, "\" colour_primaries=\"%d", sps->colour_primaries);
+ 			inspect_printf(dump, "\" cw_flag=\"%d", sps->cw_flag);
+ 			if (sps->cw_flag) {
+ 				inspect_printf(dump, "\" cw_bottom=\"%d", sps->cw_bottom);
+ 				inspect_printf(dump, "\" cw_top=\"%d", sps->cw_top);
+ 				inspect_printf(dump, "\" cw_left=\"%d", sps->cw_left);
+ 				inspect_printf(dump, "\" cw_right=\"%d", sps->cw_right);
+ 			}
+ 			inspect_printf(dump, "\" height=\"%d", sps->height);
+ 			inspect_printf(dump, "\" width=\"%d", sps->width);
+ 			inspect_printf(dump, "\" log2_max_pic_order_cnt_lsb=\"%d", sps->log2_max_pic_order_cnt_lsb);
+ 			inspect_printf(dump, "\" long_term_ref_pics_present_flag=\"%d", sps->long_term_ref_pics_present_flag);
+ 			inspect_printf(dump, "\" matrix_coeffs=\"%d", sps->matrix_coeffs);
+ 			inspect_printf(dump, "\" max_CU_depth=\"%d", sps->max_CU_depth);
+ 			inspect_printf(dump, "\" max_CU_width=\"%d", sps->max_CU_width);
+ 			inspect_printf(dump, "\" max_CU_height=\"%d", sps->max_CU_height);
+ 			inspect_printf(dump, "\" num_long_term_ref_pic_sps=\"%d", sps->num_long_term_ref_pic_sps);
+ 			inspect_printf(dump, "\" num_short_term_ref_pic_sets=\"%d", sps->num_short_term_ref_pic_sets);
+ 			inspect_printf(dump, "\" has_timing_info=\"%d", sps->has_timing_info);
+ 			if (sps->has_timing_info) {
+ 				inspect_printf(dump, "\" time_scale=\"%d", sps->time_scale);
+ 				inspect_printf(dump, "\" num_ticks_poc_diff_one_minus1=\"%d", sps->num_ticks_poc_diff_one_minus1);
+ 				inspect_printf(dump, "\" num_units_in_tick=\"%d", sps->num_units_in_tick);
+ 				inspect_printf(dump, "\" poc_proportional_to_timing_flag=\"%d", sps->poc_proportional_to_timing_flag);
+ 			}
+ 			inspect_printf(dump, "\" rep_format_idx=\"%d", sps->rep_format_idx);
+ 			inspect_printf(dump, "\" sample_adaptive_offset_enabled_flag=\"%d", sps->sample_adaptive_offset_enabled_flag);
+ 			inspect_printf(dump, "\" sar_idc=\"%d", sps->sar_idc);
+ 			inspect_printf(dump, "\" separate_colour_plane_flag=\"%d", sps->separate_colour_plane_flag);
+ 			inspect_printf(dump, "\" temporal_mvp_enable_flag=\"%d", sps->temporal_mvp_enable_flag);
+ 			inspect_printf(dump, "\" transfer_characteristic=\"%d", sps->transfer_characteristic);
+ 			inspect_printf(dump, "\" video_full_range_flag=\"%d", sps->video_full_range_flag);
+ 			inspect_printf(dump, "\" sps_ext_or_max_sub_layers_minus1=\"%d", sps->sps_ext_or_max_sub_layers_minus1);
+ 			inspect_printf(dump, "\" max_sub_layers_minus1=\"%d", sps->max_sub_layers_minus1);
+ 			inspect_printf(dump, "\" update_rep_format_flag=\"%d", sps->update_rep_format_flag);
+ 			inspect_printf(dump, "\" sub_layer_ordering_info_present_flag=\"%d", sps->sub_layer_ordering_info_present_flag);
+ 			inspect_printf(dump, "\" scaling_list_enable_flag=\"%d", sps->scaling_list_enable_flag);
+ 			inspect_printf(dump, "\" infer_scaling_list_flag=\"%d", sps->infer_scaling_list_flag);
+ 			inspect_printf(dump, "\" scaling_list_ref_layer_id=\"%d", sps->scaling_list_ref_layer_id);
+ 			inspect_printf(dump, "\" scaling_list_data_present_flag=\"%d", sps->scaling_list_data_present_flag);
+ 			inspect_printf(dump, "\" asymmetric_motion_partitions_enabled_flag=\"%d", sps->asymmetric_motion_partitions_enabled_flag);
+ 			inspect_printf(dump, "\" pcm_enabled_flag=\"%d", sps->pcm_enabled_flag);
+ 			inspect_printf(dump, "\" strong_intra_smoothing_enable_flag=\"%d", sps->strong_intra_smoothing_enable_flag);
+ 			inspect_printf(dump, "\" vui_parameters_present_flag=\"%d", sps->vui_parameters_present_flag);
+ 			inspect_printf(dump, "\" log2_diff_max_min_luma_coding_block_size=\"%d", sps->log2_diff_max_min_luma_coding_block_size);
+ 			inspect_printf(dump, "\" log2_min_transform_block_size=\"%d", sps->log2_min_transform_block_size);
+ 			inspect_printf(dump, "\" log2_min_luma_coding_block_size=\"%d", sps->log2_min_luma_coding_block_size);
+ 			inspect_printf(dump, "\" log2_max_transform_block_size=\"%d", sps->log2_max_transform_block_size);
+ 			inspect_printf(dump, "\" max_transform_hierarchy_depth_inter=\"%d", sps->max_transform_hierarchy_depth_inter);
+ 			inspect_printf(dump, "\" max_transform_hierarchy_depth_intra=\"%d", sps->max_transform_hierarchy_depth_intra);
+ 			inspect_printf(dump, "\" pcm_sample_bit_depth_luma_minus1=\"%d", sps->pcm_sample_bit_depth_luma_minus1);
+ 			inspect_printf(dump, "\" pcm_sample_bit_depth_chroma_minus1=\"%d", sps->pcm_sample_bit_depth_chroma_minus1);
+ 			inspect_printf(dump, "\" pcm_loop_filter_disable_flag=\"%d", sps->pcm_loop_filter_disable_flag);
+ 			inspect_printf(dump, "\" log2_min_pcm_luma_coding_block_size_minus3=\"%d", sps->log2_min_pcm_luma_coding_block_size_minus3);
+ 			inspect_printf(dump, "\" log2_diff_max_min_pcm_luma_coding_block_size=\"%d", sps->log2_diff_max_min_pcm_luma_coding_block_size);
+ 			inspect_printf(dump, "\" overscan_info_present=\"%d", sps->overscan_info_present);
+ 			inspect_printf(dump, "\" overscan_appropriate=\"%d", sps->overscan_appropriate);
+ 			inspect_printf(dump, "\" video_signal_type_present_flag=\"%d", sps->video_signal_type_present_flag);
+ 			inspect_printf(dump, "\" video_format=\"%d", sps->video_format);
+ 			inspect_printf(dump, "\" chroma_loc_info_present_flag=\"%d", sps->chroma_loc_info_present_flag);
+ 			inspect_printf(dump, "\" chroma_sample_loc_type_top_field=\"%d", sps->chroma_sample_loc_type_top_field);
+ 			inspect_printf(dump, "\" chroma_sample_loc_type_bottom_field=\"%d", sps->chroma_sample_loc_type_bottom_field);
+ 			inspect_printf(dump, "\" neutral_chroma_indication_flag=\"%d", sps->neutral_chroma_indication_flag);
+ 			inspect_printf(dump, "\" field_seq_flag=\"%d", sps->field_seq_flag);
+ 			inspect_printf(dump, "\" frame_field_info_present_flag=\"%d", sps->frame_field_info_present_flag);
+ 			inspect_printf(dump, "\" default_display_window_flag=\"%d", sps->default_display_window_flag);
+ 			inspect_printf(dump, "\" left_offset=\"%d", sps->left_offset);
+ 			inspect_printf(dump, "\" right_offset=\"%d", sps->right_offset);
+ 			inspect_printf(dump, "\" top_offset=\"%d", sps->top_offset);
+ 			inspect_printf(dump, "\" bottom_offset=\"%d", sps->bottom_offset);
+ 			inspect_printf(dump, "\" hrd_parameters_present_flag=\"%d", sps->hrd_parameters_present_flag);
+ 			}
+ 			break;
+ 		case GF_HEVC_NALU_PIC_PARAM:
+ 			if (full_bs_dump) break;
+ 			idx = gf_hevc_read_pps(ptr, ptr_size, hevc);
+ 			if (idx<0) {
+ 				inspect_printf(dump, "\" pps_id=\"PARSING FAILURE");
+ 				break;
+ 			}
+ 			{
+ 			HEVC_PPS *pps= &hevc->pps[idx];
+ 			inspect_printf(dump, "\" pps_id=\"%d", idx);
+ 
+ 			inspect_printf(dump, "\" cabac_init_present_flag=\"%d", pps->cabac_init_present_flag);
+ 			inspect_printf(dump, "\" dependent_slice_segments_enabled_flag=\"%d", pps->dependent_slice_segments_enabled_flag);
+ 			inspect_printf(dump, "\" entropy_coding_sync_enabled_flag=\"%d", pps->entropy_coding_sync_enabled_flag);
+ 			inspect_printf(dump, "\" lists_modification_present_flag=\"%d", pps->lists_modification_present_flag);
+ 			inspect_printf(dump, "\" loop_filter_across_slices_enabled_flag=\"%d", pps->loop_filter_across_slices_enabled_flag);
+ 			inspect_printf(dump, "\" loop_filter_across_tiles_enabled_flag=\"%d", pps->loop_filter_across_tiles_enabled_flag);
+ 			inspect_printf(dump, "\" num_extra_slice_header_bits=\"%d", pps->num_extra_slice_header_bits);
+ 			inspect_printf(dump, "\" num_ref_idx_l0_default_active=\"%d", pps->num_ref_idx_l0_default_active);
+ 			inspect_printf(dump, "\" num_ref_idx_l1_default_active=\"%d", pps->num_ref_idx_l1_default_active);
+ 			inspect_printf(dump, "\" tiles_enabled_flag=\"%d", pps->tiles_enabled_flag);
+ 			if (pps->tiles_enabled_flag) {
+ 				inspect_printf(dump, "\" uniform_spacing_flag=\"%d", pps->uniform_spacing_flag);
+ 				if (!pps->uniform_spacing_flag) {
+ 					u32 k;
+ 					inspect_printf(dump, "\" num_tile_columns=\"%d", pps->num_tile_columns);
+ 					inspect_printf(dump, "\" num_tile_rows=\"%d", pps->num_tile_rows);
+ 					inspect_printf(dump, "\" colomns_width=\"");
+ 					for (k=0; k<pps->num_tile_columns-1; k++)
+ 						inspect_printf(dump, "%d ", pps->column_width[k]);
+ 					inspect_printf(dump, "\" rows_height=\"");
+ 					for (k=0; k<pps->num_tile_rows-1; k++)
+ 						inspect_printf(dump, "%d ", pps->row_height[k]);
+ 				}
+ 			}
+ 			inspect_printf(dump, "\" output_flag_present_flag=\"%d", pps->output_flag_present_flag);
+ 			inspect_printf(dump, "\" pic_init_qp_minus26=\"%d", pps->pic_init_qp_minus26);
+ 			inspect_printf(dump, "\" slice_chroma_qp_offsets_present_flag=\"%d", pps->slice_chroma_qp_offsets_present_flag);
+ 			inspect_printf(dump, "\" slice_segment_header_extension_present_flag=\"%d", pps->slice_segment_header_extension_present_flag);
+ 			inspect_printf(dump, "\" weighted_pred_flag=\"%d", pps->weighted_pred_flag);
+ 			inspect_printf(dump, "\" weighted_bipred_flag=\"%d", pps->weighted_bipred_flag);
+ 
+ 			inspect_printf(dump, "\" sign_data_hiding_flag=\"%d", pps->sign_data_hiding_flag);
+ 			inspect_printf(dump, "\" constrained_intra_pred_flag=\"%d", pps->constrained_intra_pred_flag);
+ 			inspect_printf(dump, "\" transform_skip_enabled_flag=\"%d", pps->transform_skip_enabled_flag);
+ 			inspect_printf(dump, "\" cu_qp_delta_enabled_flag=\"%d", pps->cu_qp_delta_enabled_flag);
+ 			if (pps->cu_qp_delta_enabled_flag)
+ 				inspect_printf(dump, "\" diff_cu_qp_delta_depth=\"%d", pps->diff_cu_qp_delta_depth);
+ 			inspect_printf(dump, "\" transquant_bypass_enable_flag=\"%d", pps->transquant_bypass_enable_flag);
+ 			inspect_printf(dump, "\" pic_cb_qp_offset=\"%d", pps->pic_cb_qp_offset);
+ 			inspect_printf(dump, "\" pic_cr_qp_offset=\"%d", pps->pic_cr_qp_offset);
+ 
+ 			inspect_printf(dump, "\" deblocking_filter_control_present_flag=\"%d", pps->deblocking_filter_control_present_flag);
+ 			if (pps->deblocking_filter_control_present_flag) {
+ 				inspect_printf(dump, "\" deblocking_filter_override_enabled_flag=\"%d", pps->deblocking_filter_override_enabled_flag);
+ 				inspect_printf(dump, "\" pic_disable_deblocking_filter_flag=\"%d", pps->pic_disable_deblocking_filter_flag);
+ 				inspect_printf(dump, "\" beta_offset_div2=\"%d", pps->beta_offset_div2);
+ 				inspect_printf(dump, "\" tc_offset_div2=\"%d", pps->tc_offset_div2);
+ 			}
+ 			inspect_printf(dump, "\" pic_scaling_list_data_present_flag=\"%d", pps->pic_scaling_list_data_present_flag);
+ 			inspect_printf(dump, "\" log2_parallel_merge_level_minus2=\"%d", pps->log2_parallel_merge_level_minus2);
+ 			}
+ 			break;
+ 		case GF_HEVC_NALU_ACCESS_UNIT:
+ 			if (ptr_size<3) {
+ 				inspect_printf(dump, "\" status=\"CORRUPTED NAL");
+ 				break;
+ 			}
+ 			inspect_printf(dump, "\" primary_pic_type=\"%d", ptr[2] >> 5);
+ 			break;
+ 		//extractor
+ 		case GF_HEVC_NALU_FF_EXTRACTOR:
+ 		{
+ 			u32 remain = ptr_size-2;
+ 			char *s = ptr+2;
+ 
+ 			gf_fputs(" ", dump);
+ 
+ 			while (remain) {
+ 				u32 mode = s[0];
+ 				remain -= 1;
+ 				s += 1;
+-				if (mode) {
++				if (!remain) {
++					inspect_printf(dump, "error=\"invalid inband data extractor size, no bytes remaining\"/>\n");
++					return;
++				} else if (mode) {
+ 					u32 len = s[0];
+ 					if (len+1>remain) {
+ 						inspect_printf(dump, "error=\"invalid inband data extractor size: %d vs %d remaining\"/>\n", len, remain);
+ 						return;
+ 					}
+ 					remain -= len+1;
+ 					s += len+1;
+ 					inspect_printf(dump, "\" inband_size=\"%d", len);
+ 				} else {
+ 					if (remain < 2 + 2*nalh_size) {
+ 						inspect_printf(dump, "error=\"invalid ref data extractor size: %d vs %d remaining\"/>\n", 2 + 2*nalh_size, remain);
+ 						return;
+ 					}
+ 					track_ref_index = (u8) s[0];
+ 					sample_offset = (s8) s[1];
+ 					data_offset = inspect_get_nal_size(&s[2], nalh_size);
+ 					data_size = inspect_get_nal_size(&s[2+nalh_size], nalh_size);
+ 					inspect_printf(dump, "\" track_ref_index=\"%d\" sample_offset=\"%d\" data_offset=\"%d\" data_size=\"%d", track_ref_index, sample_offset, data_offset, data_size);
+ 
+ 					remain -= 2 + 2*nalh_size;
+ 					s += 2 + 2*nalh_size;
+ 				}
+ 			}
+ 		}
+ 			break;
+ 		default:
+ 			break;
+ 		}
+ 		gf_fputs("\"", dump);
+ 
+ 		if (!full_bs_dump && (type < GF_HEVC_NALU_VID_PARAM)) {
+ 			inspect_printf(dump, " slice=\"%s\" poc=\"%d\"", (hevc->s_info.slice_type==GF_HEVC_SLICE_TYPE_I) ? "I" : (hevc->s_info.slice_type==GF_HEVC_SLICE_TYPE_P) ? "P" : (hevc->s_info.slice_type==GF_HEVC_SLICE_TYPE_B) ? "B" : "Unknown", hevc->s_info.poc);
+ 			inspect_printf(dump, " first_slice_in_pic=\"%d\"", hevc->s_info.first_slice_segment_in_pic_flag);
+ 			inspect_printf(dump, " dependent_slice_segment=\"%d\"", hevc->s_info.dependent_slice_segment_flag);
+ 
+ 			if (!gf_sys_is_test_mode()) {
+ 				inspect_printf(dump, " redundant_pic_cnt=\"%d\"", hevc->s_info.redundant_pic_cnt);
+ 				inspect_printf(dump, " slice_qp_delta=\"%d\"", hevc->s_info.slice_qp_delta);
+ 				inspect_printf(dump, " slice_segment_address=\"%d\"", hevc->s_info.slice_segment_address);
+ 				inspect_printf(dump, " slice_type=\"%d\"", hevc->s_info.slice_type);
+ 			}
+ 		}
+ 		if (!full_bs_dump)
+ 			inspect_printf(dump, " layer_id=\"%d\" temporal_id=\"%d\"", quality_id, temporal_id);
+ 
+ 		if (bs) {
+ 			if (!pctx)
+ 				gf_bs_del(bs);
+ 			else
+ 				gf_bs_set_logger(bs, NULL, NULL);
+ 		}
+ 
+ 		if ((type == GF_HEVC_NALU_SEI_PREFIX) || (type == GF_HEVC_NALU_SEI_SUFFIX)) {
+ 			inspect_printf(dump, ">\n");
+ 			if (pctx) {
+ 				if (!pctx->bs)
+ 					pctx->bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 				else
+ 					gf_bs_reassign_buffer(pctx->bs, ptr, ptr_size);
+ 				bs = pctx->bs;
+ 			} else {
+ 				bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 			}
+ 			dump_sei(dump, bs, avc, hevc, vvc);
+ 			if (!pctx) gf_bs_del(bs);
+ 			inspect_printf(dump, "   </NALU>\n");
+ 		} else {
+ 			inspect_printf(dump, "/>\n");
+ 		}
+ 		return;
+ 	}
+ 
+ 	if (vvc) {
+ 		u8 lid, tid;
+ 
+ 		if (ptr_size<=1) {
+ 			inspect_printf(dump, "error=\"invalid nal size 1\"/>\n");
+ 			return;
+ 		}
+ 
+ 		if (full_bs_dump) {
+ 			vvc->parse_mode = 2;
+ 			if (pctx) {
+ 				if (!pctx->bs)
+ 					pctx->bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 				else
+ 					gf_bs_reassign_buffer(pctx->bs, ptr, ptr_size);
+ 				bs = pctx->bs;
+ 			} else {
+ 				bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 			}
+ 			gf_bs_set_logger(bs, regular_bs_log, &lcbk);
+ 			res = gf_vvc_parse_nalu_bs(bs, vvc, &type, &lid, &tid);
+ 		} else {
+ 			vvc->parse_mode = 0;
+ 			bs = NULL;
+ 			u32 forb_zero = (ptr[0] & 0x80) ? 1 : 0;
+ 			u32 res_zero = (ptr[0] & 0x40) ? 1 : 0;
+ 			lid = (ptr[0] & 0x3F);
+ 			tid = (ptr[1] & 0x7);
+ 			if (forb_zero || res_zero || !tid) {
+ 				inspect_printf(dump, "error=\"invalid header (forb %d res_zero %d tid %d)\"/>\n", forb_zero, res_zero, tid);
+ 				return;
+ 			}
+ 			tid -= 1;
+ 			type = ptr[1]>>3;
+ 
+ 			res = gf_vvc_parse_nalu(ptr, ptr_size, vvc, &type, &lid, &tid);
+ 			inspect_printf(dump, "code=\"%d\" temporalid=\"%d\" layerid=\"%d\"", type, tid, lid);
+ 		}
+ 		if (res==-1) {
+ 			inspect_printf(dump, " status=\"error parsing\"", type);
+ 		}
+ 
+ 		inspect_printf(dump, " type=\"");
+ 		nal_name = get_vvc_nal_name(type);
+ 		if (nal_name)
+ 			inspect_printf(dump, nal_name);
+ 		else {
+ 			inspect_printf(dump, "unknown");
+ 			res = -2;
+ 		}
+ 		//specific dump
+ 		switch (type) {
+ 		case GF_VVC_NALU_VID_PARAM:
+ 			if ((res>=0) && !full_bs_dump) {
+ 				u32 j;
+ 				VVC_VPS *vps = &vvc->vps[vvc->last_parsed_vps_id];
+ 				inspect_printf(dump, "\" id=\"%d\" num_ptl=\"%d\" max_layers=\"%d\" max_sublayers=\"%d", vps->id, vps->num_ptl, vps->max_layers, vps->max_sub_layers);
+ 				if (vps->max_layers>1) {
+ 					inspect_printf(dump, "\" max_layer_id=\"%d\" all_layers_independent=\"%d\" each_layer_is_ols=\"%d", vps->max_layer_id, vps->all_layers_independent, vps->each_layer_is_ols);
+ 				}
+ 				for (j=0; j<vps->num_ptl; j++) {
+ 					VVC_ProfileTierLevel *ptl = &vps->ptl[j];
+ 					inspect_printf(dump, "\" general_level_idc=\"%d\" frame_only_constraint=\"%d\" multilayer_enabled=\"%d\" max_tid=\"%d", ptl->general_level_idc, ptl->frame_only_constraint, ptl->multilayer_enabled, ptl->ptl_max_tid);
+ 
+ 					if (ptl->pt_present) {
+ 						inspect_printf(dump, "\" general_profile_idc=\"%d\" general_tier_flag=\"%d\" gci_present=\"%d", ptl->general_profile_idc, ptl->general_tier_flag, ptl->gci_present);
+ 					}
+ 				}
+ 			}
+ 			res = -2;
+ 			break;
+ 		case GF_VVC_NALU_SEQ_PARAM:
+ 			if ((res>=0) && !full_bs_dump) {
+ 				VVC_SPS *sps = &vvc->sps[vvc->last_parsed_sps_id];
+ 
+ 				inspect_printf(dump, "\" id=\"%d\" vps_id=\"%d\" max_sublayers=\"%d\" chroma_idc=\"%d\" bit_depth=\"%d\" CTBsizeY=\"%d\" gdr_enabled=\"%d\" ref_pic_sampling=\"%d\" subpic_info_present=\"%d\" poc_msb_cycle_flag=\"%d", sps->id, sps->vps_id, sps->max_sublayers, sps->chroma_format_idc, sps->bitdepth, 1<<sps->log2_ctu_size, sps->gdr_enabled, sps->ref_pic_resampling, sps->subpic_info_present, sps->poc_msb_cycle_flag);
+ 				if (sps->ref_pic_resampling) {
+ 					inspect_printf(dump, "\" res_change_in_clvs=\"%d", sps->res_change_in_clvs);
+ 				}
+ 				inspect_printf(dump, "\" width=\"%d\" height=\"%d", sps->width, sps->height);
+ 				if (!sps->vps_id) {
+ 					VVC_ProfileTierLevel *ptl = &vvc->vps[0].ptl[0];
+ 					inspect_printf(dump, "\" general_level_idc=\"%d\" frame_only_constraint=\"%d\" multilayer_enabled=\"%d\" max_tid=\"%d", ptl->general_level_idc, ptl->frame_only_constraint, ptl->multilayer_enabled, ptl->ptl_max_tid);
+ 
+ 					if (ptl->pt_present) {
+ 						inspect_printf(dump, "\" general_profile_idc=\"%d\" general_tier_flag=\"%d\" gci_present=\"%d", ptl->general_profile_idc, ptl->general_tier_flag, ptl->gci_present);
+ 					}
+ 				}
+ 				inspect_printf(dump, "\" conf_window=\"%d", sps->conf_window);
+ 				if (sps->conf_window) {
+ 					inspect_printf(dump, "\" cw_left=\"%d\" cw_right=\"%d\" cw_top=\"%d\" cw_bottom=\"%d", sps->cw_left, sps->cw_right, sps->cw_top, sps->cw_bottom);
+ 				}
+ 			}
+ 			res=-2;
+ 			break;
+ 		case GF_VVC_NALU_PIC_PARAM:
+ 			if ((res>=0) && !full_bs_dump) {
+ 				VVC_PPS *pps = &vvc->pps[vvc->last_parsed_pps_id];
+ 				inspect_printf(dump, "\" id=\"%d\" sps_id=\"%d\" width=\"%d\" height=\"%d\" mixed_nal_types=\"%d\" conf_window=\"%d", pps->id, pps->sps_id, pps->width, pps->height, pps->mixed_nal_types, pps->conf_window);
+ 
+ 				if (pps->conf_window) {
+ 					inspect_printf(dump, "\" cw_left=\"%d\" cw_right=\"%d\" cw_top=\"%d\" cw_bottom=\"%d", pps->cw_left, pps->cw_right, pps->cw_top, pps->cw_bottom);
+ 				}
+ 				inspect_printf(dump, "\" output_flag_present_flag=\"%d\" no_pic_partition_flag=\"%d\" subpic_id_mapping_present_flag=\"%d", pps->output_flag_present_flag, pps->no_pic_partition_flag, pps->subpic_id_mapping_present_flag);
+ 			}
+ 			res=-2;
+ 			break;
+ 		default:
+ 			break;
+ 		}
+ 		inspect_printf(dump, "\"");
+ 
+ 		//picture header or slice
+ 		if ((type!=GF_VVC_NALU_PIC_HEADER) && (type>GF_VVC_NALU_SLICE_GDR))
+ 			res = -2;
+ 		if ((res>=0) && !full_bs_dump) {
+ 			if (type!=GF_VVC_NALU_PIC_HEADER)
+ 				inspect_printf(dump, " picture_header_in_slice_header_flag=\"%d\"", vvc->s_info.picture_header_in_slice_header_flag);
+ 
+ 			if ((type==GF_VVC_NALU_PIC_HEADER) || vvc->s_info.picture_header_in_slice_header_flag) {
+ 				inspect_printf(dump, " pps_id=\"%d\" poc=\"%d\" irap_or_gdr_pic=\"%d\" non_ref_pic=\"%d\" inter_slice_allowed_flag=\"%d\" poc_lsb=\"%d\"", vvc->s_info.pps->id, vvc->s_info.poc, vvc->s_info.irap_or_gdr_pic, vvc->s_info.non_ref_pic, vvc->s_info.inter_slice_allowed_flag, vvc->s_info.poc_lsb);
+ 				if (vvc->s_info.irap_or_gdr_pic)
+ 					inspect_printf(dump, " gdr_pic=\"%d\" gdr_recovery_count=\"%d\"", vvc->s_info.gdr_pic, vvc->s_info.gdr_recovery_count);
+ 				if (vvc->s_info.inter_slice_allowed_flag)
+ 					inspect_printf(dump, " intra_slice_allowed_flag=\"%d\"", vvc->s_info.intra_slice_allowed_flag);
+ 				if (vvc->s_info.sps->poc_msb_cycle_flag && vvc->s_info.poc_msb_cycle_present_flag)
+ 					inspect_printf(dump, " poc_msb_cycle=\"%d\"", vvc->s_info.poc_msb_cycle);
+ 			}
+ 			if (type!=GF_VVC_NALU_PIC_HEADER)
+ 				inspect_printf(dump, " slice_type=\"%d\"", vvc->s_info.slice_type);
+ 		}
+ 
+ 		if (bs) {
+ 			if (!pctx)
+ 				gf_bs_del(bs);
+ 			else
+ 				gf_bs_set_logger(bs, NULL, NULL);
+ 		}
+ 
+ 		if ((type == GF_VVC_NALU_SEI_PREFIX) || (type == GF_VVC_NALU_SEI_SUFFIX)) {
+ 			inspect_printf(dump, ">\n");
+ 			if (pctx) {
+ 				if (!pctx->bs)
+ 					pctx->bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 				else
+ 					gf_bs_reassign_buffer(pctx->bs, ptr, ptr_size);
+ 				bs = pctx->bs;
+ 			} else {
+ 				bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 			}
+ 			dump_sei(dump, bs, avc, hevc, vvc);
+ 			if (!pctx) gf_bs_del(bs);
+ 			inspect_printf(dump, "   </NALU>\n");
+ 		} else {
+ 			inspect_printf(dump, "/>\n");
+ 		}
+ 		return;
+ 	}
+ 
+ 	//avc
+ 	if (!ptr_size) {
+ 		inspect_printf(dump, "error=\"invalid nal size 1\"/>\n");
+ 		return;
+ 	}
+ 	type = ptr[0] & 0x1F;
+ 	nal_ref_idc = ptr[0] & 0x60;
+ 	nal_ref_idc>>=5;
+ 	if (! full_bs_dump)
+ 		inspect_printf(dump, "code=\"%d\" ", type);
+ 
+ 	inspect_printf(dump, "type=\"");
+ 	res = -2;
+ 	nal_name = get_avc_nal_name(type);
+ 	if (type == GF_AVC_NALU_SVC_SLICE) nal_name = is_svc ? "SVCSlice" : "CodedSliceExtension";
+ 	if (nal_name) {
+ 		gf_fputs(nal_name, dump);
+ 	} else {
+ 		gf_fputs("unknown", dump);
+ 	}
+ 
+ 	if (pctx) {
+ 		if (!pctx->bs)
+ 			pctx->bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 		else
+ 			gf_bs_reassign_buffer(pctx->bs, ptr, ptr_size);
+ 		bs = pctx->bs;
+ 	} else {
+ 		bs = gf_bs_new(ptr, ptr_size, GF_BITSTREAM_READ);
+ 	}
+ 
+ 	if (full_bs_dump)
+ 		gf_bs_set_logger(bs, shifted_bs_log, &lcbk);
+ 
+ 	//specific dump
+ 	switch (type) {
+ 	case GF_AVC_NALU_NON_IDR_SLICE:
+ 	case GF_AVC_NALU_DP_A_SLICE:
+ 	case GF_AVC_NALU_DP_B_SLICE:
+ 	case GF_AVC_NALU_DP_C_SLICE:
+ 	case GF_AVC_NALU_IDR_SLICE:
+ 		if (is_encrypted) break;
+ 		res = gf_avc_parse_nalu(bs, avc);
+ 		break;
+ 	case GF_AVC_NALU_SEQ_PARAM:
+ 		if (is_encrypted) break;
+ 		idx = gf_avc_read_sps_bs(bs, avc, 0, NULL);
+ 		if (idx<0) {
+ 			inspect_printf(dump, "\" sps_id=\"PARSING FAILURE");
+ 			break;
+ 		}
+ 		if (full_bs_dump) break;
+ 		inspect_printf(dump, "\" sps_id=\"%d", idx);
+ 		inspect_printf(dump, "\" frame_mbs_only_flag=\"%d", avc->sps->frame_mbs_only_flag);
+ 		inspect_printf(dump, "\" mb_adaptive_frame_field_flag=\"%d", avc->sps->mb_adaptive_frame_field_flag);
+ 		inspect_printf(dump, "\" vui_parameters_present_flag=\"%d", avc->sps->vui_parameters_present_flag);
+ 		inspect_printf(dump, "\" max_num_ref_frames=\"%d", avc->sps->max_num_ref_frames);
+ 		inspect_printf(dump, "\" gaps_in_frame_num_value_allowed_flag=\"%d", avc->sps->gaps_in_frame_num_value_allowed_flag);
+ 		inspect_printf(dump, "\" chroma_format_idc=\"%d", avc->sps->chroma_format);
+ 		inspect_printf(dump, "\" bit_depth_luma_minus8=\"%d", avc->sps->luma_bit_depth_m8);
+ 		inspect_printf(dump, "\" bit_depth_chroma_minus8=\"%d", avc->sps->chroma_bit_depth_m8);
+ 		inspect_printf(dump, "\" width=\"%d", avc->sps->width);
+ 		inspect_printf(dump, "\" height=\"%d", avc->sps->height);
+ 		inspect_printf(dump, "\" crop_top=\"%d", avc->sps->crop.top);
+ 		inspect_printf(dump, "\" crop_left=\"%d", avc->sps->crop.left);
+ 		inspect_printf(dump, "\" crop_bottom=\"%d", avc->sps->crop.bottom);
+ 		inspect_printf(dump, "\" crop_right=\"%d", avc->sps->crop.right);
+ 		if (avc->sps->vui_parameters_present_flag) {
+ 			inspect_printf(dump, "\" vui_video_full_range_flag=\"%d", avc->sps->vui.video_full_range_flag);
+ 			inspect_printf(dump, "\" vui_video_signal_type_present_flag=\"%d", avc->sps->vui.video_signal_type_present_flag);
+ 			inspect_printf(dump, "\" vui_aspect_ratio_info_present_flag=\"%d", avc->sps->vui.aspect_ratio_info_present_flag);
+ 			inspect_printf(dump, "\" vui_aspect_ratio_num=\"%d", avc->sps->vui.par_num);
+ 			inspect_printf(dump, "\" vui_aspect_ratio_den=\"%d", avc->sps->vui.par_den);
+ 			inspect_printf(dump, "\" vui_overscan_info_present_flag=\"%d", avc->sps->vui.overscan_info_present_flag);
+ 			inspect_printf(dump, "\" vui_colour_description_present_flag=\"%d", avc->sps->vui.colour_description_present_flag);
+ 			inspect_printf(dump, "\" vui_colour_primaries=\"%d", avc->sps->vui.colour_primaries);
+ 			inspect_printf(dump, "\" vui_transfer_characteristics=\"%d", avc->sps->vui.transfer_characteristics);
+ 			inspect_printf(dump, "\" vui_matrix_coefficients=\"%d", avc->sps->vui.matrix_coefficients);
+ 			inspect_printf(dump, "\" vui_low_delay_hrd_flag=\"%d", avc->sps->vui.low_delay_hrd_flag);
+ 		}
+ 		inspect_printf(dump, "\" log2_max_poc_lsb=\"%d", avc->sps->log2_max_poc_lsb);
+ 		inspect_printf(dump, "\" log2_max_frame_num=\"%d", avc->sps->log2_max_frame_num);
+ 		inspect_printf(dump, "\" delta_pic_order_always_zero_flag=\"%d", avc->sps->delta_pic_order_always_zero_flag);
+ 		inspect_printf(dump, "\" offset_for_non_ref_pic=\"%d", avc->sps->offset_for_non_ref_pic);
+ 
+ 		break;
+ 	case GF_AVC_NALU_PIC_PARAM:
+ 		if (is_encrypted) break;
+ 		idx = gf_avc_read_pps_bs(bs, avc);
+ 		if (idx<0) {
+ 			inspect_printf(dump, "\" pps_id=\"PARSING FAILURE");
+ 			break;
+ 		}
+ 		if (full_bs_dump) break;
+ 		inspect_printf(dump, "\" pps_id=\"%d\" sps_id=\"%d", idx, avc->pps[idx].sps_id);
+ 		inspect_printf(dump, "\" entropy_coding_mode_flag=\"%d", avc->pps[idx].entropy_coding_mode_flag);
+ 		inspect_printf(dump, "\" deblocking_filter_control_present_flag=\"%d", avc->pps[idx].deblocking_filter_control_present_flag);
+ 		inspect_printf(dump, "\" mb_slice_group_map_type=\"%d", avc->pps[idx].mb_slice_group_map_type);
+ 		inspect_printf(dump, "\" num_ref_idx_l0_default_active_minus1=\"%d", avc->pps[idx].num_ref_idx_l0_default_active_minus1);
+ 		inspect_printf(dump, "\" num_ref_idx_l1_default_active_minus1=\"%d", avc->pps[idx].num_ref_idx_l1_default_active_minus1);
+ 		inspect_printf(dump, "\" pic_order_present=\"%d", avc->pps[idx].pic_order_present);
+ 		inspect_printf(dump, "\" pic_size_in_map_units_minus1=\"%d", avc->pps[idx].pic_size_in_map_units_minus1);
+ 		inspect_printf(dump, "\" redundant_pic_cnt_present=\"%d", avc->pps[idx].redundant_pic_cnt_present);
+ 		inspect_printf(dump, "\" slice_group_change_rate_minus1=\"%d", avc->pps[idx].slice_group_change_rate_minus1);
+ 		inspect_printf(dump, "\" slice_group_count=\"%d", avc->pps[idx].slice_group_count);
+ 		inspect_printf(dump, "\" weighted_pred_flag=\"%d", avc->pps[idx].weighted_pred_flag);
+ 		inspect_printf(dump, "\" weighted_bipred_idc=\"%d", avc->pps[idx].weighted_bipred_idc);
+ 		break;
+ 	case GF_AVC_NALU_ACCESS_UNIT:
+ 		if (is_encrypted) break;
+ 		if (full_bs_dump) break;
+ 		inspect_printf(dump, "\" primary_pic_type=\"%d", gf_bs_read_u8(bs) >> 5);
+ 		break;
+ 	case GF_AVC_NALU_SVC_SUBSEQ_PARAM:
+ 		if (is_encrypted) break;
+ 		idx = gf_avc_read_sps_bs(bs, avc, 1, NULL);
+ 		if (idx<0) {
+ 			inspect_printf(dump, "\" status=\"CORRUPTED NAL");
+ 			break;
+ 		}
+ 		if (full_bs_dump) break;
+ 		inspect_printf(dump, "\" sps_id=\"%d", idx - GF_SVC_SSPS_ID_SHIFT);
+ 		break;
+ 	case GF_AVC_NALU_SVC_SLICE:
+ 		if (is_encrypted) break;
+ 		gf_avc_parse_nalu(bs, avc);
+ 		if (full_bs_dump) break;
+ 		if (ptr_size<4) {
+ 			inspect_printf(dump, "\" status=\"CORRUPTED NAL");
+ 			break;
+ 		}
+ 		dependency_id = (ptr[2] & 0x70) >> 4;
+ 		quality_id = (ptr[2] & 0x0F);
+ 		temporal_id = (ptr[3] & 0xE0) >> 5;
+ 		inspect_printf(dump, "\" dependency_id=\"%d\" quality_id=\"%d\" temporal_id=\"%d", dependency_id, quality_id, temporal_id);
+ 		inspect_printf(dump, "\" poc=\"%d", avc->s_info.poc);
+ 		break;
+ 	case GF_AVC_NALU_SVC_PREFIX_NALU:
+ 		if (is_encrypted) break;
+ 		if (full_bs_dump) break;
+ 		if (ptr_size<4) {
+ 			inspect_printf(dump, "\" status=\"CORRUPTED NAL");
+ 			break;
+ 		}
+ 		dependency_id = (ptr[2] & 0x70) >> 4;
+ 		quality_id = (ptr[2] & 0x0F);
+ 		temporal_id = (ptr[3] & 0xE0) >> 5;
+ 		inspect_printf(dump, "\" dependency_id=\"%d\" quality_id=\"%d\" temporal_id=\"%d", dependency_id, quality_id, temporal_id);
+ 		break;
+ 	//extractor
+ 	case GF_AVC_NALU_FF_EXTRACTOR:
+ 		if (is_encrypted) break;
+ 		if (ptr_size<7+nalh_size+nalh_size) {
+ 			inspect_printf(dump, "\" status=\"CORRUPTED NAL");
+ 			break;
+ 		}
+ 		track_ref_index = (u8) ptr[4];
+ 		sample_offset = (s8) ptr[5];
+ 		data_offset = inspect_get_nal_size(&ptr[6], nalh_size);
+ 		data_size = inspect_get_nal_size(&ptr[6+nalh_size], nalh_size);
+ 		inspect_printf(dump, "\" track_ref_index=\"%d\" sample_offset=\"%d\" data_offset=\"%d\" data_size=\"%d\"", track_ref_index, sample_offset, data_offset, data_size);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 	gf_fputs("\"", dump);
+ 
+ 	if (!full_bs_dump) {
+ 		if (nal_ref_idc) {
+ 			inspect_printf(dump, " nal_ref_idc=\"%d\"", nal_ref_idc);
+ 		}
+ 		if (res>=0) {
+ 			inspect_printf(dump, " poc=\"%d\" pps_id=\"%d\" field_pic_flag=\"%d\"", avc->s_info.poc, avc->s_info.pps->id, (int)avc->s_info.field_pic_flag);
+ 		}
+ 	}
+ 
+ 	if (res == -1)
+ 		inspect_printf(dump, " status=\"error decoding slice\"");
+ 
+ 	if (!is_encrypted && (type == GF_AVC_NALU_SEI)) {
+ 		inspect_printf(dump, ">\n");
+ 		gf_bs_set_logger(bs, NULL, NULL);
+ 		dump_sei(dump, bs, avc, hevc, vvc);
+ 		inspect_printf(dump, "   </NALU>\n");
+ 	} else {
+ 		inspect_printf(dump, "/>\n");
+ 	}
+ 
+ 	if (bs) {
+ 		if (!pctx)
+ 			gf_bs_del(bs);
+ 		else
+ 			gf_bs_set_logger(bs, NULL, NULL);
+ 	}
+ }

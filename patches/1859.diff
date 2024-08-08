@@ -1,0 +1,7690 @@
+commit 3f96e07e6b398cfc220a4997b5be20dd308b9381
+Author: Philip.Hazel <Philip.Hazel@gmail.com>
+Date:   Sat May 27 15:49:29 2017 +0000
+
+    Fix lookbehind with zero-length branch in DFA matching. Fixes oss-fuzz 1959.
+
+diff --git a/ChangeLog b/ChangeLog
+index d37ec15..942b360 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -169,8 +169,11 @@ all the tests can run with clang's sanitizing options.
+ 33. Implement extra compile options in the compile context and add the first 
+ one: PCRE2_EXTRA_ALLOW_SURROGATE_ESCAPES.
+ 
+ 34. Implement newline type PCRE2_NEWLINE_NUL.
+ 
++35. A lookbehind assertion that had a zero-length branch caused undefined 
++behaviour when processed by pcre2_dfa_match(). This is oss-fuzz issue 1859.
++
+ 
+ Version 10.23 14-February-2017
+ ------------------------------
+diff --git a/src/pcre2_dfa_match.c b/src/pcre2_dfa_match.c
+index 5194a85..f9acba3 100644
+--- a/src/pcre2_dfa_match.c
++++ b/src/pcre2_dfa_match.c
+@@ -375,14 +375,10 @@ internal_dfa_match(
+ {
+ stateblock *active_states, *new_states, *temp_states;
+ stateblock *next_active_state, *next_new_state;
+-
+ const uint8_t *ctypes, *lcc, *fcc;
+ PCRE2_SPTR ptr;
+ PCRE2_SPTR end_code;
+-PCRE2_SPTR first_op;
+-
+ dfa_recursion_info new_recursive;
+-
+ int active_count, new_count, match_count;
+ 
+ /* Some fields in the mb block are frequently referenced, so we load them into
+@@ -417,79 +413,75 @@ active_states = (stateblock *)(workspace + 2);
+ next_new_state = new_states = active_states + wscount;
+ new_count = 0;
+ 
+-first_op = this_start_code + 1 + LINK_SIZE +
+-  ((*this_start_code == OP_CBRA || *this_start_code == OP_SCBRA ||
+-    *this_start_code == OP_CBRAPOS || *this_start_code == OP_SCBRAPOS)
+-    ? IMM2_SIZE:0);
+-
+ /* The first thing in any (sub) pattern is a bracket of some sort. Push all
+ the alternative states onto the list, and find out where the end is. This
+ makes is possible to use this function recursively, when we want to stop at a
+ matching internal ket rather than at the end.
+ 
+-If the first opcode in the first alternative is OP_REVERSE, we are dealing with
+-a backward assertion. In that case, we have to find out the maximum amount to
+-move back, and set up each alternative appropriately. */
++If we are dealing with a backward assertion we have to find out the maximum
++amount to move back, and set up each alternative appropriately. */
+ 
+-if (*first_op == OP_REVERSE)
++if (*this_start_code == OP_ASSERTBACK || *this_start_code == OP_ASSERTBACK_NOT)
+   {
+   size_t max_back = 0;
+   size_t gone_back;
+ 
+   end_code = this_start_code;
+   do
+     {
+     size_t back = (size_t)GET(end_code, 2+LINK_SIZE);
+     if (back > max_back) max_back = back;
+     end_code += GET(end_code, 1);
+     }
+   while (*end_code == OP_ALT);
+ 
+   /* If we can't go back the amount required for the longest lookbehind
+   pattern, go back as far as we can; some alternatives may still be viable. */
+ 
+ #ifdef SUPPORT_UNICODE
+   /* In character mode we have to step back character by character */
+ 
+   if (utf)
+     {
+     for (gone_back = 0; gone_back < max_back; gone_back++)
+       {
+       if (current_subject <= start_subject) break;
+       current_subject--;
+       ACROSSCHAR(current_subject > start_subject, *current_subject, current_subject--);
+       }
+     }
+   else
+ #endif
+ 
+   /* In byte-mode we can do this quickly. */
+ 
+     {
+     size_t current_offset = (size_t)(current_subject - start_subject);
+     gone_back = (current_offset < max_back)? current_offset : max_back;
+     current_subject -= gone_back;
+     }
+ 
+   /* Save the earliest consulted character */
+ 
+   if (current_subject < mb->start_used_ptr)
+     mb->start_used_ptr = current_subject;
+ 
+-  /* Now we can process the individual branches. */
++  /* Now we can process the individual branches. There will be an OP_REVERSE at
++  the start of each branch, except when the length of the branch is zero. */
+ 
+   end_code = this_start_code;
+   do
+     {
+-    size_t back = (size_t)GET(end_code, 2+LINK_SIZE);
++    uint32_t revlen = (end_code[1+LINK_SIZE] == OP_REVERSE)? 1 + LINK_SIZE : 0;
++    size_t back = (revlen == 0)? 0 : (size_t)GET(end_code, 2+LINK_SIZE);
+     if (back <= gone_back)
+       {
+-      int bstate = (int)(end_code - start_code + 2 + 2*LINK_SIZE);
++      int bstate = (int)(end_code - start_code + 1 + LINK_SIZE + revlen);
+       ADD_NEW_DATA(-bstate, 0, (int)(gone_back - back));
+       }
+     end_code += GET(end_code, 1);
+     }
+   while (*end_code == OP_ALT);
+  }
+ 
+ /* This is the code for a "normal" subpattern (not a backward assertion). The
+@@ -538,2553 +530,2553 @@ ptr = current_subject;
+ for (;;)
+   {
+   int i, j;
+   int clen, dlen;
+   uint32_t c, d;
+   int forced_fail = 0;
+   BOOL partial_newline = FALSE;
+   BOOL could_continue = reset_could_continue;
+   reset_could_continue = FALSE;
+-  
++
+   if (ptr > mb->last_used_ptr) mb->last_used_ptr = ptr;
+ 
+   /* Make the new state list into the active state list and empty the
+   new state list. */
+ 
+   temp_states = active_states;
+   active_states = new_states;
+   new_states = temp_states;
+   active_count = new_count;
+   new_count = 0;
+ 
+   workspace[0] ^= 1;              /* Remember for the restarting feature */
+   workspace[1] = active_count;
+ 
+   /* Set the pointers for adding new states */
+ 
+   next_active_state = active_states + active_count;
+   next_new_state = new_states;
+ 
+   /* Load the current character from the subject outside the loop, as many
+   different states may want to look at it, and we assume that at least one
+   will. */
+ 
+   if (ptr < end_subject)
+     {
+     clen = 1;        /* Number of data items in the character */
+ #ifdef SUPPORT_UNICODE
+     GETCHARLENTEST(c, ptr, clen);
+ #else
+     c = *ptr;
+ #endif  /* SUPPORT_UNICODE */
+     }
+   else
+     {
+     clen = 0;        /* This indicates the end of the subject */
+     c = NOTACHAR;    /* This value should never actually be used */
+     }
+ 
+   /* Scan up the active states and act on each one. The result of an action
+   may be to add more states to the currently active list (e.g. on hitting a
+   parenthesis) or it may be to put states on the new list, for considering
+   when we move the character pointer on. */
+ 
+   for (i = 0; i < active_count; i++)
+     {
+     stateblock *current_state = active_states + i;
+     BOOL caseless = FALSE;
+     PCRE2_SPTR code;
+     uint32_t codevalue;
+     int state_offset = current_state->offset;
+     int rrc;
+     int count;
+-    
++
+     /* A negative offset is a special case meaning "hold off going to this
+     (negated) state until the number of characters in the data field have
+     been skipped". If the could_continue flag was passed over from a previous
+     state, arrange for it to passed on. */
+ 
+     if (state_offset < 0)
+       {
+       if (current_state->data > 0)
+         {
+         ADD_NEW_DATA(state_offset, current_state->count,
+           current_state->data - 1);
+         if (could_continue) reset_could_continue = TRUE;
+         continue;
+         }
+       else
+         {
+         current_state->offset = state_offset = -state_offset;
+         }
+       }
+ 
+     /* Check for a duplicate state with the same count, and skip if found.
+     See the note at the head of this module about the possibility of improving
+     performance here. */
+ 
+     for (j = 0; j < i; j++)
+       {
+       if (active_states[j].offset == state_offset &&
+           active_states[j].count == current_state->count)
+         goto NEXT_ACTIVE_STATE;
+       }
+ 
+     /* The state offset is the offset to the opcode */
+ 
+     code = start_code + state_offset;
+     codevalue = *code;
+-    
++
+     /* If this opcode inspects a character, but we are at the end of the
+     subject, remember the fact for use when testing for a partial match. */
+ 
+     if (clen == 0 && poptable[codevalue] != 0)
+       could_continue = TRUE;
+ 
+     /* If this opcode is followed by an inline character, load it. It is
+     tempting to test for the presence of a subject character here, but that
+     is wrong, because sometimes zero repetitions of the subject are
+     permitted.
+ 
+     We also use this mechanism for opcodes such as OP_TYPEPLUS that take an
+     argument that is not a data character - but is always one byte long because
+     the values are small. We have to take special action to deal with  \P, \p,
+     \H, \h, \V, \v and \X in this case. To keep the other cases fast, convert
+     these ones to new opcodes. */
+ 
+     if (coptable[codevalue] > 0)
+       {
+       dlen = 1;
+ #ifdef SUPPORT_UNICODE
+       if (utf) { GETCHARLEN(d, (code + coptable[codevalue]), dlen); } else
+ #endif  /* SUPPORT_UNICODE */
+       d = code[coptable[codevalue]];
+       if (codevalue >= OP_TYPESTAR)
+         {
+         switch(d)
+           {
+           case OP_ANYBYTE: return PCRE2_ERROR_DFA_UITEM;
+           case OP_NOTPROP:
+           case OP_PROP: codevalue += OP_PROP_EXTRA; break;
+           case OP_ANYNL: codevalue += OP_ANYNL_EXTRA; break;
+           case OP_EXTUNI: codevalue += OP_EXTUNI_EXTRA; break;
+           case OP_NOT_HSPACE:
+           case OP_HSPACE: codevalue += OP_HSPACE_EXTRA; break;
+           case OP_NOT_VSPACE:
+           case OP_VSPACE: codevalue += OP_VSPACE_EXTRA; break;
+           default: break;
+           }
+         }
+       }
+     else
+       {
+       dlen = 0;         /* Not strictly necessary, but compilers moan */
+       d = NOTACHAR;     /* if these variables are not set. */
+       }
+ 
+ 
+     /* Now process the individual opcodes */
+ 
+     switch (codevalue)
+       {
+ /* ========================================================================== */
+       /* These cases are never obeyed. This is a fudge that causes a compile-
+       time error if the vectors coptable or poptable, which are indexed by
+       opcode, are not the correct length. It seems to be the only way to do
+       such a check at compile time, as the sizeof() operator does not work
+       in the C preprocessor. */
+ 
+       case OP_TABLE_LENGTH:
+       case OP_TABLE_LENGTH +
+         ((sizeof(coptable) == OP_TABLE_LENGTH) &&
+          (sizeof(poptable) == OP_TABLE_LENGTH)):
+       return 0;
+ 
+ /* ========================================================================== */
+       /* Reached a closing bracket. If not at the end of the pattern, carry
+       on with the next opcode. For repeating opcodes, also add the repeat
+       state. Note that KETRPOS will always be encountered at the end of the
+       subpattern, because the possessive subpattern repeats are always handled
+       using recursive calls. Thus, it never adds any new states.
+ 
+       At the end of the (sub)pattern, unless we have an empty string and
+       PCRE2_NOTEMPTY is set, or PCRE2_NOTEMPTY_ATSTART is set and we are at the
+       start of the subject, save the match data, shifting up all previous
+       matches so we always have the longest first. */
+ 
+       case OP_KET:
+       case OP_KETRMIN:
+       case OP_KETRMAX:
+       case OP_KETRPOS:
+       if (code != end_code)
+         {
+         ADD_ACTIVE(state_offset + 1 + LINK_SIZE, 0);
+         if (codevalue != OP_KET)
+           {
+           ADD_ACTIVE(state_offset - (int)GET(code, 1), 0);
+           }
+         }
+       else
+         {
+         if (ptr > current_subject ||
+             ((mb->moptions & PCRE2_NOTEMPTY) == 0 &&
+               ((mb->moptions & PCRE2_NOTEMPTY_ATSTART) == 0 ||
+                 current_subject > start_subject + mb->start_offset)))
+           {
+           if (match_count < 0) match_count = (offsetcount >= 2)? 1 : 0;
+             else if (match_count > 0 && ++match_count * 2 > (int)offsetcount)
+               match_count = 0;
+           count = ((match_count == 0)? (int)offsetcount : match_count * 2) - 2;
+           if (count > 0) memmove(offsets + 2, offsets,
+             (size_t)count * sizeof(PCRE2_SIZE));
+           if (offsetcount >= 2)
+             {
+             offsets[0] = (PCRE2_SIZE)(current_subject - start_subject);
+             offsets[1] = (PCRE2_SIZE)(ptr - start_subject);
+             }
+           if ((mb->moptions & PCRE2_DFA_SHORTEST) != 0) return match_count;
+           }
+         }
+       break;
+ 
+ /* ========================================================================== */
+       /* These opcodes add to the current list of states without looking
+       at the current character. */
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ALT:
+       do { code += GET(code, 1); } while (*code == OP_ALT);
+       ADD_ACTIVE((int)(code - start_code), 0);
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_BRA:
+       case OP_SBRA:
+       do
+         {
+         ADD_ACTIVE((int)(code - start_code + 1 + LINK_SIZE), 0);
+         code += GET(code, 1);
+         }
+       while (*code == OP_ALT);
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_CBRA:
+       case OP_SCBRA:
+       ADD_ACTIVE((int)(code - start_code + 1 + LINK_SIZE + IMM2_SIZE),  0);
+       code += GET(code, 1);
+       while (*code == OP_ALT)
+         {
+         ADD_ACTIVE((int)(code - start_code + 1 + LINK_SIZE),  0);
+         code += GET(code, 1);
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_BRAZERO:
+       case OP_BRAMINZERO:
+       ADD_ACTIVE(state_offset + 1, 0);
+       code += 1 + GET(code, 2);
+       while (*code == OP_ALT) code += GET(code, 1);
+       ADD_ACTIVE((int)(code - start_code + 1 + LINK_SIZE), 0);
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_SKIPZERO:
+       code += 1 + GET(code, 2);
+       while (*code == OP_ALT) code += GET(code, 1);
+       ADD_ACTIVE((int)(code - start_code + 1 + LINK_SIZE), 0);
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_CIRC:
+       if (ptr == start_subject && (mb->moptions & PCRE2_NOTBOL) == 0)
+         { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_CIRCM:
+       if ((ptr == start_subject && (mb->moptions & PCRE2_NOTBOL) == 0) ||
+           ((ptr != end_subject || (mb->poptions & PCRE2_ALT_CIRCUMFLEX) != 0 )
+             && WAS_NEWLINE(ptr)))
+         { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EOD:
+       if (ptr >= end_subject)
+         {
+         if ((mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+           could_continue = TRUE;
+         else { ADD_ACTIVE(state_offset + 1, 0); }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_SOD:
+       if (ptr == start_subject) { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_SOM:
+       if (ptr == start_subject + start_offset) { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+ 
+ /* ========================================================================== */
+       /* These opcodes inspect the next subject character, and sometimes
+       the previous one as well, but do not have an argument. The variable
+       clen contains the length of the current character and is zero if we are
+       at the end of the subject. */
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ANY:
+       if (clen > 0 && !IS_NEWLINE(ptr))
+         {
+         if (ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else
+           {
+           ADD_NEW(state_offset + 1, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ALLANY:
+       if (clen > 0)
+         { ADD_NEW(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EODN:
+       if (clen == 0 && (mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+         could_continue = TRUE;
+       else if (clen == 0 || (IS_NEWLINE(ptr) && ptr == end_subject - mb->nllen))
+         { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_DOLL:
+       if ((mb->moptions & PCRE2_NOTEOL) == 0)
+         {
+         if (clen == 0 && (mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+           could_continue = TRUE;
+         else if (clen == 0 ||
+             ((mb->poptions & PCRE2_DOLLAR_ENDONLY) == 0 && IS_NEWLINE(ptr) &&
+                (ptr == end_subject - mb->nllen)
+             ))
+           { ADD_ACTIVE(state_offset + 1, 0); }
+         else if (ptr + 1 >= mb->end_subject &&
+                  (mb->moptions & (PCRE2_PARTIAL_HARD|PCRE2_PARTIAL_SOFT)) != 0 &&
+                  NLBLOCK->nltype == NLTYPE_FIXED &&
+                  NLBLOCK->nllen == 2 &&
+                  c == NLBLOCK->nl[0])
+           {
+           if ((mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+             {
+             reset_could_continue = TRUE;
+             ADD_NEW_DATA(-(state_offset + 1), 0, 1);
+             }
+           else could_continue = partial_newline = TRUE;
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_DOLLM:
+       if ((mb->moptions & PCRE2_NOTEOL) == 0)
+         {
+         if (clen == 0 && (mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+           could_continue = TRUE;
+         else if (clen == 0 ||
+             ((mb->poptions & PCRE2_DOLLAR_ENDONLY) == 0 && IS_NEWLINE(ptr)))
+           { ADD_ACTIVE(state_offset + 1, 0); }
+         else if (ptr + 1 >= mb->end_subject &&
+                  (mb->moptions & (PCRE2_PARTIAL_HARD|PCRE2_PARTIAL_SOFT)) != 0 &&
+                  NLBLOCK->nltype == NLTYPE_FIXED &&
+                  NLBLOCK->nllen == 2 &&
+                  c == NLBLOCK->nl[0])
+           {
+           if ((mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+             {
+             reset_could_continue = TRUE;
+             ADD_NEW_DATA(-(state_offset + 1), 0, 1);
+             }
+           else could_continue = partial_newline = TRUE;
+           }
+         }
+       else if (IS_NEWLINE(ptr))
+         { ADD_ACTIVE(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+ 
+       case OP_DIGIT:
+       case OP_WHITESPACE:
+       case OP_WORDCHAR:
+       if (clen > 0 && c < 256 &&
+             ((ctypes[c] & toptable1[codevalue]) ^ toptable2[codevalue]) != 0)
+         { ADD_NEW(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_NOT_DIGIT:
+       case OP_NOT_WHITESPACE:
+       case OP_NOT_WORDCHAR:
+       if (clen > 0 && (c >= 256 ||
+             ((ctypes[c] & toptable1[codevalue]) ^ toptable2[codevalue]) != 0))
+         { ADD_NEW(state_offset + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_WORD_BOUNDARY:
+       case OP_NOT_WORD_BOUNDARY:
+         {
+         int left_word, right_word;
+ 
+         if (ptr > start_subject)
+           {
+           PCRE2_SPTR temp = ptr - 1;
+           if (temp < mb->start_used_ptr) mb->start_used_ptr = temp;
+ #if defined SUPPORT_UNICODE && PCRE2_CODE_UNIT_WIDTH != 32
+           if (utf) { BACKCHAR(temp); }
+ #endif
+           GETCHARTEST(d, temp);
+ #ifdef SUPPORT_UNICODE
+           if ((mb->poptions & PCRE2_UCP) != 0)
+             {
+             if (d == '_') left_word = TRUE; else
+               {
+               uint32_t cat = UCD_CATEGORY(d);
+               left_word = (cat == ucp_L || cat == ucp_N);
+               }
+             }
+           else
+ #endif
+           left_word = d < 256 && (ctypes[d] & ctype_word) != 0;
+           }
+         else left_word = FALSE;
+ 
+         if (clen > 0)
+           {
+           if (ptr >= mb->last_used_ptr)
+             {
+             PCRE2_SPTR temp = ptr + 1;
+ #if defined SUPPORT_UNICODE && PCRE2_CODE_UNIT_WIDTH != 32
+             if (utf) { FORWARDCHARTEST(temp, mb->end_subject); }
+ #endif
+             mb->last_used_ptr = temp;
+             }
+ #ifdef SUPPORT_UNICODE
+           if ((mb->poptions & PCRE2_UCP) != 0)
+             {
+             if (c == '_') right_word = TRUE; else
+               {
+               uint32_t cat = UCD_CATEGORY(c);
+               right_word = (cat == ucp_L || cat == ucp_N);
+               }
+             }
+           else
+ #endif
+           right_word = c < 256 && (ctypes[c] & ctype_word) != 0;
+           }
+         else right_word = FALSE;
+ 
+         if ((left_word == right_word) == (codevalue == OP_NOT_WORD_BOUNDARY))
+           { ADD_ACTIVE(state_offset + 1, 0); }
+         }
+       break;
+ 
+ 
+       /*-----------------------------------------------------------------*/
+       /* Check the next character by Unicode property. We will get here only
+       if the support is in the binary; otherwise a compile-time error occurs.
+       */
+ 
+ #ifdef SUPPORT_UNICODE
+       case OP_PROP:
+       case OP_NOTPROP:
+       if (clen > 0)
+         {
+         BOOL OK;
+         const uint32_t *cp;
+         const ucd_record * prop = GET_UCD(c);
+         switch(code[1])
+           {
+           case PT_ANY:
+           OK = TRUE;
+           break;
+ 
+           case PT_LAMP:
+           OK = prop->chartype == ucp_Lu || prop->chartype == ucp_Ll ||
+                prop->chartype == ucp_Lt;
+           break;
+ 
+           case PT_GC:
+           OK = PRIV(ucp_gentype)[prop->chartype] == code[2];
+           break;
+ 
+           case PT_PC:
+           OK = prop->chartype == code[2];
+           break;
+ 
+           case PT_SC:
+           OK = prop->script == code[2];
+           break;
+ 
+           /* These are specials for combination cases. */
+ 
+           case PT_ALNUM:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N;
+           break;
+ 
+           /* Perl space used to exclude VT, but from Perl 5.18 it is included,
+           which means that Perl space and POSIX space are now identical. PCRE
+           was changed at release 8.34. */
+ 
+           case PT_SPACE:    /* Perl space */
+           case PT_PXSPACE:  /* POSIX space */
+           switch(c)
+             {
+             HSPACE_CASES:
+             VSPACE_CASES:
+             OK = TRUE;
+             break;
+ 
+             default:
+             OK = PRIV(ucp_gentype)[prop->chartype] == ucp_Z;
+             break;
+             }
+           break;
+ 
+           case PT_WORD:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N ||
+                c == CHAR_UNDERSCORE;
+           break;
+ 
+           case PT_CLIST:
+           cp = PRIV(ucd_caseless_sets) + code[2];
+           for (;;)
+             {
+             if (c < *cp) { OK = FALSE; break; }
+             if (c == *cp++) { OK = TRUE; break; }
+             }
+           break;
+ 
+           case PT_UCNC:
+           OK = c == CHAR_DOLLAR_SIGN || c == CHAR_COMMERCIAL_AT ||
+                c == CHAR_GRAVE_ACCENT || (c >= 0xa0 && c <= 0xd7ff) ||
+                c >= 0xe000;
+           break;
+ 
+           /* Should never occur, but keep compilers from grumbling. */
+ 
+           default:
+           OK = codevalue != OP_PROP;
+           break;
+           }
+ 
+         if (OK == (codevalue == OP_PROP)) { ADD_NEW(state_offset + 3, 0); }
+         }
+       break;
+ #endif
+ 
+ 
+ 
+ /* ========================================================================== */
+       /* These opcodes likewise inspect the subject character, but have an
+       argument that is not a data character. It is one of these opcodes:
+       OP_ANY, OP_ALLANY, OP_DIGIT, OP_NOT_DIGIT, OP_WHITESPACE, OP_NOT_SPACE,
+       OP_WORDCHAR, OP_NOT_WORDCHAR. The value is loaded into d. */
+ 
+       case OP_TYPEPLUS:
+       case OP_TYPEMINPLUS:
+       case OP_TYPEPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 2, 0); }
+       if (clen > 0)
+         {
+         if (d == OP_ANY && ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else if ((c >= 256 && d != OP_DIGIT && d != OP_WHITESPACE && d != OP_WORDCHAR) ||
+             (c < 256 &&
+               (d != OP_ANY || !IS_NEWLINE(ptr)) &&
+               ((ctypes[c] & toptable1[d]) ^ toptable2[d]) != 0))
+           {
+           if (count > 0 && codevalue == OP_TYPEPOSPLUS)
+             {
+             active_count--;            /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW(state_offset, count);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_TYPEQUERY:
+       case OP_TYPEMINQUERY:
+       case OP_TYPEPOSQUERY:
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         if (d == OP_ANY && ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else if ((c >= 256 && d != OP_DIGIT && d != OP_WHITESPACE && d != OP_WORDCHAR) ||
+             (c < 256 &&
+               (d != OP_ANY || !IS_NEWLINE(ptr)) &&
+               ((ctypes[c] & toptable1[d]) ^ toptable2[d]) != 0))
+           {
+           if (codevalue == OP_TYPEPOSQUERY)
+             {
+             active_count--;            /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW(state_offset + 2, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_TYPESTAR:
+       case OP_TYPEMINSTAR:
+       case OP_TYPEPOSSTAR:
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         if (d == OP_ANY && ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else if ((c >= 256 && d != OP_DIGIT && d != OP_WHITESPACE && d != OP_WORDCHAR) ||
+             (c < 256 &&
+               (d != OP_ANY || !IS_NEWLINE(ptr)) &&
+               ((ctypes[c] & toptable1[d]) ^ toptable2[d]) != 0))
+           {
+           if (codevalue == OP_TYPEPOSSTAR)
+             {
+             active_count--;            /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW(state_offset, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_TYPEEXACT:
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         if (d == OP_ANY && ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else if ((c >= 256 && d != OP_DIGIT && d != OP_WHITESPACE && d != OP_WORDCHAR) ||
+             (c < 256 &&
+               (d != OP_ANY || !IS_NEWLINE(ptr)) &&
+               ((ctypes[c] & toptable1[d]) ^ toptable2[d]) != 0))
+           {
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW(state_offset + 1 + IMM2_SIZE + 1, 0); }
+           else
+             { ADD_NEW(state_offset, count); }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_TYPEUPTO:
+       case OP_TYPEMINUPTO:
+       case OP_TYPEPOSUPTO:
+       ADD_ACTIVE(state_offset + 2 + IMM2_SIZE, 0);
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         if (d == OP_ANY && ptr + 1 >= mb->end_subject &&
+             (mb->moptions & (PCRE2_PARTIAL_HARD)) != 0 &&
+             NLBLOCK->nltype == NLTYPE_FIXED &&
+             NLBLOCK->nllen == 2 &&
+             c == NLBLOCK->nl[0])
+           {
+           could_continue = partial_newline = TRUE;
+           }
+         else if ((c >= 256 && d != OP_DIGIT && d != OP_WHITESPACE && d != OP_WORDCHAR) ||
+             (c < 256 &&
+               (d != OP_ANY || !IS_NEWLINE(ptr)) &&
+               ((ctypes[c] & toptable1[d]) ^ toptable2[d]) != 0))
+           {
+           if (codevalue == OP_TYPEPOSUPTO)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW(state_offset + 2 + IMM2_SIZE, 0); }
+           else
+             { ADD_NEW(state_offset, count); }
+           }
+         }
+       break;
+ 
+ /* ========================================================================== */
+       /* These are virtual opcodes that are used when something like
+       OP_TYPEPLUS has OP_PROP, OP_NOTPROP, OP_ANYNL, or OP_EXTUNI as its
+       argument. It keeps the code above fast for the other cases. The argument
+       is in the d variable. */
+ 
+ #ifdef SUPPORT_UNICODE
+       case OP_PROP_EXTRA + OP_TYPEPLUS:
+       case OP_PROP_EXTRA + OP_TYPEMINPLUS:
+       case OP_PROP_EXTRA + OP_TYPEPOSPLUS:
+       count = current_state->count;           /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 4, 0); }
+       if (clen > 0)
+         {
+         BOOL OK;
+         const uint32_t *cp;
+         const ucd_record * prop = GET_UCD(c);
+         switch(code[2])
+           {
+           case PT_ANY:
+           OK = TRUE;
+           break;
+ 
+           case PT_LAMP:
+           OK = prop->chartype == ucp_Lu || prop->chartype == ucp_Ll ||
+             prop->chartype == ucp_Lt;
+           break;
+ 
+           case PT_GC:
+           OK = PRIV(ucp_gentype)[prop->chartype] == code[3];
+           break;
+ 
+           case PT_PC:
+           OK = prop->chartype == code[3];
+           break;
+ 
+           case PT_SC:
+           OK = prop->script == code[3];
+           break;
+ 
+           /* These are specials for combination cases. */
+ 
+           case PT_ALNUM:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N;
+           break;
+ 
+           /* Perl space used to exclude VT, but from Perl 5.18 it is included,
+           which means that Perl space and POSIX space are now identical. PCRE
+           was changed at release 8.34. */
+ 
+           case PT_SPACE:    /* Perl space */
+           case PT_PXSPACE:  /* POSIX space */
+           switch(c)
+             {
+             HSPACE_CASES:
+             VSPACE_CASES:
+             OK = TRUE;
+             break;
+ 
+             default:
+             OK = PRIV(ucp_gentype)[prop->chartype] == ucp_Z;
+             break;
+             }
+           break;
+ 
+           case PT_WORD:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N ||
+                c == CHAR_UNDERSCORE;
+           break;
+ 
+           case PT_CLIST:
+           cp = PRIV(ucd_caseless_sets) + code[3];
+           for (;;)
+             {
+             if (c < *cp) { OK = FALSE; break; }
+             if (c == *cp++) { OK = TRUE; break; }
+             }
+           break;
+ 
+           case PT_UCNC:
+           OK = c == CHAR_DOLLAR_SIGN || c == CHAR_COMMERCIAL_AT ||
+                c == CHAR_GRAVE_ACCENT || (c >= 0xa0 && c <= 0xd7ff) ||
+                c >= 0xe000;
+           break;
+ 
+           /* Should never occur, but keep compilers from grumbling. */
+ 
+           default:
+           OK = codevalue != OP_PROP;
+           break;
+           }
+ 
+         if (OK == (d == OP_PROP))
+           {
+           if (count > 0 && codevalue == OP_PROP_EXTRA + OP_TYPEPOSPLUS)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW(state_offset, count);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EXTUNI_EXTRA + OP_TYPEPLUS:
+       case OP_EXTUNI_EXTRA + OP_TYPEMINPLUS:
+       case OP_EXTUNI_EXTRA + OP_TYPEPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 2, 0); }
+       if (clen > 0)
+         {
+         uint32_t lgb, rgb;
+         PCRE2_SPTR nptr = ptr + clen;
+         int ncount = 0;
+         if (count > 0 && codevalue == OP_EXTUNI_EXTRA + OP_TYPEPOSPLUS)
+           {
+           active_count--;           /* Remove non-match possibility */
+           next_active_state--;
+           }
+         lgb = UCD_GRAPHBREAK(c);
+         while (nptr < end_subject)
+           {
+           dlen = 1;
+           if (!utf) d = *nptr; else { GETCHARLEN(d, nptr, dlen); }
+           rgb = UCD_GRAPHBREAK(d);
+           if ((PRIV(ucp_gbtable)[lgb] & (1u << rgb)) == 0) break;
+           ncount++;
+           lgb = rgb;
+           nptr += dlen;
+           }
+         count++;
+         ADD_NEW_DATA(-state_offset, count, ncount);
+         }
+       break;
+ #endif
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ANYNL_EXTRA + OP_TYPEPLUS:
+       case OP_ANYNL_EXTRA + OP_TYPEMINPLUS:
+       case OP_ANYNL_EXTRA + OP_TYPEPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 2, 0); }
+       if (clen > 0)
+         {
+         int ncount = 0;
+         switch (c)
+           {
+           case CHAR_VT:
+           case CHAR_FF:
+           case CHAR_NEL:
+ #ifndef EBCDIC
+           case 0x2028:
+           case 0x2029:
+ #endif  /* Not EBCDIC */
+           if (mb->bsr_convention == PCRE2_BSR_ANYCRLF) break;
+           goto ANYNL01;
+ 
+           case CHAR_CR:
+           if (ptr + 1 < end_subject && UCHAR21TEST(ptr + 1) == CHAR_LF) ncount = 1;
+           /* Fall through */
+ 
+           ANYNL01:
+           case CHAR_LF:
+           if (count > 0 && codevalue == OP_ANYNL_EXTRA + OP_TYPEPOSPLUS)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW_DATA(-state_offset, count, ncount);
+           break;
+ 
+           default:
+           break;
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_VSPACE_EXTRA + OP_TYPEPLUS:
+       case OP_VSPACE_EXTRA + OP_TYPEMINPLUS:
+       case OP_VSPACE_EXTRA + OP_TYPEPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 2, 0); }
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           VSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           break;
+           }
+ 
+         if (OK == (d == OP_VSPACE))
+           {
+           if (count > 0 && codevalue == OP_VSPACE_EXTRA + OP_TYPEPOSPLUS)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW_DATA(-state_offset, count, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_HSPACE_EXTRA + OP_TYPEPLUS:
+       case OP_HSPACE_EXTRA + OP_TYPEMINPLUS:
+       case OP_HSPACE_EXTRA + OP_TYPEPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + 2, 0); }
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           HSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           break;
+           }
+ 
+         if (OK == (d == OP_HSPACE))
+           {
+           if (count > 0 && codevalue == OP_HSPACE_EXTRA + OP_TYPEPOSPLUS)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW_DATA(-state_offset, count, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+ #ifdef SUPPORT_UNICODE
+       case OP_PROP_EXTRA + OP_TYPEQUERY:
+       case OP_PROP_EXTRA + OP_TYPEMINQUERY:
+       case OP_PROP_EXTRA + OP_TYPEPOSQUERY:
+       count = 4;
+       goto QS1;
+ 
+       case OP_PROP_EXTRA + OP_TYPESTAR:
+       case OP_PROP_EXTRA + OP_TYPEMINSTAR:
+       case OP_PROP_EXTRA + OP_TYPEPOSSTAR:
+       count = 0;
+ 
+       QS1:
+ 
+       ADD_ACTIVE(state_offset + 4, 0);
+       if (clen > 0)
+         {
+         BOOL OK;
+         const uint32_t *cp;
+         const ucd_record * prop = GET_UCD(c);
+         switch(code[2])
+           {
+           case PT_ANY:
+           OK = TRUE;
+           break;
+ 
+           case PT_LAMP:
+           OK = prop->chartype == ucp_Lu || prop->chartype == ucp_Ll ||
+             prop->chartype == ucp_Lt;
+           break;
+ 
+           case PT_GC:
+           OK = PRIV(ucp_gentype)[prop->chartype] == code[3];
+           break;
+ 
+           case PT_PC:
+           OK = prop->chartype == code[3];
+           break;
+ 
+           case PT_SC:
+           OK = prop->script == code[3];
+           break;
+ 
+           /* These are specials for combination cases. */
+ 
+           case PT_ALNUM:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N;
+           break;
+ 
+           /* Perl space used to exclude VT, but from Perl 5.18 it is included,
+           which means that Perl space and POSIX space are now identical. PCRE
+           was changed at release 8.34. */
+ 
+           case PT_SPACE:    /* Perl space */
+           case PT_PXSPACE:  /* POSIX space */
+           switch(c)
+             {
+             HSPACE_CASES:
+             VSPACE_CASES:
+             OK = TRUE;
+             break;
+ 
+             default:
+             OK = PRIV(ucp_gentype)[prop->chartype] == ucp_Z;
+             break;
+             }
+           break;
+ 
+           case PT_WORD:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N ||
+                c == CHAR_UNDERSCORE;
+           break;
+ 
+           case PT_CLIST:
+           cp = PRIV(ucd_caseless_sets) + code[3];
+           for (;;)
+             {
+             if (c < *cp) { OK = FALSE; break; }
+             if (c == *cp++) { OK = TRUE; break; }
+             }
+           break;
+ 
+           case PT_UCNC:
+           OK = c == CHAR_DOLLAR_SIGN || c == CHAR_COMMERCIAL_AT ||
+                c == CHAR_GRAVE_ACCENT || (c >= 0xa0 && c <= 0xd7ff) ||
+                c >= 0xe000;
+           break;
+ 
+           /* Should never occur, but keep compilers from grumbling. */
+ 
+           default:
+           OK = codevalue != OP_PROP;
+           break;
+           }
+ 
+         if (OK == (d == OP_PROP))
+           {
+           if (codevalue == OP_PROP_EXTRA + OP_TYPEPOSSTAR ||
+               codevalue == OP_PROP_EXTRA + OP_TYPEPOSQUERY)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW(state_offset + count, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EXTUNI_EXTRA + OP_TYPEQUERY:
+       case OP_EXTUNI_EXTRA + OP_TYPEMINQUERY:
+       case OP_EXTUNI_EXTRA + OP_TYPEPOSQUERY:
+       count = 2;
+       goto QS2;
+ 
+       case OP_EXTUNI_EXTRA + OP_TYPESTAR:
+       case OP_EXTUNI_EXTRA + OP_TYPEMINSTAR:
+       case OP_EXTUNI_EXTRA + OP_TYPEPOSSTAR:
+       count = 0;
+ 
+       QS2:
+ 
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         uint32_t lgb, rgb;
+         PCRE2_SPTR nptr = ptr + clen;
+         int ncount = 0;
+         if (codevalue == OP_EXTUNI_EXTRA + OP_TYPEPOSSTAR ||
+             codevalue == OP_EXTUNI_EXTRA + OP_TYPEPOSQUERY)
+           {
+           active_count--;           /* Remove non-match possibility */
+           next_active_state--;
+           }
+         lgb = UCD_GRAPHBREAK(c);
+         while (nptr < end_subject)
+           {
+           dlen = 1;
+           if (!utf) d = *nptr; else { GETCHARLEN(d, nptr, dlen); }
+           rgb = UCD_GRAPHBREAK(d);
+           if ((PRIV(ucp_gbtable)[lgb] & (1u << rgb)) == 0) break;
+           ncount++;
+           lgb = rgb;
+           nptr += dlen;
+           }
+         ADD_NEW_DATA(-(state_offset + count), 0, ncount);
+         }
+       break;
+ #endif
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ANYNL_EXTRA + OP_TYPEQUERY:
+       case OP_ANYNL_EXTRA + OP_TYPEMINQUERY:
+       case OP_ANYNL_EXTRA + OP_TYPEPOSQUERY:
+       count = 2;
+       goto QS3;
+ 
+       case OP_ANYNL_EXTRA + OP_TYPESTAR:
+       case OP_ANYNL_EXTRA + OP_TYPEMINSTAR:
+       case OP_ANYNL_EXTRA + OP_TYPEPOSSTAR:
+       count = 0;
+ 
+       QS3:
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         int ncount = 0;
+         switch (c)
+           {
+           case CHAR_VT:
+           case CHAR_FF:
+           case CHAR_NEL:
+ #ifndef EBCDIC
+           case 0x2028:
+           case 0x2029:
+ #endif  /* Not EBCDIC */
+           if (mb->bsr_convention == PCRE2_BSR_ANYCRLF) break;
+           goto ANYNL02;
+ 
+           case CHAR_CR:
+           if (ptr + 1 < end_subject && UCHAR21TEST(ptr + 1) == CHAR_LF) ncount = 1;
+           /* Fall through */
+ 
+           ANYNL02:
+           case CHAR_LF:
+           if (codevalue == OP_ANYNL_EXTRA + OP_TYPEPOSSTAR ||
+               codevalue == OP_ANYNL_EXTRA + OP_TYPEPOSQUERY)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW_DATA(-(state_offset + (int)count), 0, ncount);
+           break;
+ 
+           default:
+           break;
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_VSPACE_EXTRA + OP_TYPEQUERY:
+       case OP_VSPACE_EXTRA + OP_TYPEMINQUERY:
+       case OP_VSPACE_EXTRA + OP_TYPEPOSQUERY:
+       count = 2;
+       goto QS4;
+ 
+       case OP_VSPACE_EXTRA + OP_TYPESTAR:
+       case OP_VSPACE_EXTRA + OP_TYPEMINSTAR:
+       case OP_VSPACE_EXTRA + OP_TYPEPOSSTAR:
+       count = 0;
+ 
+       QS4:
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           VSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           break;
+           }
+         if (OK == (d == OP_VSPACE))
+           {
+           if (codevalue == OP_VSPACE_EXTRA + OP_TYPEPOSSTAR ||
+               codevalue == OP_VSPACE_EXTRA + OP_TYPEPOSQUERY)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW_DATA(-(state_offset + (int)count), 0, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_HSPACE_EXTRA + OP_TYPEQUERY:
+       case OP_HSPACE_EXTRA + OP_TYPEMINQUERY:
+       case OP_HSPACE_EXTRA + OP_TYPEPOSQUERY:
+       count = 2;
+       goto QS5;
+ 
+       case OP_HSPACE_EXTRA + OP_TYPESTAR:
+       case OP_HSPACE_EXTRA + OP_TYPEMINSTAR:
+       case OP_HSPACE_EXTRA + OP_TYPEPOSSTAR:
+       count = 0;
+ 
+       QS5:
+       ADD_ACTIVE(state_offset + 2, 0);
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           HSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           break;
+           }
+ 
+         if (OK == (d == OP_HSPACE))
+           {
+           if (codevalue == OP_HSPACE_EXTRA + OP_TYPEPOSSTAR ||
+               codevalue == OP_HSPACE_EXTRA + OP_TYPEPOSQUERY)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW_DATA(-(state_offset + (int)count), 0, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+ #ifdef SUPPORT_UNICODE
+       case OP_PROP_EXTRA + OP_TYPEEXACT:
+       case OP_PROP_EXTRA + OP_TYPEUPTO:
+       case OP_PROP_EXTRA + OP_TYPEMINUPTO:
+       case OP_PROP_EXTRA + OP_TYPEPOSUPTO:
+       if (codevalue != OP_PROP_EXTRA + OP_TYPEEXACT)
+         { ADD_ACTIVE(state_offset + 1 + IMM2_SIZE + 3, 0); }
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         BOOL OK;
+         const uint32_t *cp;
+         const ucd_record * prop = GET_UCD(c);
+         switch(code[1 + IMM2_SIZE + 1])
+           {
+           case PT_ANY:
+           OK = TRUE;
+           break;
+ 
+           case PT_LAMP:
+           OK = prop->chartype == ucp_Lu || prop->chartype == ucp_Ll ||
+             prop->chartype == ucp_Lt;
+           break;
+ 
+           case PT_GC:
+           OK = PRIV(ucp_gentype)[prop->chartype] == code[1 + IMM2_SIZE + 2];
+           break;
+ 
+           case PT_PC:
+           OK = prop->chartype == code[1 + IMM2_SIZE + 2];
+           break;
+ 
+           case PT_SC:
+           OK = prop->script == code[1 + IMM2_SIZE + 2];
+           break;
+ 
+           /* These are specials for combination cases. */
+ 
+           case PT_ALNUM:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N;
+           break;
+ 
+           /* Perl space used to exclude VT, but from Perl 5.18 it is included,
+           which means that Perl space and POSIX space are now identical. PCRE
+           was changed at release 8.34. */
+ 
+           case PT_SPACE:    /* Perl space */
+           case PT_PXSPACE:  /* POSIX space */
+           switch(c)
+             {
+             HSPACE_CASES:
+             VSPACE_CASES:
+             OK = TRUE;
+             break;
+ 
+             default:
+             OK = PRIV(ucp_gentype)[prop->chartype] == ucp_Z;
+             break;
+             }
+           break;
+ 
+           case PT_WORD:
+           OK = PRIV(ucp_gentype)[prop->chartype] == ucp_L ||
+                PRIV(ucp_gentype)[prop->chartype] == ucp_N ||
+                c == CHAR_UNDERSCORE;
+           break;
+ 
+           case PT_CLIST:
+           cp = PRIV(ucd_caseless_sets) + code[1 + IMM2_SIZE + 2];
+           for (;;)
+             {
+             if (c < *cp) { OK = FALSE; break; }
+             if (c == *cp++) { OK = TRUE; break; }
+             }
+           break;
+ 
+           case PT_UCNC:
+           OK = c == CHAR_DOLLAR_SIGN || c == CHAR_COMMERCIAL_AT ||
+                c == CHAR_GRAVE_ACCENT || (c >= 0xa0 && c <= 0xd7ff) ||
+                c >= 0xe000;
+           break;
+ 
+           /* Should never occur, but keep compilers from grumbling. */
+ 
+           default:
+           OK = codevalue != OP_PROP;
+           break;
+           }
+ 
+         if (OK == (d == OP_PROP))
+           {
+           if (codevalue == OP_PROP_EXTRA + OP_TYPEPOSUPTO)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW(state_offset + 1 + IMM2_SIZE + 3, 0); }
+           else
+             { ADD_NEW(state_offset, count); }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EXTUNI_EXTRA + OP_TYPEEXACT:
+       case OP_EXTUNI_EXTRA + OP_TYPEUPTO:
+       case OP_EXTUNI_EXTRA + OP_TYPEMINUPTO:
+       case OP_EXTUNI_EXTRA + OP_TYPEPOSUPTO:
+       if (codevalue != OP_EXTUNI_EXTRA + OP_TYPEEXACT)
+         { ADD_ACTIVE(state_offset + 2 + IMM2_SIZE, 0); }
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         uint32_t lgb, rgb;
+         PCRE2_SPTR nptr = ptr + clen;
+         int ncount = 0;
+         if (codevalue == OP_EXTUNI_EXTRA + OP_TYPEPOSUPTO)
+           {
+           active_count--;           /* Remove non-match possibility */
+           next_active_state--;
+           }
+         lgb = UCD_GRAPHBREAK(c);
+         while (nptr < end_subject)
+           {
+           dlen = 1;
+           if (!utf) d = *nptr; else { GETCHARLEN(d, nptr, dlen); }
+           rgb = UCD_GRAPHBREAK(d);
+           if ((PRIV(ucp_gbtable)[lgb] & (1u << rgb)) == 0) break;
+           ncount++;
+           lgb = rgb;
+           nptr += dlen;
+           }
+         if (nptr >= end_subject && (mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+             reset_could_continue = TRUE;
+         if (++count >= (int)GET2(code, 1))
+           { ADD_NEW_DATA(-(state_offset + 2 + IMM2_SIZE), 0, ncount); }
+         else
+           { ADD_NEW_DATA(-state_offset, count, ncount); }
+         }
+       break;
+ #endif
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ANYNL_EXTRA + OP_TYPEEXACT:
+       case OP_ANYNL_EXTRA + OP_TYPEUPTO:
+       case OP_ANYNL_EXTRA + OP_TYPEMINUPTO:
+       case OP_ANYNL_EXTRA + OP_TYPEPOSUPTO:
+       if (codevalue != OP_ANYNL_EXTRA + OP_TYPEEXACT)
+         { ADD_ACTIVE(state_offset + 2 + IMM2_SIZE, 0); }
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         int ncount = 0;
+         switch (c)
+           {
+           case CHAR_VT:
+           case CHAR_FF:
+           case CHAR_NEL:
+ #ifndef EBCDIC
+           case 0x2028:
+           case 0x2029:
+ #endif  /* Not EBCDIC */
+           if (mb->bsr_convention == PCRE2_BSR_ANYCRLF) break;
+           goto ANYNL03;
+ 
+           case CHAR_CR:
+           if (ptr + 1 < end_subject && UCHAR21TEST(ptr + 1) == CHAR_LF) ncount = 1;
+           /* Fall through */
+ 
+           ANYNL03:
+           case CHAR_LF:
+           if (codevalue == OP_ANYNL_EXTRA + OP_TYPEPOSUPTO)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW_DATA(-(state_offset + 2 + IMM2_SIZE), 0, ncount); }
+           else
+             { ADD_NEW_DATA(-state_offset, count, ncount); }
+           break;
+ 
+           default:
+           break;
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_VSPACE_EXTRA + OP_TYPEEXACT:
+       case OP_VSPACE_EXTRA + OP_TYPEUPTO:
+       case OP_VSPACE_EXTRA + OP_TYPEMINUPTO:
+       case OP_VSPACE_EXTRA + OP_TYPEPOSUPTO:
+       if (codevalue != OP_VSPACE_EXTRA + OP_TYPEEXACT)
+         { ADD_ACTIVE(state_offset + 2 + IMM2_SIZE, 0); }
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           VSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           }
+ 
+         if (OK == (d == OP_VSPACE))
+           {
+           if (codevalue == OP_VSPACE_EXTRA + OP_TYPEPOSUPTO)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW_DATA(-(state_offset + 2 + IMM2_SIZE), 0, 0); }
+           else
+             { ADD_NEW_DATA(-state_offset, count, 0); }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_HSPACE_EXTRA + OP_TYPEEXACT:
+       case OP_HSPACE_EXTRA + OP_TYPEUPTO:
+       case OP_HSPACE_EXTRA + OP_TYPEMINUPTO:
+       case OP_HSPACE_EXTRA + OP_TYPEPOSUPTO:
+       if (codevalue != OP_HSPACE_EXTRA + OP_TYPEEXACT)
+         { ADD_ACTIVE(state_offset + 2 + IMM2_SIZE, 0); }
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         BOOL OK;
+         switch (c)
+           {
+           HSPACE_CASES:
+           OK = TRUE;
+           break;
+ 
+           default:
+           OK = FALSE;
+           break;
+           }
+ 
+         if (OK == (d == OP_HSPACE))
+           {
+           if (codevalue == OP_HSPACE_EXTRA + OP_TYPEPOSUPTO)
+             {
+             active_count--;           /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW_DATA(-(state_offset + 2 + IMM2_SIZE), 0, 0); }
+           else
+             { ADD_NEW_DATA(-state_offset, count, 0); }
+           }
+         }
+       break;
+ 
+ /* ========================================================================== */
+       /* These opcodes are followed by a character that is usually compared
+       to the current subject character; it is loaded into d. We still get
+       here even if there is no subject character, because in some cases zero
+       repetitions are permitted. */
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_CHAR:
+       if (clen > 0 && c == d) { ADD_NEW(state_offset + dlen + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_CHARI:
+       if (clen == 0) break;
+ 
+ #ifdef SUPPORT_UNICODE
+       if (utf)
+         {
+         if (c == d) { ADD_NEW(state_offset + dlen + 1, 0); } else
+           {
+           unsigned int othercase;
+           if (c < 128)
+             othercase = fcc[c];
+           else
+             othercase = UCD_OTHERCASE(c);
+           if (d == othercase) { ADD_NEW(state_offset + dlen + 1, 0); }
+           }
+         }
+       else
+ #endif  /* SUPPORT_UNICODE */
+       /* Not UTF mode */
+         {
+         if (TABLE_GET(c, lcc, c) == TABLE_GET(d, lcc, d))
+           { ADD_NEW(state_offset + 2, 0); }
+         }
+       break;
+ 
+ 
+ #ifdef SUPPORT_UNICODE
+       /*-----------------------------------------------------------------*/
+       /* This is a tricky one because it can match more than one character.
+       Find out how many characters to skip, and then set up a negative state
+       to wait for them to pass before continuing. */
+ 
+       case OP_EXTUNI:
+       if (clen > 0)
+         {
+         uint32_t lgb, rgb;
+         PCRE2_SPTR nptr = ptr + clen;
+         int ncount = 0;
+         lgb = UCD_GRAPHBREAK(c);
+         while (nptr < end_subject)
+           {
+           dlen = 1;
+           if (!utf) d = *nptr; else { GETCHARLEN(d, nptr, dlen); }
+           rgb = UCD_GRAPHBREAK(d);
+           if ((PRIV(ucp_gbtable)[lgb] & (1u << rgb)) == 0) break;
+           ncount++;
+           lgb = rgb;
+           nptr += dlen;
+           }
+         if (nptr >= end_subject && (mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+             reset_could_continue = TRUE;
+         ADD_NEW_DATA(-(state_offset + 1), 0, ncount);
+         }
+       break;
+ #endif
+ 
+       /*-----------------------------------------------------------------*/
+       /* This is a tricky like EXTUNI because it too can match more than one
+       character (when CR is followed by LF). In this case, set up a negative
+       state to wait for one character to pass before continuing. */
+ 
+       case OP_ANYNL:
+       if (clen > 0) switch(c)
+         {
+         case CHAR_VT:
+         case CHAR_FF:
+         case CHAR_NEL:
+ #ifndef EBCDIC
+         case 0x2028:
+         case 0x2029:
+ #endif  /* Not EBCDIC */
+         if (mb->bsr_convention == PCRE2_BSR_ANYCRLF) break;
+ 
+         case CHAR_LF:
+         ADD_NEW(state_offset + 1, 0);
+         break;
+ 
+         case CHAR_CR:
+         if (ptr + 1 >= end_subject)
+           {
+           ADD_NEW(state_offset + 1, 0);
+           if ((mb->moptions & PCRE2_PARTIAL_HARD) != 0)
+             reset_could_continue = TRUE;
+           }
+         else if (UCHAR21TEST(ptr + 1) == CHAR_LF)
+           {
+           ADD_NEW_DATA(-(state_offset + 1), 0, 1);
+           }
+         else
+           {
+           ADD_NEW(state_offset + 1, 0);
+           }
+         break;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_NOT_VSPACE:
+       if (clen > 0) switch(c)
+         {
+         VSPACE_CASES:
+         break;
+ 
+         default:
+         ADD_NEW(state_offset + 1, 0);
+         break;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_VSPACE:
+       if (clen > 0) switch(c)
+         {
+         VSPACE_CASES:
+         ADD_NEW(state_offset + 1, 0);
+         break;
+ 
+         default:
+         break;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_NOT_HSPACE:
+       if (clen > 0) switch(c)
+         {
+         HSPACE_CASES:
+         break;
+ 
+         default:
+         ADD_NEW(state_offset + 1, 0);
+         break;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_HSPACE:
+       if (clen > 0) switch(c)
+         {
+         HSPACE_CASES:
+         ADD_NEW(state_offset + 1, 0);
+         break;
+ 
+         default:
+         break;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       /* Match a negated single character casefully. */
+ 
+       case OP_NOT:
+       if (clen > 0 && c != d) { ADD_NEW(state_offset + dlen + 1, 0); }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       /* Match a negated single character caselessly. */
+ 
+       case OP_NOTI:
+       if (clen > 0)
+         {
+         unsigned int otherd;
+ #ifdef SUPPORT_UNICODE
+         if (utf && d >= 128)
+           otherd = UCD_OTHERCASE(d);
+         else
+ #endif  /* SUPPORT_UNICODE */
+         otherd = TABLE_GET(d, fcc, d);
+         if (c != d && c != otherd)
+           { ADD_NEW(state_offset + dlen + 1, 0); }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_PLUSI:
+       case OP_MINPLUSI:
+       case OP_POSPLUSI:
+       case OP_NOTPLUSI:
+       case OP_NOTMINPLUSI:
+       case OP_NOTPOSPLUSI:
+       caseless = TRUE;
+       codevalue -= OP_STARI - OP_STAR;
+ 
+       /* Fall through */
+       case OP_PLUS:
+       case OP_MINPLUS:
+       case OP_POSPLUS:
+       case OP_NOTPLUS:
+       case OP_NOTMINPLUS:
+       case OP_NOTPOSPLUS:
+       count = current_state->count;  /* Already matched */
+       if (count > 0) { ADD_ACTIVE(state_offset + dlen + 1, 0); }
+       if (clen > 0)
+         {
+         uint32_t otherd = NOTACHAR;
+         if (caseless)
+           {
+ #ifdef SUPPORT_UNICODE
+           if (utf && d >= 128)
+             otherd = UCD_OTHERCASE(d);
+           else
+ #endif  /* SUPPORT_UNICODE */
+           otherd = TABLE_GET(d, fcc, d);
+           }
+         if ((c == d || c == otherd) == (codevalue < OP_NOTSTAR))
+           {
+           if (count > 0 &&
+               (codevalue == OP_POSPLUS || codevalue == OP_NOTPOSPLUS))
+             {
+             active_count--;             /* Remove non-match possibility */
+             next_active_state--;
+             }
+           count++;
+           ADD_NEW(state_offset, count);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_QUERYI:
+       case OP_MINQUERYI:
+       case OP_POSQUERYI:
+       case OP_NOTQUERYI:
+       case OP_NOTMINQUERYI:
+       case OP_NOTPOSQUERYI:
+       caseless = TRUE;
+       codevalue -= OP_STARI - OP_STAR;
+       /* Fall through */
+       case OP_QUERY:
+       case OP_MINQUERY:
+       case OP_POSQUERY:
+       case OP_NOTQUERY:
+       case OP_NOTMINQUERY:
+       case OP_NOTPOSQUERY:
+       ADD_ACTIVE(state_offset + dlen + 1, 0);
+       if (clen > 0)
+         {
+         uint32_t otherd = NOTACHAR;
+         if (caseless)
+           {
+ #ifdef SUPPORT_UNICODE
+           if (utf && d >= 128)
+             otherd = UCD_OTHERCASE(d);
+           else
+ #endif  /* SUPPORT_UNICODE */
+           otherd = TABLE_GET(d, fcc, d);
+           }
+         if ((c == d || c == otherd) == (codevalue < OP_NOTSTAR))
+           {
+           if (codevalue == OP_POSQUERY || codevalue == OP_NOTPOSQUERY)
+             {
+             active_count--;            /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW(state_offset + dlen + 1, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_STARI:
+       case OP_MINSTARI:
+       case OP_POSSTARI:
+       case OP_NOTSTARI:
+       case OP_NOTMINSTARI:
+       case OP_NOTPOSSTARI:
+       caseless = TRUE;
+       codevalue -= OP_STARI - OP_STAR;
+       /* Fall through */
+       case OP_STAR:
+       case OP_MINSTAR:
+       case OP_POSSTAR:
+       case OP_NOTSTAR:
+       case OP_NOTMINSTAR:
+       case OP_NOTPOSSTAR:
+       ADD_ACTIVE(state_offset + dlen + 1, 0);
+       if (clen > 0)
+         {
+         uint32_t otherd = NOTACHAR;
+         if (caseless)
+           {
+ #ifdef SUPPORT_UNICODE
+           if (utf && d >= 128)
+             otherd = UCD_OTHERCASE(d);
+           else
+ #endif  /* SUPPORT_UNICODE */
+           otherd = TABLE_GET(d, fcc, d);
+           }
+         if ((c == d || c == otherd) == (codevalue < OP_NOTSTAR))
+           {
+           if (codevalue == OP_POSSTAR || codevalue == OP_NOTPOSSTAR)
+             {
+             active_count--;            /* Remove non-match possibility */
+             next_active_state--;
+             }
+           ADD_NEW(state_offset, 0);
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_EXACTI:
+       case OP_NOTEXACTI:
+       caseless = TRUE;
+       codevalue -= OP_STARI - OP_STAR;
+       /* Fall through */
+       case OP_EXACT:
+       case OP_NOTEXACT:
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         uint32_t otherd = NOTACHAR;
+         if (caseless)
+           {
+ #ifdef SUPPORT_UNICODE
+           if (utf && d >= 128)
+             otherd = UCD_OTHERCASE(d);
+           else
+ #endif  /* SUPPORT_UNICODE */
+           otherd = TABLE_GET(d, fcc, d);
+           }
+         if ((c == d || c == otherd) == (codevalue < OP_NOTSTAR))
+           {
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW(state_offset + dlen + 1 + IMM2_SIZE, 0); }
+           else
+             { ADD_NEW(state_offset, count); }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_UPTOI:
+       case OP_MINUPTOI:
+       case OP_POSUPTOI:
+       case OP_NOTUPTOI:
+       case OP_NOTMINUPTOI:
+       case OP_NOTPOSUPTOI:
+       caseless = TRUE;
+       codevalue -= OP_STARI - OP_STAR;
+       /* Fall through */
+       case OP_UPTO:
+       case OP_MINUPTO:
+       case OP_POSUPTO:
+       case OP_NOTUPTO:
+       case OP_NOTMINUPTO:
+       case OP_NOTPOSUPTO:
+       ADD_ACTIVE(state_offset + dlen + 1 + IMM2_SIZE, 0);
+       count = current_state->count;  /* Number already matched */
+       if (clen > 0)
+         {
+         uint32_t otherd = NOTACHAR;
+         if (caseless)
+           {
+ #ifdef SUPPORT_UNICODE
+           if (utf && d >= 128)
+             otherd = UCD_OTHERCASE(d);
+           else
+ #endif  /* SUPPORT_UNICODE */
+           otherd = TABLE_GET(d, fcc, d);
+           }
+         if ((c == d || c == otherd) == (codevalue < OP_NOTSTAR))
+           {
+           if (codevalue == OP_POSUPTO || codevalue == OP_NOTPOSUPTO)
+             {
+             active_count--;             /* Remove non-match possibility */
+             next_active_state--;
+             }
+           if (++count >= (int)GET2(code, 1))
+             { ADD_NEW(state_offset + dlen + 1 + IMM2_SIZE, 0); }
+           else
+             { ADD_NEW(state_offset, count); }
+           }
+         }
+       break;
+ 
+ 
+ /* ========================================================================== */
+       /* These are the class-handling opcodes */
+ 
+       case OP_CLASS:
+       case OP_NCLASS:
+       case OP_XCLASS:
+         {
+         BOOL isinclass = FALSE;
+         int next_state_offset;
+         PCRE2_SPTR ecode;
+ 
+         /* For a simple class, there is always just a 32-byte table, and we
+         can set isinclass from it. */
+ 
+         if (codevalue != OP_XCLASS)
+           {
+           ecode = code + 1 + (32 / sizeof(PCRE2_UCHAR));
+           if (clen > 0)
+             {
+             isinclass = (c > 255)? (codevalue == OP_NCLASS) :
+               ((((uint8_t *)(code + 1))[c/8] & (1 << (c&7))) != 0);
+             }
+           }
+ 
+         /* An extended class may have a table or a list of single characters,
+         ranges, or both, and it may be positive or negative. There's a
+         function that sorts all this out. */
+ 
+         else
+          {
+          ecode = code + GET(code, 1);
+          if (clen > 0) isinclass = PRIV(xclass)(c, code + 1 + LINK_SIZE, utf);
+          }
+ 
+         /* At this point, isinclass is set for all kinds of class, and ecode
+         points to the byte after the end of the class. If there is a
+         quantifier, this is where it will be. */
+ 
+         next_state_offset = (int)(ecode - start_code);
+ 
+         switch (*ecode)
+           {
+           case OP_CRSTAR:
+           case OP_CRMINSTAR:
+           case OP_CRPOSSTAR:
+           ADD_ACTIVE(next_state_offset + 1, 0);
+           if (isinclass)
+             {
+             if (*ecode == OP_CRPOSSTAR)
+               {
+               active_count--;           /* Remove non-match possibility */
+               next_active_state--;
+               }
+             ADD_NEW(state_offset, 0);
+             }
+           break;
+ 
+           case OP_CRPLUS:
+           case OP_CRMINPLUS:
+           case OP_CRPOSPLUS:
+           count = current_state->count;  /* Already matched */
+           if (count > 0) { ADD_ACTIVE(next_state_offset + 1, 0); }
+           if (isinclass)
+             {
+             if (count > 0 && *ecode == OP_CRPOSPLUS)
+               {
+               active_count--;           /* Remove non-match possibility */
+               next_active_state--;
+               }
+             count++;
+             ADD_NEW(state_offset, count);
+             }
+           break;
+ 
+           case OP_CRQUERY:
+           case OP_CRMINQUERY:
+           case OP_CRPOSQUERY:
+           ADD_ACTIVE(next_state_offset + 1, 0);
+           if (isinclass)
+             {
+             if (*ecode == OP_CRPOSQUERY)
+               {
+               active_count--;           /* Remove non-match possibility */
+               next_active_state--;
+               }
+             ADD_NEW(next_state_offset + 1, 0);
+             }
+           break;
+ 
+           case OP_CRRANGE:
+           case OP_CRMINRANGE:
+           case OP_CRPOSRANGE:
+           count = current_state->count;  /* Already matched */
+           if (count >= (int)GET2(ecode, 1))
+             { ADD_ACTIVE(next_state_offset + 1 + 2 * IMM2_SIZE, 0); }
+           if (isinclass)
+             {
+             int max = (int)GET2(ecode, 1 + IMM2_SIZE);
+ 
+             if (*ecode == OP_CRPOSRANGE && count >= (int)GET2(ecode, 1))
+               {
+               active_count--;           /* Remove non-match possibility */
+               next_active_state--;
+               }
+ 
+             if (++count >= max && max != 0)   /* Max 0 => no limit */
+               { ADD_NEW(next_state_offset + 1 + 2 * IMM2_SIZE, 0); }
+             else
+               { ADD_NEW(state_offset, count); }
+             }
+           break;
+ 
+           default:
+           if (isinclass) { ADD_NEW(next_state_offset, 0); }
+           break;
+           }
+         }
+       break;
+ 
+ /* ========================================================================== */
+       /* These are the opcodes for fancy brackets of various kinds. We have
+       to use recursion in order to handle them. The "always failing" assertion
+       (?!) is optimised to OP_FAIL when compiling, so we have to support that,
+       though the other "backtracking verbs" are not supported. */
+ 
+       case OP_FAIL:
+       forced_fail++;    /* Count FAILs for multiple states */
+       break;
+ 
+       case OP_ASSERT:
+       case OP_ASSERT_NOT:
+       case OP_ASSERTBACK:
+       case OP_ASSERTBACK_NOT:
+         {
+         PCRE2_SPTR endasscode = code + GET(code, 1);
+         PCRE2_SIZE local_offsets[2];
+         int rc;
+         int local_workspace[1000];
+ 
+         while (*endasscode == OP_ALT) endasscode += GET(endasscode, 1);
+ 
+         rc = internal_dfa_match(
+           mb,                                   /* static match data */
+           code,                                 /* this subexpression's code */
+           ptr,                                  /* where we currently are */
+           (PCRE2_SIZE)(ptr - start_subject),    /* start offset */
+           local_offsets,                        /* offset vector */
+           sizeof(local_offsets)/sizeof(PCRE2_SIZE), /* size of same */
+           local_workspace,                      /* workspace vector */
+           sizeof(local_workspace)/sizeof(int),  /* size of same */
+           rlevel);                              /* function recursion level */
+ 
+         if (rc < 0 && rc != PCRE2_ERROR_NOMATCH) return rc;
+         if ((rc >= 0) == (codevalue == OP_ASSERT || codevalue == OP_ASSERTBACK))
+             { ADD_ACTIVE((int)(endasscode + LINK_SIZE + 1 - start_code), 0); }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_COND:
+       case OP_SCOND:
+         {
+         PCRE2_SIZE local_offsets[1000];
+         int local_workspace[1000];
+         int codelink = (int)GET(code, 1);
+         PCRE2_UCHAR condcode;
+ 
+         /* Because of the way auto-callout works during compile, a callout item
+         is inserted between OP_COND and an assertion condition. This does not
+         happen for the other conditions. */
+ 
+         if (code[LINK_SIZE + 1] == OP_CALLOUT
+             || code[LINK_SIZE + 1] == OP_CALLOUT_STR)
+           {
+           PCRE2_SIZE callout_length = (code[LINK_SIZE + 1] == OP_CALLOUT)?
+             (PCRE2_SIZE)PRIV(OP_lengths)[OP_CALLOUT] :
+             (PCRE2_SIZE)GET(code, 2 + 3*LINK_SIZE);
+ 
+           rrc = 0;
+           if (mb->callout != NULL)
+             {
+             pcre2_callout_block cb;
+             cb.version          = 1;
+             cb.capture_top      = 1;
+             cb.capture_last     = 0;
+             cb.offset_vector    = offsets;
+             cb.mark             = NULL;   /* No (*MARK) support */
+             cb.subject          = start_subject;
+             cb.subject_length   = (PCRE2_SIZE)(end_subject - start_subject);
+             cb.start_match      = (PCRE2_SIZE)(current_subject - start_subject);
+             cb.current_position = (PCRE2_SIZE)(ptr - start_subject);
+             cb.pattern_position = GET(code, LINK_SIZE + 2);
+             cb.next_item_length = GET(code, LINK_SIZE + 2 + LINK_SIZE);
+ 
+             if (code[LINK_SIZE + 1] == OP_CALLOUT)
+               {
+               cb.callout_number = code[2 + 3*LINK_SIZE];
+               cb.callout_string_offset = 0;
+               cb.callout_string = NULL;
+               cb.callout_string_length = 0;
+               }
+             else
+               {
+               cb.callout_number = 0;
+               cb.callout_string_offset = GET(code, 2 + 4*LINK_SIZE);
+               cb.callout_string = code + (2 + 5*LINK_SIZE) + 1;
+               cb.callout_string_length =
+                 callout_length - (1 + 4*LINK_SIZE) - 2;
+               }
+ 
+             if ((rrc = (mb->callout)(&cb, mb->callout_data)) < 0)
+               return rrc;   /* Abandon */
+             }
+           if (rrc > 0) break;                      /* Fail this thread */
+           code += callout_length;                  /* Skip callout data */
+           }
+ 
+         condcode = code[LINK_SIZE+1];
+ 
+         /* Back reference conditions and duplicate named recursion conditions
+         are not supported */
+ 
+         if (condcode == OP_CREF || condcode == OP_DNCREF ||
+             condcode == OP_DNRREF)
+           return PCRE2_ERROR_DFA_UCOND;
+ 
+         /* The DEFINE condition is always false, and the assertion (?!) is
+         converted to OP_FAIL. */
+ 
+         if (condcode == OP_FALSE || condcode == OP_FAIL)
+           { ADD_ACTIVE(state_offset + codelink + LINK_SIZE + 1, 0); }
+ 
+         /* There is also an always-true condition */
+ 
+         else if (condcode == OP_TRUE)
+           { ADD_ACTIVE(state_offset + LINK_SIZE + 2 + IMM2_SIZE, 0); }
+ 
+         /* The only supported version of OP_RREF is for the value RREF_ANY,
+         which means "test if in any recursion". We can't test for specifically
+         recursed groups. */
+ 
+         else if (condcode == OP_RREF)
+           {
+           unsigned int value = GET2(code, LINK_SIZE + 2);
+           if (value != RREF_ANY) return PCRE2_ERROR_DFA_UCOND;
+           if (mb->recursive != NULL)
+             { ADD_ACTIVE(state_offset + LINK_SIZE + 2 + IMM2_SIZE, 0); }
+           else { ADD_ACTIVE(state_offset + codelink + LINK_SIZE + 1, 0); }
+           }
+ 
+         /* Otherwise, the condition is an assertion */
+ 
+         else
+           {
+           int rc;
+           PCRE2_SPTR asscode = code + LINK_SIZE + 1;
+           PCRE2_SPTR endasscode = asscode + GET(asscode, 1);
+ 
+           while (*endasscode == OP_ALT) endasscode += GET(endasscode, 1);
+ 
+           rc = internal_dfa_match(
+             mb,                                   /* fixed match data */
+             asscode,                              /* this subexpression's code */
+             ptr,                                  /* where we currently are */
+             (PCRE2_SIZE)(ptr - start_subject),    /* start offset */
+             local_offsets,                        /* offset vector */
+             sizeof(local_offsets)/sizeof(PCRE2_SIZE), /* size of same */
+             local_workspace,                      /* workspace vector */
+             sizeof(local_workspace)/sizeof(int),  /* size of same */
+             rlevel);                              /* function recursion level */
+ 
+           if (rc < 0 && rc != PCRE2_ERROR_NOMATCH) return rc;
+           if ((rc >= 0) ==
+                 (condcode == OP_ASSERT || condcode == OP_ASSERTBACK))
+             { ADD_ACTIVE((int)(endasscode + LINK_SIZE + 1 - start_code), 0); }
+           else
+             { ADD_ACTIVE(state_offset + codelink + LINK_SIZE + 1, 0); }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_RECURSE:
+         {
+         dfa_recursion_info *ri;
+         PCRE2_SIZE local_offsets[1000];
+         int local_workspace[1000];
+         PCRE2_SPTR callpat = start_code + GET(code, 1);
+         uint32_t recno = (callpat == mb->start_code)? 0 :
+           GET2(callpat, 1 + LINK_SIZE);
+         int rc;
+ 
+         /* Check for repeating a recursion without advancing the subject
+         pointer. This should catch convoluted mutual recursions. (Some simple
+         cases are caught at compile time.) */
+ 
+         for (ri = mb->recursive; ri != NULL; ri = ri->prevrec)
+           if (recno == ri->group_num && ptr == ri->subject_position)
+             return PCRE2_ERROR_RECURSELOOP;
+ 
+         /* Remember this recursion and where we started it so as to
+         catch infinite loops. */
+ 
+         new_recursive.group_num = recno;
+         new_recursive.subject_position = ptr;
+         new_recursive.prevrec = mb->recursive;
+         mb->recursive = &new_recursive;
+ 
+         rc = internal_dfa_match(
+           mb,                                   /* fixed match data */
+           callpat,                              /* this subexpression's code */
+           ptr,                                  /* where we currently are */
+           (PCRE2_SIZE)(ptr - start_subject),    /* start offset */
+           local_offsets,                        /* offset vector */
+           sizeof(local_offsets)/sizeof(PCRE2_SIZE), /* size of same */
+           local_workspace,                      /* workspace vector */
+           sizeof(local_workspace)/sizeof(int),  /* size of same */
+           rlevel);                              /* function recursion level */
+ 
+         mb->recursive = new_recursive.prevrec;  /* Done this recursion */
+ 
+         /* Ran out of internal offsets */
+ 
+         if (rc == 0) return PCRE2_ERROR_DFA_RECURSE;
+ 
+         /* For each successful matched substring, set up the next state with a
+         count of characters to skip before trying it. Note that the count is in
+         characters, not bytes. */
+ 
+         if (rc > 0)
+           {
+           for (rc = rc*2 - 2; rc >= 0; rc -= 2)
+             {
+             PCRE2_SIZE charcount = local_offsets[rc+1] - local_offsets[rc];
+ #if defined SUPPORT_UNICODE && PCRE2_CODE_UNIT_WIDTH != 32
+             if (utf)
+               {
+               PCRE2_SPTR p = start_subject + local_offsets[rc];
+               PCRE2_SPTR pp = start_subject + local_offsets[rc+1];
+               while (p < pp) if (NOT_FIRSTCU(*p++)) charcount--;
+               }
+ #endif
+             if (charcount > 0)
+               {
+               ADD_NEW_DATA(-(state_offset + LINK_SIZE + 1), 0,
+                 (int)(charcount - 1));
+               }
+             else
+               {
+               ADD_ACTIVE(state_offset + LINK_SIZE + 1, 0);
+               }
+             }
+           }
+         else if (rc != PCRE2_ERROR_NOMATCH) return rc;
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_BRAPOS:
+       case OP_SBRAPOS:
+       case OP_CBRAPOS:
+       case OP_SCBRAPOS:
+       case OP_BRAPOSZERO:
+         {
+         PCRE2_SIZE charcount, matched_count;
+         PCRE2_SPTR local_ptr = ptr;
+         BOOL allow_zero;
+ 
+         if (codevalue == OP_BRAPOSZERO)
+           {
+           allow_zero = TRUE;
+           codevalue = *(++code);  /* Codevalue will be one of above BRAs */
+           }
+         else allow_zero = FALSE;
+ 
+         /* Loop to match the subpattern as many times as possible as if it were
+         a complete pattern. */
+ 
+         for (matched_count = 0;; matched_count++)
+           {
+           PCRE2_SIZE local_offsets[2];
+           int local_workspace[1000];
+ 
+           int rc = internal_dfa_match(
+             mb,                                   /* fixed match data */
+             code,                                 /* this subexpression's code */
+             local_ptr,                            /* where we currently are */
+             (PCRE2_SIZE)(ptr - start_subject),    /* start offset */
+             local_offsets,                        /* offset vector */
+             sizeof(local_offsets)/sizeof(PCRE2_SIZE), /* size of same */
+             local_workspace,                      /* workspace vector */
+             sizeof(local_workspace)/sizeof(int),  /* size of same */
+             rlevel);                              /* function recursion level */
+ 
+           /* Failed to match */
+ 
+           if (rc < 0)
+             {
+             if (rc != PCRE2_ERROR_NOMATCH) return rc;
+             break;
+             }
+ 
+           /* Matched: break the loop if zero characters matched. */
+ 
+           charcount = local_offsets[1] - local_offsets[0];
+           if (charcount == 0) break;
+           local_ptr += charcount;    /* Advance temporary position ptr */
+           }
+ 
+         /* At this point we have matched the subpattern matched_count
+         times, and local_ptr is pointing to the character after the end of the
+         last match. */
+ 
+         if (matched_count > 0 || allow_zero)
+           {
+           PCRE2_SPTR end_subpattern = code;
+           int next_state_offset;
+ 
+           do { end_subpattern += GET(end_subpattern, 1); }
+             while (*end_subpattern == OP_ALT);
+           next_state_offset =
+             (int)(end_subpattern - start_code + LINK_SIZE + 1);
+ 
+           /* Optimization: if there are no more active states, and there
+           are no new states yet set up, then skip over the subject string
+           right here, to save looping. Otherwise, set up the new state to swing
+           into action when the end of the matched substring is reached. */
+ 
+           if (i + 1 >= active_count && new_count == 0)
+             {
+             ptr = local_ptr;
+             clen = 0;
+             ADD_NEW(next_state_offset, 0);
+             }
+           else
+             {
+             PCRE2_SPTR p = ptr;
+             PCRE2_SPTR pp = local_ptr;
+             charcount = (PCRE2_SIZE)(pp - p);
+ #if defined SUPPORT_UNICODE && PCRE2_CODE_UNIT_WIDTH != 32
+             if (utf) while (p < pp) if (NOT_FIRSTCU(*p++)) charcount--;
+ #endif
+             ADD_NEW_DATA(-next_state_offset, 0, (int)(charcount - 1));
+             }
+           }
+         }
+       break;
+ 
+       /*-----------------------------------------------------------------*/
+       case OP_ONCE:
+         {
+         PCRE2_SIZE local_offsets[2];
+         int local_workspace[1000];
+ 
+         int rc = internal_dfa_match(
+           mb,                                   /* fixed match data */
+           code,                                 /* this subexpression's code */
+           ptr,                                  /* where we currently are */
+           (PCRE2_SIZE)(ptr - start_subject),    /* start offset */
+           local_offsets,                        /* offset vector */
+           sizeof(local_offsets)/sizeof(PCRE2_SIZE), /* size of same */
+           local_workspace,                      /* workspace vector */
+           sizeof(local_workspace)/sizeof(int),  /* size of same */
+           rlevel);                              /* function recursion level */
+ 
+         if (rc >= 0)
+           {
+           PCRE2_SPTR end_subpattern = code;
+           PCRE2_SIZE charcount = local_offsets[1] - local_offsets[0];
+           int next_state_offset, repeat_state_offset;
+ 
+           do { end_subpattern += GET(end_subpattern, 1); }
+             while (*end_subpattern == OP_ALT);
+           next_state_offset =
+             (int)(end_subpattern - start_code + LINK_SIZE + 1);
+ 
+           /* If the end of this subpattern is KETRMAX or KETRMIN, we must
+           arrange for the repeat state also to be added to the relevant list.
+           Calculate the offset, or set -1 for no repeat. */
+ 
+           repeat_state_offset = (*end_subpattern == OP_KETRMAX ||
+                                  *end_subpattern == OP_KETRMIN)?
+             (int)(end_subpattern - start_code - GET(end_subpattern, 1)) : -1;
+ 
+           /* If we have matched an empty string, add the next state at the
+           current character pointer. This is important so that the duplicate
+           checking kicks in, which is what breaks infinite loops that match an
+           empty string. */
+ 
+           if (charcount == 0)
+             {
+             ADD_ACTIVE(next_state_offset, 0);
+             }
+ 
+           /* Optimization: if there are no more active states, and there
+           are no new states yet set up, then skip over the subject string
+           right here, to save looping. Otherwise, set up the new state to swing
+           into action when the end of the matched substring is reached. */
+ 
+           else if (i + 1 >= active_count && new_count == 0)
+             {
+             ptr += charcount;
+             clen = 0;
+             ADD_NEW(next_state_offset, 0);
+ 
+             /* If we are adding a repeat state at the new character position,
+             we must fudge things so that it is the only current state.
+             Otherwise, it might be a duplicate of one we processed before, and
+             that would cause it to be skipped. */
+ 
+             if (repeat_state_offset >= 0)
+               {
+               next_active_state = active_states;
+               active_count = 0;
+               i = -1;
+               ADD_ACTIVE(repeat_state_offset, 0);
+               }
+             }
+           else
+             {
+ #if defined SUPPORT_UNICODE && PCRE2_CODE_UNIT_WIDTH != 32
+             if (utf)
+               {
+               PCRE2_SPTR p = start_subject + local_offsets[0];
+               PCRE2_SPTR pp = start_subject + local_offsets[1];
+               while (p < pp) if (NOT_FIRSTCU(*p++)) charcount--;
+               }
+ #endif
+             ADD_NEW_DATA(-next_state_offset, 0, (int)(charcount - 1));
+             if (repeat_state_offset >= 0)
+               { ADD_NEW_DATA(-repeat_state_offset, 0, (int)(charcount - 1)); }
+             }
+           }
+         else if (rc != PCRE2_ERROR_NOMATCH) return rc;
+         }
+       break;
+ 
+ 
+ /* ========================================================================== */
+       /* Handle callouts */
+ 
+       case OP_CALLOUT:
+       case OP_CALLOUT_STR:
+         {
+         unsigned int callout_length = (*code == OP_CALLOUT)
+             ? PRIV(OP_lengths)[OP_CALLOUT] : GET(code, 1 + 2*LINK_SIZE);
+         rrc = 0;
+ 
+         if (mb->callout != NULL)
+           {
+           pcre2_callout_block cb;
+           cb.version          = 1;
+           cb.capture_top      = 1;
+           cb.capture_last     = 0;
+           cb.offset_vector    = offsets;
+           cb.mark             = NULL;   /* No (*MARK) support */
+           cb.subject          = start_subject;
+           cb.subject_length   = (PCRE2_SIZE)(end_subject - start_subject);
+           cb.start_match      = (PCRE2_SIZE)(current_subject - start_subject);
+           cb.current_position = (PCRE2_SIZE)(ptr - start_subject);
+           cb.pattern_position = GET(code, 1);
+           cb.next_item_length = GET(code, 1 + LINK_SIZE);
+ 
+           if (*code == OP_CALLOUT)
+             {
+             cb.callout_number = code[1 + 2*LINK_SIZE];
+             cb.callout_string_offset = 0;
+             cb.callout_string = NULL;
+             cb.callout_string_length = 0;
+             }
+           else
+             {
+             cb.callout_number = 0;
+             cb.callout_string_offset = GET(code, 1 + 3*LINK_SIZE);
+             cb.callout_string = code + (1 + 4*LINK_SIZE) + 1;
+             cb.callout_string_length =
+               callout_length - (1 + 4*LINK_SIZE) - 2;
+             }
+ 
+           if ((rrc = (mb->callout)(&cb, mb->callout_data)) < 0)
+             return rrc;   /* Abandon */
+           }
+         if (rrc == 0)
+           { ADD_ACTIVE(state_offset + (int)callout_length, 0); }
+         }
+       break;
+ 
+ 
+ /* ========================================================================== */
+       default:        /* Unsupported opcode */
+       return PCRE2_ERROR_DFA_UITEM;
+       }
+ 
+     NEXT_ACTIVE_STATE: continue;
+ 
+     }      /* End of loop scanning active states */
+ 
+   /* We have finished the processing at the current subject character. If no
+   new states have been set for the next character, we have found all the
+   matches that we are going to find. If we are at the top level and partial
+   matching has been requested, check for appropriate conditions.
+ 
+   The "forced_ fail" variable counts the number of (*F) encountered for the
+   character. If it is equal to the original active_count (saved in
+   workspace[1]) it means that (*F) was found on every active state. In this
+   case we don't want to give a partial match.
+ 
+   The "could_continue" variable is true if a state could have continued but
+   for the fact that the end of the subject was reached. */
+ 
+   if (new_count <= 0)
+     {
+     if (rlevel == 1 &&                               /* Top level, and */
+         could_continue &&                            /* Some could go on, and */
+         forced_fail != workspace[1] &&               /* Not all forced fail & */
+         (                                            /* either... */
+         (mb->moptions & PCRE2_PARTIAL_HARD) != 0      /* Hard partial */
+         ||                                           /* or... */
+         ((mb->moptions & PCRE2_PARTIAL_SOFT) != 0 &&  /* Soft partial and */
+          match_count < 0)                            /* no matches */
+         ) &&                                         /* And... */
+         (
+         partial_newline ||                           /* Either partial NL */
+           (                                          /* or ... */
+           ptr >= end_subject &&                /* End of subject and */
+           ptr > mb->start_used_ptr)            /* Inspected non-empty string */
+           )
+         )
+       match_count = PCRE2_ERROR_PARTIAL;
+     break;  /* Exit from loop along the subject string */
+     }
+ 
+   /* One or more states are active for the next character. */
+ 
+   ptr += clen;    /* Advance to next subject character */
+   }               /* Loop to move along the subject string */
+ 
+-/* Control gets here from "break" a few lines above. If we have a match and 
++/* Control gets here from "break" a few lines above. If we have a match and
+ PCRE2_ENDANCHORED is set, the match fails. */
+ 
+-if (match_count >= 0 && 
++if (match_count >= 0 &&
+     ((mb->moptions | mb->poptions) & PCRE2_ENDANCHORED) != 0 &&
+     ptr < end_subject)
+-  match_count = PCRE2_ERROR_NOMATCH;    
++  match_count = PCRE2_ERROR_NOMATCH;
+ 
+ return match_count;
+ }
+@@ -3157,12 +3149,12 @@ if (re == NULL || subject == NULL || workspace == NULL || match_data == NULL)
+ if (wscount < 20) return PCRE2_ERROR_DFA_WSSIZE;
+ if (start_offset > length) return PCRE2_ERROR_BADOFFSET;
+ 
+-/* Partial matching and PCRE2_ENDANCHORED are currently not allowed at the same 
+-time. */ 
+-              
++/* Partial matching and PCRE2_ENDANCHORED are currently not allowed at the same
++time. */
++
+ if ((options & (PCRE2_PARTIAL_HARD|PCRE2_PARTIAL_SOFT)) != 0 &&
+    ((re->overall_options | options) & PCRE2_ENDANCHORED) != 0)
+-  return PCRE2_ERROR_BADOPTION; 
++  return PCRE2_ERROR_BADOPTION;
+ 
+ /* Check that the first field in the block is the magic number. If it is not,
+ return with PCRE2_ERROR_BADMAGIC. */
+diff --git a/testdata/testinput6 b/testdata/testinput6
+index dfd78a4..df38249 100644
+--- a/testdata/testinput6
++++ b/testdata/testinput6
+@@ -1,4932 +1,4944 @@
+ # This set of tests check the DFA matching functionality of pcre2_dfa_match(),
+ # excluding UTF and Unicode property support. All matches are done using DFA,
+ # forced by setting a default subject modifier at the start.
+     
+ #forbid_utf
+ #subject dfa
+ #newline_default lf anycrlf any
+      
+ /abc/
+     abc
+     
+ /ab*c/
+     abc
+     abbbbc
+     ac
+     
+ /ab+c/
+     abc
+     abbbbbbc
+ \= Expect no match 
+     ac
+     ab
+     
+ /a*/no_auto_possess
+     a
+     aaaaaaaaaaaaaaaaa
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\=ovector=10 
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\=dfa_shortest
+     
+ /(a|abcd|african)/
+     a
+     abcd
+     african
+     
+ /^abc/
+     abcdef
+ \= Expect no match
+     xyzabc
+     xyz\nabc    
+     
+ /^abc/m
+     abcdef
+     xyz\nabc    
+ \= Expect no match
+     xyzabc
+     
+ /\Aabc/
+     abcdef
+ \= Expect no match
+     xyzabc
+     xyz\nabc    
+     
+ /\Aabc/m
+     abcdef
+ \= Expect no match
+     xyzabc
+     xyz\nabc    
+     
+ /\Gabc/
+     abcdef
+     xyzabc\=offset=3
+ \= Expect no match
+     xyzabc    
+     xyzabc\=offset=2
+     
+ /x\dy\Dz/
+     x9yzz
+     x0y+z
+ \= Expect no match
+     xyz
+     xxy0z     
+     
+ /x\sy\Sz/
+     x yzz
+     x y+z
+ \= Expect no match
+     xyz
+     xxyyz
+     
+ /x\wy\Wz/
+     xxy+z
+ \= Expect no match
+     xxy0z
+     x+y+z         
+     
+ /x.y/
+     x+y
+     x-y
+ \= Expect no match
+     x\ny
+     
+ /x.y/s
+     x+y
+     x-y
+     x\ny
+ 
+ /(a.b(?s)c.d|x.y)p.q/
+     a+bc+dp+q
+     a+bc\ndp+q
+     x\nyp+q 
+ \= Expect no match 
+     a\nbc\ndp+q
+     a+bc\ndp\nq
+     x\nyp\nq 
+ 
+ /a\d\z/
+     ba0
+ \= Expect no match
+     ba0\n
+     ba0\ncd   
+ 
+ /a\d\z/m
+     ba0
+ \= Expect no match
+     ba0\n
+     ba0\ncd   
+ 
+ /a\d\Z/
+     ba0
+     ba0\n
+ \= Expect no match
+     ba0\ncd   
+ 
+ /a\d\Z/m
+     ba0
+     ba0\n
+ \= Expect no match
+     ba0\ncd   
+ 
+ /a\d$/
+     ba0
+     ba0\n
+ \= Expect no match
+     ba0\ncd   
+ 
+ /a\d$/m
+     ba0
+     ba0\n
+     ba0\ncd   
+ 
+ /abc/i
+     abc
+     aBc
+     ABC
+     
+ /[^a]/
+     abcd
+     
+ /ab?\w/
+     abz
+     abbz
+     azz  
+ 
+ /x{0,3}yz/
+     ayzq
+     axyzq
+     axxyz
+     axxxyzq
+     axxxxyzq
+ \= Expect no match
+     ax
+     axx     
+       
+ /x{3}yz/
+     axxxyzq
+     axxxxyzq
+ \= Expect no match
+     ax
+     axx     
+     ayzq
+     axyzq
+     axxyz
+       
+ /x{2,3}yz/
+     axxyz
+     axxxyzq
+     axxxxyzq
+ \= Expect no match
+     ax
+     axx     
+     ayzq
+     axyzq
+       
+ /[^a]+/no_auto_possess
+     bac
+     bcdefax
+ \= Expect no match
+     aaaaa   
+ 
+ /[^a]*/no_auto_possess
+     bac
+     bcdefax
+     aaaaa   
+     
+ /[^a]{3,5}/no_auto_possess
+     xyz
+     awxyza
+     abcdefa
+     abcdefghijk
+ \= Expect no match
+     axya
+     axa
+     aaaaa         
+ 
+ /\d*/
+     1234b567
+     xyz
+     
+ /\D*/
+     a1234b567
+     xyz
+      
+ /\d+/
+     ab1234c56
+ \= Expect no match
+     xyz
+     
+ /\D+/
+     ab123c56
+ \= Expect no match
+     789
+     
+ /\d?A/
+     045ABC
+     ABC
+ \= Expect no match
+     XYZ
+     
+ /\D?A/
+     ABC
+     BAC
+     9ABC             
+ 
+ /a+/
+     aaaa
+ 
+ /^.*xyz/
+     xyz
+     ggggggggxyz
+     
+ /^.+xyz/
+     abcdxyz
+     axyz
+ \= Expect no match
+     xyz
+     
+ /^.?xyz/
+     xyz
+     cxyz       
+ 
+ /^\d{2,3}X/
+     12X
+     123X
+ \= Expect no match
+     X
+     1X
+     1234X     
+ 
+ /^[abcd]\d/
+     a45
+     b93
+     c99z
+     d04
+ \= Expect no match
+     e45
+     abcd      
+     abcd1234
+     1234  
+ 
+ /^[abcd]*\d/
+     a45
+     b93
+     c99z
+     d04
+     abcd1234
+     1234  
+ \= Expect no match
+     e45
+     abcd      
+ 
+ /^[abcd]+\d/
+     a45
+     b93
+     c99z
+     d04
+     abcd1234
+ \= Expect no match
+     1234  
+     e45
+     abcd      
+ 
+ /^a+X/
+     aX
+     aaX 
+ 
+ /^[abcd]?\d/
+     a45
+     b93
+     c99z
+     d04
+     1234  
+ \= Expect no match
+     abcd1234
+     e45
+ 
+ /^[abcd]{2,3}\d/
+     ab45
+     bcd93
+ \= Expect no match
+     1234 
+     a36 
+     abcd1234
+     ee45
+ 
+ /^(abc)*\d/
+     abc45
+     abcabcabc45
+     42xyz 
+ 
+ /^(abc)+\d/
+     abc45
+     abcabcabc45
+ \= Expect no match
+     42xyz 
+ 
+ /^(abc)?\d/
+     abc45
+     42xyz 
+ \= Expect no match
+     abcabcabc45
+ 
+ /^(abc){2,3}\d/
+     abcabc45
+     abcabcabc45
+ \= Expect no match
+     abcabcabcabc45
+     abc45
+     42xyz 
+ 
+ /1(abc|xyz)2(?1)3/
+     1abc2abc3456
+     1abc2xyz3456 
+ 
+ /^(a*\w|ab)=(a*\w|ab)/
+     ab=ab
+ 
+ /^(a*\w|ab)=(?1)/
+     ab=ab
+ 
+ /^([^()]|\((?1)*\))*$/
+     abc
+     a(b)c
+     a(b(c))d  
+ \= Expect no match)
+     a(b(c)d  
+ 
+ /^>abc>([^()]|\((?1)*\))*<xyz<$/
+     >abc>123<xyz<
+     >abc>1(2)3<xyz<
+     >abc>(1(2)3)<xyz<
+ 
+ /^(?>a*)\d/
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9876
+ \= Expect no match 
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ 
+ /< (?: (?(R) \d++  | [^<>]*+) | (?R)) * >/x
+     <>
+     <abcd>
+     <abc <123> hij>
+     <abc <def> hij>
+     <abc<>def> 
+     <abc<>      
+ \= Expect no match
+     <abc
+ 
+ /^(?(?=abc)\w{3}:|\d\d)$/
+     abc:                          
+     12                             
+ \= Expect no match                     
+     123                       
+     xyz                        
+                                 
+ /^(?(?!abc)\d\d|\w{3}:)$/
+     abc:                        
+     12         
+ \= Expect no match
+     123
+     xyz    
+ 
+ /^(?=abc)\w{5}:$/
+     abcde:                          
+ \= Expect no match                     
+     abc.. 
+     123                       
+     vwxyz                        
+                                 
+ /^(?!abc)\d\d$/
+     12         
+ \= Expect no match
+     abcde:
+     abc..  
+     123
+     vwxyz    
+ 
+ /(?<=abc|xy)123/
+     abc12345
+     wxy123z
+ \= Expect no match
+     123abc
+ 
+ /(?<!abc|xy)123/
+     123abc
+     mno123456 
+ \= Expect no match
+     abc12345
+     wxy123z
+ 
+ /abc(?C1)xyz/
+     abcxyz
+     123abcxyz999 
+ 
+ /(ab|cd){3,4}/auto_callout
+   ababab
+   abcdabcd
+   abcdcdcdcdcd  
+ 
+ /^abc/
+     abcdef
+ \= Expect no match
+     abcdef\=notbol
+ 
+ /^(a*|xyz)/
+     bcd
+     aaabcd
+     xyz
+     xyz\=notempty
+ \= Expect no match
+     bcd\=notempty
+     
+ /xyz$/
+     xyz
+     xyz\n
+ \= Expect no match
+     xyz\=noteol
+     xyz\n\=noteol
+     
+ /xyz$/m
+     xyz
+     xyz\n 
+     abcxyz\npqr 
+     abcxyz\npqr\=noteol
+     xyz\n\=noteol
+ \= Expect no match
+     xyz\=noteol
+ 
+ /\Gabc/
+     abcdef
+     defabcxyz\=offset=3
+ \= Expect no match 
+     defabcxyz
+ 
+ /^abcdef/
+     ab\=ps
+     abcde\=ps
+     abcdef\=ps
+ \= Expect no match
+     abx\=ps
+ 
+ /^a{2,4}\d+z/
+     a\=ps
+     aa\=ps
+     aa2\=ps
+     aaa\=ps
+     aaa23\=ps
+     aaaa12345\=ps
+     aa0z\=ps
+     aaaa4444444444444z\=ps
+ \= Expect no match
+     az\=ps
+     aaaaa\=ps
+     a56\=ps
+ 
+ /^abcdef/
+    abc\=ps
+    def\=dfa_restart
+    
+ /(?<=foo)bar/
+    foob\=ps,offset=2
+    foobar...\=ps,dfa_restart,offset=4
+    foobar\=offset=2
+ \= Expect no match
+    xyzfo\=ps
+    obar\=dfa_restart
+ 
+ /(ab*(cd|ef))+X/
+     lkjhlkjhlkjhlkjhabbbbbbcdaefabbbbbbbefa\=ps,notbol,noteol
+     cdabbbbbbbb\=ps,notbol,dfa_restart,noteol
+     efabbbbbbbbbbbbbbbb\=ps,notbol,dfa_restart,noteol
+     bbbbbbbbbbbbcdXyasdfadf\=ps,notbol,dfa_restart,noteol
+ \= Expect no match
+     adfadadaklhlkalkajhlkjahdfasdfasdfladsfjkj\=ps,noteol
+ 
+ /the quick brown fox/
+     the quick brown fox
+     What do you know about the quick brown fox?
+ \= Expect no match
+     The quick brown FOX
+     What do you know about THE QUICK BROWN FOX?
+ 
+ /The quick brown fox/i
+     the quick brown fox
+     The quick brown FOX
+     What do you know about the quick brown fox?
+     What do you know about THE QUICK BROWN FOX?
+ 
+ /abcd\t\n\r\f\a\e\071\x3b\$\\\?caxyz/
+     abcd\t\n\r\f\a\e9;\$\\?caxyz
+ 
+ /a*abc?xyz+pqr{3}ab{2,}xy{4,5}pq{0,6}AB{0,}zz/
+     abxyzpqrrrabbxyyyypqAzz
+     abxyzpqrrrabbxyyyypqAzz
+     aabxyzpqrrrabbxyyyypqAzz
+     aaabxyzpqrrrabbxyyyypqAzz
+     aaaabxyzpqrrrabbxyyyypqAzz
+     abcxyzpqrrrabbxyyyypqAzz
+     aabcxyzpqrrrabbxyyyypqAzz
+     aaabcxyzpqrrrabbxyyyypAzz
+     aaabcxyzpqrrrabbxyyyypqAzz
+     aaabcxyzpqrrrabbxyyyypqqAzz
+     aaabcxyzpqrrrabbxyyyypqqqAzz
+     aaabcxyzpqrrrabbxyyyypqqqqAzz
+     aaabcxyzpqrrrabbxyyyypqqqqqAzz
+     aaabcxyzpqrrrabbxyyyypqqqqqqAzz
+     aaaabcxyzpqrrrabbxyyyypqAzz
+     abxyzzpqrrrabbxyyyypqAzz
+     aabxyzzzpqrrrabbxyyyypqAzz
+     aaabxyzzzzpqrrrabbxyyyypqAzz
+     aaaabxyzzzzpqrrrabbxyyyypqAzz
+     abcxyzzpqrrrabbxyyyypqAzz
+     aabcxyzzzpqrrrabbxyyyypqAzz
+     aaabcxyzzzzpqrrrabbxyyyypqAzz
+     aaaabcxyzzzzpqrrrabbxyyyypqAzz
+     aaaabcxyzzzzpqrrrabbbxyyyypqAzz
+     aaaabcxyzzzzpqrrrabbbxyyyyypqAzz
+     aaabcxyzpqrrrabbxyyyypABzz
+     aaabcxyzpqrrrabbxyyyypABBzz
+     >>>aaabxyzpqrrrabbxyyyypqAzz
+     >aaaabxyzpqrrrabbxyyyypqAzz
+     >>>>abcxyzpqrrrabbxyyyypqAzz
+ \= Expect no match
+     abxyzpqrrabbxyyyypqAzz
+     abxyzpqrrrrabbxyyyypqAzz
+     abxyzpqrrrabxyyyypqAzz
+     aaaabcxyzzzzpqrrrabbbxyyyyyypqAzz
+     aaaabcxyzzzzpqrrrabbbxyyypqAzz
+     aaabcxyzpqrrrabbxyyyypqqqqqqqAzz
+ 
+ /^(abc){1,2}zz/
+     abczz
+     abcabczz
+ \= Expect no match
+     zz
+     abcabcabczz
+     >>abczz
+ 
+ /^(b+?|a){1,2}?c/
+     bc
+     bbc
+     bbbc
+     bac
+     bbac
+     aac
+     abbbbbbbbbbbc
+     bbbbbbbbbbbac
+ \= Expect no match
+     aaac
+     abbbbbbbbbbbac
+ 
+ /^(b+|a){1,2}c/
+     bc
+     bbc
+     bbbc
+     bac
+     bbac
+     aac
+     abbbbbbbbbbbc
+     bbbbbbbbbbbac
+ \= Expect no match
+     aaac
+     abbbbbbbbbbbac
+ 
+ /^(b+|a){1,2}?bc/
+     bbc
+ 
+ /^(b*|ba){1,2}?bc/
+     babc
+     bbabc
+     bababc
+ \= Expect no match
+     bababbc
+     babababc
+ 
+ /^(ba|b*){1,2}?bc/
+     babc
+     bbabc
+     bababc
+ \= Expect no match
+     bababbc
+     babababc
+ 
+ /^\ca\cA\c[\c{\c:/
+     \x01\x01\e;z
+ 
+ /^[ab\]cde]/
+     athing
+     bthing
+     ]thing
+     cthing
+     dthing
+     ething
+ \= Expect no match
+     fthing
+     [thing
+     \\thing
+ 
+ /^[]cde]/
+     ]thing
+     cthing
+     dthing
+     ething
+ \= Expect no match
+     athing
+     fthing
+ 
+ /^[^ab\]cde]/
+     fthing
+     [thing
+     \\thing
+ \= Expect no match
+     athing
+     bthing
+     ]thing
+     cthing
+     dthing
+     ething
+ 
+ /^[^]cde]/
+     athing
+     fthing
+ \= Expect no match
+     ]thing
+     cthing
+     dthing
+     ething
+ 
+ /^\Å/
+     Å
+ 
+ /^ˇ/
+     ˇ
+ 
+ /^[0-9]+$/
+     0
+     1
+     2
+     3
+     4
+     5
+     6
+     7
+     8
+     9
+     10
+     100
+ \= Expect no match
+     abc
+ 
+ /^.*nter/
+     enter
+     inter
+     uponter
+ 
+ /^xxx[0-9]+$/
+     xxx0
+     xxx1234
+ \= Expect no match
+     xxx
+ 
+ /^.+[0-9][0-9][0-9]$/
+     x123
+     xx123
+     123456
+     x1234
+ \= Expect no match
+     123
+ 
+ /^.+?[0-9][0-9][0-9]$/
+     x123
+     xx123
+     123456
+     x1234
+ \= Expect no match
+     123
+ 
+ /^([^!]+)!(.+)=apquxz\.ixr\.zzz\.ac\.uk$/
+     abc!pqr=apquxz.ixr.zzz.ac.uk
+ \= Expect no match
+     !pqr=apquxz.ixr.zzz.ac.uk
+     abc!=apquxz.ixr.zzz.ac.uk
+     abc!pqr=apquxz:ixr.zzz.ac.uk
+     abc!pqr=apquxz.ixr.zzz.ac.ukk
+ 
+ /:/
+     Well, we need a colon: somewhere
+ \= Expect no match
+     No match without a colon
+ 
+ /([\da-f:]+)$/i
+     0abc
+     abc
+     fed
+     E
+     ::
+     5f03:12C0::932e
+     fed def
+     Any old stuff
+ \= Expect no match
+     0zzz
+     gzzz
+     fed\x20
+     Any old rubbish
+ 
+ /^.*\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+     .1.2.3
+     A.12.123.0
+ \= Expect no match
+     .1.2.3333
+     1.2.3
+     1234.2.3
+ 
+ /^(\d+)\s+IN\s+SOA\s+(\S+)\s+(\S+)\s*\(\s*$/
+     1 IN SOA non-sp1 non-sp2(
+     1    IN    SOA    non-sp1    non-sp2   (
+ \= Expect no match
+     1IN SOA non-sp1 non-sp2(
+ 
+ /^[a-zA-Z\d][a-zA-Z\d\-]*(\.[a-zA-Z\d][a-zA-z\d\-]*)*\.$/
+     a.
+     Z.
+     2.
+     ab-c.pq-r.
+     sxk.zzz.ac.uk.
+     x-.y-.
+ \= Expect no match
+     -abc.peq.
+ 
+ /^\*\.[a-z]([a-z\-\d]*[a-z\d]+)?(\.[a-z]([a-z\-\d]*[a-z\d]+)?)*$/
+     *.a
+     *.b0-a
+     *.c3-b.c
+     *.c-a.b-c
+ \= Expect no match
+     *.0
+     *.a-
+     *.a-b.c-
+     *.c-a.0-c
+ 
+ /^(?=ab(de))(abd)(e)/
+     abde
+ 
+ /^(?!(ab)de|x)(abd)(f)/
+     abdf
+ 
+ /^(?=(ab(cd)))(ab)/
+     abcd
+ 
+ /^[\da-f](\.[\da-f])*$/i
+     a.b.c.d
+     A.B.C.D
+     a.b.c.1.2.3.C
+ 
+ /^\".*\"\s*(;.*)?$/
+     \"1234\"
+     \"abcd\" ;
+     \"\" ; rhubarb
+ \= Expect no match
+     \"1234\" : things
+ 
+ /^$/
+     \
+ 
+ /   ^    a   (?# begins with a)  b\sc (?# then b c) $ (?# then end)/x
+     ab c
+ \= Expect no match
+     abc
+     ab cde
+ 
+ /(?x)   ^    a   (?# begins with a)  b\sc (?# then b c) $ (?# then end)/
+     ab c
+ \= Expect no match
+     abc
+     ab cde
+ 
+ /^   a\ b[c ]d       $/x
+     a bcd
+     a b d
+ \= Expect no match
+     abcd
+     ab d
+ 
+ /^(a(b(c)))(d(e(f)))(h(i(j)))(k(l(m)))$/
+     abcdefhijklm
+ 
+ /^(?:a(b(c)))(?:d(e(f)))(?:h(i(j)))(?:k(l(m)))$/
+     abcdefhijklm
+ 
+ /^[\w][\W][\s][\S][\d][\D][\b][\n][\c]][\022]/
+     a+ Z0+\x08\n\x1d\x12
+ 
+ /^[.^$|()*+?{,}]+/
+     .^\$(*+)|{?,?}
+ 
+ /^a*\w/
+     z
+     az
+     aaaz
+     a
+     aa
+     aaaa
+     a+
+     aa+
+ 
+ /^a*?\w/
+     z
+     az
+     aaaz
+     a
+     aa
+     aaaa
+     a+
+     aa+
+ 
+ /^a+\w/
+     az
+     aaaz
+     aa
+     aaaa
+     aa+
+ 
+ /^a+?\w/
+     az
+     aaaz
+     aa
+     aaaa
+     aa+
+ 
+ /^\d{8}\w{2,}/
+     1234567890
+     12345678ab
+     12345678__
+ \= Expect no match
+     1234567
+ 
+ /^[aeiou\d]{4,5}$/
+     uoie
+     1234
+     12345
+     aaaaa
+ \= Expect no match
+     123456
+ 
+ /^[aeiou\d]{4,5}?/
+     uoie
+     1234
+     12345
+     aaaaa
+     123456
+ 
+ /^From +([^ ]+) +[a-zA-Z][a-zA-Z][a-zA-Z] +[a-zA-Z][a-zA-Z][a-zA-Z] +[0-9]?[0-9] +[0-9][0-9]:[0-9][0-9]/
+     From abcd  Mon Sep 01 12:33:02 1997
+ 
+ /^From\s+\S+\s+([a-zA-Z]{3}\s+){2}\d{1,2}\s+\d\d:\d\d/
+     From abcd  Mon Sep 01 12:33:02 1997
+     From abcd  Mon Sep  1 12:33:02 1997
+ \= Expect no match
+     From abcd  Sep 01 12:33:02 1997
+ 
+ /^12.34/s
+     12\n34
+     12\r34
+ 
+ /\w+(?=\t)/
+     the quick brown\t fox
+ 
+ /foo(?!bar)(.*)/
+     foobar is foolish see?
+ 
+ /(?:(?!foo)...|^.{0,2})bar(.*)/
+     foobar crowbar etc
+     barrel
+     2barrel
+     A barrel
+ 
+ /^(\D*)(?=\d)(?!123)/
+     abc456
+ \= Expect no match
+     abc123
+ 
+ /^1234(?# test newlines
+   inside)/
+     1234
+ 
+ /^1234 #comment in extended re
+   /x
+     1234
+ 
+ /#rhubarb
+   abcd/x
+     abcd
+ 
+ /^abcd#rhubarb/x
+     abcd
+ 
+ /(?!^)abc/
+     the abc
+ \= Expect no match
+     abc
+ 
+ /(?=^)abc/
+     abc
+ \= Expect no match
+     the abc
+ 
+ /^[ab]{1,3}(ab*|b)/no_auto_possess
+     aabbbbb
+ 
+ /^[ab]{1,3}?(ab*|b)/no_auto_possess
+     aabbbbb
+ 
+ /^[ab]{1,3}?(ab*?|b)/no_auto_possess
+     aabbbbb
+ 
+ /^[ab]{1,3}(ab*?|b)/no_auto_possess
+     aabbbbb
+ 
+ /  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*                          # optional leading comment
+ (?:    (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ )                    # initial word
+ (?:  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ )  )* # further okay, if led by a period
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  @  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*    (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                           # initial subdomain
+ (?:                                  #
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.                        # if led by a period...
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                     #   ...further okay
+ )*
+ # address
+ |                     #  or
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ )             # one word, optionally followed by....
+ (?:
+ [^()<>@,;:".\\\[\]\x80-\xff\000-\010\012-\037]  |  # atom and space parts, or...
+ \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)       |  # comments, or...
+ 
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ # quoted strings
+ )*
+ <  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*                     # leading <
+ (?:  @  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*    (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                           # initial subdomain
+ (?:                                  #
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.                        # if led by a period...
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                     #   ...further okay
+ )*
+ 
+ (?:  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  ,  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  @  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*    (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                           # initial subdomain
+ (?:                                  #
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.                        # if led by a period...
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                     #   ...further okay
+ )*
+ )* # further okay, if led by comma
+ :                                # closing colon
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  )? #       optional route
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ )                    # initial word
+ (?:  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ " (?:                      # opening quote...
+ [^\\\x80-\xff\n\015"]                #   Anything except backslash and quote
+ |                     #    or
+ \\ [^\x80-\xff]           #   Escaped something (something != CR)
+ )* "  # closing quote
+ )  )* # further okay, if led by a period
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  @  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*    (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                           # initial subdomain
+ (?:                                  #
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  \.                        # if led by a period...
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*   (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |   \[                         # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*    #    stuff
+ \]                        #           ]
+ )                     #   ...further okay
+ )*
+ #       address spec
+ (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*  > #                  trailing >
+ # name and address
+ )  (?: [\040\t] |  \(
+ (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  |  \( (?:  [^\\\x80-\xff\n\015()]  |  \\ [^\x80-\xff]  )* \)  )*
+ \)  )*                       # optional trailing comment
+ /x
+     Alan Other <user\@dom.ain>
+     <user\@dom.ain>
+     user\@dom.ain
+     \"A. Other\" <user.1234\@dom.ain> (a comment)
+     A. Other <user.1234\@dom.ain> (a comment)
+     \"/s=user/ou=host/o=place/prmd=uu.yy/admd= /c=gb/\"\@x400-re.lay
+     A missing angle <user\@some.where
+ \= Expect no match
+     The quick brown fox
+ 
+ /[\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional leading comment
+ (?:
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ # Atom
+ |                       #  or
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ # Quoted string
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ # Atom
+ |                       #  or
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ # Quoted string
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # additional words
+ )*
+ @
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ )*
+ # address
+ |                             #  or
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ # Atom
+ |                       #  or
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ # Quoted string
+ )
+ # leading word
+ [^()<>@,;:".\\\[\]\x80-\xff\000-\010\012-\037] *               # "normal" atoms and or spaces
+ (?:
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ |
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ ) # "special" comment or quoted string
+ [^()<>@,;:".\\\[\]\x80-\xff\000-\010\012-\037] *            #  more "normal"
+ )*
+ <
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # <
+ (?:
+ @
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ )*
+ (?: ,
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ @
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ )*
+ )*  # additional domains
+ :
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ )?     #       optional route
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ # Atom
+ |                       #  or
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ # Quoted string
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ # Atom
+ |                       #  or
+ "                                     # "
+ [^\\\x80-\xff\n\015"] *                            #   normal
+ (?:  \\ [^\x80-\xff]  [^\\\x80-\xff\n\015"] * )*        #   ( special normal* )*
+ "                                     #        "
+ # Quoted string
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # additional words
+ )*
+ @
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ (?:
+ \.
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ (?:
+ [^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]+    # some number of atom characters...
+ (?![^(\040)<>@,;:".\\\[\]\000-\037\x80-\xff]) # ..not followed by something that could be part of an atom
+ |
+ \[                            # [
+ (?: [^\\\x80-\xff\n\015\[\]] |  \\ [^\x80-\xff]  )*     #    stuff
+ \]                           #           ]
+ )
+ [\040\t]*                    # Nab whitespace.
+ (?:
+ \(                              #  (
+ [^\\\x80-\xff\n\015()] *                             #     normal*
+ (?:                                 #       (
+ (?:  \\ [^\x80-\xff]  |
+ \(                            #  (
+ [^\\\x80-\xff\n\015()] *                            #     normal*
+ (?:  \\ [^\x80-\xff]   [^\\\x80-\xff\n\015()] * )*        #     (special normal*)*
+ \)                           #                       )
+ )    #         special
+ [^\\\x80-\xff\n\015()] *                         #         normal*
+ )*                                  #            )*
+ \)                             #                )
+ [\040\t]* )*    # If comment found, allow more spaces.
+ # optional trailing comments
+ )*
+ #       address spec
+ >                    #                 >
+ # name and address
+ )
+ /x
+     Alan Other <user\@dom.ain>
+     <user\@dom.ain>
+     user\@dom.ain
+     \"A. Other\" <user.1234\@dom.ain> (a comment)
+     A. Other <user.1234\@dom.ain> (a comment)
+     \"/s=user/ou=host/o=place/prmd=uu.yy/admd= /c=gb/\"\@x400-re.lay
+     A missing angle <user\@some.where
+ \= Expect no match
+     The quick brown fox
+ 
+ /abc\0def\00pqr\000xyz\0000AB/
+     abc\0def\00pqr\000xyz\0000AB
+     abc456 abc\0def\00pqr\000xyz\0000ABCDE
+ 
+ /abc\x0def\x00pqr\x000xyz\x0000AB/
+     abc\x0def\x00pqr\x000xyz\x0000AB
+     abc456 abc\x0def\x00pqr\x000xyz\x0000ABCDE
+ 
+ /^[\000-\037]/
+     \0A
+     \01B
+     \037C
+ 
+ /\0*/
+     \0\0\0\0
+ 
+ /A\x0{2,3}Z/
+     The A\x0\x0Z
+     An A\0\x0\0Z
+ \= Expect no match
+     A\0Z
+     A\0\x0\0\x0Z
+ 
+ /^\s/
+     \040abc
+     \x0cabc
+     \nabc
+     \rabc
+     \tabc
+ \= Expect no match
+     abc
+ 
+ /^a	b
+       c/x
+     abc
+ 
+ /ab{1,3}bc/
+     abbbbc
+     abbbc
+     abbc
+ \= Expect no match
+     abc
+     abbbbbc
+ 
+ /([^.]*)\.([^:]*):[T ]+(.*)/
+     track1.title:TBlah blah blah
+ 
+ /([^.]*)\.([^:]*):[T ]+(.*)/i
+     track1.title:TBlah blah blah
+ 
+ /([^.]*)\.([^:]*):[t ]+(.*)/i
+     track1.title:TBlah blah blah
+ 
+ /^[W-c]+$/
+     WXY_^abc
+ \= Expect no match
+     wxy
+ 
+ /^[W-c]+$/i
+     WXY_^abc
+     wxy_^ABC
+ 
+ /^[\x3f-\x5F]+$/i
+     WXY_^abc
+     wxy_^ABC
+ 
+ /^abc$/m
+     abc
+     qqq\nabc
+     abc\nzzz
+     qqq\nabc\nzzz
+ 
+ /^abc$/
+     abc
+ \= Expect no match
+     qqq\nabc
+     abc\nzzz
+     qqq\nabc\nzzz
+ 
+ /\Aabc\Z/m
+     abc
+     abc\n 
+ \= Expect no match
+     qqq\nabc
+     abc\nzzz
+     qqq\nabc\nzzz
+     
+ /\A(.)*\Z/s
+     abc\ndef
+ 
+ /\A(.)*\Z/m
+ \= Expect no match
+     abc\ndef
+ 
+ /(?:b)|(?::+)/
+     b::c
+     c::b
+ 
+ /[-az]+/
+     az-
+ \= Expect no match
+     b
+ 
+ /[az-]+/
+     za-
+ \= Expect no match
+     b
+ 
+ /[a\-z]+/
+     a-z
+ \= Expect no match
+     b
+ 
+ /[a-z]+/
+     abcdxyz
+ 
+ /[\d-]+/
+     12-34
+ \= Expect no match
+     aaa
+ 
+ /[\d-z]+/
+     12-34z
+ \= Expect no match
+     aaa
+ 
+ /\x5c/
+     \\
+ 
+ /\x20Z/
+     the Zoo
+ \= Expect no match
+     Zulu
+ 
+ /ab{3cd/
+     ab{3cd
+ 
+ /ab{3,cd/
+     ab{3,cd
+ 
+ /ab{3,4a}cd/
+     ab{3,4a}cd
+ 
+ /{4,5a}bc/
+     {4,5a}bc
+ 
+ /^a.b/newline=lf
+     a\rb
+ \= Expect no match
+     a\nb
+ 
+ /abc$/
+     abc
+     abc\n
+ \= Expect no match
+     abc\ndef
+ 
+ /(abc)\123/
+     abc\x53
+ 
+ /(abc)\223/
+     abc\x93
+ 
+ /(abc)\323/
+     abc\xd3
+ 
+ /(abc)\100/
+     abc\x40
+     abc\100
+ 
+ /(abc)\1000/
+     abc\x400
+     abc\x40\x30
+     abc\1000
+     abc\100\x30
+     abc\100\060
+     abc\100\60
+ 
+ /(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)\12\123/
+     abcdefghijk\12S
+ 
+ /a{0}bc/
+     bc
+ 
+ /(a|(bc)){0,0}?xyz/
+     xyz
+ 
+ /abc[\10]de/
+     abc\010de
+ 
+ /abc[\1]de/
+     abc\1de
+ 
+ /(abc)[\1]de/
+     abc\1de
+ 
+ /(?s)a.b/
+     a\nb
+ 
+ /^([^a])([^\b])([^c]*)([^d]{3,4})/
+     baNOTccccd
+     baNOTcccd
+     baNOTccd
+     bacccd
+ \= Expect no match
+     anything
+     b\bc   
+     baccd
+ 
+ /[^a]/
+     Abc
+   
+ /[^a]/i
+     Abc 
+ 
+ /[^a]+/
+     AAAaAbc
+   
+ /[^a]+/i
+     AAAaAbc 
+ 
+ /[^a]+/
+     bbb\nccc
+    
+ /[^k]$/
+     abc
+ \= Expect no match
+     abk   
+    
+ /[^k]{2,3}$/
+     abc
+     kbc
+     kabc 
+ \= Expect no match
+     abk
+     akb
+     akk 
+ 
+ /^\d{8,}\@.+[^k]$/
+     12345678\@a.b.c.d
+     123456789\@x.y.z
+ \= Expect no match
+     12345678\@x.y.uk
+     1234567\@a.b.c.d       
+ 
+ /[^a]/
+     aaaabcd
+     aaAabcd 
+ 
+ /[^a]/i
+     aaaabcd
+     aaAabcd 
+ 
+ /[^az]/
+     aaaabcd
+     aaAabcd 
+ 
+ /[^az]/i
+     aaaabcd
+     aaAabcd 
+ 
+ /\000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\040\041\042\043\044\045\046\047\050\051\052\053\054\055\056\057\060\061\062\063\064\065\066\067\070\071\072\073\074\075\076\077\100\101\102\103\104\105\106\107\110\111\112\113\114\115\116\117\120\121\122\123\124\125\126\127\130\131\132\133\134\135\136\137\140\141\142\143\144\145\146\147\150\151\152\153\154\155\156\157\160\161\162\163\164\165\166\167\170\171\172\173\174\175\176\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307\310\311\312\313\314\315\316\317\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337\340\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357\360\361\362\363\364\365\366\367\370\371\372\373\374\375\376\377/
+  \000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\040\041\042\043\044\045\046\047\050\051\052\053\054\055\056\057\060\061\062\063\064\065\066\067\070\071\072\073\074\075\076\077\100\101\102\103\104\105\106\107\110\111\112\113\114\115\116\117\120\121\122\123\124\125\126\127\130\131\132\133\134\135\136\137\140\141\142\143\144\145\146\147\150\151\152\153\154\155\156\157\160\161\162\163\164\165\166\167\170\171\172\173\174\175\176\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307\310\311\312\313\314\315\316\317\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337\340\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357\360\361\362\363\364\365\366\367\370\371\372\373\374\375\376\377
+ 
+ /P[^*]TAIRE[^*]{1,6}?LL/
+     xxxxxxxxxxxPSTAIREISLLxxxxxxxxx
+ 
+ /P[^*]TAIRE[^*]{1,}?LL/
+     xxxxxxxxxxxPSTAIREISLLxxxxxxxxx
+ 
+ /(\.\d\d[1-9]?)\d+/
+     1.230003938
+     1.875000282   
+     1.235  
+                   
+ /(\.\d\d((?=0)|\d(?=\d)))/
+     1.230003938      
+     1.875000282
+ \= Expect no match 
+     1.235 
+     
+ /a(?)b/
+     ab 
+  
+ /\b(foo)\s+(\w+)/i
+     Food is on the foo table
+     
+ /foo(.*)bar/
+     The food is under the bar in the barn.
+     
+ /foo(.*?)bar/
+     The food is under the bar in the barn.
+ 
+ /(.*)(\d*)/no_auto_possess
+     I have 2 numbers: 53147
+     
+ /(.*)(\d+)/
+     I have 2 numbers: 53147
+  
+ /(.*?)(\d*)/no_auto_possess
+     I have 2 numbers: 53147
+ 
+ /(.*?)(\d+)/
+     I have 2 numbers: 53147
+ 
+ /(.*)(\d+)$/
+     I have 2 numbers: 53147
+ 
+ /(.*?)(\d+)$/
+     I have 2 numbers: 53147
+ 
+ /(.*)\b(\d+)$/
+     I have 2 numbers: 53147
+ 
+ /(.*\D)(\d+)$/
+     I have 2 numbers: 53147
+ 
+ /^\D*(?!123)/
+     ABC123
+      
+ /^(\D*)(?=\d)(?!123)/
+     ABC445
+ \= Expect no match
+     ABC123
+     
+ /^[W-]46]/
+     W46]789 
+     -46]789
+ \= Expect no match
+     Wall
+     Zebra
+     42
+     [abcd] 
+     ]abcd[
+        
+ /^[W-\]46]/
+     W46]789 
+     Wall
+     Zebra
+     Xylophone  
+     42
+     [abcd] 
+     ]abcd[
+     \\backslash 
+ \= Expect no match
+     -46]789
+     well
+     
+ /\d\d\/\d\d\/\d\d\d\d/
+     01/01/2000
+ 
+ /word (?:[a-zA-Z0-9]+ ){0,10}otherword/
+   word cat dog elephant mussel cow horse canary baboon snake shark otherword
+ \= Expect no match
+   word cat dog elephant mussel cow horse canary baboon snake shark
+ 
+ /word (?:[a-zA-Z0-9]+ ){0,300}otherword/
+ \= Expect no match
+   word cat dog elephant mussel cow horse canary baboon snake shark the quick brown fox and the lazy dog and several other words getting close to thirty by now I hope
+ 
+ /^(a){0,0}/
+     bcd
+     abc
+     aab     
+ 
+ /^(a){0,1}/
+     bcd
+     abc
+     aab  
+ 
+ /^(a){0,2}/
+     bcd
+     abc
+     aab  
+ 
+ /^(a){0,3}/
+     bcd
+     abc
+     aab
+     aaa   
+ 
+ /^(a){0,}/
+     bcd
+     abc
+     aab
+     aaa
+     aaaaaaaa    
+ 
+ /^(a){1,1}/
+     abc
+     aab  
+ \= Expect no match
+     bcd
+ 
+ /^(a){1,2}/
+     abc
+     aab  
+ \= Expect no match
+     bcd
+ 
+ /^(a){1,3}/
+     abc
+     aab
+     aaa   
+ \= Expect no match
+     bcd
+ 
+ /^(a){1,}/
+     abc
+     aab
+     aaa
+     aaaaaaaa    
+ \= Expect no match
+     bcd
+ 
+ /.*\.gif/
+     borfle\nbib.gif\nno
+ 
+ /.{0,}\.gif/
+     borfle\nbib.gif\nno
+ 
+ /.*\.gif/m
+     borfle\nbib.gif\nno
+ 
+ /.*\.gif/s
+     borfle\nbib.gif\nno
+ 
+ /.*\.gif/ms
+     borfle\nbib.gif\nno
+     
+ /.*$/
+     borfle\nbib.gif\nno
+ 
+ /.*$/m
+     borfle\nbib.gif\nno
+ 
+ /.*$/s
+     borfle\nbib.gif\nno
+ 
+ /.*$/ms
+     borfle\nbib.gif\nno
+     
+ /.*$/
+     borfle\nbib.gif\nno\n
+ 
+ /.*$/m
+     borfle\nbib.gif\nno\n
+ 
+ /.*$/s
+     borfle\nbib.gif\nno\n
+ 
+ /.*$/ms
+     borfle\nbib.gif\nno\n
+     
+ /(.*X|^B)/
+     abcde\n1234Xyz
+     BarFoo 
+ \= Expect no match
+     abcde\nBar  
+ 
+ /(.*X|^B)/m
+     abcde\n1234Xyz
+     BarFoo 
+     abcde\nBar  
+ 
+ /(.*X|^B)/s
+     abcde\n1234Xyz
+     BarFoo 
+ \= Expect no match
+     abcde\nBar  
+ 
+ /(.*X|^B)/ms
+     abcde\n1234Xyz
+     BarFoo 
+     abcde\nBar  
+ 
+ /(?s)(.*X|^B)/
+     abcde\n1234Xyz
+     BarFoo 
+ \= Expect no match 
+     abcde\nBar  
+ 
+ /(?s:.*X|^B)/
+     abcde\n1234Xyz
+     BarFoo 
+ \= Expect no match 
+     abcde\nBar  
+ 
+ /^.*B/
+ \= Expect no match
+     abc\nB
+      
+ /(?s)^.*B/
+     abc\nB
+ 
+ /(?m)^.*B/
+     abc\nB
+      
+ /(?ms)^.*B/
+     abc\nB
+ 
+ /(?ms)^B/
+     abc\nB
+ 
+ /(?s)B$/
+     B\n
+ 
+ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/
+     123456654321
+   
+ /^\d\d\d\d\d\d\d\d\d\d\d\d/
+     123456654321 
+ 
+ /^[\d][\d][\d][\d][\d][\d][\d][\d][\d][\d][\d][\d]/
+     123456654321
+   
+ /^[abc]{12}/
+     abcabcabcabc
+     
+ /^[a-c]{12}/
+     abcabcabcabc
+     
+ /^(a|b|c){12}/
+     abcabcabcabc 
+ 
+ /^[abcdefghijklmnopqrstuvwxy0123456789]/
+     n
+ \= Expect no match 
+     z 
+ 
+ /abcde{0,0}/
+     abcd
+ \= Expect no match
+     abce  
+ 
+ /ab[cd]{0,0}e/
+     abe
+ \= Expect no match
+     abcde 
+     
+ /ab(c){0,0}d/
+     abd
+ \= Expect no match
+     abcd   
+ 
+ /a(b*)/
+     a
+     ab
+     abbbb
+ \= Expect no match
+     bbbbb    
+     
+ /ab\d{0}e/
+     abe
+ \= Expect no match
+     ab1e   
+     
+ /"([^\\"]+|\\.)*"/
+     the \"quick\" brown fox
+     \"the \\\"quick\\\" brown fox\" 
+ 
+ /.*?/g,aftertext
+     abc
+   
+ /\b/g,aftertext
+     abc 
+ 
+ /\b/g,aftertext
+     abc 
+ 
+ //g
+     abc
+ 
+ /<tr([\w\W\s\d][^<>]{0,})><TD([\w\W\s\d][^<>]{0,})>([\d]{0,}\.)(.*)((<BR>([\w\W\s\d][^<>]{0,})|[\s]{0,}))<\/a><\/TD><TD([\w\W\s\d][^<>]{0,})>([\w\W\s\d][^<>]{0,})<\/TD><TD([\w\W\s\d][^<>]{0,})>([\w\W\s\d][^<>]{0,})<\/TD><\/TR>/is
+   <TR BGCOLOR='#DBE9E9'><TD align=left valign=top>43.<a href='joblist.cfm?JobID=94 6735&Keyword='>Word Processor<BR>(N-1286)</a></TD><TD align=left valign=top>Lega lstaff.com</TD><TD align=left valign=top>CA - Statewide</TD></TR>
+ 
+ /a[^a]b/
+     acb
+     a\nb
+     
+ /a.b/
+     acb
+ \= Expect no match 
+     a\nb   
+     
+ /a[^a]b/s
+     acb
+     a\nb  
+     
+ /a.b/s
+     acb
+     a\nb  
+ 
+ /^(b+?|a){1,2}?c/
+     bac
+     bbac
+     bbbac
+     bbbbac
+     bbbbbac 
+ 
+ /^(b+|a){1,2}?c/
+     bac
+     bbac
+     bbbac
+     bbbbac
+     bbbbbac 
+     
+ /(?!\A)x/m
+     a\bx\n  
+ \= Expect no match
+     x\nb\n
+     
+ /\x0{ab}/
+     \0{ab} 
+ 
+ /(A|B)*?CD/
+     CD 
+     
+ /(A|B)*CD/
+     CD 
+ 
+ /(?<!bar)foo/
+     foo
+     catfood
+     arfootle
+     rfoosh
+ \= Expect no match
+     barfoo
+     towbarfoo
+ 
+ /\w{3}(?<!bar)foo/
+     catfood
+ \= Expect no match
+     foo
+     barfoo
+     towbarfoo
+ 
+ /(?<=(foo)a)bar/
+     fooabar
+ \= Expect no match
+     bar
+     foobbar
+       
+ /\Aabc\z/m
+     abc
+ \= Expect no match
+     abc\n   
+     qqq\nabc
+     abc\nzzz
+     qqq\nabc\nzzz
+ 
+ "(?>.*/)foo"
+ \= Expect no match
+     /this/is/a/very/long/line/in/deed/with/very/many/slashes/in/it/you/see/
+ 
+ "(?>.*/)foo"
+     /this/is/a/very/long/line/in/deed/with/very/many/slashes/in/and/foo
+ 
+ /(?>(\.\d\d[1-9]?))\d+/
+     1.230003938
+     1.875000282
+ \= Expect no match 
+     1.235 
+ 
+ /^((?>\w+)|(?>\s+))*$/
+     now is the time for all good men to come to the aid of the party
+ \= Expect no match
+     this is not a line with only words and spaces!
+     
+ /(\d+)(\w)/
+     12345a
+     12345+ 
+ 
+ /((?>\d+))(\w)/
+     12345a
+ \= Expect no match
+     12345+ 
+ 
+ /(?>a+)b/
+     aaab
+ 
+ /((?>a+)b)/
+     aaab
+ 
+ /(?>(a+))b/
+     aaab
+ 
+ /(?>b)+/
+     aaabbbccc
+ 
+ /(?>a+|b+|c+)*c/
+     aaabbbbccccd
+     
+ /(a+|b+|c+)*c/
+     aaabbbbccccd
+ 
+ /((?>[^()]+)|\([^()]*\))+/
+     ((abc(ade)ufh()()x
+     
+ /\(((?>[^()]+)|\([^()]+\))+\)/
+     (abc)
+     (abc(def)xyz)
+ \= Expect no match
+     ((()aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa   
+ 
+ /a(?-i)b/i
+     ab
+     Ab
+ \= Expect no match 
+     aB
+     AB
+         
+ /(a (?x)b c)d e/
+     a bcd e
+ \= Expect no match
+     a b cd e
+     abcd e   
+     a bcde 
+  
+ /(a b(?x)c d (?-x)e f)/
+     a bcde f
+ \= Expect no match
+     abcdef  
+ 
+ /(a(?i)b)c/
+     abc
+     aBc
+ \= Expect no match
+     abC
+     aBC  
+     Abc
+     ABc
+     ABC
+     AbC
+     
+ /a(?i:b)c/
+     abc
+     aBc
+ \= Expect no match 
+     ABC
+     abC
+     aBC
+     
+ /a(?i:b)*c/
+     aBc
+     aBBc
+ \= Expect no match 
+     aBC
+     aBBC
+     
+ /a(?=b(?i)c)\w\wd/
+     abcd
+     abCd
+ \= Expect no match
+     aBCd
+     abcD     
+     
+ /(?s-i:more.*than).*million/i
+     more than million
+     more than MILLION
+     more \n than Million 
+ \= Expect no match
+     MORE THAN MILLION    
+     more \n than \n million 
+ 
+ /(?:(?s-i)more.*than).*million/i
+     more than million
+     more than MILLION
+     more \n than Million 
+ \= Expect no match
+     MORE THAN MILLION    
+     more \n than \n million 
+     
+ /(?>a(?i)b+)+c/
+     abc
+     aBbc
+     aBBc 
+ \= Expect no match
+     Abc
+     abAb    
+     abbC 
+     
+ /(?=a(?i)b)\w\wc/
+     abc
+     aBc
+ \= Expect no match
+     Ab 
+     abC
+     aBC     
+     
+ /(?<=a(?i)b)(\w\w)c/
+     abxxc
+     aBxxc
+ \= Expect no match
+     Abxxc
+     ABxxc
+     abxxC      
+ 
+ /^(?(?=abc)\w{3}:|\d\d)$/
+     abc:
+     12
+ \= Expect no match
+     123
+     xyz    
+ 
+ /^(?(?!abc)\d\d|\w{3}:)$/
+     abc:
+     12
+ \= Expect no match
+     123
+     xyz    
+     
+ /(?(?<=foo)bar|cat)/
+     foobar
+     cat
+     fcat
+     focat   
+ \= Expect no match
+     foocat  
+ 
+ /(?(?<!foo)cat|bar)/
+     foobar
+     cat
+     fcat
+     focat   
+ \= Expect no match
+     foocat  
+ 
+ /(?>a*)*/
+     a
+     aa
+     aaaa
+     
+ /(abc|)+/
+     abc
+     abcabc
+     abcabcabc
+     xyz      
+ 
+ /([a]*)*/
+     a
+     aaaaa 
+  
+ /([ab]*)*/
+     a
+     b
+     ababab
+     aaaabcde
+     bbbb    
+  
+ /([^a]*)*/
+     b
+     bbbb
+     aaa   
+  
+ /([^ab]*)*/
+     cccc
+     abab  
+  
+ /([a]*?)*/
+     a
+     aaaa 
+  
+ /([ab]*?)*/
+     a
+     b
+     abab
+     baba   
+  
+ /([^a]*?)*/
+     b
+     bbbb
+     aaa   
+  
+ /([^ab]*?)*/
+     c
+     cccc
+     baba   
+  
+ /(?>a*)*/
+     a
+     aaabcde 
+  
+ /((?>a*))*/
+     aaaaa
+     aabbaa 
+  
+ /((?>a*?))*/
+     aaaaa
+     aabbaa 
+ 
+ /(?(?=[^a-z]+[a-z])  \d{2}-[a-z]{3}-\d{2}  |  \d{2}-\d{2}-\d{2} ) /x
+     12-sep-98
+     12-09-98
+ \= Expect no match
+     sep-12-98
+         
+ /(?i:saturday|sunday)/
+     saturday
+     sunday
+     Saturday
+     Sunday
+     SATURDAY
+     SUNDAY
+     SunDay
+     
+ /(a(?i)bc|BB)x/
+     abcx
+     aBCx
+     bbx
+     BBx
+ \= Expect no match
+     abcX
+     aBCX
+     bbX
+     BBX               
+ 
+ /^([ab](?i)[cd]|[ef])/
+     ac
+     aC
+     bD
+     elephant
+     Europe 
+     frog
+     France
+ \= Expect no match
+     Africa     
+ 
+ /^(ab|a(?i)[b-c](?m-i)d|x(?i)y|z)/
+     ab
+     aBd
+     xy
+     xY
+     zebra
+     Zambesi
+ \= Expect no match
+     aCD  
+     XY  
+ 
+ /(?<=foo\n)^bar/m
+     foo\nbar
+ \= Expect no match
+     bar
+     baz\nbar   
+ 
+ /(?<=(?<!foo)bar)baz/
+     barbaz
+     barbarbaz 
+     koobarbaz 
+ \= Expect no match
+     baz
+     foobarbaz 
+ 
+ # The following tests are taken from the Perl 5.005 test suite; some of them
+ # are compatible with 5.004, but I'd rather not have to sort them out.
+ 
+ /abc/
+     abc
+     xabcy
+     ababc
+ \= Expect no match
+     xbc
+     axc
+     abx
+ 
+ /ab*c/
+     abc
+ 
+ /ab*bc/
+     abc
+     abbc
+     abbbbc
+ 
+ /.{1}/
+     abbbbc
+ 
+ /.{3,4}/
+     abbbbc
+ 
+ /ab{0,}bc/
+     abbbbc
+ 
+ /ab+bc/
+     abbc
+ \= Expect no match
+     abc
+     abq
+ 
+ /ab+bc/
+     abbbbc
+ 
+ /ab{1,}bc/
+     abbbbc
+ 
+ /ab{1,3}bc/
+     abbbbc
+ 
+ /ab{3,4}bc/
+     abbbbc
+ 
+ /ab{4,5}bc/
+ \= Expect no match
+     abq
+     abbbbc
+ 
+ /ab?bc/
+     abbc
+     abc
+ 
+ /ab{0,1}bc/
+     abc
+ 
+ /ab?bc/
+ 
+ /ab?c/
+     abc
+ 
+ /ab{0,1}c/
+     abc
+ 
+ /^abc$/
+     abc
+ \= Expect no match
+     abbbbc
+     abcc
+ 
+ /^abc/
+     abcc
+ 
+ /^abc$/
+ 
+ /abc$/
+     aabc
+     aabc
+ \= Expect no match
+     aabcd
+ 
+ /^/
+     abc
+ 
+ /$/
+     abc
+ 
+ /a.c/
+     abc
+     axc
+ 
+ /a.*c/
+     axyzc
+ 
+ /a[bc]d/
+     abd
+ \= Expect no match
+     axyzd
+     abc
+ 
+ /a[b-d]e/
+     ace
+ 
+ /a[b-d]/
+     aac
+ 
+ /a[-b]/
+     a-
+ 
+ /a[b-]/
+     a-
+ 
+ /a]/
+     a]
+ 
+ /a[]]b/
+     a]b
+ 
+ /a[^bc]d/
+     aed
+ \= Expect no match
+     abd
+     abd
+ 
+ /a[^-b]c/
+     adc
+ 
+ /a[^]b]c/
+     adc
+     a-c
+ \= Expect no match
+     a]c
+ 
+ /\ba\b/
+     a-
+     -a
+     -a-
+ 
+ /\by\b/
+ \= Expect no match
+     xy
+     yz
+     xyz
+ 
+ /\Ba\B/
+ \= Expect no match
+     a-
+     -a
+     -a-
+ 
+ /\By\b/
+     xy
+ 
+ /\by\B/
+     yz
+ 
+ /\By\B/
+     xyz
+ 
+ /\w/
+     a
+ 
+ /\W/
+     -
+ \= Expect no match
+     a
+ 
+ /a\sb/
+     a b
+ 
+ /a\Sb/
+     a-b
+ \= Expect no match
+     a b
+ 
+ /\d/
+     1
+ 
+ /\D/
+     -
+ \= Expect no match
+     1
+ 
+ /[\w]/
+     a
+ 
+ /[\W]/
+     -
+ \= Expect no match
+     a
+ 
+ /a[\s]b/
+     a b
+ 
+ /a[\S]b/
+     a-b
+ \= Expect no match
+     a b
+ 
+ /[\d]/
+     1
+ 
+ /[\D]/
+     -
+ \= Expect no match
+     1
+ 
+ /ab|cd/
+     abc
+     abcd
+ 
+ /()ef/
+     def
+ 
+ /$b/
+ 
+ /a\(b/
+     a(b
+ 
+ /a\(*b/
+     ab
+     a((b
+ 
+ /a\\b/
+     a\\b
+ \= Expect no match
+     a\b
+ 
+ /((a))/
+     abc
+ 
+ /(a)b(c)/
+     abc
+ 
+ /a+b+c/
+     aabbabc
+ 
+ /a{1,}b{1,}c/
+     aabbabc
+ 
+ /a.+?c/
+     abcabc
+ 
+ /(a+|b)*/
+     ab
+ 
+ /(a+|b){0,}/
+     ab
+ 
+ /(a+|b)+/
+     ab
+ 
+ /(a+|b){1,}/
+     ab
+ 
+ /(a+|b)?/
+     ab
+ 
+ /(a+|b){0,1}/
+     ab
+ 
+ /[^ab]*/
+     cde
+ 
+ /abc/
+ \= Expect no match
+     b
+ 
+ /a*/
+ 
+ /([abc])*d/
+     abbbcd
+ 
+ /([abc])*bcd/
+     abcd
+ 
+ /a|b|c|d|e/
+     e
+ 
+ /(a|b|c|d|e)f/
+     ef
+ 
+ /abcd*efg/
+     abcdefg
+ 
+ /ab*/
+     xabyabbbz
+     xayabbbz
+ 
+ /(ab|cd)e/
+     abcde
+ 
+ /[abhgefdc]ij/
+     hij
+ 
+ /^(ab|cd)e/
+ 
+ /(abc|)ef/
+     abcdef
+ 
+ /(a|b)c*d/
+     abcd
+ 
+ /(ab|ab*)bc/
+     abc
+ 
+ /a([bc]*)c*/
+     abc
+ 
+ /a([bc]*)(c*d)/
+     abcd
+ 
+ /a([bc]+)(c*d)/
+     abcd
+ 
+ /a([bc]*)(c+d)/
+     abcd
+ 
+ /a[bcd]*dcdcde/
+     adcdcde
+ 
+ /a[bcd]+dcdcde/
+ \= Expect no match
+     abcde
+     adcdcde
+ 
+ /(ab|a)b*c/
+     abc
+ 
+ /((a)(b)c)(d)/
+     abcd
+ 
+ /[a-zA-Z_][a-zA-Z0-9_]*/
+     alpha
+ 
+ /^a(bc+|b[eh])g|.h$/
+     abh
+ 
+ /(bc+d$|ef*g.|h?i(j|k))/
+     effgz
+     ij
+     reffgz
+ \= Expect no match
+     effg
+     bcdd
+ 
+ /((((((((((a))))))))))/
+     a
+ 
+ /(((((((((a)))))))))/
+     a
+ 
+ /multiple words of text/
+ \= Expect no match
+     aa
+     uh-uh
+ 
+ /multiple words/
+     multiple words, yeah
+ 
+ /(.*)c(.*)/
+     abcde
+ 
+ /\((.*), (.*)\)/
+     (a, b)
+ 
+ /[k]/
+ 
+ /abcd/
+     abcd
+ 
+ /a(bc)d/
+     abcd
+ 
+ /a[-]?c/
+     ac
+ 
+ /abc/i
+     ABC
+     XABCY
+     ABABC
+ \= Expect no match
+     aaxabxbaxbbx
+     XBC
+     AXC
+     ABX
+ 
+ /ab*c/i
+     ABC
+ 
+ /ab*bc/i
+     ABC
+     ABBC
+ 
+ /ab*?bc/i
+     ABBBBC
+ 
+ /ab{0,}?bc/i
+     ABBBBC
+ 
+ /ab+?bc/i
+     ABBC
+ 
+ /ab+bc/i
+ \= Expect no match
+     ABC
+     ABQ
+ 
+ /ab{1,}bc/i
+ 
+ /ab+bc/i
+     ABBBBC
+ 
+ /ab{1,}?bc/i
+     ABBBBC
+ 
+ /ab{1,3}?bc/i
+     ABBBBC
+ 
+ /ab{3,4}?bc/i
+     ABBBBC
+ 
+ /ab{4,5}?bc/i
+ \= Expect no match
+     ABQ
+     ABBBBC
+ 
+ /ab??bc/i
+     ABBC
+     ABC
+ 
+ /ab{0,1}?bc/i
+     ABC
+ 
+ /ab??bc/i
+ 
+ /ab??c/i
+     ABC
+ 
+ /ab{0,1}?c/i
+     ABC
+ 
+ /^abc$/i
+     ABC
+ \= Expect no match
+     ABBBBC
+     ABCC
+ 
+ /^abc/i
+     ABCC
+ 
+ /^abc$/i
+ 
+ /abc$/i
+     AABC
+ 
+ /^/i
+     ABC
+ 
+ /$/i
+     ABC
+ 
+ /a.c/i
+     ABC
+     AXC
+ 
+ /a.*?c/i
+     AXYZC
+ 
+ /a.*c/i
+     AABC
+ \= Expect no match
+     AXYZD
+ 
+ /a[bc]d/i
+     ABD
+ 
+ /a[b-d]e/i
+     ACE
+ \= Expect no match
+     ABC
+     ABD
+ 
+ /a[b-d]/i
+     AAC
+ 
+ /a[-b]/i
+     A-
+ 
+ /a[b-]/i
+     A-
+ 
+ /a]/i
+     A]
+ 
+ /a[]]b/i
+     A]B
+ 
+ /a[^bc]d/i
+     AED
+ 
+ /a[^-b]c/i
+     ADC
+ \= Expect no match
+     ABD
+     A-C
+ 
+ /a[^]b]c/i
+     ADC
+ 
+ /ab|cd/i
+     ABC
+     ABCD
+ 
+ /()ef/i
+     DEF
+ 
+ /$b/i
+ \= Expect no match
+     A]C
+     B
+ 
+ /a\(b/i
+     A(B
+ 
+ /a\(*b/i
+     AB
+     A((B
+ 
+ /a\\b/i
+ \= Expect no match
+     A\=notbol
+ 
+ /((a))/i
+     ABC
+ 
+ /(a)b(c)/i
+     ABC
+ 
+ /a+b+c/i
+     AABBABC
+ 
+ /a{1,}b{1,}c/i
+     AABBABC
+ 
+ /a.+?c/i
+     ABCABC
+ 
+ /a.*?c/i
+     ABCABC
+ 
+ /a.{0,5}?c/i
+     ABCABC
+ 
+ /(a+|b)*/i
+     AB
+ 
+ /(a+|b){0,}/i
+     AB
+ 
+ /(a+|b)+/i
+     AB
+ 
+ /(a+|b){1,}/i
+     AB
+ 
+ /(a+|b)?/i
+     AB
+ 
+ /(a+|b){0,1}/i
+     AB
+ 
+ /(a+|b){0,1}?/i
+     AB
+ 
+ /[^ab]*/i
+     CDE
+ 
+ /abc/i
+ 
+ /a*/i
+ 
+ /([abc])*d/i
+     ABBBCD
+ 
+ /([abc])*bcd/i
+     ABCD
+ 
+ /a|b|c|d|e/i
+     E
+ 
+ /(a|b|c|d|e)f/i
+     EF
+ 
+ /abcd*efg/i
+     ABCDEFG
+ 
+ /ab*/i
+     XABYABBBZ
+     XAYABBBZ
+ 
+ /(ab|cd)e/i
+     ABCDE
+ 
+ /[abhgefdc]ij/i
+     HIJ
+ 
+ /^(ab|cd)e/i
+ \= Expect no match
+     ABCDE
+ 
+ /(abc|)ef/i
+     ABCDEF
+ 
+ /(a|b)c*d/i
+     ABCD
+ 
+ /(ab|ab*)bc/i
+     ABC
+ 
+ /a([bc]*)c*/i
+     ABC
+ 
+ /a([bc]*)(c*d)/i
+     ABCD
+ 
+ /a([bc]+)(c*d)/i
+     ABCD
+ 
+ /a([bc]*)(c+d)/i
+     ABCD
+ 
+ /a[bcd]*dcdcde/i
+     ADCDCDE
+ 
+ /a[bcd]+dcdcde/i
+ 
+ /(ab|a)b*c/i
+     ABC
+ 
+ /((a)(b)c)(d)/i
+     ABCD
+ 
+ /[a-zA-Z_][a-zA-Z0-9_]*/i
+     ALPHA
+ 
+ /^a(bc+|b[eh])g|.h$/i
+     ABH
+ 
+ /(bc+d$|ef*g.|h?i(j|k))/i
+     EFFGZ
+     IJ
+     REFFGZ
+ \= Expect no match
+     ADCDCDE
+     EFFG
+     BCDD
+ 
+ /((((((((((a))))))))))/i
+     A
+ 
+ /(((((((((a)))))))))/i
+     A
+ 
+ /(?:(?:(?:(?:(?:(?:(?:(?:(?:(a))))))))))/i
+     A
+ 
+ /(?:(?:(?:(?:(?:(?:(?:(?:(?:(a|b|c))))))))))/i
+     C
+ 
+ /multiple words of text/i
+ \= Expect no match
+     AA
+     UH-UH
+ 
+ /multiple words/i
+     MULTIPLE WORDS, YEAH
+ 
+ /(.*)c(.*)/i
+     ABCDE
+ 
+ /\((.*), (.*)\)/i
+     (A, B)
+ 
+ /[k]/i
+ 
+ /abcd/i
+     ABCD
+ 
+ /a(bc)d/i
+     ABCD
+ 
+ /a[-]?c/i
+     AC
+ 
+ /a(?!b)./
+     abad
+ 
+ /a(?=d)./
+     abad
+ 
+ /a(?=c|d)./
+     abad
+ 
+ /a(?:b|c|d)(.)/
+     ace
+ 
+ /a(?:b|c|d)*(.)/
+     ace
+ 
+ /a(?:b|c|d)+?(.)/
+     ace
+     acdbcdbe
+ 
+ /a(?:b|c|d)+(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){2}(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){4,5}(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){4,5}?(.)/
+     acdbcdbe
+ 
+ /((foo)|(bar))*/
+     foobar
+ 
+ /a(?:b|c|d){6,7}(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){6,7}?(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){5,6}(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){5,6}?(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){5,7}(.)/
+     acdbcdbe
+ 
+ /a(?:b|c|d){5,7}?(.)/
+     acdbcdbe
+ 
+ /a(?:b|(c|e){1,2}?|d)+?(.)/
+     ace
+ 
+ /^(.+)?B/
+     AB
+ 
+ /^([^a-z])|(\^)$/
+     .
+ 
+ /^[<>]&/
+     <&OUT
+ 
+ /(?:(f)(o)(o)|(b)(a)(r))*/
+     foobar
+ 
+ /(?<=a)b/
+     ab
+ \= Expect no match
+     cb
+     b
+ 
+ /(?<!c)b/
+     ab
+     b
+     b
+ 
+ /(?:..)*a/
+     aba
+ 
+ /(?:..)*?a/
+     aba
+ 
+ /^(){3,5}/
+     abc
+ 
+ /^(a+)*ax/
+     aax
+ 
+ /^((a|b)+)*ax/
+     aax
+ 
+ /^((a|bc)+)*ax/
+     aax
+ 
+ /(a|x)*ab/
+     cab
+ 
+ /(a)*ab/
+     cab
+ 
+ /(?:(?i)a)b/
+     ab
+ 
+ /((?i)a)b/
+     ab
+ 
+ /(?:(?i)a)b/
+     Ab
+ 
+ /((?i)a)b/
+     Ab
+ 
+ /(?:(?i)a)b/
+ \= Expect no match
+     cb
+     aB
+ 
+ /((?i)a)b/
+ 
+ /(?i:a)b/
+     ab
+ 
+ /((?i:a))b/
+     ab
+ 
+ /(?i:a)b/
+     Ab
+ 
+ /((?i:a))b/
+     Ab
+ 
+ /(?i:a)b/
+ \= Expect no match
+     aB
+     aB
+ 
+ /((?i:a))b/
+ 
+ /(?:(?-i)a)b/i
+     ab
+ 
+ /((?-i)a)b/i
+     ab
+ 
+ /(?:(?-i)a)b/i
+     aB
+ 
+ /((?-i)a)b/i
+     aB
+ 
+ /(?:(?-i)a)b/i
+     aB
+ \= Expect no match
+     Ab
+ 
+ /((?-i)a)b/i
+ 
+ /(?:(?-i)a)b/i
+     aB
+ 
+ /((?-i)a)b/i
+     aB
+ 
+ /(?:(?-i)a)b/i
+ \= Expect no match
+     Ab
+     AB
+ 
+ /((?-i)a)b/i
+ 
+ /(?-i:a)b/i
+     ab
+ 
+ /((?-i:a))b/i
+     ab
+ 
+ /(?-i:a)b/i
+     aB
+ 
+ /((?-i:a))b/i
+     aB
+ 
+ /(?-i:a)b/i
+ \= Expect no match
+     AB
+     Ab
+ 
+ /((?-i:a))b/i
+ 
+ /(?-i:a)b/i
+     aB
+ 
+ /((?-i:a))b/i
+     aB
+ 
+ /(?-i:a)b/i
+ \= Expect no match
+     Ab
+     AB
+ 
+ /((?-i:a))b/i
+ 
+ /((?-i:a.))b/i
+ \= Expect no match
+     AB
+     a\nB
+ 
+ /((?s-i:a.))b/i
+     a\nB
+ 
+ /(?:c|d)(?:)(?:a(?:)(?:b)(?:b(?:))(?:b(?:)(?:b)))/
+     cabbbb
+ 
+ /(?:c|d)(?:)(?:aaaaaaaa(?:)(?:bbbbbbbb)(?:bbbbbbbb(?:))(?:bbbbbbbb(?:)(?:bbbbbbbb)))/
+     caaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ 
+ /foo\w*\d{4}baz/
+     foobar1234baz
+ 
+ /x(~~)*(?:(?:F)?)?/
+     x~~
+ 
+ /^a(?#xxx){3}c/
+     aaac
+ 
+ /^a (?#xxx) (?#yyy) {3}c/x
+     aaac
+ 
+ /(?<![cd])b/
+ \= Expect no match
+     B\nB
+     dbcb
+ 
+ /(?<![cd])[ab]/
+     dbaacb
+ 
+ /(?<!(c|d))b/
+ 
+ /(?<!(c|d))[ab]/
+     dbaacb
+ 
+ /(?<!cd)[ab]/
+     cdaccb
+ 
+ /^(?:a?b?)*$/
+ \= Expect no match
+     dbcb
+     a--
+ 
+ /((?s)^a(.))((?m)^b$)/
+     a\nb\nc\n
+ 
+ /((?m)^b$)/
+     a\nb\nc\n
+ 
+ /(?m)^b/
+     a\nb\n
+ 
+ /(?m)^(b)/
+     a\nb\n
+ 
+ /((?m)^b)/
+     a\nb\n
+ 
+ /\n((?m)^b)/
+     a\nb\n
+ 
+ /((?s).)c(?!.)/
+     a\nb\nc\n
+     a\nb\nc\n
+ 
+ /((?s)b.)c(?!.)/
+     a\nb\nc\n
+     a\nb\nc\n
+ 
+ /^b/
+ 
+ /()^b/
+ \= Expect no match
+     a\nb\nc\n
+     a\nb\nc\n
+ 
+ /((?m)^b)/
+     a\nb\nc\n
+ 
+ /(?(?!a)a|b)/
+ 
+ /(?(?!a)b|a)/
+     a
+ 
+ /(?(?=a)b|a)/
+ \= Expect no match
+     a
+     a
+ 
+ /(?(?=a)a|b)/
+     a
+ 
+ /(\w+:)+/
+     one:
+ 
+ /$(?<=^(a))/
+     a
+ 
+ /([\w:]+::)?(\w+)$/
+     abcd
+     xy:z:::abcd
+ 
+ /^[^bcd]*(c+)/
+     aexycd
+ 
+ /(a*)b+/
+     caab
+ 
+ /([\w:]+::)?(\w+)$/
+     abcd
+     xy:z:::abcd
+ \= Expect no match
+     abcd:
+     abcd:
+ 
+ /^[^bcd]*(c+)/
+     aexycd
+ 
+ /(>a+)ab/
+ 
+ /(?>a+)b/
+     aaab
+ 
+ /([[:]+)/
+     a:[b]:
+ 
+ /([[=]+)/
+     a=[b]=
+ 
+ /([[.]+)/
+     a.[b].
+ 
+ /((?>a+)b)/
+     aaab
+ 
+ /(?>(a+))b/
+     aaab
+ 
+ /((?>[^()]+)|\([^()]*\))+/
+     ((abc(ade)ufh()()x
+ 
+ /a\Z/
+ \= Expect no match
+     aaab
+     a\nb\n
+ 
+ /b\Z/
+     a\nb\n
+ 
+ /b\z/
+ 
+ /b\Z/
+     a\nb
+ 
+ /b\z/
+     a\nb
+     
+ /(?>.*)(?<=(abcd|wxyz))/
+     alphabetabcd
+     endingwxyz
+ \= Expect no match
+     a rather long string that doesn't end with one of them
+ 
+ /word (?>(?:(?!otherword)[a-zA-Z0-9]+ ){0,30})otherword/
+     word cat dog elephant mussel cow horse canary baboon snake shark otherword
+ \= Expect no match
+     word cat dog elephant mussel cow horse canary baboon snake shark
+   
+ /word (?>[a-zA-Z0-9]+ ){0,30}otherword/
+ \= Expect no match
+     word cat dog elephant mussel cow horse canary baboon snake shark the quick brown fox and the lazy dog and several other words getting close to thirty by now I hope
+ 
+ /(?<=\d{3}(?!999))foo/
+     999foo
+     123999foo 
+ \= Expect no match
+     123abcfoo
+     
+ /(?<=(?!...999)\d{3})foo/
+     999foo
+     123999foo 
+ \= Expect no match
+     123abcfoo
+ 
+ /(?<=\d{3}(?!999)...)foo/
+     123abcfoo
+     123456foo 
+ \= Expect no match
+     123999foo  
+     
+ /(?<=\d{3}...)(?<!999)foo/
+     123abcfoo   
+     123456foo 
+ \= Expect no match
+     123999foo  
+ 
+ /((Z)+|A)*/
+     ZABCDEFG
+ 
+ /(Z()|A)*/
+     ZABCDEFG
+ 
+ /(Z(())|A)*/
+     ZABCDEFG
+ 
+ /((?>Z)+|A)*/
+     ZABCDEFG
+ 
+ /((?>)+|A)*/
+     ZABCDEFG
+ 
+ /a*/g
+     abbab
+ 
+ /^[\d-a]/
+     abcde
+     -things
+     0digit
+ \= Expect no match
+     bcdef    
+     
+ /[[:space:]]+/
+     > \x09\x0a\x0c\x0d\x0b<
+      
+ /[[:blank:]]+/
+     > \x09\x0a\x0c\x0d\x0b<
+      
+ /[\s]+/
+     > \x09\x0a\x0c\x0d\x0b<
+      
+ /\s+/
+     > \x09\x0a\x0c\x0d\x0b<
+      
+ /ab/x
+     ab
+ 
+ /(?!\A)x/m
+   a\nxb\n
+ 
+ /(?!^)x/m
+ \= Expect no match
+     a\nxb\n
+ 
+ /abc\Qabc\Eabc/
+     abcabcabc
+     
+ /abc\Q(*+|\Eabc/
+     abc(*+|abc 
+ 
+ /   abc\Q abc\Eabc/x
+     abc abcabc
+ \= Expect no match
+     abcabcabc  
+     
+ /abc#comment
+     \Q#not comment
+     literal\E/x
+     abc#not comment\n    literal     
+ 
+ /abc#comment
+     \Q#not comment
+     literal/x
+     abc#not comment\n    literal     
+ 
+ /abc#comment
+     \Q#not comment
+     literal\E #more comment
+     /x
+     abc#not comment\n    literal     
+ 
+ /abc#comment
+     \Q#not comment
+     literal\E #more comment/x
+     abc#not comment\n    literal     
+ 
+ /\Qabc\$xyz\E/
+     abc\\\$xyz
+ 
+ /\Qabc\E\$\Qxyz\E/
+     abc\$xyz
+ 
+ /\Gabc/
+     abc
+ \= Expect no match
+     xyzabc  
+ 
+ /\Gabc./g
+     abc1abc2xyzabc3
+ 
+ /abc./g
+     abc1abc2xyzabc3 
+ 
+ /a(?x: b c )d/
+     XabcdY
+ \= Expect no match 
+     Xa b c d Y 
+ 
+ /((?x)x y z | a b c)/
+     XabcY
+     AxyzB 
+ 
+ /(?i)AB(?-i)C/
+     XabCY
+ \= Expect no match
+     XabcY  
+ 
+ /((?i)AB(?-i)C|D)E/
+     abCE
+     DE
+ \= Expect no match
+     abcE
+     abCe  
+     dE
+     De    
+ 
+ /[z\Qa-d]\E]/
+     z
+     a
+     -
+     d
+     ] 
+ \= Expect no match
+     b     
+ 
+ /(a+)*b/
+ \= Expect no match
+     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 
+     
+ /(?i)reg(?:ul(?:[a‰]|ae)r|ex)/
+     REGular
+     regulaer
+     Regex  
+     regul‰r 
+ 
+ /≈ÊÂ‰[‡-ˇ¿-ﬂ]+/
+     ≈ÊÂ‰‡
+     ≈ÊÂ‰ˇ
+     ≈ÊÂ‰¿
+     ≈ÊÂ‰ﬂ
+ 
+ /(?<=Z)X./
+     \x84XAZXB
+ 
+ /^(?(2)a|(1)(2))+$/
+     123a
+ 
+ /(?<=a|bbbb)c/
+     ac
+     bbbbc
+ 
+ /line\nbreak/
+     this is a line\nbreak
+     line one\nthis is a line\nbreak in the second line 
+ 
+ /line\nbreak/firstline
+     this is a line\nbreak
+ \= Expect no match 
+     line one\nthis is a line\nbreak in the second line 
+ 
+ /line\nbreak/m,firstline
+     this is a line\nbreak
+ \= Expect no match 
+     line one\nthis is a line\nbreak in the second line 
+ 
+ /1234/
+     123\=ps
+ \= Expect no match 
+     a4\=ps,dfa_restart
+ 
+ /1234/
+     123\=ps
+     4\=ps,dfa_restart
+ 
+ /^/gm
+     a\nb\nc\n
+     \ 
+     
+ /(?<=C\n)^/gm
+     A\nC\nC\n 
+ 
+ /(?s)A?B/
+     AB
+     aB  
+ 
+ /(?s)A*B/
+     AB
+     aB  
+ 
+ /(?m)A?B/
+     AB
+     aB  
+ 
+ /(?m)A*B/
+     AB
+     aB  
+ 
+ /Content-Type\x3A[^\r\n]{6,}/
+     Content-Type:xxxxxyyy 
+ 
+ /Content-Type\x3A[^\r\n]{6,}z/
+     Content-Type:xxxxxyyyz
+ 
+ /Content-Type\x3A[^a]{6,}/
+     Content-Type:xxxyyy 
+ 
+ /Content-Type\x3A[^a]{6,}z/
+     Content-Type:xxxyyyz
+ 
+ /^abc/Im,newline=lf
+     xyz\nabc
+     xyz\r\nabc
+ \= Expect no match
+     xyz\rabc
+     xyzabc\r
+     xyzabc\rpqr
+     xyzabc\r\n
+     xyzabc\r\npqr
+ 
+ /^abc/Im,newline=crlf
+     xyz\r\nabclf>
+ \= Expect no match
+     xyz\nabclf
+     xyz\rabclf
+     
+ /^abc/Im,newline=cr
+     xyz\rabc
+ \= Expect no match
+     xyz\nabc
+     xyz\r\nabc
+ 
+ /.*/I,newline=lf
+     abc\ndef
+     abc\rdef
+     abc\r\ndef
+ 
+ /.*/I,newline=cr
+     abc\ndef
+     abc\rdef
+     abc\r\ndef
+ 
+ /.*/I,newline=crlf
+     abc\ndef
+     abc\rdef
+     abc\r\ndef
+ 
+ /\w+(.)(.)?def/Is
+     abc\ndef
+     abc\rdef
+     abc\r\ndef
+ 
+ /\w+(.)(.)?def/s
+     abc\ndef
+     abc\rdef
+     abc\r\ndef
+ 
+ /^\w+=.*(\\\n.*)*/
+     abc=xyz\\\npqr
+ 
+ /^(a()*)*/
+     aaaa
+ 
+ /^(?:a(?:(?:))*)*/
+     aaaa
+ 
+ /^(a()+)+/
+     aaaa
+ 
+ /^(?:a(?:(?:))+)+/
+     aaaa
+ 
+ /(a|)*\d/
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4
+ \= Expect no match
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ 
+ /(?>a|)*\d/
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4
+ \= Expect no match
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ 
+ /(?:a|)*\d/
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4
+ \= Expect no match
+   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ 
+ /^a.b/newline=lf
+     a\rb
+ \= Expect no match
+     a\nb
+ 
+ /^a.b/newline=cr
+     a\nb
+ \= Expect no match
+     a\rb
+ 
+ /^a.b/newline=anycrlf
+     a\x85b
+ \= Expect no match
+     a\rb
+ 
+ /^a.b/newline=any
+ \= Expect no match
+     a\nb
+     a\rb
+     a\x85b
+ 
+ /^abc./gmx,newline=any
+     abc1 \x0aabc2 \x0babc3xx \x0cabc4 \x0dabc5xx \x0d\x0aabc6 \x85abc7 JUNK
+ 
+ /abc.$/gmx,newline=any
+     abc1\x0a abc2\x0b abc3\x0c abc4\x0d abc5\x0d\x0a abc6\x85 abc9
+ 
+ /^a\Rb/bsr=unicode
+     a\nb
+     a\rb
+     a\r\nb
+     a\x0bb
+     a\x0cb
+     a\x85b   
+ \= Expect no match
+     a\n\rb    
+ 
+ /^a\R*b/bsr=unicode
+     ab
+     a\nb
+     a\rb
+     a\r\nb
+     a\x0bb
+     a\x0cb
+     a\x85b   
+     a\n\rb    
+     a\n\r\x85\x0cb 
+ 
+ /^a\R+b/bsr=unicode
+     a\nb
+     a\rb
+     a\r\nb
+     a\x0bb
+     a\x0cb
+     a\x85b   
+     a\n\rb    
+     a\n\r\x85\x0cb 
+ \= Expect no match
+     ab  
+     
+ /^a\R{1,3}b/bsr=unicode
+     a\nb
+     a\n\rb
+     a\n\r\x85b
+     a\r\n\r\nb 
+     a\r\n\r\n\r\nb 
+     a\n\r\n\rb
+     a\n\n\r\nb 
+ \= Expect no match
+     a\n\n\n\rb
+     a\r
+ 
+ /.+foo/
+     afoo
+ \= Expect no match 
+     \r\nfoo 
+     \nfoo 
+ 
+ /.+foo/newline=crlf
+     afoo
+     \nfoo 
+ \= Expect no match 
+     \r\nfoo 
+ 
+ /.+foo/newline=any
+     afoo
+ \= Expect no match 
+     \nfoo 
+     \r\nfoo 
+ 
+ /.+foo/s
+     afoo
+     \r\nfoo 
+     \nfoo 
+ 
+ /^$/gm,newline=any
+     abc\r\rxyz
+     abc\n\rxyz  
+ \= Expect no match 
+     abc\r\nxyz
+ 
+ /^X/m
+     XABC
+ \= Expect no match 
+     XABC\=notbol
+ 
+ /(?m)^$/g,newline=any,aftertext
+     abc\r\n\r\n
+ 
+ /(?m)^$|^\r\n/g,newline=any,aftertext
+     abc\r\n\r\n
+     
+ /(?m)$/g,newline=any,aftertext
+     abc\r\n\r\n
+ 
+ /(?|(abc)|(xyz))/
+    >abc<
+    >xyz< 
+ 
+ /(x)(?|(abc)|(xyz))(x)/
+     xabcx
+     xxyzx 
+ 
+ /(x)(?|(abc)(pqr)|(xyz))(x)/
+     xabcpqrx
+     xxyzx 
+ 
+ /(?|(abc)|(xyz))(?1)/
+     abcabc
+     xyzabc 
+ \= Expect no match 
+     xyzxyz 
+  
+ /\H\h\V\v/
+     X X\x0a
+     X\x09X\x0b
+ \= Expect no match
+     \xa0 X\x0a   
+     
+ /\H*\h+\V?\v{3,4}/
+     \x09\x20\xa0X\x0a\x0b\x0c\x0d\x0a
+     \x09\x20\xa0\x0a\x0b\x0c\x0d\x0a
+     \x09\x20\xa0\x0a\x0b\x0c
+ \= Expect no match 
+     \x09\x20\xa0\x0a\x0b
+      
+ /\H{3,4}/
+     XY  ABCDE
+     XY  PQR ST 
+     
+ /.\h{3,4}./
+     XY  AB    PQRS
+ 
+ /\h*X\h?\H+Y\H?Z/
+     >XNNNYZ
+     >  X NYQZ
+ \= Expect no match
+     >XYZ   
+     >  X NY Z
+ 
+ /\v*X\v?Y\v+Z\V*\x0a\V+\x0b\V{2,3}\x0c/
+     >XY\x0aZ\x0aA\x0bNN\x0c
+     >\x0a\x0dX\x0aY\x0a\x0bZZZ\x0aAAA\x0bNNN\x0c
+ 
+ /.+A/newline=crlf
+ \= Expect no match
+     \r\nA
+     
+ /\nA/newline=crlf
+     \r\nA 
+ 
+ /[\r\n]A/newline=crlf
+     \r\nA 
+ 
+ /(\r|\n)A/newline=crlf
+     \r\nA 
+ 
+ /a\Rb/I,bsr=anycrlf
+     a\rb
+     a\nb
+     a\r\nb
+ \= Expect no match
+     a\x85b
+     a\x0bb     
+ 
+ /a\Rb/I,bsr=unicode
+     a\rb
+     a\nb
+     a\r\nb
+     a\x85b
+     a\x0bb     
+     
+ /a\R?b/I,bsr=anycrlf
+     a\rb
+     a\nb
+     a\r\nb
+ \= Expect no match
+     a\x85b
+     a\x0bb     
+ 
+ /a\R?b/I,bsr=unicode
+     a\rb
+     a\nb
+     a\r\nb
+     a\x85b
+     a\x0bb     
+     
+ /a\R{2,4}b/I,bsr=anycrlf
+     a\r\n\nb
+     a\n\r\rb
+     a\r\n\r\n\r\n\r\nb
+ \= Expect no match
+     a\x0b\x0bb     
+     a\x85\x85b
+ 
+ /a\R{2,4}b/I,bsr=unicode
+     a\r\rb
+     a\n\n\nb
+     a\r\n\n\r\rb
+     a\x85\x85b
+     a\x0b\x0bb     
+ \= Expect no match 
+     a\r\r\r\r\rb 
+     
+ /a(?!)|\wbc/
+     abc 
+ 
+ /a[]b/alt_bsux,allow_empty_class,match_unset_backref,dupnames
+ \= Expect no match
+     ab
+ 
+ /a[]+b/alt_bsux,allow_empty_class,match_unset_backref,dupnames
+ \= Expect no match
+     ab 
+ 
+ /a[]*+b/alt_bsux,allow_empty_class,match_unset_backref,dupnames
+ \= Expect no match
+     ab 
+ 
+ /a[^]b/alt_bsux,allow_empty_class,match_unset_backref,dupnames
+     aXb
+     a\nb 
+ \= Expect no match
+     ab  
+     
+ /a[^]+b/alt_bsux,allow_empty_class,match_unset_backref,dupnames
+     aXb
+     a\nX\nXb 
+ \= Expect no match
+     ab  
+ 
+ /X$/dollar_endonly
+     X
+ \= Expect no match 
+     X\n 
+ 
+ /X$/
+     X
+     X\n 
+ 
+ /xyz/auto_callout
+   xyz 
+   abcxyz 
+ \= Expect no match 
+   abc
+   abcxypqr  
+ 
+ /xyz/auto_callout,no_start_optimize
+   abcxyz 
+ \= Expect no match 
+   abc
+   abcxypqr  
+ 
+ /(*NO_START_OPT)xyz/auto_callout
+   abcxyz 
+   
+ /(?C)ab/
+   ab
+   ab\=callout_none
+   
+ /ab/auto_callout
+   ab
+   ab\=callout_none
+ 
+ /^"((?(?=[a])[^"])|b)*"$/auto_callout
+     "ab"
+     "ab"\=callout_none
+ 
+ /\d+X|9+Y/
+     ++++123999\=ps
+     ++++123999Y\=ps
+ 
+ /Z(*F)/
+ \= Expect no match 
+     Z\=ps
+     ZA\=ps
+     
+ /Z(?!)/
+ \= Expect no match 
+     Z\=ps
+     ZA\=ps
+ 
+ /dog(sbody)?/
+     dogs\=ps
+     dogs\=ph
+     
+ /dog(sbody)??/
+     dogs\=ps
+     dogs\=ph
+ 
+ /dog|dogsbody/
+     dogs\=ps
+     dogs\=ph
+  
+ /dogsbody|dog/
+     dogs\=ps
+     dogs\=ph
+ 
+ /Z(*F)Q|ZXY/
+     Z\=ps
+ \= Expect no match 
+     ZA\=ps
+     X\=ps
+ 
+ /\bthe cat\b/
+     the cat\=ps
+     the cat\=ph
+ 
+ /dog(sbody)?/
+     dogs\=ps
+     body\=dfa_restart
+ 
+ /dog(sbody)?/
+     dogs\=ph
+     body\=dfa_restart
+ 
+ /abc/
+    abc\=ps
+    abc\=ph
+ 
+ /abc\K123/
+     xyzabc123pqr
+     
+ /(?<=abc)123/
+     xyzabc123pqr 
+     xyzabc12\=ps
+     xyzabc12\=ph
+ 
+ /\babc\b/
+     +++abc+++
+     +++ab\=ps
+     +++ab\=ph
+ 
+ /(?=C)/g,aftertext
+     ABCDECBA
+ 
+ /(abc|def|xyz)/I
+     terhjk;abcdaadsfe
+     the quick xyz brown fox 
+ \= Expect no match
+     thejk;adlfj aenjl;fda asdfasd ehj;kjxyasiupd
+ 
+ /(abc|def|xyz)/I,no_start_optimize
+     terhjk;abcdaadsfe
+     the quick xyz brown fox
+ \= Expect no match
+     thejk;adlfj aenjl;fda asdfasd ehj;kjxyasiupd
+ 
+ /abcd*/aftertext
+     xxxxabcd\=ps
+     xxxxabcd\=ph
+     dddxxx\=dfa_restart
+     xxxxabcd\=ph
+     xxx\=dfa_restart
+ 
+ /abcd*/i
+     xxxxabcd\=ps
+     xxxxabcd\=ph
+     XXXXABCD\=ps
+     XXXXABCD\=ph
+ 
+ /abc\d*/
+     xxxxabc1\=ps
+     xxxxabc1\=ph
+ 
+ /abc[de]*/
+     xxxxabcde\=ps
+     xxxxabcde\=ph
+ 
+ /(?:(?1)|B)(A(*F)|C)/
+     ABCD
+     CCD
+ \= Expect no match
+     CAD   
+ 
+ /^(?:(?1)|B)(A(*F)|C)/
+     CCD
+     BCD 
+ \= Expect no match
+     ABCD
+     CAD
+     BAD    
+ 
+ /^(?!a(*SKIP)b)/
+     ac
+     
+ /^(?=a(*SKIP)b|ac)/
+     ac
+     
+ /^(?=a(*THEN)b|ac)/
+     ac
+     
+ /^(?=a(*PRUNE)b)/
+     ab  
+ 
+ /^(?(?!a(*SKIP)b))/
+     ac
+ 
+ /(?<=abc)def/
+     abc\=ph
+ 
+ /abc$/
+     abc
+     abc\=ps
+     abc\=ph
+ 
+ /abc$/m
+     abc
+     abc\n
+     abc\=ph
+     abc\n\=ph
+     abc\=ps
+     abc\n\=ps
+ 
+ /abc\z/
+     abc
+     abc\=ps
+     abc\=ph
+ 
+ /abc\Z/
+     abc
+     abc\=ps
+     abc\=ph
+ 
+ /abc\b/
+     abc
+     abc\=ps
+     abc\=ph
+ 
+ /abc\B/
+     abc\=ps
+     abc\=ph
+ \= Expect no match 
+     abc
+ 
+ /.+/
+     abc\=offset=0
+     abc\=offset=1
+     abc\=offset=2
+ \= Bad offsets
+     abc\=offset=4
+     abc\=offset=-4 
+ \= Expect no match 
+     abc\=offset=3
+ 
+ /^(?:a)++\w/
+      aaaab
+ \= Expect no match 
+      aaaa 
+      bbb 
+ 
+ /^(?:aa|(?:a)++\w)/
+      aaaab
+      aaaa 
+ \= Expect no match 
+      bbb 
+ 
+ /^(?:a)*+\w/
+      aaaab
+      bbb 
+ \= Expect no match 
+      aaaa 
+ 
+ /^(a)++\w/
+      aaaab
+ \= Expect no match 
+      aaaa 
+      bbb 
+ 
+ /^(a|)++\w/
+      aaaab
+ \= Expect no match 
+      aaaa 
+      bbb 
+ 
+ /(?=abc){3}abc/aftertext
+     abcabcabc
+ \= Expect no match
+     xyz  
+     
+ /(?=abc)+abc/aftertext
+     abcabcabc
+ \= Expect no match
+     xyz  
+     
+ /(?=abc)++abc/aftertext
+     abcabcabc
+ \= Expect no match
+     xyz  
+     
+ /(?=abc){0}xyz/
+     xyz 
+ 
+ /(?=abc){1}xyz/
+ \= Expect no match
+     xyz 
+     
+ /(?=(a))?./
+     ab
+     bc
+       
+ /(?=(a))??./
+     ab
+     bc
+ 
+ /^(?=(a)){0}b(?1)/
+     backgammon
+ 
+ /^(?=(?1))?[az]([abc])d/
+     abd 
+     zcdxx 
+ 
+ /^(?!a){0}\w+/
+     aaaaa
+ 
+ /(?<=(abc))?xyz/
+     abcxyz
+     pqrxyz 
+ 
+ /((?2))((?1))/
+     abc
+ 
+ /(?(R)a+|(?R)b)/
+     aaaabcde
+ 
+ /(?(R)a+|((?R))b)/
+     aaaabcde
+ 
+ /((?(R)a+|(?1)b))/
+     aaaabcde
+ 
+ /((?(R2)a+|(?1)b))()/
+     aaaabcde
+ 
+ /(?(R)a*(?1)|((?R))b)/
+     aaaabcde
+ 
+ /(a+)/no_auto_possess
+     aaaa\=ovector=3
+     aaaa\=ovector=4
+ 
+ /^\R/
+     \r\=ps
+     \r\=ph
+     
+ /^\R{2,3}x/
+     \r\=ps
+     \r\=ph
+     \r\r\=ps
+     \r\r\=ph
+     \r\r\r\=ps
+     \r\r\r\=ph
+     \r\rx
+     \r\r\rx    
+ 
+ /^\R{2,3}?x/
+     \r\=ps
+     \r\=ph
+     \r\r\=ps
+     \r\r\=ph
+     \r\r\r\=ps
+     \r\r\r\=ph
+     \r\rx
+     \r\r\rx    
+     
+ /^\R?x/
+     \r\=ps
+     \r\=ph
+     x
+     \rx  
+ 
+ /^\R+x/
+     \r\=ps
+     \r\=ph
+     \r\n\=ps
+     \r\n\=ph
+     \rx  
+ 
+ /^a$/newline=crlf
+     a\r\=ps
+     a\r\=ph
+ 
+ /^a$/m,newline=crlf
+     a\r\=ps
+     a\r\=ph
+ 
+ /^(a$|a\r)/newline=crlf
+     a\r\=ps
+     a\r\=ph
+ 
+ /^(a$|a\r)/m,newline=crlf
+     a\r\=ps
+     a\r\=ph
+ 
+ /./newline=crlf
+     \r\=ps
+     \r\=ph
+   
+ /.{2,3}/newline=crlf
+     \r\=ps
+     \r\=ph
+     \r\r\=ps
+     \r\r\=ph
+     \r\r\r\=ps
+     \r\r\r\=ph
+ 
+ /.{2,3}?/newline=crlf
+     \r\=ps
+     \r\=ph
+     \r\r\=ps
+     \r\r\=ph
+     \r\r\r\=ps
+     \r\r\r\=ph
+ 
+ # Test simple validity check for restarts 
+ 
+ /abcdef/
+    abc\=dfa_restart
+ 
+ /<H((?(?!<H|F>)(.)|(?R))++)*F>/
+     text <H more text <H texting more  hexA0-"\xA0"    hex above 7F-"\xBC" F> text xxxxx <H text F> text F> text2 <H text sample F> more text.
+ 
+ /^(?>.{4})abc|^\w\w.xabcd/
+     xxxxabcd
+     xx\xa0xabcd 
+ 
+ /^(.{4}){2}+abc|^\w\w.x\w\w\w\wabcd/
+     xxxxxxxxabcd
+     xx\xa0xxxxxabcd 
+ 
+ /abcd/
+     abcd\=ovector=0
+ 
+ # These tests show up auto-possessification 
+ 
+ /[ab]*/
+     aaaa
+     
+ /[ab]*?/
+     aaaa
+     
+ /[ab]?/
+     aaaa
+     
+ /[ab]??/
+     aaaa
+     
+ /[ab]+/
+     aaaa
+     
+ /[ab]+?/
+     aaaa
+     
+ /[ab]{2,3}/
+     aaaa
+     
+ /[ab]{2,3}?/
+     aaaa
+     
+ /[ab]{2,}/
+     aaaa    
+ 
+ /[ab]{2,}?/
+     aaaa    
+ 
+ '\A(?:[^\"]++|\"(?:[^\"]*+|\"\")*+\")++'
+     NON QUOTED \"QUOT\"\"ED\" AFTER \"NOT MATCHED
+ 
+ '\A(?:[^\"]++|\"(?:[^\"]++|\"\")*+\")++'
+     NON QUOTED \"QUOT\"\"ED\" AFTER \"NOT MATCHED
+ 
+ /abc(?=xyz)/allusedtext
+     abcxyzpqr
+     abcxyzpqr\=aftertext
+     
+ /(?<=pqr)abc(?=xyz)/allusedtext
+     xyzpqrabcxyzpqr
+     xyzpqrabcxyzpqr\=aftertext
+     
+ /a\b/
+     a.\=allusedtext
+     a\=allusedtext  
+ 
+ /abc(?=abcde)(?=ab)/allusedtext
+     abcabcdefg
+ 
+ /a*?b*?/
+     ab
+ 
+ /(*NOTEMPTY)a*?b*?/
+     ab
+     ba
+     cb  
+ 
+ /(*NOTEMPTY_ATSTART)a*?b*?/aftertext
+     ab
+     cdab 
+ 
+ /(a)(b)|(c)/
+     XcX\=ovector=2,get=1,get=2,get=3,get=4,getall
+ 
+ /(?<A>aa)/
+     aa\=get=A
+     aa\=copy=A 
+ 
+ /a+/no_auto_possess
+     a\=ovector=2,get=1,get=2,getall
+     aaa\=ovector=2,get=1,get=2,getall
+ 
+ /a(b)c(d)/
+     abc\=ph,copy=0,copy=1,getall
+ 
+ /ab(?C" any text with spaces ")cde/B
+     abcde
+     12abcde
+ 
+ /^a(b)c(?C1)def/
+       abcdef
+ 
+ /^a(b)c(?C"AB")def/
+       abcdef
+ 
+ /^a(b)c(?C1)def/
+       abcdef\=callout_capture
+ 
+ /^a(b)c(?C{AB})def/B
+       abcdef\=callout_capture
+ 
+ /^(?(?C25)(?=abc)abcd|xyz)/B
+     abcdefg
+     xyz123 
+ 
+ /^(?(?C$abc$)(?=abc)abcd|xyz)/B
+     abcdefg
+     xyz123 
+ 
+ /^ab(?C'first')cd(?C"second")ef/
+     abcdefg
+ 
+ /(?:a(?C`code`)){3}X/
+     aaaXY
+ 
+ # Binary zero in callout string
+ /"a(?C'x" 00 "z')b"/hex
+     abcdefgh
+ 
+ /(?(?!)a|b)/
+     bbb
+ \= Expect no match
+     aaa 
+ 
+ /^/gm
+     \n\n\n
+ 
+ /^/gm,alt_circumflex
+     \n\n\n
+ 
+ /abc/use_offset_limit
+     1234abcde\=offset_limit=100
+     1234abcde\=offset_limit=9
+     1234abcde\=offset_limit=4
+     1234abcde\=offset_limit=4,offset=4
+ \= Expect no match
+     1234abcde\=offset_limit=4,offset=5
+     1234abcde\=offset_limit=3
+ 
+ /(?<=abc)/use_offset_limit
+     1234abc\=offset_limit=7
+ \= Expect no match
+     1234abc\=offset_limit=6
+ 
+ /abcd/null_context
+     abcd\=null_context
+ 
+ /()()a+/no_auto_possess
+     aaa\=allcaptures
+     a\=allcaptures
+ 
+ /(*LIMIT_DEPTH=100)^((.)(?1)|.)$/
+ \= Expect depth limit exceeded
+     a[00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]([00]
+ 
+ /(02-)?[0-9]{3}-[0-9]{3}/
+     02-123-123
+ 
+ /^(a(?2))(b)(?1)/
+     abbab\=find_limits 
+ 
+ /abc/endanchored
+     xyzabc
+ \= Expect no match
+     xyzabcdef
+ \= Expect error
+     xyzabc\=ph
+ 
+ /abc/
+     xyzabc\=endanchored
+ \= Expect no match
+     xyzabcdef\=endanchored
+ \= Expect error
+     xyzabc\=ps,endanchored
+ 
+ /abc|bcd/endanchored
+     xyzabcd
+ \= Expect no match
+     xyzabcdef
+ 
+ /(*NUL)^.*/
+     a\nb\x00ccc
+     
+ /(*NUL)^.*/s
+     a\nb\x00ccc
+     
+ /^x/m,newline=nul
+     ab\x00xy
+     
+ /'#comment' 0d 0a 00 '^x\' 0a 'y'/x,newline=nul,hex
+     x\nyz 
+  
+ /(*NUL)^X\NY/
+     X\nY
+     X\rY
+ \= Expect no match
+     X\x00Y      
+ 
++/(?<=abc|)/
++    abcde\=aftertext
++    
++/(?<=|abc)/ 
++    abcde\=aftertext
++
++/(?<=abc|)/endanchored
++    abcde\=aftertext
++    
++/(?<=|abc)/endanchored
++    abcde\=aftertext
++
+ # End of testinput6
+diff --git a/testdata/testoutput6 b/testdata/testoutput6
+index 78f5740..f029123 100644
+--- a/testdata/testoutput6
++++ b/testdata/testoutput6
+@@ -7740,10 +7740,30 @@ No match
+ /(*NUL)^X\NY/
+     X\nY
+  0: X\x0aY
+     X\rY
+  0: X\x0dY
+ \= Expect no match
+     X\x00Y      
+ No match
+ 
++/(?<=abc|)/
++    abcde\=aftertext
++ 0: 
++ 0+ abcde
++    
++/(?<=|abc)/ 
++    abcde\=aftertext
++ 0: 
++ 0+ abcde
++
++/(?<=abc|)/endanchored
++    abcde\=aftertext
++ 0: 
++ 0+ 
++    
++/(?<=|abc)/endanchored
++    abcde\=aftertext
++ 0: 
++ 0+ 
++
+ # End of testinput6

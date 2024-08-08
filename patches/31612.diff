@@ -1,0 +1,256 @@
+commit 91789b65699fed69b8e31b22b3c02d435b38a24b
+Author: Nathan Moinvaziri <nathan@nathanm.com>
+Date:   Fri Mar 12 18:05:21 2021 -0800
+
+    Fixed null-dereference write when unable to create thread context memory.
+    https://oss-fuzz.com/testcase-detail/4589997492666368
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 99498e21..83d98c98 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -1556,50 +1556,55 @@ static int parallel_blosc(blosc2_context* context) {
+ }
+ 
+ /* initialize a thread_context that has already been allocated */
+-static void init_thread_context(struct thread_context* thread_context, blosc2_context* context, int32_t tid)
++static int init_thread_context(struct thread_context* thread_context, blosc2_context* context, int32_t tid)
+ {
+   int32_t ebsize;
+ 
+   thread_context->parent_context = context;
+   thread_context->tid = tid;
+ 
+   ebsize = context->blocksize + context->typesize * (signed)sizeof(int32_t);
+   thread_context->tmp_nbytes = (size_t)4 * ebsize;
+   thread_context->tmp = my_malloc(thread_context->tmp_nbytes);
++  BLOSC_ERROR_NULL(thread_context->tmp, BLOSC2_ERROR_MEMORY_ALLOC);
+   thread_context->tmp2 = thread_context->tmp + ebsize;
+   thread_context->tmp3 = thread_context->tmp2 + ebsize;
+   thread_context->tmp4 = thread_context->tmp3 + ebsize;
+   thread_context->tmp_blocksize = context->blocksize;
+   #if defined(HAVE_ZSTD)
+   thread_context->zstd_cctx = NULL;
+   thread_context->zstd_dctx = NULL;
+   #endif
+ 
+   /* Create the hash table for LZ4 in case we are using IPP */
+ #ifdef HAVE_IPP
+   IppStatus status;
+   int inlen = thread_context->tmp_blocksize > 0 ? thread_context->tmp_blocksize : 1 << 16;
+   int hash_size = 0;
+   status = ippsEncodeLZ4HashTableGetSize_8u(&hash_size);
+   if (status != ippStsNoErr) {
+       BLOSC_TRACE_ERROR("Error in ippsEncodeLZ4HashTableGetSize_8u.");
+   }
+   Ipp8u *hash_table = ippsMalloc_8u(hash_size);
+   status = ippsEncodeLZ4HashTableInit_8u(hash_table, inlen);
+   if (status != ippStsNoErr) {
+     BLOSC_TRACE_ERROR("Error in ippsEncodeLZ4HashTableInit_8u.");
+   }
+   thread_context->lz4_hash_table = hash_table;
+ #endif
++  return 0;
+ }
+ 
+ static struct thread_context*
+ create_thread_context(blosc2_context* context, int32_t tid) {
+   struct thread_context* thread_context;
+   thread_context = (struct thread_context*)my_malloc(sizeof(struct thread_context));
+   BLOSC_ERROR_NULL(thread_context, NULL);
+-  init_thread_context(thread_context, context, tid);
++  int rc = init_thread_context(thread_context, context, tid);
++  if (rc < 0) {
++    return NULL;
++  }
+   return thread_context;
+ }
+ 
+ /* free members of thread_context, but not thread_context itself */
+@@ -1648,30 +1653,31 @@ int check_nthreads(blosc2_context* context) {
+ /* Do the compression or decompression of the buffer depending on the
+    global params. */
+ static int do_job(blosc2_context* context) {
+   int32_t ntbytes;
+ 
+   /* Set sentinels */
+   context->dref_not_init = 1;
+ 
+   /* Check whether we need to restart threads */
+   check_nthreads(context);
+ 
+   /* Run the serial version when nthreads is 1 or when the buffers are
+      not larger than blocksize */
+   if (context->nthreads == 1 || (context->sourcesize / context->blocksize) <= 1) {
+     /* The context for this 'thread' has no been initialized yet */
+     if (context->serial_context == NULL) {
+       context->serial_context = create_thread_context(context, 0);
+     }
+     else if (context->blocksize != context->serial_context->tmp_blocksize) {
+       free_thread_context(context->serial_context);
+       context->serial_context = create_thread_context(context, 0);
+     }
++    BLOSC_ERROR_NULL(context->serial_context, BLOSC2_ERROR_THREAD_CREATE);
+     ntbytes = serial_blosc(context->serial_context);
+   }
+   else {
+     ntbytes = parallel_blosc(context);
+   }
+ 
+   return ntbytes;
+ }
+@@ -2602,32 +2608,32 @@ int blosc_getitem(const void* src, int start, int nitems, void* dest) {
+ int blosc2_getitem_ctx(blosc2_context* context, const void* src, int32_t srcsize,
+     int start, int nitems, void* dest, int32_t destsize) {
+   blosc_header header;
+   int result;
+ 
+   /* Minimally populate the context */
+   result = blosc_read_header((uint8_t *)src, srcsize, true, &header);
+   if (result < 0) {
+     return result;
+   }
+ 
+   context->src = src;
+   context->srcsize = srcsize;
+   context->dest = dest;
+   context->destsize = destsize;
+ 
+   result = blosc2_initialize_context_from_header(context, &header);
+   if (result < 0) {
+     return result;
+   }
+ 
+   if (context->serial_context == NULL) {
+     context->serial_context = create_thread_context(context, 0);
+   }
+-
++  BLOSC_ERROR_NULL(context->serial_context, BLOSC2_ERROR_THREAD_CREATE);
+   /* Call the actual getitem function */
+   result = _blosc_getitem(context, &header, src, srcsize, start, nitems, dest, destsize);
+ 
+   return result;
+ }
+ 
+ /* execute single compression/decompression job for a single thread_context */
+@@ -2848,70 +2854,70 @@ static void* t_blosc(void* ctxt) {
+ int init_threadpool(blosc2_context *context) {
+   int32_t tid;
+   int rc2;
+ 
+   /* Initialize mutex and condition variable objects */
+   pthread_mutex_init(&context->count_mutex, NULL);
+   pthread_mutex_init(&context->delta_mutex, NULL);
+   pthread_cond_init(&context->delta_cv, NULL);
+ 
+   /* Set context thread sentinels */
+   context->thread_giveup_code = 1;
+   context->thread_nblock = -1;
+ 
+   /* Barrier initialization */
+ #ifdef BLOSC_POSIX_BARRIERS
+   pthread_barrier_init(&context->barr_init, NULL, context->nthreads + 1);
+   pthread_barrier_init(&context->barr_finish, NULL, context->nthreads + 1);
+ #else
+   pthread_mutex_init(&context->count_threads_mutex, NULL);
+   pthread_cond_init(&context->count_threads_cv, NULL);
+   context->count_threads = 0;      /* Reset threads counter */
+ #endif
+ 
+   if (threads_callback) {
+       /* Create thread contexts to store data for callback threads */
+     context->thread_contexts = (struct thread_context *)my_malloc(
+             context->nthreads * sizeof(struct thread_context));
+     BLOSC_ERROR_NULL(context->thread_contexts, BLOSC2_ERROR_MEMORY_ALLOC);
+     for (tid = 0; tid < context->nthreads; tid++)
+       init_thread_context(context->thread_contexts + tid, context, tid);
+   }
+   else {
+     #if !defined(_WIN32)
+       /* Initialize and set thread detached attribute */
+       pthread_attr_init(&context->ct_attr);
+       pthread_attr_setdetachstate(&context->ct_attr, PTHREAD_CREATE_JOINABLE);
+     #endif
+ 
+     /* Make space for thread handlers */
+     context->threads = (pthread_t*)my_malloc(
+             context->nthreads * sizeof(pthread_t));
+     BLOSC_ERROR_NULL(context->threads, BLOSC2_ERROR_MEMORY_ALLOC);
+     /* Finally, create the threads */
+     for (tid = 0; tid < context->nthreads; tid++) {
+       /* Create a thread context (will destroy when finished) */
+       struct thread_context *thread_context = create_thread_context(context, tid);
+-
++      BLOSC_ERROR_NULL(thread_context, BLOSC2_ERROR_THREAD_CREATE);
+       #if !defined(_WIN32)
+         rc2 = pthread_create(&context->threads[tid], &context->ct_attr, t_blosc,
+                             (void*)thread_context);
+       #else
+         rc2 = pthread_create(&context->threads[tid], NULL, t_blosc,
+                             (void *)thread_context);
+       #endif
+       if (rc2) {
+         BLOSC_TRACE_ERROR("Return code from pthread_create() is %d.\n"
+                           "\tError detail: %s\n", rc2, strerror(rc2));
+-        return (-1);
++        return BLOSC2_ERROR_THREAD_CREATE;
+       }
+     }
+   }
+ 
+   /* We have now started/initialized the threads */
+   context->threads_started = context->nthreads;
+   context->new_nthreads = context->nthreads;
+ 
+-  return (0);
++  return 0;
+ }
+ 
+ int blosc_get_nthreads(void)
+diff --git a/blosc/blosc2.h b/blosc/blosc2.h
+index 889840c6..7370474f 100644
+--- a/blosc/blosc2.h
++++ b/blosc/blosc2.h
+@@ -248,41 +248,42 @@ enum {
+ /**
+  * @brief Error codes
+  */
+ enum {
+   BLOSC2_ERROR_SUCCESS = 0,           //<! Success
+   BLOSC2_ERROR_FAILURE = -1,          //<! Generic failure
+   BLOSC2_ERROR_STREAM = 2,            //<! Bad stream
+   BLOSC2_ERROR_DATA = -3,             //<! Invalid data
+   BLOSC2_ERROR_MEMORY_ALLOC = -4,     //<! Memory alloc/realloc failure
+   BLOSC2_ERROR_READ_BUFFER = -5,      //!< Not enough space to read
+   BLOSC2_ERROR_WRITE_BUFFER = -6,     //!< Not enough space to write
+   BLOSC2_ERROR_CODEC_SUPPORT = -7,    //!< Codec not supported
+   BLOSC2_ERROR_CODEC_PARAM = -8,      //!< Invalid parameter supplied to codec
+   BLOSC2_ERROR_CODEC_DICT = -9,       //!< Codec dictionary error
+   BLOSC2_ERROR_VERSION_SUPPORT = -10, //!< Version not supported
+   BLOSC2_ERROR_INVALID_HEADER = -11,  //!< Invalid value in header
+   BLOSC2_ERROR_INVALID_PARAM = -12,   //!< Invalid parameter supplied to function
+   BLOSC2_ERROR_FILE_READ = -13,       //!< File read failure
+   BLOSC2_ERROR_FILE_WRITE = -14,      //!< File write failure
+   BLOSC2_ERROR_FILE_OPEN = -15,       //!< File open failure
+   BLOSC2_ERROR_NOT_FOUND = -16,       //!< Not found
+   BLOSC2_ERROR_RUN_LENGTH = -17,      //!< Bad run length encoding
+   BLOSC2_ERROR_FILTER_PIPELINE = -18, //!< Filter pipeline error
+   BLOSC2_ERROR_CHUNK_INSERT = -19,    //!< Chunk insert failure
+   BLOSC2_ERROR_CHUNK_APPEND = -20,    //!< Chunk append failure
+   BLOSC2_ERROR_CHUNK_UPDATE = -21,    //!< Chunk update failure
+   BLOSC2_ERROR_2GB_LIMIT = -22,       //!< Sizes larger than 2gb not supported
+   BLOSC2_ERROR_SCHUNK_COPY = -23,     //!< Super-chunk copy failure
+   BLOSC2_ERROR_FRAME_TYPE = -24,      //!< Wrong type for frame
+   BLOSC2_ERROR_FILE_TRUNCATE = -25,   //!< File truncate failure
++  BLOSC2_ERROR_THREAD_CREATE = -26,   //!< Thread or thread context creation failure
+ 
+ };
+ 
+ /**
+  * @brief Initialize the Blosc library environment.
+  *
+  * You must call this previous to any other Blosc call, unless you want
+  * Blosc to be used simultaneously in a multi-threaded environment, in
+  * which case you can use the
+  * @see #blosc2_compress_ctx #blosc2_decompress_ctx pair.
+  */

@@ -1,0 +1,589 @@
+commit d4fe8a8130b77b3601fbd167a7a4884d097aa97d
+Author: Joachim Metz <joachim.metz@gmail.com>
+Date:   Tue Apr 27 07:42:40 2021 +0200
+
+    Fixed HFS B-Tree node OOB read
+
+diff --git a/tsk/fs/hfs.c b/tsk/fs/hfs.c
+index 003db5a95..8f9e0d945 100644
+--- a/tsk/fs/hfs.c
++++ b/tsk/fs/hfs.c
+@@ -3835,572 +3835,578 @@ static uint8_t
+ hfs_load_extended_attrs(TSK_FS_FILE * fs_file,
+     unsigned char *isCompressed, unsigned char *cmpType,
+     uint64_t *uncompressedSize)
+ {
+     TSK_FS_INFO *fs = fs_file->fs_info;
+     uint64_t fileID;
+     ATTR_FILE_T attrFile;
+     uint8_t *nodeData;
+     TSK_ENDIAN_ENUM endian;
+     hfs_btree_node *nodeDescriptor;     // The node descriptor
+     uint32_t nodeID;            // The number or ID of the Attributes file node to read.
+     hfs_btree_key_attr *keyB;   // ptr to the key of the Attr file record.
+     unsigned char done;         // Flag to indicate that we are done looping over leaf nodes
+     uint16_t attribute_counter = 2;     // The ID of the next attribute to be loaded.
+     HFS_INFO *hfs;
+     char *buffer = NULL;   // buffer to hold the attribute
+     TSK_LIST *nodeIDs_processed = NULL; // Keep track of node IDs to prevent an infinite loop
+     ssize_t cnt;                    // count of chars read from file.
+ 
+     tsk_error_reset();
+ 
+     // The CNID (or inode number) of the file
+     //  Note that in TSK such numbers are 64 bits, but in HFS+ they are only 32 bits.
+     fileID = fs_file->meta->addr;
+ 
+     if (fs == NULL) {
+         error_detected(TSK_ERR_FS_ARG,
+             "hfs_load_extended_attrs: NULL fs arg");
+         return 1;
+     }
+ 
+     hfs = (HFS_INFO *) fs;
+ 
+     if (!hfs->has_attributes_file) {
+         // No attributes file, and so, no extended attributes
+         return 0;
+     }
+ 
+     if (tsk_verbose) {
+         tsk_fprintf(stderr,
+             "hfs_load_extended_attrs:  Processing file %" PRIuINUM "\n",
+             fileID);
+     }
+ 
+     // Open the Attributes File
+     if (open_attr_file(fs, &attrFile)) {
+         error_returned
+             ("hfs_load_extended_attrs: could not open Attributes file");
+         return 1;
+     }
+ 
+     // Is the Attributes file empty?
+     if (attrFile.rootNode == 0) {
+         if (tsk_verbose)
+             tsk_fprintf(stderr,
+                 "hfs_load_extended_attrs: Attributes file is empty\n");
+         close_attr_file(&attrFile);
+         *isCompressed = FALSE;
+         *cmpType = 0;
+         return 0;
+     }
+ 
++    if (attrFile.nodeSize < sizeof(hfs_btree_node)) {
++        error_returned
++            ("hfs_load_extended_attrs: node size too small");
++        return 1;
++    }
++
+     // A place to hold one node worth of data
+     nodeData = (uint8_t *) malloc(attrFile.nodeSize);
+     if (nodeData == NULL) {
+         error_detected(TSK_ERR_AUX_MALLOC,
+             "hfs_load_extended_attrs: Could not malloc space for an Attributes file node");
+         goto on_error;
+     }
+ 
+     // Initialize these
+     *isCompressed = FALSE;
+     *cmpType = 0;
+ 
+     endian = attrFile.fs->endian;
+ 
+     // Start with the root node
+     nodeID = attrFile.rootNode;
+ 
+     // While loop, over nodes in path from root node to the correct LEAF node.
+     while (1) {
+         uint16_t numRec;        // Number of records in the node
+         int recIndx;            // index for looping over records
+ 
+         if (tsk_verbose) {
+             tsk_fprintf(stderr,
+                 "hfs_load_extended_attrs: Reading Attributes File node with ID %"
+                 PRIu32 "\n", nodeID);
+         }
+ 
+         /* Make sure we do not get into an infinite loop */
+         if (tsk_list_find(nodeIDs_processed, nodeID)) {
+             error_detected(TSK_ERR_FS_READ,
+                 "hfs_load_extended_attrs: Infinite loop detected - trying to read node %" PRIu32 " which has already been processed", nodeID);
+             goto on_error;
+         }
+ 
+ 
+         /* Read the node */
+         cnt = tsk_fs_file_read(attrFile.file,
+             (TSK_OFF_T)nodeID * attrFile.nodeSize,
+             (char *) nodeData,
+             attrFile.nodeSize, (TSK_FS_FILE_READ_FLAG_ENUM) 0);
+         if (cnt != (ssize_t)attrFile.nodeSize) {
+             error_returned
+                 ("hfs_load_extended_attrs: Could not read in a node from the Attributes File");
+             goto on_error;
+         }
+ 
+         /* Save this node ID to the list of processed nodes */
+         if (tsk_list_add(&nodeIDs_processed, nodeID)) {
+             error_detected(TSK_ERR_FS_READ,
+                 "hfs_load_extended_attrs: Could not save nodeID to the list of processed nodes");
+             goto on_error;
+         }
+ 
+         /** Node has a:
+          * Descriptor
+          * Set of records
+          * Table at the end with pointers to the records
+          */
+         // Parse the Node header
+         nodeDescriptor = (hfs_btree_node *) nodeData;
+ 
+         // If we are at a leaf node, then we have found the right node
+         if (nodeDescriptor->type == HFS_ATTR_NODE_LEAF) {
+             break;
+         }
+ 
+         // This had better be an INDEX node, if not its an error
+         else if (nodeDescriptor->type != HFS_ATTR_NODE_INDEX) {
+             error_detected(TSK_ERR_FS_READ,
+                 "hfs_load_extended_attrs: Reached a non-INDEX and non-LEAF node in searching the Attributes File");
+             goto on_error;
+         }
+ 
+         // OK, we are in an INDEX node.  loop over the records to find the last one whose key is
+         // smaller than or equal to the desired key
+ 
+         numRec = tsk_getu16(endian, nodeDescriptor->num_rec);
+         if (numRec == 0) {
+             // This is wrong, there must always be at least 1 record in an INDEX node.
+             error_detected(TSK_ERR_FS_READ,
+                 "hfs_load_extended_attrs:Attributes File index node %"
+                 PRIu32 " has zero records", nodeID);
+             goto on_error;
+         }
+ 
+         for (recIndx = 0; recIndx < numRec; ++recIndx) {
+             uint16_t keyLength;
+             int comp;           // comparison result
+             char *compStr;      // comparison result, as a string
+             uint8_t *recData;   // pointer to the data part of the record
+             uint32_t keyFileID;
+ 
+             // The offset to the record is stored in table at end of node
+             uint8_t *recOffsetTblEntry = &nodeData[attrFile.nodeSize - (2 * (recIndx + 1))];  // data describing where this record is
+             uint16_t recOffset = tsk_getu16(endian, recOffsetTblEntry);
+             //uint8_t * nextRecOffsetData = &nodeData[attrFile.nodeSize - 2* (recIndx+2)];
+ 
+             // make sure the record and first fields are in the buffer
+             if (recOffset + 14 > attrFile.nodeSize) {
+                 error_detected(TSK_ERR_FS_READ,
+                     "hfs_load_extended_attrs: Unable to process attribute (offset too big)");
+                 goto on_error;
+             }
+ 
+             // Pointer to first byte of record
+             uint8_t *recordBytes = &nodeData[recOffset];
+ 
+ 
+             // Cast that to the Attributes file key (n.b., the key is the first thing in the record)
+             keyB = (hfs_btree_key_attr *) recordBytes;
+ 
+             // Is this key less than what we are seeking?
+             //int comp = comp_attr_key(endian, keyB, fileID, attrName, startBlock);
+ 
+             keyFileID = tsk_getu32(endian, keyB->file_id);
+             if (keyFileID < fileID) {
+                 comp = -1;
+                 compStr = "less than";
+             }
+             else if (keyFileID > fileID) {
+                 comp = 1;
+                 compStr = "greater than";
+             }
+             else {
+                 comp = 0;
+                 compStr = "equal to";
+             }
+             if (tsk_verbose)
+                 tsk_fprintf(stderr,
+                     "hfs_load_extended_attrs: INDEX record %d, fileID %"
+                     PRIu32 " is %s the file ID we are seeking, %" PRIu32
+                     ".\n", recIndx, keyFileID, compStr, fileID);
+             if (comp > 0) {
+                 // The key of this record is greater than what we are seeking
+                 if (recIndx == 0) {
+                     // This is the first record, so no records are appropriate
+                     // Nothing in this btree will match.  We can stop right here.
+                     goto on_exit;
+                 }
+ 
+                 // This is not the first record, so, the previous record's child is the one we want.
+                 break;
+             }
+ 
+             // CASE:  key in this record matches the key we are seeking.  The previous record's child
+             // is the one we want.  However, if this is the first record, then we want THIS record's child.
+             if (comp == 0 && recIndx != 0) {
+                 break;
+             }
+ 
+             // Extract the child node ID from the record data (stored after the key)
+             keyLength = tsk_getu16(endian, keyB->key_len);
+             // make sure the fields we care about are still in the buffer
+             // +2 is because key_len doesn't include its own length
+             // +4 is because of the amount of data we read from the data
+             if (recOffset + keyLength + 2 + 4 > attrFile.nodeSize) {
+                 error_detected(TSK_ERR_FS_READ,
+                     "hfs_load_extended_attrs: Unable to process attribute");
+                 goto on_error;
+             }
+ 
+             recData = &recordBytes[keyLength + 2];
+ 
+             // Data must start on an even offset from the beginning of the record.
+             // So, correct this if needed.
+             if ((recData - recordBytes) % 2) {
+                 recData += 1;
+             }
+ 
+             // The next four bytes should be the Node ID of the child of this node.
+             nodeID = tsk_getu32(endian, recData);
+ 
+             // At this point, either comp<0 or comp=0 && recIndx=0.  In the latter case we want to
+             // descend to the child of this node, so we break.
+             if (recIndx == 0 && comp == 0) {
+                 break;
+             }
+ 
+             // CASE: key in this record is less than key we seek.  comp < 0
+             // So, continue looping over records in this node.
+         }                       // END loop over records
+ 
+     }                           // END while loop over Nodes in path from root to LEAF node
+ 
+     // At this point nodeData holds the contents of a LEAF node with the right range of keys
+     // and nodeDescriptor points to the descriptor of that node.
+ 
+     // Loop over successive LEAF nodes, starting with this one
+     done = FALSE;
+     while (!done) {
+         uint16_t numRec;        // number of records
+         unsigned int recIndx;            // index for looping over records
+ 
+         if (tsk_verbose)
+             tsk_fprintf(stderr,
+                 "hfs_load_extended_attrs: Attributes File LEAF Node %"
+                 PRIu32 ".\n", nodeID);
+         numRec = tsk_getu16(endian, nodeDescriptor->num_rec);
+         // Note, leaf node could have one (or maybe zero) records
+ 
+         // Loop over the records in this node
+         for (recIndx = 0; recIndx < numRec; ++recIndx) {
+ 
+             // The offset to the record is stored in table at end of node
+             uint8_t *recOffsetTblEntry = &nodeData[attrFile.nodeSize - (2 * (recIndx + 1))];  // data describing where this record is
+             uint16_t recOffset = tsk_getu16(endian, recOffsetTblEntry);
+ 
+             int comp;           // comparison result
+             char *compStr;      // comparison result as a string
+             uint32_t keyFileID;
+ 
+             // make sure the record and first fields are in the buffer
+             if (recOffset + 14 > attrFile.nodeSize) {
+                 error_detected(TSK_ERR_FS_READ,
+                     "hfs_load_extended_attrs: Unable to process attribute (offset too big)");
+                 goto on_error;
+             }
+ 
+             // Pointer to first byte of record
+             uint8_t *recordBytes = &nodeData[recOffset];
+ 
+             // Cast that to the Attributes file key
+             keyB = (hfs_btree_key_attr *) recordBytes;
+ 
+             // Compare recordBytes key to the key that we are seeking
+             keyFileID = tsk_getu32(endian, keyB->file_id);
+ 
+             //fprintf(stdout, " Key file ID = %lu\n", keyFileID);
+             if (keyFileID < fileID) {
+                 comp = -1;
+                 compStr = "less than";
+             }
+             else if (keyFileID > fileID) {
+                 comp = 1;
+                 compStr = "greater than";
+             }
+             else {
+                 comp = 0;
+                 compStr = "equal to";
+             }
+ 
+             if (tsk_verbose)
+                 tsk_fprintf(stderr,
+                     "hfs_load_extended_attrs: LEAF Record key file ID %"
+                     PRIu32 " is %s the desired file ID %" PRIu32 "\n",
+                     keyFileID, compStr, fileID);
+             // Are they the same?
+             if (comp == 0) {
+                 // Yes, so load this attribute
+ 
+                 uint8_t *recData;       // pointer to the data part of the recordBytes
+                 hfs_attr_data *attrData;
+                 uint32_t attributeLength;
+                 uint32_t nameLength;
+                 uint32_t recordType;
+                 uint16_t keyLength;
+                 int conversionResult;
+                 char nameBuff[HFS_MAX_ATTR_NAME_LEN_UTF8_B+1];
+                 TSK_FS_ATTR_TYPE_ENUM attrType;
+                 TSK_FS_ATTR *fs_attr;   // Points to the attribute to be loaded.
+ 
+                 keyLength = tsk_getu16(endian, keyB->key_len);
+                 // make sure the fields we care about are still in the buffer
+                 // +2 because key_len doesn't include its own length
+                 // +16 for the amount of data we'll read from data
+                 if (recOffset + keyLength + 2 + 16 > attrFile.nodeSize) {
+                     error_detected(TSK_ERR_FS_READ,
+                         "hfs_load_extended_attrs: Unable to process attribute");
+                     goto on_error;
+                 }
+ 
+                 recData = &recordBytes[keyLength + 2];
+ 
+                 // Data must start on an even offset from the beginning of the record.
+                 // So, correct this if needed.
+                 if ((recData - recordBytes) % 2) {
+                     recData += 1;
+                 }
+ 
+                 attrData = (hfs_attr_data *) recData;
+ 
+                 // Check we can process the record type before allocating memory
+                 recordType = tsk_getu32(endian, attrData->record_type);
+                 if (recordType != HFS_ATTR_RECORD_INLINE_DATA) {
+                   error_detected(TSK_ERR_FS_UNSUPTYPE,
+                       "hfs_load_extended_attrs: Unsupported record type: (%d)",
+                       recordType);
+                   goto on_error;
+                 }
+ 
+                 // This is the length of the useful data, not including the record header
+                 attributeLength = tsk_getu32(endian, attrData->attr_size);
+ 
+                 // Check the attribute fits in the node
+                 //if (recordType != HFS_ATTR_RECORD_INLINE_DATA) {
+                 if (recOffset + keyLength + 2 + attributeLength > attrFile.nodeSize) {
+                     error_detected(TSK_ERR_FS_READ,
+                         "hfs_load_extended_attrs: Unable to process attribute");
+                     goto on_error;
+                 }
+ 
+                 // attr_name_len is in UTF_16 chars
+                 nameLength = tsk_getu16(endian, keyB->attr_name_len);
+                 if (2 * nameLength > HFS_MAX_ATTR_NAME_LEN_UTF16_B) {
+                     error_detected(TSK_ERR_FS_CORRUPT,
+                         "hfs_load_extended_attrs: Name length in bytes (%d) > max name length in bytes (%d).",
+                         2*nameLength, HFS_MAX_ATTR_NAME_LEN_UTF16_B);
+                     goto on_error;
+                 }
+ 
+                 if ((int32_t)(2*nameLength) > keyLength - 12) {
+                     error_detected(TSK_ERR_FS_CORRUPT,
+                         "hfs_load_extended_attrs: Name length in bytes (%d) > remaining struct length (%d).",
+                         2*nameLength, keyLength - 12);
+                     goto on_error;
+                 }
+ 
+                 buffer = tsk_malloc(attributeLength);
+                 if (buffer == NULL) {
+                     error_detected(TSK_ERR_AUX_MALLOC,
+                         "hfs_load_extended_attrs: Could not malloc space for the attribute.");
+                     goto on_error;
+                 }
+ 
+                 memcpy(buffer, attrData->attr_data, attributeLength);
+ 
+                 // Use the "attr_name" part of the key as the attribute name
+                 // but must convert to UTF8.  Unfortunately, there does not seem to
+                 // be any easy way to determine how long the converted string will
+                 // be because UTF8 is a variable length encoding. However, the longest
+                 // it will be is 3 * the max number of UTF16 code units.  Add one for null
+                 // termination.   (thanks Judson!)
+ 
+ 
+                 conversionResult = hfs_UTF16toUTF8(fs, keyB->attr_name,
+                     nameLength, nameBuff, HFS_MAX_ATTR_NAME_LEN_UTF8_B+1, 0);
+                 if (conversionResult != 0) {
+                     error_returned
+                         ("-- hfs_load_extended_attrs could not convert the attr_name in the btree key into a UTF8 attribute name");
+                     goto on_error;
+                 }
+ 
+                 // What is the type of this attribute?  If it is a compression record, then
+                 // use TSK_FS_ATTR_TYPE_HFS_COMP_REC.  Else, use TSK_FS_ATTR_TYPE_HFS_EXT_ATTR
+                 // Only "inline data" kind of record is handled.
+                 if (strcmp(nameBuff, "com.apple.decmpfs") == 0 &&
+                     tsk_getu32(endian, attrData->record_type) == HFS_ATTR_RECORD_INLINE_DATA) {
+                     // Now, look at the compression record
+                     DECMPFS_DISK_HEADER *cmph = (DECMPFS_DISK_HEADER *) buffer;
+                     *cmpType =
+                         tsk_getu32(TSK_LIT_ENDIAN, cmph->compression_type);
+                     uint64_t uncSize = tsk_getu64(TSK_LIT_ENDIAN,
+                         cmph->uncompressed_size);
+ 
+                     if (tsk_verbose)
+                         tsk_fprintf(stderr,
+                             "hfs_load_extended_attrs: This attribute is a compression record.\n");
+ 
+                     attrType = TSK_FS_ATTR_TYPE_HFS_COMP_REC;
+                     *isCompressed = TRUE;       // The data is governed by a compression record (but might not be compressed)
+                     *uncompressedSize = uncSize;
+ 
+                     switch (*cmpType) {
+                     // Data is inline. We will load the uncompressed
+                     // data as a resident attribute.
+                     case DECMPFS_TYPE_ZLIB_ATTR:
+                         if (!decmpfs_file_read_zlib_attr(
+                                 fs_file, buffer, attributeLength, uncSize))
+                         {
+                             goto on_error;
+                         }
+                         break;
+ 
+                     case DECMPFS_TYPE_LZVN_ATTR:
+                         if (!decmpfs_file_read_lzvn_attr(
+                                 fs_file, buffer, attributeLength, uncSize))
+                         {
+                             goto on_error;
+                         }
+                         break;
+ 
+                     // Data is compressed in the resource fork
+                     case DECMPFS_TYPE_ZLIB_RSRC:
+                     case DECMPFS_TYPE_LZVN_RSRC:
+                         if (tsk_verbose)
+                             tsk_fprintf(stderr,
+                                 "%s: Compressed data is in the file Resource Fork.\n", __func__);
+                         break;
+                     }
+                 }
+                 else {          // Attrbute name is NOT com.apple.decmpfs
+                     attrType = TSK_FS_ATTR_TYPE_HFS_EXT_ATTR;
+                 }               // END if attribute name is com.apple.decmpfs  ELSE clause
+ 
+                 if ((fs_attr =
+                         tsk_fs_attrlist_getnew(fs_file->meta->attr,
+                             TSK_FS_ATTR_RES)) == NULL) {
+                     error_returned(" - hfs_load_extended_attrs");
+                     goto on_error;
+                 }
+ 
+                 if (tsk_verbose) {
+                     tsk_fprintf(stderr,
+                         "hfs_load_extended_attrs: loading attribute %s, type %u (%s)\n",
+                         nameBuff, (uint32_t) attrType,
+                         hfs_attrTypeName((uint32_t) attrType));
+                 }
+ 
+                 // set the details in the fs_attr structure
+                 if (tsk_fs_attr_set_str(fs_file, fs_attr, nameBuff,
+                         attrType, attribute_counter, buffer,
+                         attributeLength)) {
+                     error_returned(" - hfs_load_extended_attrs");
+                     goto on_error;
+                 }
+ 
+                 free(buffer);
+                 buffer = NULL;
+ 
+                 ++attribute_counter;
+             }                   // END if comp == 0
+             if (comp == 1) {
+                 // since this record key is greater than our search key, all
+                 // subsequent records will also be greater.
+                 done = TRUE;
+                 break;
+             }
+         }                       // END loop over records in one LEAF node
+ 
+         /*
+          * We get to this point if either:
+          *
+          * 1. We finish the loop over records and we are still loading attributes
+          *    for the given file.  In this case we are NOT done, and must read in
+          *    the next leaf node, and process its records.  The following code
+          *    loads the next leaf node before we return to the top of the loop.
+          *
+          * 2. We "broke" out of the loop over records because we found a key that
+          *    whose file ID is greater than the one we are working on.  In that case
+          *    we are done.  The following code does not run, and we exit the
+          *    while loop over successive leaf nodes.
+          */
+ 
+         if (!done) {
+             // We did not finish loading the attributes when we got to the end of that node,
+             // so we must get the next node, and continue.
+ 
+             // First determine the nodeID of the next LEAF node
+             uint32_t newNodeID = tsk_getu32(endian, nodeDescriptor->flink);
+ 
+             //fprintf(stdout, "Next Node ID = %u\n",  newNodeID);
+             if (tsk_verbose)
+                 tsk_fprintf(stderr,
+                     "hfs_load_extended_attrs: Processed last record of THIS node, still gathering attributes.\n");
+ 
+             // If we are at the very last leaf node in the btree, then
+             // this "flink" will be zero.  We break out of this loop over LEAF nodes.
+             if (newNodeID == 0) {
+                 if (tsk_verbose)
+                     tsk_fprintf(stderr,
+                         "hfs_load_extended_attrs: But, there are no more leaf nodes, so we are done.\n");
+                 break;
+             }
+ 
+             if (tsk_verbose)
+                 tsk_fprintf(stderr,
+                     "hfs_load_extended_attrs: Reading the next LEAF node %"
+                     PRIu32 ".\n", nodeID);
+ 
+             nodeID = newNodeID;
+ 
+             cnt = tsk_fs_file_read(attrFile.file,
+                 nodeID * attrFile.nodeSize,
+                 (char *) nodeData,
+                 attrFile.nodeSize, (TSK_FS_FILE_READ_FLAG_ENUM) 0);
+             if (cnt != (ssize_t)attrFile.nodeSize) {
+                 error_returned
+                     ("hfs_load_extended_attrs: Could not read in the next LEAF node from the Attributes File btree");
+                 goto on_error;
+             }
+ 
+             // Parse the Node header
+             nodeDescriptor = (hfs_btree_node *) nodeData;
+ 
+             // If we are NOT leaf node, then this is an error
+             if (nodeDescriptor->type != HFS_ATTR_NODE_LEAF) {
+                 error_detected(TSK_ERR_FS_CORRUPT,
+                     "hfs_load_extended_attrs: found a non-LEAF node as a successor to a LEAF node");
+                 goto on_error;
+             }
+         }                       // END if(! done)
+ 
+ 
+ 
+     }                           // END while(! done)  loop over successive LEAF nodes
+ 
+ on_exit:
+     free(nodeData);
+     tsk_list_free(nodeIDs_processed);
+     close_attr_file(&attrFile);
+     return 0;
+ 
+ on_error:
+     free(buffer);
+     free(nodeData);
+     tsk_list_free(nodeIDs_processed);
+     close_attr_file(&attrFile);
+     return 1;
+ }

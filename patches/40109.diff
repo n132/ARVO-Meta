@@ -1,0 +1,166 @@
+commit 70024b6b47b9eacfe01e8f92349ca9bf1ccd7d5a
+Author: Michael Niedermayer <michael@niedermayer.cc>
+Date:   Thu Oct 21 13:25:59 2021 +0200
+
+    avcodec/flac_parser: Consider AV_INPUT_BUFFER_PADDING_SIZE
+    
+    Fixes: out if array read
+    Fixes: 40109/clusterfuzz-testcase-minimized-ffmpeg_dem_FLAC_fuzzer-4805686811295744
+    
+    Found-by: continuous fuzzing process https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+    Reviewed-by: Mattias Wadman <mattias.wadman@gmail.com>
+    Signed-off-by: Michael Niedermayer <michael@niedermayer.cc>
+
+diff --git a/libavcodec/flac_parser.c b/libavcodec/flac_parser.c
+index 2c550507fc..3b27b152fc 100644
+--- a/libavcodec/flac_parser.c
++++ b/libavcodec/flac_parser.c
+@@ -1,60 +1,61 @@
+ /*
+  * FLAC parser
+  * Copyright (c) 2010 Michael Chinen
+  *
+  * This file is part of FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+  * version 2.1 of the License, or (at your option) any later version.
+  *
+  * FFmpeg is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  * Lesser General Public License for more details.
+  *
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
+ /**
+  * @file
+  * FLAC parser
+  *
+  * The FLAC parser buffers input until FLAC_MIN_HEADERS has been found.
+  * Each time it finds and verifies a CRC-8 header it sees which of the
+  * FLAC_MAX_SEQUENTIAL_HEADERS that came before it have a valid CRC-16 footer
+  * that ends at the newly found header.
+  * Headers are scored by FLAC_HEADER_BASE_SCORE plus the max of its crc-verified
+  * children, penalized by changes in sample rate, frame number, etc.
+  * The parser returns the frame with the highest score.
+  **/
+ 
+ #include "libavutil/attributes.h"
+ #include "libavutil/crc.h"
+ #include "libavutil/fifo.h"
+ #include "bytestream.h"
+ #include "parser.h"
+ #include "flac.h"
+ 
+ /** maximum number of adjacent headers that compare CRCs against each other   */
+ #define FLAC_MAX_SEQUENTIAL_HEADERS 4
+ /** minimum number of headers buffered and checked before returning frames    */
+ #define FLAC_MIN_HEADERS 10
+ /** estimate for average size of a FLAC frame                                 */
+ #define FLAC_AVG_FRAME_SIZE 8192
+ 
+ /** scoring settings for score_header */
+ #define FLAC_HEADER_BASE_SCORE        10
+ #define FLAC_HEADER_CHANGED_PENALTY   7
+ #define FLAC_HEADER_CRC_FAIL_PENALTY  50
+ #define FLAC_HEADER_NOT_PENALIZED_YET 100000
+ #define FLAC_HEADER_NOT_SCORED_YET    -100000
+ 
+ /** largest possible size of flac header */
+ #define MAX_FRAME_HEADER_SIZE 16
++#define MAX_FRAME_VERIFY_SIZE (MAX_FRAME_HEADER_SIZE + 1)
+ 
+ typedef struct FLACHeaderMarker {
+     int offset;       /**< byte offset from start of FLACParseContext->buffer */
+@@ -95,47 +96,47 @@ typedef struct FLACParseContext {
+ static int frame_header_is_valid(AVCodecContext *avctx, const uint8_t *buf,
+                                  FLACFrameInfo *fi)
+ {
+     GetBitContext gb;
+     uint8_t subframe_type;
+ 
+     // header plus one byte from first subframe
+-    init_get_bits(&gb, buf, MAX_FRAME_HEADER_SIZE * 8 + 8);
++    init_get_bits(&gb, buf, MAX_FRAME_VERIFY_SIZE * 8);
+     if (ff_flac_decode_frame_header(avctx, &gb, fi, 127)) {
+         return 0;
+     }
+     // subframe zero bit
+     if (get_bits1(&gb) != 0) {
+         return 0;
+     }
+     // subframe type
+     // 000000 : SUBFRAME_CONSTANT
+     // 000001 : SUBFRAME_VERBATIM
+     // 00001x : reserved
+     // 0001xx : reserved
+     // 001xxx : if(xxx <= 4) SUBFRAME_FIXED, xxx=order ; else reserved
+     // 01xxxx : reserved
+     // 1xxxxx : SUBFRAME_LPC, xxxxx=order-1
+     subframe_type = get_bits(&gb, 6);
+     if (!(subframe_type == 0 ||
+           subframe_type == 1 ||
+           ((subframe_type >= 8) && (subframe_type <= 12)) ||
+           (subframe_type >= 32))) {
+         return 0;
+     }
+ 
+     return 1;
+ }
+ 
+ /**
+  * Non-destructive fast fifo pointer fetching
+  * Returns a pointer from the specified offset.
+  * If possible the pointer points within the fifo buffer.
+  * Otherwise (if it would cause a wrap around,) a pointer to a user-specified
+  * buffer is used.
+  * The pointer can be NULL.  In any case it will be reallocated to hold the size.
+  * If the returned pointer will be used after subsequent calls to flac_fifo_read_wrap
+  * then the subsequent calls should pass in a different wrap_buf so as to not
+  * overwrite the contents of the previous wrap_buf.
+  * This function is based on av_fifo_generic_read, which is why there is a comment
+  * about a memory barrier for SMP.
+  */
+@@ -193,36 +194,36 @@ static uint8_t *flac_fifo_read(FLACParseContext *fpc, int offset, int *len)
+ static int find_headers_search_validate(FLACParseContext *fpc, int offset)
+ {
+     FLACFrameInfo fi;
+     uint8_t *header_buf;
+     int size = 0;
+     header_buf = flac_fifo_read_wrap(fpc, offset,
+-                                     MAX_FRAME_HEADER_SIZE,
++                                     MAX_FRAME_VERIFY_SIZE + AV_INPUT_BUFFER_PADDING_SIZE,
+                                      &fpc->wrap_buf,
+                                      &fpc->wrap_buf_allocated_size);
+     if (frame_header_is_valid(fpc->avctx, header_buf, &fi)) {
+         FLACHeaderMarker **end_handle = &fpc->headers;
+         int i;
+ 
+         size = 0;
+         while (*end_handle) {
+             end_handle = &(*end_handle)->next;
+             size++;
+         }
+ 
+         *end_handle = av_mallocz(sizeof(**end_handle));
+         if (!*end_handle) {
+             av_log(fpc->avctx, AV_LOG_ERROR,
+                    "couldn't allocate FLACHeaderMarker\n");
+             return AVERROR(ENOMEM);
+         }
+         (*end_handle)->fi     = fi;
+         (*end_handle)->offset = offset;
+ 
+         for (i = 0; i < FLAC_MAX_SEQUENTIAL_HEADERS; i++)
+             (*end_handle)->link_penalty[i] = FLAC_HEADER_NOT_PENALIZED_YET;
+ 
+         fpc->nb_headers_found++;
+         size++;
+     }
+     return size;
+ }

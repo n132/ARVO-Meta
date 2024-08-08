@@ -1,0 +1,339 @@
+commit abd1c594422eefed24c9586724d58525a7628226
+Merge: b3e4793d41 d814ae8680
+Author: Bart Van Assche <bvanassche@users.noreply.github.com>
+Date:   Tue Nov 2 20:19:57 2021 -0700
+
+    Merge pull request #370 from DavidKorczynski/agent-fix-1
+    
+    snmpd: Ensure contextNameLen follows buffer size
+
+diff --git a/agent/mibgroup/agentx/protocol.c b/agent/mibgroup/agentx/protocol.c
+index 78ce5cf0ca..a4e347277f 100644
+--- a/agent/mibgroup/agentx/protocol.c
++++ b/agent/mibgroup/agentx/protocol.c
+@@ -1559,320 +1559,325 @@ int
+ agentx_parse(netsnmp_session * session, netsnmp_pdu *pdu, u_char * data,
+              size_t len)
+ {
+     const u_char   *bufp = data;
+     char            data_buffer[64];
+     struct rszbuf   data_buf = {
+         data_buffer,
+         -(int)sizeof(data_buffer)
+     };
+     oid             oid_buffer[32];
+     struct rszbuf   oid_buf = {
+         oid_buffer,
+         -(int)sizeof(oid_buffer)
+     };
+     oid             end_oid_buffer[32];
+     struct rszbuf   end_oid_buf = {
+         end_oid_buffer,
+         -(int)sizeof(end_oid_buffer)
+     };
+     int             range_bound;        /* OID-range upper bound */
+     int             inc;        /* Inclusive SearchRange flag */
+     int             type;       /* VarBind data type */
+     size_t         *length = &len;
+     const int       dbgindent = debug_indent_get();
+     int             res = SNMP_ERR_NOERROR;
+ 
+     if (pdu == NULL)
+         return SNMP_ERR_NOERROR;
+  
+     if (!IS_AGENTX_VERSION(session->version)) {
+         res = SNMPERR_BAD_VERSION;
+         goto out;
+     }
+ 
+ #ifndef SNMPERR_INCOMPLETE_PACKET
+     /*
+      *  Ideally, "short" packets on stream connections should
+      *    be handled specially, and the driving code set up to
+      *    keep reading until the full packet is received.
+      *
+      *  For now, lets assume that all packets are read in one go.
+      *    I've probably inflicted enough damage on the UCD library
+      *    for one week!
+      *
+      *  I'll come back to this once Wes is speaking to me again.
+      */
+ #define SNMPERR_INCOMPLETE_PACKET SNMPERR_ASN_PARSE_ERR
+ #endif
+ 
+     if (len > 65536)
+         goto parse_err;
+ 
+     /*
+      *  Handle (common) header ....
+      */
+     bufp = agentx_parse_header(pdu, bufp, length);
+     if (bufp == NULL) {
+         res = SNMPERR_INCOMPLETE_PACKET;       /* i.e. wait for the rest */
+         goto out;
+     }
+ 
+     /*
+      * Control PDU handling 
+      */
+     pdu->flags |= UCD_MSG_FLAG_ALWAYS_IN_VIEW;
+     pdu->flags |= UCD_MSG_FLAG_FORCE_PDU_COPY;
+     pdu->flags &= (~UCD_MSG_FLAG_RESPONSE_PDU);
+ 
+     /*
+      *  ... and (not-un-common) context
+      */
+     if (pdu->flags & AGENTX_MSG_FLAG_NON_DEFAULT_CONTEXT) {
+         DEBUGDUMPHEADER("recv", "Context");
+         bufp = agentx_parse_string(bufp, length, &data_buf, pdu->flags &
+                                    AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         if (bufp == NULL)
+             goto parse_err;
+ 
+         pdu->community_len = data_buf.used;
+         snmp_clone_mem((void **)&pdu->community, data_buf.buf, data_buf.used);
+ 		
+         /* The NetSNMP API stuffs the context into the PDU's community string
+          * field, when using the AgentX Protocol.  The rest of the code however,
+          * expects to find the context in the PDU's context field.  Therefore we
+          * need to copy the context into the PDU's context fields.  */
+         if (pdu->community_len > 0 && pdu->contextName == NULL) {
++            /*
++             * strlen() is safe here because snmp_clone_mem() '\0'-terminates its output
++             */
++            if (strlen(pdu->community) != pdu->community_len)
++                goto parse_err;
+             pdu->contextName    = strdup((char *) pdu->community);
+             pdu->contextNameLen = pdu->community_len;
+         }
+     }
+ 
+ #define AGENTX_NEEDLEN( len ) \
+         if ( *length < len ) { \
+             goto parse_err; \
+         }
+     DEBUGDUMPHEADER("recv", "PDU");
+     switch (pdu->command) {
+     case AGENTX_MSG_OPEN:
+         AGENTX_NEEDLEN(4);
+         pdu->time = *bufp;      /* Timeout */
+         bufp += 4;
+         *length -= 4;
+ 
+         /*
+          * Store subagent OID & description in a VarBind 
+          */
+         DEBUGDUMPHEADER("recv", "Subagent OID");
+         bufp = agentx_parse_oid(bufp, length, NULL, &oid_buf, pdu->flags &
+                                 AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         if (bufp == NULL)
+             goto parse_err;
+         DEBUGDUMPHEADER("recv", "Subagent Description");
+         bufp = agentx_parse_string(bufp, length, &data_buf, pdu->flags &
+                                    AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         if (bufp == NULL)
+             goto parse_err;
+         snmp_pdu_add_variable(pdu, oid_buf.buf, oid_buf.used,
+                               ASN_OCTET_STR, data_buf.buf, data_buf.used);
+         break;
+ 
+     case AGENTX_MSG_CLOSE:
+         AGENTX_NEEDLEN(4);
+         pdu->errstat = *bufp;   /* Reason */
+         bufp += 4;
+         *length -= 4;
+ 
+         break;
+ 
+     case AGENTX_MSG_UNREGISTER:
+     case AGENTX_MSG_REGISTER:
+         AGENTX_NEEDLEN(4);
+         DEBUGDUMPHEADER("recv", "Registration Header");
+         if (pdu->command == AGENTX_MSG_REGISTER) {
+             pdu->time = *bufp;  /* Timeout (Register only) */
+             DEBUGDUMPSETUP("recv", bufp, 1);
+             DEBUGMSG(("dumpv_recv", "  Timeout:     \t%d\n", *bufp));
+         }
+         bufp++;
+         pdu->priority = *bufp;
+         DEBUGDUMPSETUP("recv", bufp, 1);
+         DEBUGMSG(("dumpv_recv", "  Priority:    \t%d\n", *bufp));
+         bufp++;
+         pdu->range_subid = *bufp;
+         DEBUGDUMPSETUP("recv", bufp, 1);
+         DEBUGMSG(("dumpv_recv", "  Range Sub-Id:\t%d\n", *bufp));
+         bufp++;
+         bufp++;
+         *length -= 4;
+         DEBUGINDENTLESS();
+ 
+         DEBUGDUMPHEADER("recv", "Registration OID");
+         bufp = agentx_parse_oid(bufp, length, NULL, &oid_buf, pdu->flags &
+                                 AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         if (bufp == NULL)
+             goto parse_err;
+ 
+         if (pdu->range_subid) {
+             if (pdu->range_subid > oid_buf.used)
+                 goto parse_err;
+             AGENTX_NEEDLEN(4);
+             range_bound = agentx_parse_int(bufp, pdu->flags &
+                                            AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+             bufp += 4;
+             *length -= 4;
+ 
+             /*
+              * Construct the end-OID.  
+              */
+             if (!increase_size(&end_oid_buf, oid_buf.used * sizeof(oid)))
+                 goto parse_err;
+             memcpy(end_oid_buf.buf, oid_buf.buf, oid_buf.used * sizeof(oid));
+             ((oid *)end_oid_buf.buf)[pdu->range_subid - 1] = range_bound;
+ 
+             snmp_pdu_add_variable(pdu, oid_buf.buf, oid_buf.used,
+                                   ASN_PRIV_INCL_RANGE, end_oid_buf.buf,
+                                   oid_buf.used * sizeof(oid));
+         } else {
+             snmp_add_null_var(pdu, oid_buf.buf, oid_buf.used);
+         }
+         break;
+ 
+     case AGENTX_MSG_GETBULK:
+         AGENTX_NEEDLEN(4);
+         DEBUGDUMPHEADER("recv", "Non-repeaters");
+         pdu->non_repeaters = agentx_parse_short(bufp, pdu->flags &
+                                                 AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         DEBUGDUMPHEADER("recv", "Max-repeaters");
+         pdu->max_repetitions = agentx_parse_short(bufp + 2, pdu->flags &
+                                                   AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         DEBUGINDENTLESS();
+         bufp += 4;
+         *length -= 4;
+         /* FALLTHROUGH */
+ 
+     case AGENTX_MSG_GETNEXT:
+     case AGENTX_MSG_GET:
+ 
+         /*
+          * *  SearchRange List
+          * *  Keep going while we have data left
+          */
+         DEBUGDUMPHEADER("recv", "Search Range");
+         while (*length > 0) {
+             bufp = agentx_parse_oid(bufp, length, &inc, &oid_buf, pdu->flags &
+                                     AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+             if (bufp == NULL)
+                 goto parse_err;
+             bufp = agentx_parse_oid(bufp, length, NULL, &end_oid_buf,
+                                     pdu->flags &
+                                     AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+             if (bufp == NULL)
+                 goto parse_err;
+             /*
+              * 'agentx_parse_oid()' returns the number of sub_ids 
+              */
+             snmp_pdu_add_variable(pdu, oid_buf.buf, oid_buf.used,
+                                   inc ? ASN_PRIV_INCL_RANGE :
+                                   ASN_PRIV_EXCL_RANGE,
+                                   end_oid_buf.buf,
+                                   end_oid_buf.used * sizeof(oid));
+         }
+ 
+         DEBUGINDENTLESS();
+         break;
+ 
+ 
+     case AGENTX_MSG_RESPONSE:
+ 
+         pdu->flags |= UCD_MSG_FLAG_RESPONSE_PDU;
+ 
+         AGENTX_NEEDLEN(8);
+ 
+         /*
+          * sysUpTime 
+          */
+         pdu->time = agentx_parse_int(bufp, pdu->flags &
+                                      AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         bufp += 4;
+         *length -= 4;
+ 
+         pdu->errstat = agentx_parse_short(bufp, pdu->flags &
+                                           AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         pdu->errindex =
+             agentx_parse_short(bufp + 2,
+                                pdu->flags & AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         bufp += 4;
+         *length -= 4;
+         /* FALL THROUGH */
+ 
+     case AGENTX_MSG_INDEX_ALLOCATE:
+     case AGENTX_MSG_INDEX_DEALLOCATE:
+     case AGENTX_MSG_NOTIFY:
+     case AGENTX_MSG_TESTSET:
+ 
+         /*
+          * *  VarBind List
+          * *  Keep going while we have data left
+          */
+ 
+         DEBUGDUMPHEADER("recv", "VarBindList");
+         while (*length > 0) {
+             bufp = agentx_parse_varbind(bufp, length, &type, &oid_buf,
+                                         &data_buf, pdu->flags &
+                                         AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+             if (bufp == NULL)
+                 goto parse_err;
+             snmp_pdu_add_variable(pdu, oid_buf.buf, oid_buf.used, type,
+                                   data_buf.buf, data_buf.used);
+         }
+         DEBUGINDENTLESS();
+         break;
+ 
+     case AGENTX_MSG_COMMITSET:
+     case AGENTX_MSG_UNDOSET:
+     case AGENTX_MSG_CLEANUPSET:
+     case AGENTX_MSG_PING:
+ 
+         /*
+          * "Empty" packet 
+          */
+         break;
+ 
+ 
+     case AGENTX_MSG_ADD_AGENT_CAPS:
+         /*
+          * Store AgentCap OID & description in a VarBind 
+          */
+         bufp = agentx_parse_oid(bufp, length, NULL, &oid_buf,
+                                 pdu->flags & AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         if (bufp == NULL)
+             goto parse_err;
+         bufp = agentx_parse_string(bufp, length, &data_buf, pdu->flags &
+                                    AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         if (bufp == NULL)
+             goto parse_err;
+         snmp_pdu_add_variable(pdu, oid_buf.buf, oid_buf.used,
+                               ASN_OCTET_STR, data_buf.buf, data_buf.used);
+         break;
+ 
+     case AGENTX_MSG_REMOVE_AGENT_CAPS:
+         /*
+          * Store AgentCap OID & description in a VarBind 
+          */
+         bufp = agentx_parse_oid(bufp, length, NULL, &oid_buf,
+                                 pdu->flags & AGENTX_FLAGS_NETWORK_BYTE_ORDER);
+         if (bufp == NULL)
+             goto parse_err;
+         snmp_add_null_var(pdu, oid_buf.buf, oid_buf.used);
+         break;
+ 
+     default:
+         DEBUGMSGTL(("agentx", "Unrecognised PDU type: %d\n",
+                     pdu->command));
+         res = SNMPERR_UNKNOWN_PDU;
+     }

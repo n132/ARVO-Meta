@@ -1,0 +1,181 @@
+commit 3a32d25c88a771892c9db1d2055395ae4523a682
+Merge: 9f960bfca 66cfabd7b
+Author: Ann Priestman <apriestman@basistech.com>
+Date:   Wed Sep 15 13:37:39 2021 -0400
+
+    Merge pull request #2520 from joachimmetz/apfs_fix_oob_read1
+    
+    Fixed multiple OOB reads in APFSJObject::add_entry #2519
+
+diff --git a/tsk/fs/apfs_fs.cpp b/tsk/fs/apfs_fs.cpp
+index 67c1b2071..e0a64a56d 100644
+--- a/tsk/fs/apfs_fs.cpp
++++ b/tsk/fs/apfs_fs.cpp
+@@ -64,132 +64,148 @@ APFSJObject::APFSJObject(const jit& start, const jit& end) {
+ void APFSJObject::add_entry(const jit::value_type& e) {
+   const auto key = e.key.template as<key_type>();
+ 
+   switch (key->type()) {
+     // Inode records
+     case APFS_JOBJTYPE_INODE: {
+       const auto value = e.value.template as<apfs_inode>();
+       _inode = *value;
+ 
+       // If the private_id is not the same as the oid then we're a clone
+       _is_clone = (_inode.private_id != key->oid());
+ 
+       // If there's more data than the size of the inode then we have xdata
+-      if ((size_t)e.value.count() > sizeof(apfs_inode)) {
++      size_t e_offset = sizeof(apfs_inode);
++      size_t e_size = e.value.count();
++      // Need at least 4 bytes for start of extended fields (xf_blob_t)
++      if (e_size > sizeof(apfs_inode) + 4) {
+         // The xfield headers are right after the inode
+         const auto xfield = reinterpret_cast<const apfs_xfield*>(value + 1);
+ 
+-        // The xfield data is after all of the xfield headers
+-        auto xfield_data =
+-            reinterpret_cast<const char*>(&xfield->entries[xfield->num_exts]);
++        e_offset += 4;
+ 
+-        for (auto i = 0U; i < xfield->num_exts; i++) {
+-          const auto& ext = xfield->entries[i];
++        // Need at least 4 bytes for each x_field_t
++        if (xfield->num_exts < (e_size - e_offset) / 4) {
++          // sizeof(xf_blob_t) + number of extenteded fields * sizeof(x_field_t)
++          e_offset += xfield->num_exts * 4;
+ 
+-          switch (ext.type) {
+-            case APFS_XFIELD_TYPE_NAME:
+-              _name = std::string(xfield_data);
+-              break;
+-            case APFS_XFIELD_TYPE_DSTREAM: {
+-              const auto ds =
+-                  reinterpret_cast<const apfs_dstream*>(xfield_data);
++          // The xfield data is after all of the xfield headers
++          auto xfield_data =
++              reinterpret_cast<const char*>(&xfield->entries[xfield->num_exts]);
+ 
+-              _size = ds->size;
+-              _size_on_disk = ds->alloced_size;
+-              break;
++          for (auto i = 0U; i < xfield->num_exts; i++) {
++            const auto& ext = xfield->entries[i];
++
++            switch (ext.type) {
++              case APFS_XFIELD_TYPE_NAME:
++                if((ext.len < 1) || (ext.len > e_size) || (e_offset > e_size - ext.len)) {
++                  break;
++                }
++                _name = std::string(xfield_data, ext.len - 1);
++                break;
++
++              case APFS_XFIELD_TYPE_DSTREAM: {
++                const auto ds =
++                    reinterpret_cast<const apfs_dstream*>(xfield_data);
++
++                _size = ds->size;
++                _size_on_disk = ds->alloced_size;
++                break;
++              }
+             }
+-          }
+ 
+-          // The next data needs to be aligned properly
+-          xfield_data += (ext.len + 7) & 0xFFF8;
++            // The next data needs to be aligned properly
++            xfield_data += (ext.len + 7) & 0xFFF8;
++            e_offset += (ext.len + 7) & 0xFFF8;
++          }
+         }
+       }
+       break;
+     }
+ 
+     // Directory records
+     case APFS_JOBJTYPE_DIR_RECORD: {
+ #pragma pack(push, 1)
+       struct dir_record_key : key_type {
+         uint32_t namelen_and_hash;
+         char name[0];
+ 
+         inline uint32_t name_len() const noexcept {
+           return bitfield_value(namelen_and_hash, 10, 0);
+         }
+ 
+         inline uint32_t hash() const noexcept {
+           return bitfield_value(namelen_and_hash, 22, 10);
+         }
+       };
+ #pragma pack(pop)
+       static_assert(sizeof(dir_record_key) == 0x0C, "invalid struct padding");
+ 
+       const auto k = e.key.template as<dir_record_key>();
+       const auto value = e.value.template as<apfs_dir_record>();
+ 
+       _children.emplace_back(
+           child_entry{std::string(k->name, k->name_len() - 1U), *value});
+       break;
+     }
+ 
+     // File extents
+     case APFS_JOBJTYPE_FILE_EXTENT: {
+       struct file_extent_key : key_type {
+         uint64_t offset;
+       };
+ 
+       const auto k = e.key.template as<file_extent_key>();
+       const auto value = e.value.template as<apfs_file_extent>();
+       const auto len =
+           bitfield_value(value->len_and_flags, APFS_FILE_EXTENT_LEN_BITS,
+                          APFS_FILE_EXTENT_LEN_SHIFT);
+ 
+       _extents.emplace_back(extent{k->offset, value->phys, len, value->crypto});
+ 
+       break;
+     }
+ 
+     // Extended Attributes
+     case APFS_JOBJTYPE_XATTR: {
+       struct xattr_key : key_type {
+         uint16_t name_len;
+         char name[0];
+       };
+ 
+       const auto k = e.key.template as<xattr_key>();
+       const auto value = e.value.template as<apfs_xattr>();
+ 
+       if (value->flags & APFS_XATTR_FLAG_INLINE) {
+ #pragma pack(push, 1)
+         struct ixattr : apfs_xattr {
+           char data[0];
+         };
+ #pragma pack(pop)
+ 
+         const auto ix = e.value.template as<ixattr>();
+         _inline_xattrs.emplace_back(inline_xattr{{k->name, k->name_len - 1U},
+                                                  {ix->data, ix->xdata_len}});
+         break;
+       }
+ 
+ // Non-Resident XATTRs
+ #pragma pack(push, 1)
+       struct nrattr : apfs_xattr {
+         uint64_t xattr_obj_id;
+         apfs_dstream dstream;
+       };
+ #pragma pack(pop)
+       static_assert(sizeof(nrattr) == 0x34, "misaligned structure");
+ 
+       const auto nrx = e.value.template as<nrattr>();
+ 
+       _nonres_xattrs.emplace_back(nonres_xattr{{k->name, k->name_len - 1U},
+                                                nrx->xattr_obj_id,
+                                                nrx->dstream.size,
+                                                nrx->dstream.alloced_size,
+                                                nrx->dstream.default_crypto_id});
+ 
+       break;
+     }
+   };
+ }

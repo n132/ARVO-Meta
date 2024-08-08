@@ -1,0 +1,314 @@
+commit 38b3bde1293ea8b6064bd6c2a1ed60171adea82b
+Author: Robin Watts <Robin.Watts@artifex.com>
+Date:   Thu Mar 24 16:54:02 2022 +0000
+
+    Bug 705128: Fix division by zero causing matrix with NaNs.
+    
+    This in turn causes MIN_INT phases, which upsets stuff in the
+    graphics library when attempting to fit a tile to a device
+    in copy_mono.
+
+diff --git a/base/gximage3.c b/base/gximage3.c
+index 609e58ea8..cf5e31cb6 100644
+--- a/base/gximage3.c
++++ b/base/gximage3.c
+@@ -190,297 +190,298 @@ int
+ gx_begin_image3_generic(gx_device * dev,
+                         const gs_gstate *pgs, const gs_matrix *pmat,
+                         const gs_image_common_t *pic, const gs_int_rect *prect,
+                         const gx_drawing_color *pdcolor,
+                         const gx_clip_path *pcpath, gs_memory_t *mem,
+                         image3_make_mid_proc_t make_mid,
+                         image3_make_mcde_proc_t make_mcde,
+                         gx_image_enum_common_t **pinfo)
+ {
+     const gs_image3_t *pim = (const gs_image3_t *)pic;
+     gs_image3_t local_pim;
+     gx_image3_enum_t *penum;
+     gs_int_rect mask_rect, data_rect;
+     gx_device *mdev = 0;
+     gx_device *pcdev = 0;
+     gs_image_t i_pixel, i_mask;
+     gs_matrix mi_pixel, mi_mask, mat;
+     gs_rect mrect;
+     gs_int_point origin;
+     int code;
+ 
+     /* Validate the parameters. */
+-    if (pim->Height <= 0 || pim->MaskDict.Height <= 0)
++    if (pim->Width <= 0 || pim->MaskDict.Width <= 0 ||
++        pim->Height <= 0 || pim->MaskDict.Height <= 0)
+         return_error(gs_error_rangecheck);
+     switch (pim->InterleaveType) {
+         default:
+             return_error(gs_error_rangecheck);
+         case interleave_chunky:
+             if (pim->MaskDict.Width != pim->Width ||
+                 pim->MaskDict.Height != pim->Height ||
+                 pim->MaskDict.BitsPerComponent != pim->BitsPerComponent ||
+                 pim->format != gs_image_format_chunky
+                 )
+                 return_error(gs_error_rangecheck);
+             break;
+         case interleave_scan_lines:
+             if (pim->MaskDict.Height % pim->Height != 0 &&
+                 pim->Height % pim->MaskDict.Height != 0
+                 )
+                 return_error(gs_error_rangecheck);
+             /* falls through */
+         case interleave_separate_source:
+             if (pim->MaskDict.BitsPerComponent != 1)
+                 return_error(gs_error_rangecheck);
+     }
+     if ((code = gs_matrix_invert(&pim->ImageMatrix, &mi_pixel)) < 0)
+         return code;
+     /* For Explicit Masking, we follow Acrobats example, and completely
+      * ignore the supplied mask. Instead we generate a new one based on the
+      * image mask, adjusted for any difference in width/height. */
+     if (pim->InterleaveType == interleave_separate_source ||
+         pim->InterleaveType == interleave_scan_lines) {
+         memcpy(&local_pim, pim, sizeof(local_pim));
+         pim = &local_pim;
+         gs_matrix_scale(&mi_pixel,
+                         ((double)pim->Width)  / pim->MaskDict.Width,
+                         ((double)pim->Height) / pim->MaskDict.Height,
+                         &mi_mask);
+         if ((code = gs_matrix_invert(&mi_mask, &local_pim.MaskDict.ImageMatrix)) < 0)
+             return code;
+     } else {
+         if ((code = gs_matrix_invert(&pim->MaskDict.ImageMatrix, &mi_mask)) < 0)
+             return code;
+ 
+         if (!check_image3_extent(pim->ImageMatrix.xx,
+                                  pim->MaskDict.ImageMatrix.xx) ||
+             !check_image3_extent(pim->ImageMatrix.xy,
+                                  pim->MaskDict.ImageMatrix.xy) ||
+             !check_image3_extent(pim->ImageMatrix.yx,
+                                  pim->MaskDict.ImageMatrix.yx) ||
+             !check_image3_extent(pim->ImageMatrix.yy,
+                                  pim->MaskDict.ImageMatrix.yy)
+             )
+             return_error(gs_error_rangecheck);
+     }
+     if (fabs(mi_pixel.tx - mi_mask.tx) >= 0.5 ||
+         fabs(mi_pixel.ty - mi_mask.ty) >= 0.5
+         )
+         return_error(gs_error_rangecheck);
+ #ifdef DEBUG
+     {
+         /* Although the PLRM says that the Mask and Image *must* be the same size,  */
+         /* Adobe CPSI (and other RIPS) ignore this and process anyway. Note that we */
+         /* are not compatible if the Mask Height than the Data (pixel) Height. CPSI */
+         /* de-interleaves the mask from the data image and stops at the Mask Height */
+         /* Problem detected with Genoa 468-03 (part of file 468-01.ps)              */
+         /*****           fixme: When Data Image Height > Mask Height            *****/
+         gs_point ep, em;
+ 
+         if ((code = gs_point_transform(pim->Width, pim->Height, &mi_pixel,
+                                        &ep)) < 0 ||
+             (code = gs_point_transform(pim->MaskDict.Width,
+                                        pim->MaskDict.Height, &mi_mask,
+                                        &em)) < 0
+             )
+             return code;
+         if (fabs(ep.x - em.x) >= 0.5 || fabs(ep.y - em.y) >= 0.5)
+             code = gs_error_rangecheck;	/* leave the check in for debug breakpoint */
+     }
+ #endif /* DEBUG */
+     penum = gs_alloc_struct(mem, gx_image3_enum_t, &st_image3_enum,
+                             "gx_begin_image3");
+     if (penum == 0)
+         return_error(gs_error_VMerror);
+     penum->num_components =
+         gs_color_space_num_components(pim->ColorSpace);
+     gx_image_enum_common_init((gx_image_enum_common_t *) penum,
+                               (const gs_data_image_t *)pim,
+                               &image3_enum_procs, dev,
+                               1 + penum->num_components,
+                               pim->format);
+     /* Initialize pointers now in case we bail out. */
+     penum->mask_data = 0;
+     penum->pixel_data = 0;
+     if (prect) {
+         long lmw = pim->MaskDict.Width, lmh = pim->MaskDict.Height;
+ 
+         data_rect = *prect;
+         mask_rect.p.x = (int)(data_rect.p.x * lmw / pim->Width);
+         mask_rect.p.y = (int)(data_rect.p.y * lmh / pim->Height);
+         mask_rect.q.x = (int)((data_rect.q.x + pim->Width - 1) * lmw /
+                               pim->Width);
+         mask_rect.q.y = (int)((data_rect.q.y + pim->Height - 1) * lmh /
+                               pim->Height);
+     } else {
+         mask_rect.p.x = mask_rect.p.y = 0;
+         mask_rect.q.x = pim->MaskDict.Width;
+         mask_rect.q.y = pim->MaskDict.Height;
+         data_rect.p.x = data_rect.p.y = 0;
+         data_rect.q.x = pim->Width;
+         data_rect.q.y = pim->Height;
+     }
+     penum->mask_width = mask_rect.q.x - mask_rect.p.x;
+     penum->mask_height = mask_rect.q.y - mask_rect.p.y;
+     penum->mask_full_height = pim->MaskDict.Height;
+     penum->mask_y = 0;
+     penum->mask_skip = 0;
+     penum->pixel_width = data_rect.q.x - data_rect.p.x;
+     penum->pixel_height = data_rect.q.y - data_rect.p.y;
+     penum->pixel_full_height = pim->Height;
+     penum->pixel_y = 0;
+     penum->mask_info = 0;
+     penum->pixel_info = 0;
+     if (pim->InterleaveType == interleave_chunky) {
+         /* Allocate row buffers for the mask and pixel data. */
+         penum->pixel_data =
+             gs_alloc_bytes(mem,
+                            (penum->pixel_width * pim->BitsPerComponent *
+                             penum->num_components + 7) >> 3,
+                            "gx_begin_image3(pixel_data)");
+         penum->mask_data =
+             gs_alloc_bytes(mem, (penum->mask_width + 7) >> 3,
+                            "gx_begin_image3(mask_data)");
+         if (penum->pixel_data == 0 || penum->mask_data == 0) {
+             code = gs_note_error(gs_error_VMerror);
+             goto out1;
+         }
+         /* Because the mask data is 1 BPC, if the width is not a multiple of 8
+          * then we will not fill the last byte of mask_data completely. This
+          * provokes valgrind when running to pdfwrite, because pdfwrite has to
+          * write the full byte of mask data to the file. It also means (potentially)
+          * that we could run the same input twice and get (slightly) different
+          * PDF files produced. So we set the last byte to zero to ensure the bits
+          * are fully initialised. See Bug #693814
+          */
+         penum->mask_data[((penum->mask_width + 7) >> 3) - 1] = 0x00;
+     }
+     penum->InterleaveType = pim->InterleaveType;
+     penum->bpc = pim->BitsPerComponent;
+     penum->memory = mem;
+     mrect.p.x = mrect.p.y = 0;
+     mrect.q.x = pim->MaskDict.Width;
+     mrect.q.y = pim->MaskDict.Height;
+     if (pmat == 0)
+         pmat = &ctm_only(pgs);
+     if ((code = gs_matrix_multiply(&mi_mask, pmat, &mat)) < 0 ||
+         (code = gs_bbox_transform(&mrect, &mat, &mrect)) < 0
+         )
+         return code;
+ 
+     /* Bug 700438: If the rectangle is out of range, bail */
+     if (mrect.p.x >= (double)INT_MAX || mrect.q.x <= (double)INT_MIN ||
+         mrect.p.y >= (double)INT_MAX || mrect.q.y <= (double)INT_MIN ||
+         mrect.p.x <= (double)INT_MIN || mrect.q.x >= (double)INT_MAX ||
+         mrect.p.y <= (double)INT_MIN || mrect.q.y >= (double)INT_MAX
+ 	) {
+             code = gs_note_error(gs_error_rangecheck);
+         goto out1;
+     }
+ 
+     /* This code was changed for bug 686843/687411, but in a way that
+      * a) looked wrong, and b) doesn't appear to make a difference. Revert
+      * it to the sane version until we have evidence why not. */
+     origin.x = (int)floor(mrect.p.x);
+     origin.y = (int)floor(mrect.p.y);
+     code = make_mid(&mdev, dev, (int)ceil(mrect.q.x) - origin.x,
+                     (int)ceil(mrect.q.y) - origin.y, mem);
+     if (code < 0)
+         goto out1;
+     penum->mdev = mdev;
+     gs_image_t_init_mask(&i_mask, false);
+     i_mask.adjust = false;
+     {
+         const gx_image_type_t *type1 = i_mask.type;
+ 
+         *(gs_data_image_t *)&i_mask = pim->MaskDict;
+         i_mask.type = type1;
+         i_mask.BitsPerComponent = 1;
+         i_mask.image_parent_type = gs_image_type3;
+     }
+     {
+         gx_drawing_color dcolor;
+         gs_matrix m_mat;
+ 
+         set_nonclient_dev_color(&dcolor, 1);
+         /*
+          * Adjust the translation for rendering the mask to include a
+          * negative translation by origin.{x,y} in device space.
+          */
+         m_mat = *pmat;
+         m_mat.tx -= origin.x;
+         m_mat.ty -= origin.y;
+         i_mask.override_in_smask = (dev_proc(dev, dev_spec_op)(dev, gxdso_in_smask, NULL, 0)) > 0;
+         /*
+          * Note that pgs = NULL here, since we don't want to have to
+          * create another gs_gstate with default log_op, etc.
+          */
+         code = gx_device_begin_typed_image(mdev, NULL, &m_mat,
+                                            (const gs_image_common_t *)&i_mask,
+                                            &mask_rect, &dcolor, NULL, mem,
+                                            &penum->mask_info);
+         if (code < 0)
+             goto out2;
+     }
+     gs_image_t_init(&i_pixel, pim->ColorSpace);
+     {
+         const gx_image_type_t *type1 = i_pixel.type;
+ 
+         *(gs_pixel_image_t *)&i_pixel = *(const gs_pixel_image_t *)pim;
+         i_pixel.type = type1;
+         i_pixel.image_parent_type = gs_image_type3;
+     }
+     code = make_mcde(dev, pgs, pmat, (const gs_image_common_t *)&i_pixel,
+                      prect, pdcolor, pcpath, mem, &penum->pixel_info,
+                      &pcdev, mdev, penum->mask_info, &origin);
+     if (code < 0)
+         goto out3;
+     penum->pcdev = pcdev;
+     /*
+      * Set num_planes, plane_widths, and plane_depths from the values in the
+      * enumerators for the mask and the image data.
+      */
+     switch (pim->InterleaveType) {
+     case interleave_chunky:
+         /* Add the mask data to the depth of the image data. */
+         penum->num_planes = 1;
+         penum->plane_widths[0] = pim->Width;
+         penum->plane_depths[0] =
+             penum->pixel_info->plane_depths[0] *
+             (penum->num_components + 1) / penum->num_components;
+         break;
+     case interleave_scan_lines:
+         /*
+          * There is only 1 plane, with dynamically changing width & depth.
+          * Initialize it for the mask data, since that is what will be
+          * read first.
+          */
+         penum->num_planes = 1;
+         penum->plane_depths[0] = 1;
+         penum->plane_widths[0] = pim->MaskDict.Width;
+         break;
+     case interleave_separate_source:
+         /* Insert the mask data as a separate plane before the image data. */
+         penum->num_planes = penum->pixel_info->num_planes + 1;
+         penum->plane_widths[0] = pim->MaskDict.Width;
+         penum->plane_depths[0] = 1;
+         memcpy(&penum->plane_widths[1], &penum->pixel_info->plane_widths[0],
+                (penum->num_planes - 1) * sizeof(penum->plane_widths[0]));
+         memcpy(&penum->plane_depths[1], &penum->pixel_info->plane_depths[0],
+                (penum->num_planes - 1) * sizeof(penum->plane_depths[0]));
+         break;
+     }
+     gx_device_retain(mdev, true); /* will free explicitly */
+     gx_device_retain(pcdev, true); /* ditto */
+     *pinfo = (gx_image_enum_common_t *) penum;
+     return 0;
+   out3:
+     gx_image_end(penum->mask_info, false);
+   out2:
+     gs_closedevice(mdev);
+     gs_free_object(mem, mdev, "gx_begin_image3(mdev)");
+   out1:
+     gs_free_object(mem, penum->mask_data, "gx_begin_image3(mask_data)");
+     gs_free_object(mem, penum->pixel_data, "gx_begin_image3(pixel_data)");
+     gs_free_object(mem, penum, "gx_begin_image3");
+     return code;
+ }

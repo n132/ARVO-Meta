@@ -1,0 +1,259 @@
+commit 8a38852f9c7da025602aa81ff83f1ae2ef8e21e0
+Author: Julius Pfrommer <julius.pfrommer@web.de>
+Date:   Sun May 31 14:32:02 2020 +0200
+
+    fix(core): Fix fuzzing cases in JSON decoding
+
+diff --git a/src/ua_types_encoding_json.c b/src/ua_types_encoding_json.c
+index c0ced08ec..fdbc1d5f2 100644
+--- a/src/ua_types_encoding_json.c
++++ b/src/ua_types_encoding_json.c
+@@ -108,30 +108,34 @@ static WRITE_JSON_ELEMENT(Quote) {
+ 
+ WRITE_JSON_ELEMENT(ObjStart) {
+     /* increase depth, save: before first key-value no comma needed. */
+-    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION)
++    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION - 1)
+         return UA_STATUSCODE_BADENCODINGERROR;
+     ctx->depth++;
+     ctx->commaNeeded[ctx->depth] = false;
+     return writeChar(ctx, '{');
+ }
+ 
+ WRITE_JSON_ELEMENT(ObjEnd) {
+-    ctx->depth--; //decrease depth
++    if(ctx->depth == 0)
++        return UA_STATUSCODE_BADENCODINGERROR;
++    ctx->depth--;
+     ctx->commaNeeded[ctx->depth] = true;
+     return writeChar(ctx, '}');
+ }
+ 
+ WRITE_JSON_ELEMENT(ArrStart) {
+     /* increase depth, save: before first array entry no comma needed. */
+-    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION)
++    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION - 1)
+         return UA_STATUSCODE_BADENCODINGERROR;
+     ctx->depth++;
+     ctx->commaNeeded[ctx->depth] = false;
+     return writeChar(ctx, '[');
+ }
+ 
+ WRITE_JSON_ELEMENT(ArrEnd) {
+-    ctx->depth--; //decrease depth
++    if(ctx->depth == 0)
++        return UA_STATUSCODE_BADENCODINGERROR;
++    ctx->depth--;
+     ctx->commaNeeded[ctx->depth] = true;
+     return writeChar(ctx, ']');
+ }
+@@ -223,23 +227,22 @@ status UA_FUNC_ATTR_WARN_UNUSED_RESULT
+ writeJsonKey(CtxJson *ctx, const char* key) {
+     size_t size = strlen(key);
+     if(ctx->pos + size + 4 > ctx->end) /* +4 because of " " : and , */
+         return UA_STATUSCODE_BADENCODINGLIMITSEXCEEDED;
+     status ret = writeJsonCommaIfNeeded(ctx);
+     ctx->commaNeeded[ctx->depth] = true;
+     if(ctx->calcOnly) {
+-        ctx->commaNeeded[ctx->depth] = true;
+         ctx->pos += 3;
+         ctx->pos += size;
+         return ret;
+     }
+ 
+     ret |= writeChar(ctx, '\"');
+     for(size_t i = 0; i < size; i++) {
+         *(ctx->pos++) = (u8)key[i];
+     }
+     ret |= writeChar(ctx, '\"');
+     ret |= writeChar(ctx, ':');
+     return ret;
+ }
+ 
+ /* Boolean */
+@@ -507,18 +510,22 @@ static status
+ encodeJsonArray(CtxJson *ctx, const void *ptr, size_t length,
+                 const UA_DataType *type) {
+     encodeJsonSignature encodeType = encodeJsonJumpTable[type->typeKind];
+     status ret = writeJsonArrStart(ctx);
++    if(ret != UA_STATUSCODE_GOOD)
++        return ret;
+     uintptr_t uptr = (uintptr_t)ptr;
+     for(size_t i = 0; i < length && ret == UA_STATUSCODE_GOOD; ++i) {
+         ret |= writeJsonCommaIfNeeded(ctx);
+         ret |= encodeType((const void*)uptr, type, ctx);
++        if(ret != UA_STATUSCODE_GOOD)
++            return ret;
+         ctx->commaNeeded[ctx->depth] = true;
+         uptr += type->memSize;
+     }
+     ret |= writeJsonArrEnd(ctx);
+     return ret;
+ }
+ 
+ /*****************/
+ /* Builtin Types */
+ /*****************/
+@@ -1089,37 +1096,39 @@ static status
+ Variant_encodeJsonWrapExtensionObject(const UA_Variant *src, const bool isArray, CtxJson *ctx) {
+     size_t length = 1;
+ 
+     status ret = UA_STATUSCODE_GOOD;
+     if(isArray) {
+         if(src->arrayLength > UA_INT32_MAX)
+             return UA_STATUSCODE_BADENCODINGERROR;
+         
+         length = src->arrayLength;
+     }
+ 
+     /* Set up the ExtensionObject */
+     UA_ExtensionObject eo;
+     UA_ExtensionObject_init(&eo);
+     eo.encoding = UA_EXTENSIONOBJECT_DECODED;
+     eo.content.decoded.type = src->type;
+     const u16 memSize = src->type->memSize;
+     uintptr_t ptr = (uintptr_t) src->data;
+ 
+     if(isArray) {
+-        ret |= writeJsonArrStart(ctx);
++        ret = writeJsonArrStart(ctx);
++        if(ret != UA_STATUSCODE_GOOD)
++            return ret;
+         ctx->commaNeeded[ctx->depth] = false;
+ 
+         /* Iterate over the array */
+         for(size_t i = 0; i <  length && ret == UA_STATUSCODE_GOOD; ++i) {
+             eo.content.decoded.data = (void*) ptr;
+             ret |= writeJsonArrElm(ctx, &eo, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT]);
+             ptr += memSize;
+         }
+     
+         ret |= writeJsonArrEnd(ctx);
+         return ret;
+     }
+ 
+     eo.content.decoded.data = (void*) ptr;
+     return encodeJsonInternal(&eo, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT], ctx);
+ }
+@@ -1128,29 +1137,27 @@ static status
+ addMultiArrayContentJSON(CtxJson *ctx, void* array, const UA_DataType *type, 
+                          size_t *index, UA_UInt32 *arrayDimensions, size_t dimensionIndex, 
+                          size_t dimensionSize) {
+-    /* Check the recursion limit */
+-    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION)
+-        return UA_STATUSCODE_BADENCODINGERROR;
+-    
+     /* Stop recursion: The inner Arrays are written */
+     status ret;
+     if(dimensionIndex == (dimensionSize - 1)) {
+         ret = encodeJsonArray(ctx, ((u8*)array) + (type->memSize * *index),
+                               arrayDimensions[dimensionIndex], type);
+         (*index) += arrayDimensions[dimensionIndex];
+         return ret;
+     }
+ 
+     /* Recurse to the next dimension */
+     ret = writeJsonArrStart(ctx);
++    if(ret != UA_STATUSCODE_GOOD)
++        return ret;
+     for(size_t i = 0; i < arrayDimensions[dimensionIndex]; i++) {
+         ret |= writeJsonCommaIfNeeded(ctx);
+         ret |= addMultiArrayContentJSON(ctx, array, type, index, arrayDimensions,
+                                         dimensionIndex + 1, dimensionSize);
+         ctx->commaNeeded[ctx->depth] = true;
+         if(ret != UA_STATUSCODE_GOOD)
+             return ret;
+     }
+     ret |= writeJsonArrEnd(ctx);
+     return ret;
+ }
+@@ -1386,40 +1393,35 @@ ENCODE_JSON(DiagnosticInfo) {
+ 
+ static status
+ encodeJsonStructure(const void *src, const UA_DataType *type, CtxJson *ctx) {
+-    /* Check the recursion limit */
+-    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION)
+-        return UA_STATUSCODE_BADENCODINGERROR;
+-    ctx->depth++;
+-
+     status ret = writeJsonObjStart(ctx);
++    if(ret != UA_STATUSCODE_GOOD)
++        return ret;
+ 
+     uintptr_t ptr = (uintptr_t) src;
+     u8 membersSize = type->membersSize;
+     const UA_DataType * typelists[2] = {UA_TYPES, &type[-type->typeIndex]};
+     for(size_t i = 0; i < membersSize && ret == UA_STATUSCODE_GOOD; ++i) {
+         const UA_DataTypeMember *m = &type->members[i];
+         const UA_DataType *mt = &typelists[!m->namespaceZero][m->memberTypeIndex];
+ 
+         if(m->memberName != NULL && *m->memberName != 0)
+             ret |= writeJsonKey(ctx, m->memberName);
+ 
+         if(!m->isArray) {
+             ptr += m->padding;
+             size_t memSize = mt->memSize;
+             ret |= encodeJsonJumpTable[mt->typeKind]((const void*) ptr, mt, ctx);
+             ptr += memSize;
+         } else {
+             ptr += m->padding;
+             const size_t length = *((const size_t*) ptr);
+             ptr += sizeof (size_t);
+             ret |= encodeJsonArray(ctx, *(void * const *)ptr, length, mt);
+             ptr += sizeof (void*);
+         }
+     }
+ 
+     ret |= writeJsonObjEnd(ctx);
+-
+-    ctx->depth--;
+     return ret;
+ }
+ 
+@@ -3157,43 +3159,45 @@ static status
+ decodeJsonStructure(void *dst, const UA_DataType *type, CtxJson *ctx, 
+                     ParseCtx *parseCtx, UA_Boolean moveToken) {
+     (void) moveToken;
+     /* Check the recursion limit */
+-    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION)
++    if(ctx->depth >= UA_JSON_ENCODING_MAX_RECURSION - 1)
+         return UA_STATUSCODE_BADENCODINGERROR;
+     ctx->depth++;
+ 
+     uintptr_t ptr = (uintptr_t)dst;
+     status ret = UA_STATUSCODE_GOOD;
+     u8 membersSize = type->membersSize;
+     const UA_DataType *typelists[2] = { UA_TYPES, &type[-type->typeIndex] };
+     
+     UA_STACKARRAY(DecodeEntry, entries, membersSize);
+ 
+     for(size_t i = 0; i < membersSize && ret == UA_STATUSCODE_GOOD; ++i) {
+         const UA_DataTypeMember *m = &type->members[i];
+         const UA_DataType *mt = &typelists[!m->namespaceZero][m->memberTypeIndex];
+ 
+         entries[i].type = mt;
+         if(!m->isArray) {
+             ptr += m->padding;
+             entries[i].fieldName = m->memberName;
+             entries[i].fieldPointer = (void*)ptr;
+             entries[i].function = decodeJsonJumpTable[mt->typeKind];
+             entries[i].found = false;
+             ptr += mt->memSize;
+         } else {
+             ptr += m->padding;
+             ptr += sizeof(size_t);
+             entries[i].fieldName = m->memberName;
+             entries[i].fieldPointer = (void*)ptr;
+             entries[i].function = (decodeJsonSignature)Array_decodeJson;
+             entries[i].found = false;
+             ptr += sizeof(void*);
+         }
+     }
+     
+     ret = decodeFields(ctx, parseCtx, entries, membersSize, type);
+ 
++    if(ctx->depth == 0)
++        return UA_STATUSCODE_BADENCODINGERROR;
+     ctx->depth--;
+     return ret;
+ }

@@ -1,0 +1,340 @@
+commit 1ae6bb9985c05f8742cb31c0bd46f3c7bd8777bd
+Author: Dennis Potman <dennis@zettascale.tech>
+Date:   Mon Mar 13 21:49:19 2023 +0100
+
+    Improve error handling when dealing with invalid type identifiers and
+    invalid type objects in xtypes wrapper.
+    
+    Signed-off-by: Dennis Potman <dennis@zettascale.tech>
+
+diff --git a/src/core/ddsi/src/ddsi_typelib.c b/src/core/ddsi/src/ddsi_typelib.c
+index 61d80db1..b12946c8 100644
+--- a/src/core/ddsi/src/ddsi_typelib.c
++++ b/src/core/ddsi/src/ddsi_typelib.c
+@@ -350,34 +350,34 @@ static void type_dep_trace (struct ddsi_domaingv *gv, const char *prefix, struct
+   GVTRACE ("%sdep <%s, %s>\n", prefix, ddsi_make_typeid_str (&tistr, &dep->src_type_id), ddsi_make_typeid_str (&tistrdep, &dep->dep_type_id));
+ }
+ 
+-static void ddsi_type_fini (struct ddsi_domaingv *gv, struct ddsi_type *type)
++static void ddsi_type_free (struct ddsi_domaingv *gv, struct ddsi_type *type)
+ {
+   struct ddsi_type_dep key;
+   memset (&key, 0, sizeof (key));
+   ddsi_typeid_copy (&key.src_type_id, &type->xt.id);
+   ddsi_xt_type_fini (gv, &type->xt, true);
+ 
+   struct ddsi_type_dep *dep;
+   while ((dep = ddsrt_avl_lookup_succ_eq (&ddsi_typedeps_treedef, &gv->typedeps, &key)) != NULL && !ddsi_typeid_compare (&dep->src_type_id, &key.src_type_id))
+   {
+-    type_dep_trace (gv, "ddsi_type_fini ", dep);
++    type_dep_trace (gv, "ddsi_type_free ", dep);
+     ddsrt_avl_delete (&ddsi_typedeps_treedef, &gv->typedeps, dep);
+     ddsrt_avl_delete (&ddsi_typedeps_reverse_treedef, &gv->typedeps_reverse, dep);
+     if (dep->from_type_info)
+     {
+       /* This dependency record was added based on dependencies from a type-info object,
+          and the dep-type was ref-counted when creating the dependency. Therefore, an
+          unref is required at this point when the from_type_info flag is set. */
+       struct ddsi_type *dep_type = ddsi_type_lookup_locked (gv, &dep->dep_type_id);
+       ddsi_type_unref_locked (gv, dep_type);
+     }
+     ddsi_typeid_fini (&dep->src_type_id);
+     ddsi_typeid_fini (&dep->dep_type_id);
+     ddsrt_free (dep);
+   }
+ #ifndef NDEBUG
+   assert (!ddsi_type_proxy_guid_list_count (&type->proxy_guids));
+ #endif
+   ddsi_typeid_fini (&key.src_type_id);
+   ddsrt_free (type);
+ }
+@@ -406,34 +406,34 @@ struct ddsi_type * ddsi_type_lookup (struct ddsi_domaingv *gv, const ddsi_typeid
+ static dds_return_t ddsi_type_new (struct ddsi_domaingv *gv, struct ddsi_type **type, const struct DDS_XTypes_TypeIdentifier *type_id, const struct DDS_XTypes_TypeObject *type_obj)
+ {
+   dds_return_t ret;
+   struct ddsi_typeid_str tistr;
+   assert (type);
+   assert (!ddsi_typeid_is_none_impl (type_id));
+   assert (!ddsi_type_lookup_locked_impl (gv, type_id));
+ 
+   ddsi_typeid_t type_obj_id;
+   if (type_obj && ((ret = ddsi_typeobj_get_hash_id (type_obj, &type_obj_id))
+       || (ret = (ddsi_typeid_compare_impl (&type_obj_id.x, type_id) ? DDS_RETCODE_BAD_PARAMETER : DDS_RETCODE_OK))))
+   {
+     GVWARNING ("non-matching type identifier (%s) and type object (%s)\n", ddsi_make_typeid_str_impl (&tistr, type_id), ddsi_make_typeid_str (&tistr, &type_obj_id));
+     *type = NULL;
+     return ret;
+   }
+ 
+   if ((*type = ddsrt_calloc (1, sizeof (**type))) == NULL)
+     return DDS_RETCODE_OUT_OF_RESOURCES;
+ 
+   GVTRACE (" new %p", *type);
+   if ((ret = ddsi_xt_type_init_impl (gv, &(*type)->xt, type_id, type_obj)) != DDS_RETCODE_OK)
+   {
+-    ddsi_type_fini (gv, *type);
++    ddsi_type_free (gv, *type);
+     *type = NULL;
+     return ret;
+   }
+   if (!ddsi_typeid_is_hash (&(*type)->xt.id))
+     (*type)->state = DDSI_TYPE_RESOLVED;
+   /* inserted with refc 0 (set by calloc), refc is increased in
+      ddsi_type_ref_* functions */
+   ddsrt_avl_insert (&ddsi_typelib_treedef, &gv->typelib, *type);
+   return DDS_RETCODE_OK;
+ }
+@@ -488,37 +488,44 @@ dds_return_t ddsi_type_add_typeobj (struct ddsi_domaingv *gv, struct ddsi_type *
+ static dds_return_t ddsi_type_register_dep_impl (struct ddsi_domaingv *gv, const ddsi_typeid_t *src_type_id, struct ddsi_type **dst_dep_type, const struct DDS_XTypes_TypeIdentifier *dep_tid, bool from_type_info)
+ {
+   dds_return_t ret = DDS_RETCODE_OK;
+   struct ddsi_typeid dep_type_id;
++
++  if (ddsi_typeid_is_none_impl (dep_tid))
++    return DDS_RETCODE_BAD_PARAMETER;
++
+   dep_type_id.x = *dep_tid;
+   struct ddsi_type_dep *dep = ddsrt_calloc (1, sizeof (*dep));
+   ddsi_typeid_copy (&dep->src_type_id, src_type_id);
+   ddsi_typeid_copy (&dep->dep_type_id, &dep_type_id);
+   bool existing = ddsrt_avl_lookup (&ddsi_typedeps_treedef, &gv->typedeps, dep) != NULL;
+   type_dep_trace (gv, existing ? "has " : "add ", dep);
+   if (!existing)
+   {
+     dep->from_type_info = from_type_info;
+     ddsrt_avl_insert (&ddsi_typedeps_treedef, &gv->typedeps, dep);
+     ddsrt_avl_insert (&ddsi_typedeps_reverse_treedef, &gv->typedeps_reverse, dep);
+     if ((ret = ddsi_type_ref_id_locked (gv, dst_dep_type, &dep_type_id)) != DDS_RETCODE_OK)
+     {
+       ddsrt_avl_delete (&ddsi_typedeps_treedef, &gv->typedeps, dep);
+       ddsrt_avl_delete (&ddsi_typedeps_reverse_treedef, &gv->typedeps_reverse, dep);
++      ddsi_typeid_fini (&dep->src_type_id);
++      ddsi_typeid_fini (&dep->dep_type_id);
++      ddsrt_free (dep);
+     }
+   }
+   else
+   {
+     ddsi_typeid_fini (&dep->src_type_id);
+     ddsi_typeid_fini (&dep->dep_type_id);
+     ddsrt_free (dep);
+     if (!from_type_info)
+       ret = ddsi_type_ref_id_locked (gv, dst_dep_type, &dep_type_id);
+     else
+     {
+       *dst_dep_type = ddsi_type_lookup_locked (gv, &dep_type_id);
+       if (*dst_dep_type == NULL)
+         ret = DDS_RETCODE_ERROR;
+     }
+   }
+   return ret;
+ }
+@@ -582,19 +589,21 @@ void ddsi_type_ref_locked (struct ddsi_domaingv *gv, struct ddsi_type **type, co
+ dds_return_t ddsi_type_ref_id_locked_impl (struct ddsi_domaingv *gv, struct ddsi_type **type, const struct DDS_XTypes_TypeIdentifier *type_id)
+ {
+   struct ddsi_typeid_str tistr;
+   dds_return_t ret = DDS_RETCODE_OK;
+-  assert (!ddsi_typeid_is_none_impl (type_id));
++  if (ddsi_typeid_is_none_impl (type_id))
++    return DDS_RETCODE_BAD_PARAMETER;
++
+   GVTRACE ("ref ddsi_type type-id %s", ddsi_make_typeid_str_impl (&tistr, type_id));
+   struct ddsi_type *t = ddsi_type_lookup_locked_impl (gv, type_id);
+   if (!t && (ret = ddsi_type_new (gv, &t, type_id, NULL)) != DDS_RETCODE_OK)
+   {
+     if (type)
+       *type = NULL;
+     return ret;
+   }
+   t->refc++;
+   GVTRACE (" refc %"PRIu32"\n", t->refc);
+   if (type)
+     *type = t;
+   return ret;
+ }
+@@ -1057,12 +1066,12 @@ struct ddsi_typeobj *ddsi_type_get_typeobj (struct ddsi_domaingv *gv, const stru
+ static void ddsi_type_unref_impl_locked (struct ddsi_domaingv *gv, struct ddsi_type *type)
+ {
+   assert (type->refc > 0);
+   if (--type->refc == 0)
+   {
+     GVTRACE (" refc 0 remove type ");
+     ddsrt_avl_delete (&ddsi_typelib_treedef, &gv->typelib, type);
+-    ddsi_type_fini (gv, type);
++    ddsi_type_free (gv, type);
+   }
+   else
+     GVTRACE (" refc %" PRIu32 " ", type->refc);
+ }
+@@ -1079,18 +1088,23 @@ void ddsi_type_unreg_proxy (struct ddsi_domaingv *gv, struct ddsi_type *type, co
+   ddsrt_mutex_unlock (&gv->typelib_lock);
+ }
+ 
+-void ddsi_type_unref (struct ddsi_domaingv *gv, struct ddsi_type *type)
++void ddsi_type_unref_locked (struct ddsi_domaingv *gv, struct ddsi_type *type)
+ {
+-  struct ddsi_typeid_str tistr;
+-  if (!type)
++  if (type == NULL)
+     return;
+-  ddsrt_mutex_lock (&gv->typelib_lock);
++  struct ddsi_typeid_str tistr;
+   GVTRACE ("unref ddsi_type id %s", ddsi_make_typeid_str (&tistr, &type->xt.id));
+   ddsi_type_unref_impl_locked (gv, type);
+-  ddsrt_mutex_unlock (&gv->typelib_lock);
+   GVTRACE ("\n");
+ }
+ 
++void ddsi_type_unref (struct ddsi_domaingv *gv, struct ddsi_type *type)
++{
++  ddsrt_mutex_lock (&gv->typelib_lock);
++  ddsi_type_unref_locked (gv, type);
++  ddsrt_mutex_unlock (&gv->typelib_lock);
++}
++
+ void ddsi_type_unref_sertype (struct ddsi_domaingv *gv, const struct ddsi_sertype *sertype)
+ {
+   assert (sertype);
+@@ -1117,14 +1131,6 @@ void ddsi_type_unref_sertype (struct ddsi_domaingv *gv, const struct ddsi_sertyp
+   ddsrt_mutex_unlock (&gv->typelib_lock);
+ }
+ 
+-void ddsi_type_unref_locked (struct ddsi_domaingv *gv, struct ddsi_type *type)
+-{
+-  assert (type);
+-  struct ddsi_typeid_str tistr;
+-  GVTRACE ("unref ddsi_type id %s", ddsi_make_typeid_str (&tistr, &type->xt.id));
+-  ddsi_type_unref_impl_locked (gv, type);
+-}
+-
+ static void ddsi_type_get_gpe_matches_impl (struct ddsi_domaingv *gv, const struct ddsi_type *type, struct ddsi_generic_proxy_endpoint ***gpe_match_upd, uint32_t *n_match_upd)
+ {
+   if (!ddsi_type_proxy_guid_list_count (&type->proxy_guids))
+diff --git a/src/core/ddsi/src/ddsi_typewrap.c b/src/core/ddsi/src/ddsi_typewrap.c
+index d402b315..c984430c 100644
+--- a/src/core/ddsi/src/ddsi_typewrap.c
++++ b/src/core/ddsi/src/ddsi_typewrap.c
+@@ -1315,116 +1315,115 @@ dds_return_t ddsi_xt_type_add_typeobj (struct ddsi_domaingv *gv, struct xt_type
+ dds_return_t ddsi_xt_type_init_impl (struct ddsi_domaingv *gv, struct xt_type *xt, const struct DDS_XTypes_TypeIdentifier *ti, const struct DDS_XTypes_TypeObject *to)
+ {
+   assert (xt);
+   assert (ti);
+-  dds_return_t ret = DDS_RETCODE_OK, ret_validate = DDS_RETCODE_OK;
++  dds_return_t ret = DDS_RETCODE_OK;
+ 
+   ddsi_typeid_copy_impl (&xt->id.x, ti);
+-  xt->kind = ddsi_typeid_kind_impl (ti);
+   if (ti->_d <= DDS_XTypes_TK_STRING16)
+   {
+     if (to != NULL)
+       return DDS_RETCODE_BAD_PARAMETER;
+     xt->_d = ti->_d;
+   }
+   else
+   {
+     switch (ti->_d)
+     {
+       case DDS_XTypes_TI_STRING8_SMALL:
+         xt->_d = DDS_XTypes_TK_STRING8;
+         xt->_u.str8.bound = (DDS_XTypes_LBound) ti->_u.string_sdefn.bound;
+         break;
+       case DDS_XTypes_TI_STRING8_LARGE:
+         xt->_d = DDS_XTypes_TK_STRING8;
+         xt->_u.str8.bound = ti->_u.string_ldefn.bound;
+         break;
+       case DDS_XTypes_TI_STRING16_SMALL:
+         xt->_d = DDS_XTypes_TK_STRING16;
+         xt->_u.str16.bound = (DDS_XTypes_LBound) ti->_u.string_sdefn.bound;
+         break;
+       case DDS_XTypes_TI_STRING16_LARGE:
+         xt->_d = DDS_XTypes_TK_STRING16;
+         xt->_u.str16.bound = ti->_u.string_ldefn.bound;
+         break;
+       case DDS_XTypes_TI_PLAIN_SEQUENCE_SMALL:
+         xt->_d = DDS_XTypes_TK_SEQUENCE;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.seq.c.element_type, ti->_u.seq_sdefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt->_u.seq.bound = (DDS_XTypes_LBound) ti->_u.seq_sdefn.bound;
+         xt_collection_common_init (&xt->_u.seq.c, &ti->_u.seq_sdefn.header);
+         break;
+       case DDS_XTypes_TI_PLAIN_SEQUENCE_LARGE:
+         xt->_d = DDS_XTypes_TK_SEQUENCE;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.seq.c.element_type, ti->_u.seq_ldefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt->_u.seq.bound = ti->_u.seq_ldefn.bound;
+         xt_collection_common_init (&xt->_u.seq.c, &ti->_u.seq_ldefn.header);
+         break;
+       case DDS_XTypes_TI_PLAIN_ARRAY_SMALL:
+         xt->_d = DDS_XTypes_TK_ARRAY;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.array.c.element_type, ti->_u.array_sdefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt_collection_common_init (&xt->_u.array.c, &ti->_u.array_sdefn.header);
+         xt_sbounds_to_lbounds (&xt->_u.array.bounds, &ti->_u.array_sdefn.array_bound_seq);
+         break;
+       case DDS_XTypes_TI_PLAIN_ARRAY_LARGE:
+         xt->_d = DDS_XTypes_TK_ARRAY;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.array.c.element_type, ti->_u.array_ldefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt_collection_common_init (&xt->_u.array.c, &ti->_u.array_ldefn.header);
+         xt_lbounds_dup (&xt->_u.array.bounds, &ti->_u.array_ldefn.array_bound_seq);
+         break;
+       case DDS_XTypes_TI_PLAIN_MAP_SMALL:
+         xt->_d = DDS_XTypes_TK_MAP;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.map.c.element_type, ti->_u.map_sdefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt->_u.map.bound = (DDS_XTypes_LBound) ti->_u.map_sdefn.bound;
+         xt_collection_common_init (&xt->_u.map.c, &ti->_u.map_sdefn.header);
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.map.key_type, ti->_u.map_sdefn.key_identifier)) != DDS_RETCODE_OK)
+         {
+           ddsi_type_unref_locked (gv, xt->_u.map.c.element_type);
++          xt->_u.map.c.element_type = NULL;
+           goto err;
+         }
+         break;
+       case DDS_XTypes_TI_PLAIN_MAP_LARGE:
+         xt->_d = DDS_XTypes_TK_MAP;
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.map.c.element_type, ti->_u.map_ldefn.element_identifier)) != DDS_RETCODE_OK)
+           goto err;
+         xt->_u.map.bound = (DDS_XTypes_LBound) ti->_u.map_ldefn.bound;
+         xt_collection_common_init (&xt->_u.map.c, &ti->_u.map_ldefn.header);
+         if ((ret = ddsi_type_register_dep (gv, &xt->id, &xt->_u.map.key_type, ti->_u.map_ldefn.key_identifier)) != DDS_RETCODE_OK)
+         {
+           ddsi_type_unref_locked (gv, xt->_u.map.c.element_type);
++          xt->_u.map.c.element_type = NULL;
+           goto err;
+         }
+         break;
+       case DDS_XTypes_EK_MINIMAL:
+         if (to != NULL)
+           ret = add_minimal_typeobj (gv, xt, to);
+         break;
+       case DDS_XTypes_EK_COMPLETE:
+         if (to != NULL)
+           ret = add_complete_typeobj (gv, xt, to);
+         break;
+       case DDS_XTypes_TI_STRONGLY_CONNECTED_COMPONENT:
+         xt->_d = DDS_XTypes_TI_STRONGLY_CONNECTED_COMPONENT;
+         xt->sc_component_id = ti->_u.sc_component_id;
+         break;
+       default:
+         ddsi_typeid_fini (&xt->id);
+         ret = DDS_RETCODE_UNSUPPORTED; /* not supported */
+         break;
+     }
+   }
+-  if (ret != DDS_RETCODE_OK || (ret_validate = ddsi_xt_validate (gv, xt)) != DDS_RETCODE_OK)
++  if (ret != DDS_RETCODE_OK || (ret = ddsi_xt_validate (gv, xt)) != DDS_RETCODE_OK)
+   {
+-    if (ret == DDS_RETCODE_OK)
+-    {
+-      ddsi_xt_type_fini (gv, xt, true);
+-      ret = ret_validate;
+-    }
+     GVWARNING ("type " PTYPEIDFMT ": ddsi_xt_type_init_impl with invalid type object\n", PTYPEID (xt->id.x));
++    goto err;
+   }
++  xt->kind = ddsi_typeid_kind_impl (ti);
++
+ err:
+   return ret;
+ }

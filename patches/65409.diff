@@ -1,0 +1,4311 @@
+commit 37c6618be55935aa5cc95d2aedc35210c2190c6e
+Author: Nick Wellnhofer <wellnhofer@aevum.de>
+Date:   Sat Dec 30 02:50:34 2023 +0100
+
+    parser: Rework parsing of attribute and entity values
+    
+    Don't use a separate function to handle "complex" attributes. Validate
+    UTF-8 byte sequences without decoding. This should improve performance
+    considerably when parsing multi-byte UTF-8 sequences.
+    
+    Use a string buffer to avoid unnecessary allocations and copying when
+    expanding entities.
+    
+    Normalize attribute values in a single pass while expanding entities.
+    
+    Be more lenient in recovery mode.
+    
+    If no entity substitution was requested, validate entities without
+    expanding. Fixes #596.
+    
+    Also fixes #655.
+
+diff --git a/SAX2.c b/SAX2.c
+index fdac7009..b0e25d7b 100644
+--- a/SAX2.c
++++ b/SAX2.c
+@@ -887,362 +887,356 @@ static void
+ xmlSAX2AttributeInternal(void *ctx, const xmlChar *fullname,
+              const xmlChar *value, const xmlChar *prefix ATTRIBUTE_UNUSED)
+ {
+     xmlParserCtxtPtr ctxt = (xmlParserCtxtPtr) ctx;
+     xmlAttrPtr ret;
+     xmlChar *name;
+     xmlChar *ns;
+     xmlChar *nval;
+     xmlNsPtr namespace;
+ 
+     if (ctxt->html) {
+ 	name = xmlStrdup(fullname);
+ 	ns = NULL;
+ 	namespace = NULL;
+     } else {
+ 	/*
+ 	 * Split the full name into a namespace prefix and the tag name
+ 	 */
+ 	name = xmlSplitQName(ctxt, fullname, &ns);
+ 	if ((name != NULL) && (name[0] == 0)) {
+ 	    if (xmlStrEqual(ns, BAD_CAST "xmlns")) {
+ 		xmlNsErrMsg(ctxt, XML_ERR_NS_DECL_ERROR,
+ 			    "invalid namespace declaration '%s'\n",
+ 			    fullname, NULL);
+ 	    } else {
+ 		xmlNsWarnMsg(ctxt, XML_WAR_NS_COLUMN,
+ 			     "Avoid attribute ending with ':' like '%s'\n",
+ 			     fullname, NULL);
+ 	    }
+ 	    if (ns != NULL)
+ 		xmlFree(ns);
+ 	    ns = NULL;
+ 	    xmlFree(name);
+ 	    name = xmlStrdup(fullname);
+ 	}
+     }
+     if (name == NULL) {
+         xmlSAX2ErrMemory(ctxt);
+ 	if (ns != NULL)
+ 	    xmlFree(ns);
+ 	return;
+     }
+ 
+ #ifdef LIBXML_HTML_ENABLED
+     if ((ctxt->html) &&
+         (value == NULL) && (htmlIsBooleanAttr(fullname))) {
+             nval = xmlStrdup(fullname);
+             if (nval == NULL)
+                 xmlSAX2ErrMemory(ctxt);
+             value = (const xmlChar *) nval;
+     } else
+ #endif
+     {
+ #ifdef LIBXML_VALID_ENABLED
+         /*
+          * Do the last stage of the attribute normalization
+          * Needed for HTML too:
+          *   http://www.w3.org/TR/html4/types.html#h-6.2
+          */
+         ctxt->vctxt.valid = 1;
+         nval = xmlValidCtxtNormalizeAttributeValue(&ctxt->vctxt,
+                                                ctxt->myDoc, ctxt->node,
+                                                fullname, value);
+         if (ctxt->vctxt.valid != 1) {
+             ctxt->valid = 0;
+         }
+         if (nval != NULL)
+             value = nval;
+ #else
+         nval = NULL;
+ #endif /* LIBXML_VALID_ENABLED */
+     }
+ 
+     /*
+      * Check whether it's a namespace definition
+      */
+     if ((!ctxt->html) && (ns == NULL) &&
+         (name[0] == 'x') && (name[1] == 'm') && (name[2] == 'l') &&
+         (name[3] == 'n') && (name[4] == 's') && (name[5] == 0)) {
+ 	xmlNsPtr nsret;
+ 	xmlChar *val;
+ 
+         /* Avoid unused variable warning if features are disabled. */
+         (void) nsret;
+ 
+         if (!ctxt->replaceEntities) {
+-	    ctxt->depth++;
+-	    val = xmlStringDecodeEntities(ctxt, value, XML_SUBSTITUTE_REF,
+-		                          0,0,0);
+-	    ctxt->depth--;
++            /* TODO: normalize if needed */
++	    val = xmlExpandEntitiesInAttValue(ctxt, value, /* normalize */ 0);
+ 	    if (val == NULL) {
+ 	        xmlSAX2ErrMemory(ctxt);
+ 		if (name != NULL)
+ 		    xmlFree(name);
+                 if (nval != NULL)
+                     xmlFree(nval);
+ 		return;
+ 	    }
+ 	} else {
+ 	    val = (xmlChar *) value;
+ 	}
+ 
+ 	if (val[0] != 0) {
+ 	    xmlURIPtr uri;
+ 
+ 	    if (xmlParseURISafe((const char *)val, &uri) < 0)
+                 xmlSAX2ErrMemory(ctxt);
+ 	    if (uri == NULL) {
+                 xmlNsWarnMsg(ctxt, XML_WAR_NS_URI,
+                              "xmlns:%s: %s not a valid URI\n", name, value);
+ 	    } else {
+ 		if (uri->scheme == NULL) {
+                     xmlNsWarnMsg(ctxt, XML_WAR_NS_URI_RELATIVE,
+                                  "xmlns:%s: URI %s is not absolute\n",
+                                  name, value);
+ 		}
+ 		xmlFreeURI(uri);
+ 	    }
+ 	}
+ 
+ 	/* a default namespace definition */
+ 	nsret = xmlNewNs(ctxt->node, val, NULL);
+         if (nsret == NULL) {
+             xmlSAX2ErrMemory(ctxt);
+         }
+ #ifdef LIBXML_VALID_ENABLED
+ 	/*
+ 	 * Validate also for namespace decls, they are attributes from
+ 	 * an XML-1.0 perspective
+ 	 */
+         else if (ctxt->validate && ctxt->wellFormed &&
+                  ctxt->myDoc && ctxt->myDoc->intSubset) {
+ 	    ctxt->valid &= xmlValidateOneNamespace(&ctxt->vctxt, ctxt->myDoc,
+ 					   ctxt->node, prefix, nsret, val);
+         }
+ #endif /* LIBXML_VALID_ENABLED */
+ 	if (name != NULL)
+ 	    xmlFree(name);
+ 	if (nval != NULL)
+ 	    xmlFree(nval);
+ 	if (val != value)
+ 	    xmlFree(val);
+ 	return;
+     }
+     if ((!ctxt->html) &&
+ 	(ns != NULL) && (ns[0] == 'x') && (ns[1] == 'm') && (ns[2] == 'l') &&
+         (ns[3] == 'n') && (ns[4] == 's') && (ns[5] == 0)) {
+ 	xmlNsPtr nsret;
+ 	xmlChar *val;
+ 
+         /* Avoid unused variable warning if features are disabled. */
+         (void) nsret;
+ 
+         if (!ctxt->replaceEntities) {
+-	    ctxt->depth++;
+-	    val = xmlStringDecodeEntities(ctxt, value, XML_SUBSTITUTE_REF,
+-		                          0,0,0);
+-	    ctxt->depth--;
++            /* TODO: normalize if needed */
++	    val = xmlExpandEntitiesInAttValue(ctxt, value, /* normalize */ 0);
+ 	    if (val == NULL) {
+ 	        xmlSAX2ErrMemory(ctxt);
+ 	        xmlFree(ns);
+ 		if (name != NULL)
+ 		    xmlFree(name);
+                 if (nval != NULL)
+                     xmlFree(nval);
+ 		return;
+ 	    }
+ 	} else {
+ 	    val = (xmlChar *) value;
+ 	}
+ 
+ 	if (val[0] == 0) {
+ 	    xmlNsErrMsg(ctxt, XML_NS_ERR_EMPTY,
+ 		        "Empty namespace name for prefix %s\n", name, NULL);
+ 	}
+ 	if ((ctxt->pedantic != 0) && (val[0] != 0)) {
+ 	    xmlURIPtr uri;
+ 
+ 	    if (xmlParseURISafe((const char *)val, &uri) < 0)
+                 xmlSAX2ErrMemory(ctxt);
+ 	    if (uri == NULL) {
+ 	        xmlNsWarnMsg(ctxt, XML_WAR_NS_URI,
+ 			 "xmlns:%s: %s not a valid URI\n", name, value);
+ 	    } else {
+ 		if (uri->scheme == NULL) {
+ 		    xmlNsWarnMsg(ctxt, XML_WAR_NS_URI_RELATIVE,
+ 			   "xmlns:%s: URI %s is not absolute\n", name, value);
+ 		}
+ 		xmlFreeURI(uri);
+ 	    }
+ 	}
+ 
+ 	/* a standard namespace definition */
+ 	nsret = xmlNewNs(ctxt->node, val, name);
+ 	xmlFree(ns);
+ 
+         if (nsret == NULL) {
+             xmlSAX2ErrMemory(ctxt);
+         }
+ #ifdef LIBXML_VALID_ENABLED
+ 	/*
+ 	 * Validate also for namespace decls, they are attributes from
+ 	 * an XML-1.0 perspective
+ 	 */
+         else if (ctxt->validate && ctxt->wellFormed &&
+ 	         ctxt->myDoc && ctxt->myDoc->intSubset) {
+ 	    ctxt->valid &= xmlValidateOneNamespace(&ctxt->vctxt, ctxt->myDoc,
+ 					   ctxt->node, prefix, nsret, value);
+         }
+ #endif /* LIBXML_VALID_ENABLED */
+ 	if (name != NULL)
+ 	    xmlFree(name);
+ 	if (nval != NULL)
+ 	    xmlFree(nval);
+ 	if (val != value)
+ 	    xmlFree(val);
+ 	return;
+     }
+ 
+     if (ns != NULL) {
+ 	namespace = xmlSearchNs(ctxt->myDoc, ctxt->node, ns);
+ 
+ 	if (namespace == NULL) {
+ 	    xmlNsErrMsg(ctxt, XML_NS_ERR_UNDEFINED_NAMESPACE,
+ 		    "Namespace prefix %s of attribute %s is not defined\n",
+ 		             ns, name);
+ 	} else {
+             xmlAttrPtr prop;
+ 
+             prop = ctxt->node->properties;
+             while (prop != NULL) {
+                 if (prop->ns != NULL) {
+                     if ((xmlStrEqual(name, prop->name)) &&
+                         ((namespace == prop->ns) ||
+                          (xmlStrEqual(namespace->href, prop->ns->href)))) {
+                             xmlNsErrMsg(ctxt, XML_ERR_ATTRIBUTE_REDEFINED,
+                                     "Attribute %s in %s redefined\n",
+                                              name, namespace->href);
+                         ctxt->wellFormed = 0;
+                         if (ctxt->recovery == 0) ctxt->disableSAX = 1;
+                         if (name != NULL)
+                             xmlFree(name);
+                         goto error;
+                     }
+                 }
+                 prop = prop->next;
+             }
+         }
+     } else {
+ 	namespace = NULL;
+     }
+ 
+     /* !!!!!! <a toto:arg="" xmlns:toto="http://toto.com"> */
+     ret = xmlNewNsPropEatName(ctxt->node, namespace, name, NULL);
+     if (ret == NULL) {
+         xmlSAX2ErrMemory(ctxt);
+         goto error;
+     }
+ 
+     if ((ctxt->replaceEntities == 0) && (!ctxt->html)) {
+         xmlNodePtr tmp;
+ 
+         if ((value != NULL) && (value[0] != 0)) {
+             ret->children = xmlStringGetNodeList(ctxt->myDoc, value);
+             if (ret->children == NULL)
+                 xmlSAX2ErrMemory(ctxt);
+         }
+         tmp = ret->children;
+         while (tmp != NULL) {
+             tmp->parent = (xmlNodePtr) ret;
+             if (tmp->next == NULL)
+                 ret->last = tmp;
+             tmp = tmp->next;
+         }
+     } else if (value != NULL) {
+         ret->children = xmlNewDocText(ctxt->myDoc, value);
+         if (ret->children == NULL) {
+             xmlSAX2ErrMemory(ctxt);
+         } else {
+             ret->last = ret->children;
+             ret->children->parent = (xmlNodePtr) ret;
+         }
+     }
+ 
+ #ifdef LIBXML_VALID_ENABLED
+     if ((!ctxt->html) && ctxt->validate && ctxt->wellFormed &&
+         ctxt->myDoc && ctxt->myDoc->intSubset) {
+ 
+ 	/*
+ 	 * If we don't substitute entities, the validation should be
+ 	 * done on a value with replaced entities anyway.
+ 	 */
+         if (!ctxt->replaceEntities) {
+ 	    xmlChar *val;
+ 
+-	    ctxt->depth++;
+-	    val = xmlStringDecodeEntities(ctxt, value, XML_SUBSTITUTE_REF,
+-		                          0,0,0);
+-	    ctxt->depth--;
++            /* TODO: normalize if needed */
++	    val = xmlExpandEntitiesInAttValue(ctxt, value, /* normalize */ 0);
+ 
+ 	    if (val == NULL)
+ 		ctxt->valid &= xmlValidateOneAttribute(&ctxt->vctxt,
+ 				ctxt->myDoc, ctxt->node, ret, value);
+ 	    else {
+ 		xmlChar *nvalnorm;
+ 
+ 		/*
+ 		 * Do the last stage of the attribute normalization
+ 		 * It need to be done twice ... it's an extra burden related
+ 		 * to the ability to keep xmlSAX2References in attributes
+ 		 */
+                 nvalnorm = xmlValidCtxtNormalizeAttributeValue(
+                                  &ctxt->vctxt, ctxt->myDoc,
+                                  ctxt->node, fullname, val);
+ 		if (nvalnorm != NULL) {
+ 		    xmlFree(val);
+ 		    val = nvalnorm;
+ 		}
+ 
+ 		ctxt->valid &= xmlValidateOneAttribute(&ctxt->vctxt,
+ 			        ctxt->myDoc, ctxt->node, ret, val);
+                 xmlFree(val);
+ 	    }
+ 	} else {
+ 	    ctxt->valid &= xmlValidateOneAttribute(&ctxt->vctxt, ctxt->myDoc,
+ 					       ctxt->node, ret, value);
+ 	}
+     } else
+ #endif /* LIBXML_VALID_ENABLED */
+            if (((ctxt->loadsubset & XML_SKIP_IDS) == 0) &&
+                /* Don't create IDs containing entity references */
+                (ret->children != NULL) &&
+                (ret->children->type == XML_TEXT_NODE) &&
+                (ret->children->next == NULL)) {
+         xmlChar *content = ret->children->content;
+         /*
+ 	 * when validating, the ID registration is done at the attribute
+ 	 * validation level. Otherwise we have to do specific handling here.
+ 	 */
+ 	if (xmlStrEqual(fullname, BAD_CAST "xml:id")) {
+ 	    /*
+ 	     * Add the xml:id value
+ 	     *
+ 	     * Open issue: normalization of the value.
+ 	     */
+ 	    if (xmlValidateNCName(content, 1) != 0) {
+ 	        xmlErrValid(ctxt, XML_DTD_XMLID_VALUE,
+ 		            "xml:id : attribute value %s is not an NCName\n",
+ 		            content, NULL);
+ 	    }
+ 	    xmlAddID(&ctxt->vctxt, ctxt->myDoc, content, ret);
+ 	} else {
+             int res = xmlIsID(ctxt->myDoc, ctxt->node, ret);
+ 
+             if (res < 0)
+                 xmlCtxtErrMemory(ctxt);
+             else if (res > 0)
+                 xmlAddID(&ctxt->vctxt, ctxt->myDoc, content, ret);
+             else if (xmlIsRef(ctxt->myDoc, ctxt->node, ret))
+                 xmlAddRef(&ctxt->vctxt, ctxt->myDoc, content, ret);
+         }
+     }
+@@ -1736,35 +1730,35 @@ static xmlChar *
+ xmlSAX2DecodeAttrEntities(xmlParserCtxtPtr ctxt, const xmlChar *str,
+                           const xmlChar *end) {
+     const xmlChar *in;
+-    xmlChar *ret;
+ 
+     in = str;
+     while (in < end)
+         if (*in++ == '&')
+ 	    goto decode;
+     return(NULL);
+ decode:
+-    ctxt->depth++;
+-    ret = xmlStringLenDecodeEntities(ctxt, str, end - str,
+-				     XML_SUBSTITUTE_REF, 0,0,0);
+-    ctxt->depth--;
+-    return(ret);
++    /*
++     * If the value contains '&', we can be sure it was allocated and is
++     * zero-terminated.
++     */
++    /* TODO: normalize if needed */
++    return(xmlExpandEntitiesInAttValue(ctxt, str, /* normalize */ 0));
+ }
+ #endif /* LIBXML_VALID_ENABLED */
+ 
+ /**
+  * xmlSAX2AttributeNs:
+  * @ctx: the user data (XML parser context)
+  * @localname:  the local name of the attribute
+  * @prefix:  the attribute namespace prefix if available
+  * @URI:  the attribute namespace name if available
+  * @value:  Start of the attribute value
+  * @valueend: end of the attribute value
+  *
+  * Handle an attribute that has been read by the parser.
+  * The default handling is to convert the attribute into an
+  * DOM subtree and past it in a new xmlAttr element added to
+  * the element.
+  *
+  * Returns the new attribute or NULL in case of error.
+  */
+diff --git a/include/private/entities.h b/include/private/entities.h
+index c3f15e68..d262ef47 100644
+--- a/include/private/entities.h
++++ b/include/private/entities.h
+@@ -1,21 +1,25 @@
+ #ifndef XML_ENTITIES_H_PRIVATE__
+ #define XML_ENTITIES_H_PRIVATE__
+ 
+ #include <libxml/tree.h>
+ #include <libxml/xmlstring.h>
+ 
+ /*
+  * Entity flags
+  *
+  * XML_ENT_PARSED: The entity was parsed and `children` points to the
+  * content.
+- * XML_ENT_CHECKED: The entity was checked for loops.
++ *
++ * XML_ENT_CHECKED: The entity was checked for loops and amplification.
++ * expandedSize was set.
++ *
++ * XML_ENT_VALIDATED: The entity contains a valid attribute value.
++ * Only used when entities aren't substituted.
+  */
+-#define XML_ENT_PARSED      (1<<0)
+-#define XML_ENT_CHECKED     (1<<1)
+-#define XML_ENT_EXPANDING   (1<<2)
+-#define XML_ENT_CHECKED_LT  (1<<3)
+-#define XML_ENT_CONTAINS_LT (1<<4)
++#define XML_ENT_PARSED      (1u << 0)
++#define XML_ENT_CHECKED     (1u << 1)
++#define XML_ENT_VALIDATED   (1u << 2)
++#define XML_ENT_EXPANDING   (1u << 3)
+ 
+ XML_HIDDEN xmlChar *
+ xmlEncodeAttributeEntities(xmlDocPtr doc, const xmlChar *input);
+diff --git a/include/private/parser.h b/include/private/parser.h
+index 10e65101..39680a94 100644
+--- a/include/private/parser.h
++++ b/include/private/parser.h
+@@ -87,4 +87,8 @@ XML_HIDDEN xmlParserInputPtr
+ xmlNewInputPush(xmlParserCtxtPtr ctxt, const char *url,
+                 const char *chunk, int size, const char *encoding);
+ 
++XML_HIDDEN xmlChar *
++xmlExpandEntitiesInAttValue(xmlParserCtxtPtr ctxt, const xmlChar *str,
++                            int normalize);
++
+ #endif /* XML_PARSER_H_PRIVATE__ */
+diff --git a/parser.c b/parser.c
+index 8ce0195c..dfe17009 100644
+--- a/parser.c
++++ b/parser.c
+@@ -417,31 +417,31 @@ static void
+ xmlSaturatedAddSizeT(unsigned long *dst, unsigned long val) {
+     if (val > ULONG_MAX - *dst)
+         *dst = ULONG_MAX;
+     else
+         *dst += val;
+ }
+ 
+ /**
+  * xmlParserEntityCheck:
+  * @ctxt:  parser context
+  * @extra:  sum of unexpanded entity sizes
+  *
+  * Check for non-linear entity expansion behaviour.
+  *
+- * In some cases like xmlStringDecodeEntities, this function is called
++ * In some cases like xmlExpandEntityInAttValue, this function is called
+  * for each, possibly nested entity and its unexpanded content length.
+  *
+  * In other cases like xmlParseReference, it's only called for each
+  * top-level entity with its unexpanded content length plus the sum of
+  * the unexpanded content lengths (plus fixed cost) of all nested
+  * entities.
+  *
+  * Summing the unexpanded lengths also adds the length of the reference.
+  * This is by design. Taking the length of the entity name into account
+  * discourages attacks that try to waste CPU time with abusively long
+  * entity names. See test/recurse/lol6.xml for example. Each call also
+  * adds some fixed cost XML_ENT_FIXED_COST to discourage attacks with
+  * short entities.
+  *
+  * Returns 1 on error, 0 on success.
+  */
+@@ -513,215 +513,426 @@ int
+ xmlHasFeature(xmlFeature feature)
+ {
+     switch (feature) {
+ 	case XML_WITH_THREAD:
+ #ifdef LIBXML_THREAD_ENABLED
+ 	    return(1);
+ #else
+ 	    return(0);
+ #endif
+         case XML_WITH_TREE:
+ #ifdef LIBXML_TREE_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_OUTPUT:
+ #ifdef LIBXML_OUTPUT_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_PUSH:
+ #ifdef LIBXML_PUSH_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_READER:
+ #ifdef LIBXML_READER_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_PATTERN:
+ #ifdef LIBXML_PATTERN_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_WRITER:
+ #ifdef LIBXML_WRITER_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_SAX1:
+ #ifdef LIBXML_SAX1_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_FTP:
+ #ifdef LIBXML_FTP_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_HTTP:
+ #ifdef LIBXML_HTTP_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_VALID:
+ #ifdef LIBXML_VALID_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_HTML:
+ #ifdef LIBXML_HTML_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_LEGACY:
+ #ifdef LIBXML_LEGACY_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_C14N:
+ #ifdef LIBXML_C14N_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_CATALOG:
+ #ifdef LIBXML_CATALOG_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_XPATH:
+ #ifdef LIBXML_XPATH_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_XPTR:
+ #ifdef LIBXML_XPTR_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_XINCLUDE:
+ #ifdef LIBXML_XINCLUDE_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_ICONV:
+ #ifdef LIBXML_ICONV_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_ISO8859X:
+ #ifdef LIBXML_ISO8859X_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_UNICODE:
+ #ifdef LIBXML_UNICODE_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_REGEXP:
+ #ifdef LIBXML_REGEXP_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_AUTOMATA:
+ #ifdef LIBXML_AUTOMATA_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_EXPR:
+ #ifdef LIBXML_EXPR_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_SCHEMAS:
+ #ifdef LIBXML_SCHEMAS_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_SCHEMATRON:
+ #ifdef LIBXML_SCHEMATRON_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_MODULES:
+ #ifdef LIBXML_MODULES_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_DEBUG:
+ #ifdef LIBXML_DEBUG_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_DEBUG_MEM:
+ #ifdef DEBUG_MEMORY_LOCATION
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_DEBUG_RUN:
+             return(0);
+         case XML_WITH_ZLIB:
+ #ifdef LIBXML_ZLIB_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_LZMA:
+ #ifdef LIBXML_LZMA_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         case XML_WITH_ICU:
+ #ifdef LIBXML_ICU_ENABLED
+             return(1);
+ #else
+             return(0);
+ #endif
+         default:
+ 	    break;
+      }
+      return(0);
+ }
+ 
++/************************************************************************
++ *									*
++ *			Simple string buffer				*
++ *									*
++ ************************************************************************/
++
++typedef struct {
++    xmlChar *mem;
++    unsigned size;
++    unsigned cap; /* size < cap */
++    unsigned max; /* size <= max */
++    xmlParserErrors code;
++} xmlSBuf;
++
++static void
++xmlSBufInit(xmlSBuf *buf, unsigned max) {
++    buf->mem = NULL;
++    buf->size = 0;
++    buf->cap = 0;
++    buf->max = max;
++    buf->code = XML_ERR_OK;
++}
++
++static int
++xmlSBufGrow(xmlSBuf *buf, unsigned len) {
++    xmlChar *mem;
++    unsigned cap;
++
++    if (len >= UINT_MAX / 2 - buf->size) {
++        buf->code = XML_ERR_RESOURCE_LIMIT;
++        return(-1);
++    }
++
++    cap = (buf->size + len) * 2;
++    if (cap < 240)
++        cap = 240;
++
++    mem = xmlRealloc(buf->mem, cap);
++    if (mem == NULL) {
++        buf->code = XML_ERR_NO_MEMORY;
++        return(-1);
++    }
++
++    buf->mem = mem;
++    buf->cap = cap;
++
++    return(0);
++}
++
++static void
++xmlSBufAddString(xmlSBuf *buf, const xmlChar *str, unsigned len) {
++    if (buf->max - buf->size < len) {
++        buf->code = XML_ERR_RESOURCE_LIMIT;
++        return;
++    }
++
++    if (buf->cap - buf->size <= len) {
++        if (xmlSBufGrow(buf, len) < 0)
++            return;
++    }
++
++    if (len > 0)
++        memcpy(buf->mem + buf->size, str, len);
++    buf->size += len;
++}
++
++static void
++xmlSBufAddCString(xmlSBuf *buf, const char *str, unsigned len) {
++    xmlSBufAddString(buf, (const xmlChar *) str, len);
++}
++
++static void
++xmlSBufAddChar(xmlSBuf *buf, int c) {
++    xmlChar *end;
++
++    if (buf->max - buf->size < 4) {
++        buf->code = XML_ERR_RESOURCE_LIMIT;
++        return;
++    }
++
++    if (buf->cap - buf->size <= 4) {
++        if (xmlSBufGrow(buf, 4) < 0)
++            return;
++    }
++
++    end = buf->mem + buf->size;
++
++    if (c < 0x80) {
++        *end = (xmlChar) c;
++        buf->size += 1;
++    } else {
++        buf->size += xmlCopyCharMultiByte(end, c);
++    }
++}
++
++static void
++xmlSBufAddReplChar(xmlSBuf *buf) {
++    xmlSBufAddCString(buf, "\xEF\xBF\xBD", 3);
++}
++
++static void
++xmlSBufReportError(xmlSBuf *buf, xmlParserCtxtPtr ctxt, const char *errMsg) {
++    if (buf->code == XML_ERR_NO_MEMORY)
++        xmlCtxtErrMemory(ctxt);
++    else
++        xmlFatalErr(ctxt, buf->code, errMsg);
++}
++
++static xmlChar *
++xmlSBufFinish(xmlSBuf *buf, int *sizeOut, xmlParserCtxtPtr ctxt,
++              const char *errMsg) {
++    if (buf->mem == NULL) {
++        buf->mem = xmlMalloc(1);
++        if (buf->mem == NULL) {
++            buf->code = XML_ERR_NO_MEMORY;
++        } else {
++            buf->mem[0] = 0;
++        }
++    } else {
++        buf->mem[buf->size] = 0;
++    }
++
++    if (buf->code == XML_ERR_OK) {
++        if (sizeOut != NULL)
++            *sizeOut = buf->size;
++        return(buf->mem);
++    }
++
++    xmlSBufReportError(buf, ctxt, errMsg);
++
++    xmlFree(buf->mem);
++
++    if (sizeOut != NULL)
++        *sizeOut = 0;
++    return(NULL);
++}
++
++static void
++xmlSBufCleanup(xmlSBuf *buf, xmlParserCtxtPtr ctxt, const char *errMsg) {
++    if (buf->code != XML_ERR_OK)
++        xmlSBufReportError(buf, ctxt, errMsg);
++
++    xmlFree(buf->mem);
++}
++
++static int
++xmlUTF8MultibyteLen(xmlParserCtxtPtr ctxt, const xmlChar *str,
++                    const char *errMsg) {
++    int c = str[0];
++    int c1 = str[1];
++
++    if ((c1 & 0xC0) != 0x80)
++        goto encoding_error;
++
++    if (c < 0xE0) {
++        /* 2-byte sequence */
++        if (c < 0xC2)
++            goto encoding_error;
++
++        return(2);
++    } else {
++        int c2 = str[2];
++
++        if ((c2 & 0xC0) != 0x80)
++            goto encoding_error;
++
++        if (c < 0xF0) {
++            /* 3-byte sequence */
++            if (c == 0xE0) {
++                /* overlong */
++                if (c1 < 0xA0)
++                    goto encoding_error;
++            } else if (c == 0xED) {
++                /* surrogate */
++                if (c1 >= 0xA0)
++                    goto encoding_error;
++            } else if (c == 0xEF) {
++                /* U+FFFE and U+FFFF are invalid Chars */
++                if ((c1 == 0xBF) && (c2 >= 0xBE))
++                    xmlFatalErrMsg(ctxt, XML_ERR_INVALID_CHAR, errMsg);
++            }
++
++            return(3);
++        } else {
++            /* 4-byte sequence */
++            if ((str[3] & 0xC0) != 0x80)
++                goto encoding_error;
++            if (c == 0xF0) {
++                /* overlong */
++                if (c1 < 0x90)
++                    goto encoding_error;
++            } else if (c >= 0xF4) {
++                /* greater than 0x10FFFF */
++                if ((c > 0xF4) || (c1 >= 0x90))
++                    goto encoding_error;
++            }
++
++            return(4);
++        }
++    }
++
++encoding_error:
++    /* Only report the first error */
++    if ((ctxt->input->flags & XML_INPUT_ENCODING_ERROR) == 0) {
++        xmlCtxtErrIO(ctxt, XML_ERR_INVALID_ENCODING, NULL);
++        ctxt->input->flags |= XML_INPUT_ENCODING_ERROR;
++    }
++
++    return(0);
++}
++
+ /************************************************************************
+  *									*
+  *		SAX2 defaulted attributes handling			*
+  *									*
+  ************************************************************************/
+ 
+ /**
+  * xmlDetectSAX2:
+  * @ctxt:  an XML parser context
+  *
+  * Do the SAX2 detection and specific initialization
+  */
+@@ -800,89 +1011,30 @@ static xmlChar *
+ xmlAttrNormalizeSpace(const xmlChar *src, xmlChar *dst)
+ {
+     if ((src == NULL) || (dst == NULL))
+         return(NULL);
+ 
+     while (*src == 0x20) src++;
+     while (*src != 0) {
+ 	if (*src == 0x20) {
+ 	    while (*src == 0x20) src++;
+ 	    if (*src != 0)
+ 		*dst++ = 0x20;
+ 	} else {
+ 	    *dst++ = *src++;
+ 	}
+     }
+     *dst = 0;
+     if (dst == src)
+        return(NULL);
+     return(dst);
+ }
+ 
+-/**
+- * xmlAttrNormalizeSpace2:
+- * @src: the source string
+- *
+- * Normalize the space in non CDATA attribute values, a slightly more complex
+- * front end to avoid allocation problems when running on attribute values
+- * coming from the input.
+- *
+- * Returns a pointer to the normalized value (dst) or NULL if no conversion
+- *         is needed.
+- */
+-static const xmlChar *
+-xmlAttrNormalizeSpace2(xmlParserCtxtPtr ctxt, xmlChar *src, int *len)
+-{
+-    int i;
+-    int remove_head = 0;
+-    int need_realloc = 0;
+-    const xmlChar *cur;
+-
+-    if ((ctxt == NULL) || (src == NULL) || (len == NULL))
+-        return(NULL);
+-    i = *len;
+-    if (i <= 0)
+-        return(NULL);
+-
+-    cur = src;
+-    while (*cur == 0x20) {
+-        cur++;
+-	remove_head++;
+-    }
+-    while (*cur != 0) {
+-	if (*cur == 0x20) {
+-	    cur++;
+-	    if ((*cur == 0x20) || (*cur == 0)) {
+-	        need_realloc = 1;
+-		break;
+-	    }
+-	} else
+-	    cur++;
+-    }
+-    if (need_realloc) {
+-        xmlChar *ret;
+-
+-	ret = xmlStrndup(src + remove_head, i - remove_head + 1);
+-	if (ret == NULL) {
+-	    xmlErrMemory(ctxt);
+-	    return(NULL);
+-	}
+-	xmlAttrNormalizeSpace(ret, ret);
+-	*len = strlen((const char *)ret);
+-        return(ret);
+-    } else if (remove_head) {
+-        *len -= remove_head;
+-        memmove(src, src + remove_head, 1 + *len);
+-	return(src);
+-    }
+-    return(NULL);
+-}
+-
+ /**
+  * xmlAddDefAttrs:
+  * @ctxt:  an XML parser context
+  * @fullname:  the element fullname
+  * @fullattr:  the attribute fullname
+  * @value:  the attribute value
+  *
+  * Add a defaulted attribute for an element
+  */
+@@ -2602,297 +2754,77 @@ void
+ xmlParserHandlePEReference(xmlParserCtxtPtr ctxt) {
+     xmlParsePEReference(ctxt);
+ }
+ 
+-/*
+- * Macro used to grow the current buffer.
+- * buffer##_size is expected to be a size_t
+- * mem_error: is expected to handle memory allocation failures
+- */
+-#define growBuffer(buffer, n) {						\
+-    xmlChar *tmp;							\
+-    size_t new_size = buffer##_size * 2 + n;                            \
+-    if (new_size < buffer##_size) goto mem_error;                       \
+-    tmp = (xmlChar *) xmlRealloc(buffer, new_size);                     \
+-    if (tmp == NULL) goto mem_error;					\
+-    buffer = tmp;							\
+-    buffer##_size = new_size;                                           \
+-}
+-
+-/**
+- * xmlStringDecodeEntitiesInt:
+- * @ctxt:  the parser context
+- * @str:  the input string
+- * @len: the string length
+- * @what:  combination of XML_SUBSTITUTE_REF and XML_SUBSTITUTE_PEREF
+- * @end:  an end marker xmlChar, 0 if none
+- * @end2:  an end marker xmlChar, 0 if none
+- * @end3:  an end marker xmlChar, 0 if none
+- * @check:  whether to perform entity checks
+- */
+-static xmlChar *
+-xmlStringDecodeEntitiesInt(xmlParserCtxtPtr ctxt, const xmlChar *str, int len,
+-		           int what, xmlChar end, xmlChar  end2, xmlChar end3,
+-                           int check) {
+-    xmlChar *buffer = NULL;
+-    size_t buffer_size = 0;
+-    size_t nbchars = 0;
+-
+-    xmlChar *current = NULL;
+-    xmlChar *rep = NULL;
+-    const xmlChar *last;
+-    xmlEntityPtr ent;
+-    int c,l;
+-
+-    if (str == NULL)
+-        return(NULL);
+-    last = str + len;
+-
+-    if (((ctxt->depth > 40) &&
+-         ((ctxt->options & XML_PARSE_HUGE) == 0)) ||
+-	(ctxt->depth > 100)) {
+-	xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_LOOP,
+-                       "Maximum entity nesting depth exceeded");
+-	return(NULL);
+-    }
+-
+-    /*
+-     * allocate a translation buffer.
+-     */
+-    buffer_size = XML_PARSER_BIG_BUFFER_SIZE;
+-    buffer = (xmlChar *) xmlMallocAtomic(buffer_size);
+-    if (buffer == NULL) goto mem_error;
+-
+-    /*
+-     * OK loop until we reach one of the ending char or a size limit.
+-     * we are operating on already parsed values.
+-     */
+-    if (str < last)
+-	c = CUR_SCHAR(str, l);
+-    else
+-        c = 0;
+-    while ((c != 0) && (c != end) && /* non input consuming loop */
+-           (c != end2) && (c != end3) &&
+-           (PARSER_STOPPED(ctxt) == 0)) {
+-
+-	if (c == 0) break;
+-        if ((c == '&') && (str[1] == '#')) {
+-	    int val = xmlParseStringCharRef(ctxt, &str);
+-	    if (val == 0)
+-                goto int_error;
+-	    COPY_BUF(buffer, nbchars, val);
+-	    if (nbchars + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-	        growBuffer(buffer, XML_PARSER_BUFFER_SIZE);
+-	    }
+-	} else if ((c == '&') && (what & XML_SUBSTITUTE_REF)) {
+-	    ent = xmlParseStringEntityRef(ctxt, &str);
+-	    if ((ent != NULL) &&
+-		(ent->etype == XML_INTERNAL_PREDEFINED_ENTITY)) {
+-		if (ent->content != NULL) {
+-		    COPY_BUF(buffer, nbchars, ent->content[0]);
+-		    if (nbchars + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-			growBuffer(buffer, XML_PARSER_BUFFER_SIZE);
+-		    }
+-		} else {
+-		    xmlFatalErrMsg(ctxt, XML_ERR_INTERNAL_ERROR,
+-			    "predefined entity has no content\n");
+-                    goto int_error;
+-		}
+-	    } else if ((ent != NULL) && (ent->content != NULL)) {
+-	        if ((check) && (xmlParserEntityCheck(ctxt, ent->length)))
+-                    goto int_error;
+-
+-                if (ent->flags & XML_ENT_EXPANDING) {
+-	            xmlFatalErr(ctxt, XML_ERR_ENTITY_LOOP, NULL);
+-                    xmlHaltParser(ctxt);
+-                    ent->content[0] = 0;
+-                    goto int_error;
+-                }
+-
+-                ent->flags |= XML_ENT_EXPANDING;
+-		ctxt->depth++;
+-		rep = xmlStringDecodeEntitiesInt(ctxt, ent->content,
+-                        ent->length, what, 0, 0, 0, check);
+-		ctxt->depth--;
+-                ent->flags &= ~XML_ENT_EXPANDING;
+-
+-		if (rep == NULL) {
+-                    ent->content[0] = 0;
+-                    goto int_error;
+-                }
+-
+-                current = rep;
+-                while (*current != 0) { /* non input consuming loop */
+-                    buffer[nbchars++] = *current++;
+-                    if (nbchars + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-                        growBuffer(buffer, XML_PARSER_BUFFER_SIZE);
+-                    }
+-                }
+-                xmlFree(rep);
+-                rep = NULL;
+-	    } else if (ent != NULL) {
+-		int i = xmlStrlen(ent->name);
+-		const xmlChar *cur = ent->name;
+-
+-		buffer[nbchars++] = '&';
+-		if (nbchars + i + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-		    growBuffer(buffer, i + XML_PARSER_BUFFER_SIZE);
+-		}
+-		for (;i > 0;i--)
+-		    buffer[nbchars++] = *cur++;
+-		buffer[nbchars++] = ';';
+-	    }
+-	} else if (c == '%' && (what & XML_SUBSTITUTE_PEREF)) {
+-	    ent = xmlParseStringPEReference(ctxt, &str);
+-	    if (ent != NULL) {
+-                if (ent->content == NULL) {
+-		    /*
+-		     * Note: external parsed entities will not be loaded,
+-		     * it is not required for a non-validating parser to
+-		     * complete external PEReferences coming from the
+-		     * internal subset
+-		     */
+-		    if (((ctxt->options & XML_PARSE_NOENT) != 0) ||
+-			((ctxt->options & XML_PARSE_DTDVALID) != 0) ||
+-			(ctxt->validate != 0)) {
+-			xmlLoadEntityContent(ctxt, ent);
+-		    } else {
+-			xmlWarningMsg(ctxt, XML_ERR_ENTITY_PROCESSING,
+-		  "not validating will not read content for PE entity %s\n",
+-		                      ent->name, NULL);
+-		    }
+-		}
+-
+-	        if ((check) && (xmlParserEntityCheck(ctxt, ent->length)))
+-                    goto int_error;
+-
+-                if (ent->flags & XML_ENT_EXPANDING) {
+-	            xmlFatalErr(ctxt, XML_ERR_ENTITY_LOOP, NULL);
+-                    xmlHaltParser(ctxt);
+-                    if (ent->content != NULL)
+-                        ent->content[0] = 0;
+-                    goto int_error;
+-                }
+-
+-                ent->flags |= XML_ENT_EXPANDING;
+-		ctxt->depth++;
+-		rep = xmlStringDecodeEntitiesInt(ctxt, ent->content,
+-                        ent->length, what, 0, 0, 0, check);
+-		ctxt->depth--;
+-                ent->flags &= ~XML_ENT_EXPANDING;
+-
+-		if (rep == NULL) {
+-                    if (ent->content != NULL)
+-                        ent->content[0] = 0;
+-                    goto int_error;
+-                }
+-                current = rep;
+-                while (*current != 0) { /* non input consuming loop */
+-                    buffer[nbchars++] = *current++;
+-                    if (nbchars + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-                        growBuffer(buffer, XML_PARSER_BUFFER_SIZE);
+-                    }
+-                }
+-                xmlFree(rep);
+-                rep = NULL;
+-	    }
+-	} else {
+-	    COPY_BUF(buffer, nbchars, c);
+-	    str += l;
+-	    if (nbchars + XML_PARSER_BUFFER_SIZE > buffer_size) {
+-	        growBuffer(buffer, XML_PARSER_BUFFER_SIZE);
+-	    }
+-	}
+-	if (str < last)
+-	    c = CUR_SCHAR(str, l);
+-	else
+-	    c = 0;
+-    }
+-    buffer[nbchars] = 0;
+-    return(buffer);
+-
+-mem_error:
+-    xmlErrMemory(ctxt);
+-int_error:
+-    if (rep != NULL)
+-        xmlFree(rep);
+-    if (buffer != NULL)
+-        xmlFree(buffer);
+-    return(NULL);
+-}
+-
+ /**
+  * xmlStringLenDecodeEntities:
+  * @ctxt:  the parser context
+  * @str:  the input string
+  * @len: the string length
+  * @what:  combination of XML_SUBSTITUTE_REF and XML_SUBSTITUTE_PEREF
+  * @end:  an end marker xmlChar, 0 if none
+  * @end2:  an end marker xmlChar, 0 if none
+  * @end3:  an end marker xmlChar, 0 if none
+  *
+  * DEPRECATED: Internal function, don't use.
+  *
+- * Takes a entity string content and process to do the adequate substitutions.
+- *
+- * [67] Reference ::= EntityRef | CharRef
+- *
+- * [69] PEReference ::= '%' Name ';'
+- *
+  * Returns A newly allocated string with the substitution done. The caller
+  *      must deallocate it !
+  */
+ xmlChar *
+ xmlStringLenDecodeEntities(xmlParserCtxtPtr ctxt, const xmlChar *str, int len,
+-                           int what, xmlChar end, xmlChar  end2,
+-                           xmlChar end3) {
++                           int what ATTRIBUTE_UNUSED,
++                           xmlChar end, xmlChar end2, xmlChar end3) {
+     if ((ctxt == NULL) || (str == NULL) || (len < 0))
+         return(NULL);
+-    return(xmlStringDecodeEntitiesInt(ctxt, str, len, what,
+-                                      end, end2, end3, 0));
++
++    if ((str[len] != 0) ||
++        (end != 0) || (end2 != 0) || (end3 != 0))
++        return(NULL);
++
++    return(xmlExpandEntitiesInAttValue(ctxt, str, 0));
+ }
+ 
+ /**
+  * xmlStringDecodeEntities:
+  * @ctxt:  the parser context
+  * @str:  the input string
+  * @what:  combination of XML_SUBSTITUTE_REF and XML_SUBSTITUTE_PEREF
+  * @end:  an end marker xmlChar, 0 if none
+  * @end2:  an end marker xmlChar, 0 if none
+  * @end3:  an end marker xmlChar, 0 if none
+  *
+  * DEPRECATED: Internal function, don't use.
+  *
+- * Takes a entity string content and process to do the adequate substitutions.
+- *
+- * [67] Reference ::= EntityRef | CharRef
+- *
+- * [69] PEReference ::= '%' Name ';'
+- *
+  * Returns A newly allocated string with the substitution done. The caller
+  *      must deallocate it !
+  */
+ xmlChar *
+-xmlStringDecodeEntities(xmlParserCtxtPtr ctxt, const xmlChar *str, int what,
++xmlStringDecodeEntities(xmlParserCtxtPtr ctxt, const xmlChar *str,
++                        int what ATTRIBUTE_UNUSED,
+ 		        xmlChar end, xmlChar  end2, xmlChar end3) {
+-    if ((ctxt == NULL) || (str == NULL)) return(NULL);
+-    return(xmlStringDecodeEntitiesInt(ctxt, str, xmlStrlen(str), what,
+-                                      end, end2, end3, 0));
++    if ((ctxt == NULL) || (str == NULL))
++        return(NULL);
++
++    if ((end != 0) || (end2 != 0) || (end3 != 0))
++        return(NULL);
++
++    return(xmlExpandEntitiesInAttValue(ctxt, str, 0));
+ }
+ 
+ /************************************************************************
+  *									*
+  *		Commodity functions, cleanup needed ?			*
+  *									*
+  ************************************************************************/
+ 
+ /**
+  * areBlanks:
+  * @ctxt:  an XML parser context
+  * @str:  a xmlChar *
+  * @len:  the size of @str
+  * @blank_chars: we know the chars are blanks
+  *
+  * Is this a sequence of blank chars that one can ignore ?
+  *
+  * Returns 1 if ignorable 0 otherwise.
+  */
+@@ -3256,9 +3188,6 @@ xmlIsNameChar(xmlParserCtxtPtr ctxt, int c) {
+     return(0);
+ }
+ 
+-static xmlChar * xmlParseAttValueInternal(xmlParserCtxtPtr ctxt,
+-                                          int *len, int *alloc, int normalize);
+-
+ static const xmlChar *
+ xmlParseNameComplex(xmlParserCtxtPtr ctxt) {
+     const xmlChar *ret;
+@@ -3683,513 +3612,870 @@ xmlChar *
+ xmlParseNmtoken(xmlParserCtxtPtr ctxt) {
+     xmlChar buf[XML_MAX_NAMELEN + 5];
+     xmlChar *ret;
+     int len = 0, l;
+     int c;
+     int maxLength = (ctxt->options & XML_PARSE_HUGE) ?
+                     XML_MAX_TEXT_LENGTH :
+                     XML_MAX_NAME_LENGTH;
+ 
+     c = CUR_CHAR(l);
+ 
+     while (xmlIsNameChar(ctxt, c)) {
+ 	COPY_BUF(buf, len, c);
+ 	NEXTL(l);
+ 	c = CUR_CHAR(l);
+ 	if (len >= XML_MAX_NAMELEN) {
+ 	    /*
+ 	     * Okay someone managed to make a huge token, so he's ready to pay
+ 	     * for the processing speed.
+ 	     */
+ 	    xmlChar *buffer;
+ 	    int max = len * 2;
+ 
+ 	    buffer = (xmlChar *) xmlMallocAtomic(max);
+ 	    if (buffer == NULL) {
+ 	        xmlErrMemory(ctxt);
+ 		return(NULL);
+ 	    }
+ 	    memcpy(buffer, buf, len);
+ 	    while (xmlIsNameChar(ctxt, c)) {
+ 		if (len + 10 > max) {
+ 		    xmlChar *tmp;
+ 
+ 		    max *= 2;
+ 		    tmp = (xmlChar *) xmlRealloc(buffer, max);
+ 		    if (tmp == NULL) {
+ 			xmlErrMemory(ctxt);
+ 			xmlFree(buffer);
+ 			return(NULL);
+ 		    }
+ 		    buffer = tmp;
+ 		}
+ 		COPY_BUF(buffer, len, c);
+                 if (len > maxLength) {
+                     xmlFatalErr(ctxt, XML_ERR_NAME_TOO_LONG, "NmToken");
+                     xmlFree(buffer);
+                     return(NULL);
+                 }
+ 		NEXTL(l);
+ 		c = CUR_CHAR(l);
+ 	    }
+ 	    buffer[len] = 0;
+ 	    return(buffer);
+ 	}
+     }
+     if (len == 0)
+         return(NULL);
+     if (len > maxLength) {
+         xmlFatalErr(ctxt, XML_ERR_NAME_TOO_LONG, "NmToken");
+         return(NULL);
+     }
+     ret = xmlStrndup(buf, len);
+     if (ret == NULL)
+         xmlErrMemory(ctxt);
+     return(ret);
+ }
+ 
+ /**
+- * xmlParseEntityValue:
+- * @ctxt:  an XML parser context
+- * @orig:  if non-NULL store a copy of the original entity value
+- *
+- * DEPRECATED: Internal function, don't use.
+- *
+- * parse a value for ENTITY declarations
+- *
+- * [9] EntityValue ::= '"' ([^%&"] | PEReference | Reference)* '"' |
+- *	               "'" ([^%&'] | PEReference | Reference)* "'"
++ * xmlExpandPEsInEntityValue:
++ * @ctxt:  parser context
++ * @buf:  string buffer
++ * @str:  entity value
++ * @length:  size of entity value
++ * @depth:  nesting depth
+  *
+- * Returns the EntityValue parsed with reference substituted or NULL
++ * Validate an entity value and expand parameter entities.
+  */
+-
+-xmlChar *
+-xmlParseEntityValue(xmlParserCtxtPtr ctxt, xmlChar **orig) {
+-    xmlChar *buf = NULL;
+-    int len = 0;
+-    int size = XML_PARSER_BUFFER_SIZE;
++static void
++xmlExpandPEsInEntityValue(xmlParserCtxtPtr ctxt, xmlSBuf *buf,
++                          const xmlChar *str, int length, int depth) {
++    const xmlChar *end, *chunk;
+     int c, l;
+-    int maxLength = (ctxt->options & XML_PARSE_HUGE) ?
+-                    XML_MAX_HUGE_LENGTH :
+-                    XML_MAX_TEXT_LENGTH;
+-    xmlChar stop;
+-    xmlChar *ret = NULL;
+-    const xmlChar *cur = NULL;
+-    xmlParserInputPtr input;
+ 
+-    if (RAW == '"') stop = '"';
+-    else if (RAW == '\'') stop = '\'';
+-    else {
+-	xmlFatalErr(ctxt, XML_ERR_ENTITY_NOT_STARTED, NULL);
+-	return(NULL);
++    if (str == NULL)
++        return;
++
++    depth += 1;
++    if (((depth > 40) && ((ctxt->options & XML_PARSE_HUGE) == 0)) ||
++	(depth > 100)) {
++	xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_LOOP,
++                       "Maximum entity nesting depth exceeded");
++	return;
+     }
+-    buf = (xmlChar *) xmlMallocAtomic(size);
+-    if (buf == NULL) {
+-	xmlErrMemory(ctxt);
++
++    end = str + length;
++    chunk = str;
++
++    while ((str < end) && (!PARSER_STOPPED(ctxt))) {
++        c = *str;
++
++        if (c >= 0x80) {
++            l = xmlUTF8MultibyteLen(ctxt, str,
++                    "invalid character in entity value\n");
++            if (l == 0) {
++                if (chunk < str)
++                    xmlSBufAddString(buf, chunk, str - chunk);
++                xmlSBufAddReplChar(buf);
++                str += 1;
++                chunk = str;
++            } else {
++                str += l;
++            }
++        } else if (c == '&') {
++            if (str[1] == '#') {
++                if (chunk < str)
++                    xmlSBufAddString(buf, chunk, str - chunk);
++
++                c = xmlParseStringCharRef(ctxt, &str);
++                if (c == 0)
++                    return;
++
++                xmlSBufAddChar(buf, c);
++
++                chunk = str;
++            } else {
++                xmlChar *name;
++
++                /*
++                 * General entity references are checked for
++                 * syntactic validity.
++                 */
++                str++;
++                name = xmlParseStringName(ctxt, &str);
++
++                if ((name == NULL) || (*str++ != ';')) {
++                    xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_CHAR_ERROR,
++                            "EntityValue: '&' forbidden except for entities "
++                            "references\n");
++                    xmlFree(name);
++                    return;
++                }
++
++                xmlFree(name);
++            }
++        } else if (c == '%') {
++            xmlEntityPtr ent;
++
++            if (chunk < str)
++                xmlSBufAddString(buf, chunk, str - chunk);
++
++            ent = xmlParseStringPEReference(ctxt, &str);
++            if (ent == NULL)
++                return;
++
++            if (!PARSER_EXTERNAL(ctxt)) {
++                xmlFatalErr(ctxt, XML_ERR_ENTITY_PE_INTERNAL, NULL);
++                return;
++            }
++
++            if (ent->content == NULL) {
++                /*
++                 * Note: external parsed entities will not be loaded,
++                 * it is not required for a non-validating parser to
++                 * complete external PEReferences coming from the
++                 * internal subset
++                 */
++                if (((ctxt->options & XML_PARSE_NOENT) != 0) ||
++                    ((ctxt->options & XML_PARSE_DTDVALID) != 0) ||
++                    (ctxt->validate != 0)) {
++                    xmlLoadEntityContent(ctxt, ent);
++                } else {
++                    xmlWarningMsg(ctxt, XML_ERR_ENTITY_PROCESSING,
++                                  "not validating will not read content for "
++                                  "PE entity %s\n", ent->name, NULL);
++                }
++            }
++
++            if (xmlParserEntityCheck(ctxt, ent->length))
++                return;
++
++            if (ent->flags & XML_ENT_EXPANDING) {
++                xmlFatalErr(ctxt, XML_ERR_ENTITY_LOOP, NULL);
++                xmlHaltParser(ctxt);
++                return;
++            }
++
++            ent->flags |= XML_ENT_EXPANDING;
++            xmlExpandPEsInEntityValue(ctxt, buf, ent->content, ent->length,
++                                      depth);
++            ent->flags &= ~XML_ENT_EXPANDING;
++
++            chunk = str;
++        } else {
++            /* Normal ASCII char */
++            if (!IS_BYTE_CHAR(c)) {
++                xmlFatalErrMsg(ctxt, XML_ERR_INVALID_CHAR,
++                        "invalid character in entity value\n");
++                if (chunk < str)
++                    xmlSBufAddString(buf, chunk, str - chunk);
++                xmlSBufAddReplChar(buf);
++                str += 1;
++                chunk = str;
++            } else {
++                str += 1;
++            }
++        }
++    }
++
++    if (chunk < str)
++        xmlSBufAddString(buf, chunk, str - chunk);
++
++    return;
++}
++
++/**
++ * xmlParseEntityValue:
++ * @ctxt:  an XML parser context
++ * @orig:  if non-NULL store a copy of the original entity value
++ *
++ * DEPRECATED: Internal function, don't use.
++ *
++ * parse a value for ENTITY declarations
++ *
++ * [9] EntityValue ::= '"' ([^%&"] | PEReference | Reference)* '"' |
++ *	               "'" ([^%&'] | PEReference | Reference)* "'"
++ *
++ * Returns the EntityValue parsed with reference substituted or NULL
++ */
++xmlChar *
++xmlParseEntityValue(xmlParserCtxtPtr ctxt, xmlChar **orig) {
++    unsigned maxLength = (ctxt->options & XML_PARSE_HUGE) ?
++                         XML_MAX_HUGE_LENGTH :
++                         XML_MAX_TEXT_LENGTH;
++    xmlSBuf buf;
++    const xmlChar *start;
++    int quote, length;
++
++    xmlSBufInit(&buf, maxLength);
++
++    GROW;
++
++    quote = CUR;
++    if ((quote != '"') && (quote != '\'')) {
++	xmlFatalErr(ctxt, XML_ERR_ATTRIBUTE_NOT_STARTED, NULL);
+ 	return(NULL);
+     }
++    CUR_PTR++;
++
++    length = 0;
+ 
+     /*
+-     * The content of the entity definition is copied in a buffer.
++     * Copy raw content of the entity into a buffer
+      */
++    while (1) {
++        int c;
++
++        if (PARSER_STOPPED(ctxt))
++            goto error;
++
++        if (CUR_PTR >= ctxt->input->end) {
++            xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_NOT_FINISHED, NULL);
++            goto error;
++        }
++
++        c = CUR;
++
++        if (c == 0) {
++            xmlFatalErrMsg(ctxt, XML_ERR_INVALID_CHAR,
++                    "invalid character in entity value\n");
++            goto error;
++        }
++        if (c == quote)
++            break;
++        NEXTL(1);
++        length += 1;
++
++        /*
++         * TODO: Check growth threshold
++         */
++        if (ctxt->input->end - CUR_PTR < 10)
++            GROW;
++    }
++
++    start = CUR_PTR - length;
++
++    if (orig != NULL) {
++        *orig = xmlStrndup(start, length);
++        if (*orig == NULL)
++            xmlErrMemory(ctxt);
++    }
++
++    xmlExpandPEsInEntityValue(ctxt, &buf, start, length, ctxt->inputNr);
++
++    NEXTL(1);
++
++    return(xmlSBufFinish(&buf, NULL, ctxt, "entity length too long"));
++
++error:
++    xmlSBufCleanup(&buf, ctxt, "entity length too long");
++    return(NULL);
++}
++
++/**
++ * xmlCheckEntityInAttValue:
++ * @ctxt:  parser context
++ * @pent:  entity
++ * @depth:  nesting depth
++ *
++ * Check an entity reference in an attribute value for validity
++ * without expanding it.
++ */
++static void
++xmlCheckEntityInAttValue(xmlParserCtxtPtr ctxt, xmlEntityPtr pent, int depth) {
++    const xmlChar *str;
++    unsigned long expandedSize = pent->length;
++    int c, flags;
++
++    depth += 1;
++    if (((depth > 40) && ((ctxt->options & XML_PARSE_HUGE) == 0)) ||
++	(depth > 100)) {
++	xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_LOOP,
++                       "Maximum entity nesting depth exceeded");
++	return;
++    }
++
++    if (pent->flags & XML_ENT_EXPANDING) {
++        xmlFatalErr(ctxt, XML_ERR_ENTITY_LOOP, NULL);
++        xmlHaltParser(ctxt);
++        return;
++    }
+ 
+-    input = ctxt->input;
+-    GROW;
+-    NEXT;
+-    c = CUR_CHAR(l);
+     /*
+-     * NOTE: 4.4.5 Included in Literal
+-     * When a parameter entity reference appears in a literal entity
+-     * value, ... a single or double quote character in the replacement
+-     * text is always treated as a normal data character and will not
+-     * terminate the literal.
+-     * In practice it means we stop the loop only when back at parsing
+-     * the initial entity and the quote is found
++     * If we're parsing a default attribute value in DTD content,
++     * the entity might reference other entities which weren't
++     * defined yet, so the check isn't reliable.
+      */
+-    while (((IS_CHAR(c)) && ((c != stop) || /* checked */
+-	    (ctxt->input != input))) && (PARSER_STOPPED(ctxt) == 0)) {
+-	if (len + 5 >= size) {
+-	    xmlChar *tmp;
++    if (ctxt->inSubset == 0)
++        flags = XML_ENT_CHECKED | XML_ENT_VALIDATED;
++    else
++        flags = XML_ENT_VALIDATED;
+ 
+-	    size *= 2;
+-	    tmp = (xmlChar *) xmlRealloc(buf, size);
+-	    if (tmp == NULL) {
+-		xmlErrMemory(ctxt);
+-                goto error;
+-	    }
+-	    buf = tmp;
+-	}
+-	COPY_BUF(buf, len, c);
+-	NEXTL(l);
++    str = pent->content;
++    if (str == NULL)
++        goto done;
+ 
+-	GROW;
+-	c = CUR_CHAR(l);
+-	if (c == 0) {
+-	    GROW;
+-	    c = CUR_CHAR(l);
+-	}
++    /*
++     * Note that entity values are already validated. We only check
++     * for illegal less-than signs and compute the expanded size
++     * of the entity. No special handling for multi-byte characters
++     * is needed.
++     */
++    while (!PARSER_STOPPED(ctxt)) {
++        c = *str;
+ 
+-        if (len > maxLength) {
+-            xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_NOT_FINISHED,
+-                           "entity value too long\n");
+-            goto error;
++	if (c != '&') {
++            if (c == 0)
++                break;
++
++            if (c == '<')
++                xmlFatalErrMsgStr(ctxt, XML_ERR_LT_IN_ATTRIBUTE,
++                        "'<' in entity '%s' is not allowed in attributes "
++                        "values\n", pent->name);
++
++            str += 1;
++        } else if (str[1] == '#') {
++            int val;
++
++	    val = xmlParseStringCharRef(ctxt, &str);
++	    if (val == 0)
++                break;
++	} else {
++            xmlEntityPtr ent;
++
++	    ent = xmlParseStringEntityRef(ctxt, &str);
++
++	    if ((ent != NULL) &&
++                (ent->etype != XML_INTERNAL_PREDEFINED_ENTITY)) {
++                if ((ent->flags & flags) != flags) {
++                    pent->flags |= XML_ENT_EXPANDING;
++                    xmlCheckEntityInAttValue(ctxt, ent, depth);
++                    pent->flags &= ~XML_ENT_EXPANDING;
++                }
++
++                xmlSaturatedAdd(&expandedSize, ent->expandedSize);
++                xmlSaturatedAdd(&expandedSize, XML_ENT_FIXED_COST);
++            }
+         }
+     }
+-    buf[len] = 0;
+-    if (c != stop) {
+-        xmlFatalErr(ctxt, XML_ERR_ENTITY_NOT_FINISHED, NULL);
+-        goto error;
++
++done:
++    if (ctxt->inSubset == 0)
++        pent->expandedSize = expandedSize;
++
++    pent->flags |= flags;
++}
++
++/**
++ * xmlExpandEntityInAttValue:
++ * @ctxt:  parser context
++ * @buf:  string buffer
++ * @str:  entity or attribute value
++ * @pent:  entity for entity value, NULL for attribute values
++ * @normalize:  whether to collapse whitespace
++ * @inSpace:  whitespace state
++ * @depth:  nesting depth
++ * @check:  whether to check for amplification
++ *
++ * Expand general entity references in an entity or attribute value.
++ * Perform attribute value normalization.
++ */
++static void
++xmlExpandEntityInAttValue(xmlParserCtxtPtr ctxt, xmlSBuf *buf,
++                          const xmlChar *str, xmlEntityPtr pent, int normalize,
++                          int *inSpace, int depth, int check) {
++    int c, chunkSize;
++
++    if (str == NULL)
++        return;
++
++    depth += 1;
++    if (((depth > 40) && ((ctxt->options & XML_PARSE_HUGE) == 0)) ||
++	(depth > 100)) {
++	xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_LOOP,
++                       "Maximum entity nesting depth exceeded");
++	return;
+     }
+-    NEXT;
+ 
+-    /*
+-     * Raise problem w.r.t. '&' and '%' being used in non-entities
+-     * reference constructs. Note Charref will be handled in
+-     * xmlStringDecodeEntities()
+-     */
+-    cur = buf;
+-    while (*cur != 0) { /* non input consuming */
+-	if ((*cur == '%') || ((*cur == '&') && (cur[1] != '#'))) {
+-	    xmlChar *name;
+-	    xmlChar tmp = *cur;
+-            int nameOk = 0;
++    if (pent != NULL) {
++        if (pent->flags & XML_ENT_EXPANDING) {
++            xmlFatalErr(ctxt, XML_ERR_ENTITY_LOOP, NULL);
++            xmlHaltParser(ctxt);
++            return;
++        }
++
++        if (check) {
++            if (xmlParserEntityCheck(ctxt, pent->length))
++                return;
++        }
++    }
++
++    chunkSize = 0;
++
++    /*
++     * Note that entity values are already validated. No special
++     * handling for multi-byte characters is needed.
++     */
++    while (!PARSER_STOPPED(ctxt)) {
++        c = *str;
++
++	if (c != '&') {
++            if (c == 0)
++                break;
++
++            /*
++             * If this function is called without an entity, it is used to
++             * expand entities in an attribute content where less-than was
++             * already unscaped and is allowed.
++             */
++            if ((pent != NULL) && (c == '<')) {
++                xmlFatalErrMsgStr(ctxt, XML_ERR_LT_IN_ATTRIBUTE,
++                        "'<' in entity '%s' is not allowed in attributes "
++                        "values\n", pent->name);
++                break;
++            }
++
++            if (c <= 0x20) {
++                if ((normalize) && (*inSpace)) {
++                    /* Skip char */
++                    if (chunkSize > 0) {
++                        xmlSBufAddString(buf, str - chunkSize, chunkSize);
++                        chunkSize = 0;
++                    }
++                } else if (c < 0x20) {
++                    if (chunkSize > 0) {
++                        xmlSBufAddString(buf, str - chunkSize, chunkSize);
++                        chunkSize = 0;
++                    }
++
++                    xmlSBufAddCString(buf, " ", 1);
++                } else {
++                    chunkSize += 1;
++                }
++
++                *inSpace = 1;
++            } else {
++                chunkSize += 1;
++                *inSpace = 0;
++            }
++
++            str += 1;
++        } else if (str[1] == '#') {
++            int val;
++
++            if (chunkSize > 0) {
++                xmlSBufAddString(buf, str - chunkSize, chunkSize);
++                chunkSize = 0;
++            }
++
++	    val = xmlParseStringCharRef(ctxt, &str);
++	    if (val == 0)
++                break;
++
++            if (val == ' ') {
++                if ((!normalize) || (!*inSpace))
++                    xmlSBufAddCString(buf, " ", 1);
++                *inSpace = 1;
++            } else {
++                xmlSBufAddChar(buf, val);
++                *inSpace = 0;
++            }
++	} else {
++            xmlEntityPtr ent;
++
++            if (chunkSize > 0) {
++                xmlSBufAddString(buf, str - chunkSize, chunkSize);
++                chunkSize = 0;
++            }
++
++	    ent = xmlParseStringEntityRef(ctxt, &str);
++
++	    if ((ent != NULL) &&
++		(ent->etype == XML_INTERNAL_PREDEFINED_ENTITY)) {
++		if (ent->content == NULL) {
++		    xmlFatalErrMsg(ctxt, XML_ERR_INTERNAL_ERROR,
++			    "predefined entity has no content\n");
++                    break;
++                }
++
++                xmlSBufAddString(buf, ent->content, ent->length);
++
++                *inSpace = 0;
++	    } else if ((ent != NULL) && (ent->content != NULL)) {
++                if (pent != NULL)
++                    pent->flags |= XML_ENT_EXPANDING;
++		xmlExpandEntityInAttValue(ctxt, buf, ent->content, ent,
++                                          normalize, inSpace, depth, check);
++                if (pent != NULL)
++                    pent->flags &= ~XML_ENT_EXPANDING;
++	    }
++        }
++    }
++
++    if (chunkSize > 0)
++        xmlSBufAddString(buf, str - chunkSize, chunkSize);
++
++    return;
++}
++
++/**
++ * xmlExpandEntitiesInAttValue:
++ * @ctxt:  parser context
++ * @str:  entity or attribute value
++ * @normalize:  whether to collapse whitespace
++ *
++ * Expand general entity references in an entity or attribute value.
++ * Perform attribute value normalization.
++ *
++ * Returns the expanded attribtue value.
++ */
++xmlChar *
++xmlExpandEntitiesInAttValue(xmlParserCtxtPtr ctxt, const xmlChar *str,
++                            int normalize) {
++    unsigned maxLength = (ctxt->options & XML_PARSE_HUGE) ?
++                         XML_MAX_HUGE_LENGTH :
++                         XML_MAX_TEXT_LENGTH;
++    xmlSBuf buf;
++    int inSpace = 1;
++
++    xmlSBufInit(&buf, maxLength);
++
++    xmlExpandEntityInAttValue(ctxt, &buf, str, NULL, normalize, &inSpace,
++                              ctxt->inputNr, /* check */ 0);
++
++    if ((normalize) && (inSpace) && (buf.size > 0))
++        buf.size--;
++
++    return(xmlSBufFinish(&buf, NULL, ctxt, "AttValue length too long"));
++}
++
++/**
++ * xmlParseAttValueInternal:
++ * @ctxt:  an XML parser context
++ * @len:  attribute len result
++ * @alloc:  whether the attribute was reallocated as a new string
++ * @normalize:  if 1 then further non-CDATA normalization must be done
++ *
++ * parse a value for an attribute.
++ * NOTE: if no normalization is needed, the routine will return pointers
++ *       directly from the data buffer.
++ *
++ * 3.3.3 Attribute-Value Normalization:
++ * Before the value of an attribute is passed to the application or
++ * checked for validity, the XML processor must normalize it as follows:
++ * - a character reference is processed by appending the referenced
++ *   character to the attribute value
++ * - an entity reference is processed by recursively processing the
++ *   replacement text of the entity
++ * - a whitespace character (#x20, #xD, #xA, #x9) is processed by
++ *   appending #x20 to the normalized value, except that only a single
++ *   #x20 is appended for a "#xD#xA" sequence that is part of an external
++ *   parsed entity or the literal entity value of an internal parsed entity
++ * - other characters are processed by appending them to the normalized value
++ * If the declared value is not CDATA, then the XML processor must further
++ * process the normalized attribute value by discarding any leading and
++ * trailing space (#x20) characters, and by replacing sequences of space
++ * (#x20) characters by a single space (#x20) character.
++ * All attributes for which no declaration has been read should be treated
++ * by a non-validating parser as if declared CDATA.
++ *
++ * Returns the AttValue parsed or NULL. The value has to be freed by the
++ *     caller if it was copied, this can be detected by val[*len] == 0.
++ */
++static xmlChar *
++xmlParseAttValueInternal(xmlParserCtxtPtr ctxt, int *attlen, int *alloc,
++                         int normalize) {
++    unsigned maxLength = (ctxt->options & XML_PARSE_HUGE) ?
++                         XML_MAX_HUGE_LENGTH :
++                         XML_MAX_TEXT_LENGTH;
++    xmlSBuf buf;
++    xmlChar *ret;
++    int c, l, quote, flags, chunkSize;
++    int inSpace = 1;
++
++    xmlSBufInit(&buf, maxLength);
++
++    GROW;
++
++    quote = CUR;
++    if ((quote != '"') && (quote != '\'')) {
++	xmlFatalErr(ctxt, XML_ERR_ATTRIBUTE_NOT_STARTED, NULL);
++	return(NULL);
++    }
++    CUR_PTR++;
++
++    if (ctxt->inSubset == 0)
++        flags = XML_ENT_CHECKED | XML_ENT_VALIDATED;
++    else
++        flags = XML_ENT_VALIDATED;
++
++    inSpace = 1;
++    chunkSize = 0;
++
++    while (1) {
++        if (PARSER_STOPPED(ctxt))
++            goto error;
++
++        if (CUR_PTR >= ctxt->input->end) {
++            xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
++                           "AttValue: ' expected\n");
++            goto error;
++        }
++
++        /*
++         * TODO: Check growth threshold
++         */
++        if (ctxt->input->end - CUR_PTR < 10)
++            GROW;
++
++        c = CUR;
++
++        if (c >= 0x80) {
++            l = xmlUTF8MultibyteLen(ctxt, CUR_PTR,
++                    "invalid character in attribute value\n");
++            if (l == 0) {
++                if (chunkSize > 0) {
++                    xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                    chunkSize = 0;
++                }
++                xmlSBufAddReplChar(&buf);
++                NEXTL(1);
++            } else {
++                chunkSize += l;
++                NEXTL(l);
++            }
++
++            inSpace = 0;
++        } else if (c != '&') {
++            if (c > 0x20) {
++                if (c == quote)
++                    break;
++
++                if (c == '<')
++                    xmlFatalErr(ctxt, XML_ERR_LT_IN_ATTRIBUTE, NULL);
++
++                chunkSize += 1;
++                inSpace = 0;
++            } else if (!IS_BYTE_CHAR(c)) {
++                xmlFatalErrMsg(ctxt, XML_ERR_INVALID_CHAR,
++                        "invalid character in attribute value\n");
++                if (chunkSize > 0) {
++                    xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                    chunkSize = 0;
++                }
++                xmlSBufAddReplChar(&buf);
++                inSpace = 0;
++            } else {
++                /* Whitespace */
++                if ((normalize) && (inSpace)) {
++                    /* Skip char */
++                    if (chunkSize > 0) {
++                        xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                        chunkSize = 0;
++                    }
++                } else if (c < 0x20) {
++                    /* Convert to space */
++                    if (chunkSize > 0) {
++                        xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                        chunkSize = 0;
++                    }
++
++                    xmlSBufAddCString(&buf, " ", 1);
++                } else {
++                    chunkSize += 1;
++                }
+ 
+-	    cur++;
+-	    name = xmlParseStringName(ctxt, &cur);
+-            if (name != NULL) {
+-                nameOk = 1;
+-                xmlFree(name);
++                inSpace = 1;
++
++                if ((c == 0xD) && (NXT(1) == 0xA))
++                    CUR_PTR++;
+             }
+-            if ((nameOk == 0) || (*cur != ';')) {
+-		xmlFatalErrMsgInt(ctxt, XML_ERR_ENTITY_CHAR_ERROR,
+-	    "EntityValue: '%c' forbidden except for entities references\n",
+-	                          tmp);
+-                goto error;
+-	    }
+-	    if ((tmp == '%') && (!PARSER_EXTERNAL(ctxt))) {
+-		xmlFatalErr(ctxt, XML_ERR_ENTITY_PE_INTERNAL, NULL);
++
++            NEXTL(1);
++        } else if (NXT(1) == '#') {
++            int val;
++
++            if (chunkSize > 0) {
++                xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                chunkSize = 0;
++            }
++
++            val = xmlParseCharRef(ctxt);
++            if (val == 0)
+                 goto error;
+-	    }
+-	    if (*cur == 0)
+-	        break;
+-	}
+-	cur++;
+-    }
+ 
+-    /*
+-     * Then PEReference entities are substituted.
+-     *
+-     * NOTE: 4.4.7 Bypassed
+-     * When a general entity reference appears in the EntityValue in
+-     * an entity declaration, it is bypassed and left as is.
+-     * so XML_SUBSTITUTE_REF is not set here.
+-     */
+-    ++ctxt->depth;
+-    ret = xmlStringDecodeEntitiesInt(ctxt, buf, len, XML_SUBSTITUTE_PEREF,
+-                                     0, 0, 0, /* check */ 1);
+-    --ctxt->depth;
++            if ((val == '&') && (!ctxt->replaceEntities)) {
++                /*
++                 * The reparsing will be done in xmlStringGetNodeList()
++                 * called by the attribute() function in SAX.c
++                 */
++                xmlSBufAddCString(&buf, "&#38;", 5);
++                inSpace = 0;
++            } else if (val == ' ') {
++                if ((!normalize) || (!inSpace))
++                    xmlSBufAddCString(&buf, " ", 1);
++                inSpace = 1;
++            } else {
++                xmlSBufAddChar(&buf, val);
++                inSpace = 0;
++            }
++        } else {
++            xmlEntityPtr ent;
+ 
+-    if (orig != NULL) {
+-        *orig = buf;
+-        buf = NULL;
+-    }
++            if (chunkSize > 0) {
++                xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
++                chunkSize = 0;
++            }
+ 
+-error:
+-    if (buf != NULL)
+-        xmlFree(buf);
+-    return(ret);
+-}
++            ent = xmlParseEntityRefInternal(ctxt, /* isAttr */ 1);
+ 
+-/**
+- * xmlParseAttValueComplex:
+- * @ctxt:  an XML parser context
+- * @len:   the resulting attribute len
+- * @normalize:  whether to apply the inner normalization
+- *
+- * parse a value for an attribute, this is the fallback function
+- * of xmlParseAttValue() when the attribute parsing requires handling
+- * of non-ASCII characters, or normalization compaction.
+- *
+- * Returns the AttValue parsed or NULL. The value has to be freed by the caller.
+- */
+-static xmlChar *
+-xmlParseAttValueComplex(xmlParserCtxtPtr ctxt, int *attlen, int normalize) {
+-    xmlChar limit = 0;
+-    xmlChar *buf = NULL;
+-    xmlChar *rep = NULL;
+-    size_t len = 0;
+-    size_t buf_size = 0;
+-    size_t maxLength = (ctxt->options & XML_PARSE_HUGE) ?
+-                       XML_MAX_HUGE_LENGTH :
+-                       XML_MAX_TEXT_LENGTH;
+-    int c, l, in_space = 0;
+-    xmlChar *current = NULL;
+-    xmlEntityPtr ent;
++            if (ent == NULL) {
++                /*
++                 * Probably a literal '&' which wasn't escaped.
++                 * Handle gracefully in recovery mode.
++                 */
++                if (ctxt->replaceEntities)
++                    xmlSBufAddCString(&buf, "&", 1);
++                else
++                    xmlSBufAddCString(&buf, "&#38;", 5);
++            } else if (ent->etype == XML_INTERNAL_PREDEFINED_ENTITY) {
++                if ((ent->content[0] == '&') && (!ctxt->replaceEntities))
++                    xmlSBufAddCString(&buf, "&#38;", 5);
++                else
++                    xmlSBufAddString(&buf, ent->content, ent->length);
++                inSpace = 0;
++            } else if (ctxt->replaceEntities) {
++                xmlExpandEntityInAttValue(ctxt, &buf, ent->content, ent,
++                                          normalize, &inSpace, ctxt->inputNr,
++                                          /* check */ 1);
++            } else {
++                if ((ent->flags & flags) != flags)
++                    xmlCheckEntityInAttValue(ctxt, ent, ctxt->inputNr);
+ 
+-    if (NXT(0) == '"') {
+-	limit = '"';
+-        NEXT;
+-    } else if (NXT(0) == '\'') {
+-	limit = '\'';
+-        NEXT;
+-    } else {
+-	xmlFatalErr(ctxt, XML_ERR_ATTRIBUTE_NOT_STARTED, NULL);
+-	return(NULL);
+-    }
++                if (xmlParserEntityCheck(ctxt, ent->expandedSize)) {
++                    ent->content[0] = 0;
++                    goto error;
++                }
+ 
+-    /*
+-     * allocate a translation buffer.
+-     */
+-    buf_size = XML_PARSER_BUFFER_SIZE;
+-    buf = (xmlChar *) xmlMallocAtomic(buf_size);
+-    if (buf == NULL) goto mem_error;
++                /*
++                 * Just output the reference
++                 */
++                xmlSBufAddCString(&buf, "&", 1);
++                xmlSBufAddString(&buf, ent->name, xmlStrlen(ent->name));
++                xmlSBufAddCString(&buf, ";", 1);
+ 
+-    /*
+-     * OK loop until we reach one of the ending char or a size limit.
+-     */
+-    c = CUR_CHAR(l);
+-    while (((NXT(0) != limit) && /* checked */
+-            (IS_CHAR(c)) && (c != '<')) &&
+-            (PARSER_STOPPED(ctxt) == 0)) {
+-	if (c == '&') {
+-	    in_space = 0;
+-	    if (NXT(1) == '#') {
+-		int val = xmlParseCharRef(ctxt);
+-
+-		if (val == '&') {
+-		    if (ctxt->replaceEntities) {
+-			if (len + 10 > buf_size) {
+-			    growBuffer(buf, 10);
+-			}
+-			buf[len++] = '&';
+-		    } else {
+-			/*
+-			 * The reparsing will be done in xmlStringGetNodeList()
+-			 * called by the attribute() function in SAX.c
+-			 */
+-			if (len + 10 > buf_size) {
+-			    growBuffer(buf, 10);
+-			}
+-			buf[len++] = '&';
+-			buf[len++] = '#';
+-			buf[len++] = '3';
+-			buf[len++] = '8';
+-			buf[len++] = ';';
+-		    }
+-		} else if (val != 0) {
+-		    if (len + 10 > buf_size) {
+-			growBuffer(buf, 10);
+-		    }
+-		    len += xmlCopyChar(0, &buf[len], val);
+-		}
+-	    } else {
+-		ent = xmlParseEntityRefInternal(ctxt, /* isAttr */ 1);
+-		if ((ent != NULL) &&
+-		    (ent->etype == XML_INTERNAL_PREDEFINED_ENTITY)) {
+-		    if (len + 10 > buf_size) {
+-			growBuffer(buf, 10);
+-		    }
+-		    if ((ctxt->replaceEntities == 0) &&
+-		        (ent->content[0] == '&')) {
+-			buf[len++] = '&';
+-			buf[len++] = '#';
+-			buf[len++] = '3';
+-			buf[len++] = '8';
+-			buf[len++] = ';';
+-		    } else {
+-			buf[len++] = ent->content[0];
+-		    }
+-		} else if ((ent != NULL) &&
+-		           (ctxt->replaceEntities != 0)) {
+-		    if (ent->etype != XML_INTERNAL_PREDEFINED_ENTITY) {
+-                        if (xmlParserEntityCheck(ctxt, ent->length))
+-                            goto error;
++                inSpace = 0;
++            }
++	}
++    }
+ 
+-			++ctxt->depth;
+-			rep = xmlStringDecodeEntitiesInt(ctxt, ent->content,
+-                                ent->length, XML_SUBSTITUTE_REF, 0, 0, 0,
+-                                /* check */ 1);
+-			--ctxt->depth;
+-			if (rep != NULL) {
+-			    current = rep;
+-			    while (*current != 0) { /* non input consuming */
+-                                if ((*current == 0xD) || (*current == 0xA) ||
+-                                    (*current == 0x9)) {
+-                                    buf[len++] = 0x20;
+-                                    current++;
+-                                } else
+-                                    buf[len++] = *current++;
+-				if (len + 10 > buf_size) {
+-				    growBuffer(buf, 10);
+-				}
+-			    }
+-			    xmlFree(rep);
+-			    rep = NULL;
+-			}
+-		    } else {
+-			if (len + 10 > buf_size) {
+-			    growBuffer(buf, 10);
+-			}
+-			if (ent->content != NULL)
+-			    buf[len++] = ent->content[0];
+-		    }
+-		} else if (ent != NULL) {
+-		    int i = xmlStrlen(ent->name);
+-		    const xmlChar *cur = ent->name;
++    if ((buf.mem == NULL) && (alloc != NULL)) {
++        ret = (xmlChar *) CUR_PTR - chunkSize;
+ 
+-		    /*
+-                     * We also check for recursion and amplification
+-                     * when entities are not substituted. They're
+-                     * often expanded later.
+-		     */
+-		    if ((ent->etype != XML_INTERNAL_PREDEFINED_ENTITY) &&
+-			(ent->content != NULL)) {
+-                        if ((ent->flags & XML_ENT_CHECKED) == 0) {
+-                            xmlEntityPtr entity = ctxt->input->entity;
+-                            int oldCopy = entity ?
+-                                entity->expandedSize :
+-                                ctxt->sizeentcopy;
+-                            int newCopy;
+-
+-                            ++ctxt->depth;
+-                            rep = xmlStringDecodeEntitiesInt(ctxt,
+-                                    ent->content, ent->length,
+-                                    XML_SUBSTITUTE_REF, 0, 0, 0,
+-                                    /* check */ 1);
+-                            --ctxt->depth;
+-
+-                            /*
+-                             * If we're parsing DTD content, the entity
+-                             * might reference other entities which
+-                             * weren't defined yet, so the check isn't
+-                             * reliable.
+-                             */
+-                            if (ctxt->inSubset == 0) {
+-                                ent->flags |= XML_ENT_CHECKED;
+-
+-                                newCopy = entity ?
+-                                    entity->expandedSize :
+-                                    ctxt->sizeentcopy;
+-                                ent->expandedSize =
+-                                    newCopy - oldCopy + ent->length;
+-                            }
++        if (attlen != NULL)
++            *attlen = chunkSize;
++        if ((normalize) && (inSpace) && (chunkSize > 0))
++            *attlen -= 1;
++        *alloc = 0;
+ 
+-                            if (rep != NULL) {
+-                                xmlFree(rep);
+-                                rep = NULL;
+-                            } else {
+-                                ent->content[0] = 0;
+-                            }
++        /* Report potential error */
++        xmlSBufCleanup(&buf, ctxt, "AttValue length too long");
++    } else {
++        if (chunkSize > 0)
++            xmlSBufAddString(&buf, CUR_PTR - chunkSize, chunkSize);
+ 
+-                            if (xmlParserEntityCheck(ctxt, ent->length))
+-                                goto error;
+-                        } else {
+-                            if (xmlParserEntityCheck(ctxt, ent->expandedSize))
+-                                goto error;
+-                        }
+-		    }
++        if ((normalize) && (inSpace) && (buf.size > 0))
++            buf.size--;
+ 
+-		    /*
+-		     * Just output the reference
+-		     */
+-		    buf[len++] = '&';
+-		    while (len + i + 10 > buf_size) {
+-			growBuffer(buf, i + 10);
+-		    }
+-		    for (;i > 0;i--)
+-			buf[len++] = *cur++;
+-		    buf[len++] = ';';
+-		}
+-	    }
+-	} else {
+-	    if ((c == 0x20) || (c == 0xD) || (c == 0xA) || (c == 0x9)) {
+-	        if ((len != 0) || (!normalize)) {
+-		    if ((!normalize) || (!in_space)) {
+-			COPY_BUF(buf, len, 0x20);
+-			while (len + 10 > buf_size) {
+-			    growBuffer(buf, 10);
+-			}
+-		    }
+-		    in_space = 1;
+-		}
+-	    } else {
+-	        in_space = 0;
+-		COPY_BUF(buf, len, c);
+-		if (len + 10 > buf_size) {
+-		    growBuffer(buf, 10);
+-		}
+-	    }
+-	    NEXTL(l);
+-	}
+-	GROW;
+-	c = CUR_CHAR(l);
+-        if (len > maxLength) {
+-            xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                           "AttValue length too long\n");
+-            goto error;
++        ret = xmlSBufFinish(&buf, attlen, ctxt, "AttValue length too long");
++
++        if (ret != NULL) {
++            if (attlen != NULL)
++                *attlen = buf.size;
++            if (alloc != NULL)
++                *alloc = 1;
+         }
+     }
+ 
+-    if ((in_space) && (normalize)) {
+-        while ((len > 0) && (buf[len - 1] == 0x20)) len--;
+-    }
+-    buf[len] = 0;
+-    if (RAW == '<') {
+-	xmlFatalErr(ctxt, XML_ERR_LT_IN_ATTRIBUTE, NULL);
+-    } else if (RAW != limit) {
+-	if ((c != 0) && (!IS_CHAR(c))) {
+-	    xmlFatalErrMsg(ctxt, XML_ERR_INVALID_CHAR,
+-			   "invalid character in attribute value\n");
+-	} else {
+-	    xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-			   "AttValue: ' expected\n");
+-        }
+-    } else
+-	NEXT;
++    NEXTL(1);
+ 
+-    if (attlen != NULL) *attlen = len;
+-    return(buf);
++    return(ret);
+ 
+-mem_error:
+-    xmlErrMemory(ctxt);
+ error:
+-    if (buf != NULL)
+-        xmlFree(buf);
+-    if (rep != NULL)
+-        xmlFree(rep);
++    xmlSBufCleanup(&buf, ctxt, "AttValue length too long");
+     return(NULL);
+ }
+ 
+ /**
+  * xmlParseAttValue:
+  * @ctxt:  an XML parser context
+  *
+  * DEPRECATED: Internal function, don't use.
+  *
+  * parse a value for an attribute
+  * Note: the parser won't do substitution of entities here, this
+  * will be handled later in xmlStringGetNodeList
+  *
+  * [10] AttValue ::= '"' ([^<&"] | Reference)* '"' |
+  *                   "'" ([^<&'] | Reference)* "'"
+  *
+  * 3.3.3 Attribute-Value Normalization:
+  * Before the value of an attribute is passed to the application or
+  * checked for validity, the XML processor must normalize it as follows:
+  * - a character reference is processed by appending the referenced
+  *   character to the attribute value
+  * - an entity reference is processed by recursively processing the
+  *   replacement text of the entity
+  * - a whitespace character (#x20, #xD, #xA, #x9) is processed by
+  *   appending #x20 to the normalized value, except that only a single
+  *   #x20 is appended for a "#xD#xA" sequence that is part of an external
+  *   parsed entity or the literal entity value of an internal parsed entity
+  * - other characters are processed by appending them to the normalized value
+  * If the declared value is not CDATA, then the XML processor must further
+  * process the normalized attribute value by discarding any leading and
+  * trailing space (#x20) characters, and by replacing sequences of space
+  * (#x20) characters by a single space (#x20) character.
+  * All attributes for which no declaration has been read should be treated
+  * by a non-validating parser as if declared CDATA.
+  *
+  * Returns the AttValue parsed or NULL. The value has to be freed by the caller.
+  */
+@@ -7147,155 +7433,126 @@ static xmlEntityPtr
+ xmlParseEntityRefInternal(xmlParserCtxtPtr ctxt, int inAttr) {
+     const xmlChar *name;
+     xmlEntityPtr ent = NULL;
+ 
+     GROW;
+ 
+     if (RAW != '&')
+         return(NULL);
+     NEXT;
+     name = xmlParseName(ctxt);
+     if (name == NULL) {
+ 	xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+ 		       "xmlParseEntityRef: no name\n");
+         return(NULL);
+     }
+     if (RAW != ';') {
+ 	xmlFatalErr(ctxt, XML_ERR_ENTITYREF_SEMICOL_MISSING, NULL);
+ 	return(NULL);
+     }
+     NEXT;
+ 
+     /*
+      * Predefined entities override any extra definition
+      */
+     if ((ctxt->options & XML_PARSE_OLDSAX) == 0) {
+         ent = xmlGetPredefinedEntity(name);
+         if (ent != NULL)
+             return(ent);
+     }
+ 
+     /*
+      * Ask first SAX for entity resolution, otherwise try the
+      * entities which may have stored in the parser context.
+      */
+     if (ctxt->sax != NULL) {
+ 	if (ctxt->sax->getEntity != NULL)
+ 	    ent = ctxt->sax->getEntity(ctxt->userData, name);
+ 	if ((ctxt->wellFormed == 1 ) && (ent == NULL) &&
+ 	    (ctxt->options & XML_PARSE_OLDSAX))
+ 	    ent = xmlGetPredefinedEntity(name);
+ 	if ((ctxt->wellFormed == 1 ) && (ent == NULL) &&
+ 	    (ctxt->userData==ctxt)) {
+ 	    ent = xmlSAX2GetEntity(ctxt, name);
+ 	}
+     }
+     /*
+      * [ WFC: Entity Declared ]
+      * In a document without any DTD, a document with only an
+      * internal DTD subset which contains no parameter entity
+      * references, or a document with "standalone='yes'", the
+      * Name given in the entity reference must match that in an
+      * entity declaration, except that well-formed documents
+      * need not declare any of the following entities: amp, lt,
+      * gt, apos, quot.
+      * The declaration of a parameter entity must precede any
+      * reference to it.
+      * Similarly, the declaration of a general entity must
+      * precede any reference to it which appears in a default
+      * value in an attribute-list declaration. Note that if
+      * entities are declared in the external subset or in
+      * external parameter entities, a non-validating processor
+      * is not obligated to read and process their declarations;
+      * for such documents, the rule that an entity must be
+      * declared is a well-formedness constraint only if
+      * standalone='yes'.
+      */
+     if (ent == NULL) {
+ 	if ((ctxt->standalone == 1) ||
+ 	    ((ctxt->hasExternalSubset == 0) &&
+ 	     (ctxt->hasPErefs == 0))) {
+ 	    xmlFatalErrMsgStr(ctxt, XML_ERR_UNDECLARED_ENTITY,
+ 		     "Entity '%s' not defined\n", name);
+ 	} else {
+ 	    xmlErrMsgStr(ctxt, XML_WAR_UNDECLARED_ENTITY,
+ 		     "Entity '%s' not defined\n", name);
+ 	    if ((ctxt->inSubset == 0) &&
+ 		(ctxt->sax != NULL) &&
+                 (ctxt->disableSAX == 0) &&
+ 		(ctxt->sax->reference != NULL)) {
+ 		ctxt->sax->reference(ctxt->userData, name);
+ 	    }
+ 	}
+ 	ctxt->valid = 0;
+     }
+ 
+     /*
+      * [ WFC: Parsed Entity ]
+      * An entity reference must not contain the name of an
+      * unparsed entity
+      */
+     else if (ent->etype == XML_EXTERNAL_GENERAL_UNPARSED_ENTITY) {
+ 	xmlFatalErrMsgStr(ctxt, XML_ERR_UNPARSED_ENTITY,
+ 		 "Entity reference to unparsed entity %s\n", name);
++        ent = NULL;
+     }
+ 
+     /*
+      * [ WFC: No External Entity References ]
+      * Attribute values cannot contain direct or indirect
+      * entity references to external entities.
+      */
+-    else if ((inAttr) && (ent->etype == XML_EXTERNAL_GENERAL_PARSED_ENTITY)) {
+-	xmlFatalErrMsgStr(ctxt, XML_ERR_ENTITY_IS_EXTERNAL,
+-	     "Attribute references external entity '%s'\n", name);
+-    }
+-    /*
+-     * [ WFC: No < in Attribute Values ]
+-     * The replacement text of any entity referred to directly or
+-     * indirectly in an attribute value (other than "&lt;") must
+-     * not contain a <.
+-     */
+-    else if ((inAttr) && (ent->etype != XML_INTERNAL_PREDEFINED_ENTITY)) {
+-	if ((ent->flags & XML_ENT_CHECKED_LT) == 0) {
+-            if ((ent->content != NULL) && (xmlStrchr(ent->content, '<')))
+-                ent->flags |= XML_ENT_CONTAINS_LT;
+-            ent->flags |= XML_ENT_CHECKED_LT;
++    else if (ent->etype == XML_EXTERNAL_GENERAL_PARSED_ENTITY) {
++        if (inAttr) {
++            xmlFatalErrMsgStr(ctxt, XML_ERR_ENTITY_IS_EXTERNAL,
++                 "Attribute references external entity '%s'\n", name);
++            ent = NULL;
+         }
+-        if (ent->flags & XML_ENT_CONTAINS_LT)
+-            xmlFatalErrMsgStr(ctxt, XML_ERR_LT_IN_ATTRIBUTE,
+-                    "'<' in entity '%s' is not allowed in attributes "
+-                    "values\n", name);
+-    }
+-
+-    /*
+-     * Internal check, no parameter entities here ...
+-     */
+-    else {
+-	switch (ent->etype) {
+-	    case XML_INTERNAL_PARAMETER_ENTITY:
+-	    case XML_EXTERNAL_PARAMETER_ENTITY:
+-	    xmlFatalErrMsgStr(ctxt, XML_ERR_ENTITY_IS_PARAMETER,
+-	     "Attempt to reference the parameter entity '%s'\n",
+-			      name);
+-	    break;
+-	    default:
+-	    break;
+-	}
+     }
+ 
+     /*
+      * [ WFC: No Recursion ]
+      * A parsed entity must not contain a recursive reference
+      * to itself, either directly or indirectly.
+      * Done somewhere else
+      */
+     return(ent);
+ }
+ 
+ /**
+  * xmlParseEntityRef:
+  * @ctxt:  an XML parser context
+  *
+  * DEPRECATED: Internal function, don't use.
+  *
+  * Returns the xmlEntityPtr if found, or NULL otherwise.
+  */
+@@ -7339,188 +7596,157 @@ static xmlEntityPtr
+ xmlParseStringEntityRef(xmlParserCtxtPtr ctxt, const xmlChar ** str) {
+     xmlChar *name;
+     const xmlChar *ptr;
+     xmlChar cur;
+     xmlEntityPtr ent = NULL;
+ 
+     if ((str == NULL) || (*str == NULL))
+         return(NULL);
+     ptr = *str;
+     cur = *ptr;
+     if (cur != '&')
+ 	return(NULL);
+ 
+     ptr++;
+     name = xmlParseStringName(ctxt, &ptr);
+     if (name == NULL) {
+ 	xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+ 		       "xmlParseStringEntityRef: no name\n");
+ 	*str = ptr;
+ 	return(NULL);
+     }
+     if (*ptr != ';') {
+ 	xmlFatalErr(ctxt, XML_ERR_ENTITYREF_SEMICOL_MISSING, NULL);
+         xmlFree(name);
+ 	*str = ptr;
+ 	return(NULL);
+     }
+     ptr++;
+ 
+ 
+     /*
+      * Predefined entities override any extra definition
+      */
+     if ((ctxt->options & XML_PARSE_OLDSAX) == 0) {
+         ent = xmlGetPredefinedEntity(name);
+         if (ent != NULL) {
+             xmlFree(name);
+             *str = ptr;
+             return(ent);
+         }
+     }
+ 
+     /*
+      * Ask first SAX for entity resolution, otherwise try the
+      * entities which may have stored in the parser context.
+      */
+     if (ctxt->sax != NULL) {
+ 	if (ctxt->sax->getEntity != NULL)
+ 	    ent = ctxt->sax->getEntity(ctxt->userData, name);
+ 	if ((ent == NULL) && (ctxt->options & XML_PARSE_OLDSAX))
+ 	    ent = xmlGetPredefinedEntity(name);
+ 	if ((ent == NULL) && (ctxt->userData==ctxt)) {
+ 	    ent = xmlSAX2GetEntity(ctxt, name);
+ 	}
+     }
+ 
+     /*
+      * [ WFC: Entity Declared ]
+      * In a document without any DTD, a document with only an
+      * internal DTD subset which contains no parameter entity
+      * references, or a document with "standalone='yes'", the
+      * Name given in the entity reference must match that in an
+      * entity declaration, except that well-formed documents
+      * need not declare any of the following entities: amp, lt,
+      * gt, apos, quot.
+      * The declaration of a parameter entity must precede any
+      * reference to it.
+      * Similarly, the declaration of a general entity must
+      * precede any reference to it which appears in a default
+      * value in an attribute-list declaration. Note that if
+      * entities are declared in the external subset or in
+      * external parameter entities, a non-validating processor
+      * is not obligated to read and process their declarations;
+      * for such documents, the rule that an entity must be
+      * declared is a well-formedness constraint only if
+      * standalone='yes'.
+      */
+     if (ent == NULL) {
+ 	if ((ctxt->standalone == 1) ||
+ 	    ((ctxt->hasExternalSubset == 0) &&
+ 	     (ctxt->hasPErefs == 0))) {
+ 	    xmlFatalErrMsgStr(ctxt, XML_ERR_UNDECLARED_ENTITY,
+ 		     "Entity '%s' not defined\n", name);
+ 	} else {
+ 	    xmlErrMsgStr(ctxt, XML_WAR_UNDECLARED_ENTITY,
+ 			  "Entity '%s' not defined\n",
+ 			  name);
+ 	}
+ 	/* TODO ? check regressions ctxt->valid = 0; */
+     }
+ 
+     /*
+      * [ WFC: Parsed Entity ]
+      * An entity reference must not contain the name of an
+      * unparsed entity
+      */
+     else if (ent->etype == XML_EXTERNAL_GENERAL_UNPARSED_ENTITY) {
+ 	xmlFatalErrMsgStr(ctxt, XML_ERR_UNPARSED_ENTITY,
+ 		 "Entity reference to unparsed entity %s\n", name);
++        ent = NULL;
+     }
+ 
+     /*
+      * [ WFC: No External Entity References ]
+      * Attribute values cannot contain direct or indirect
+      * entity references to external entities.
+      */
+     else if (ent->etype == XML_EXTERNAL_GENERAL_PARSED_ENTITY) {
+ 	xmlFatalErrMsgStr(ctxt, XML_ERR_ENTITY_IS_EXTERNAL,
+-	 "Attribute references external entity '%s'\n", name);
+-    }
+-    /*
+-     * [ WFC: No < in Attribute Values ]
+-     * The replacement text of any entity referred to directly or
+-     * indirectly in an attribute value (other than "&lt;") must
+-     * not contain a <.
+-     */
+-    else if (ent->etype != XML_INTERNAL_PREDEFINED_ENTITY) {
+-	if ((ent->flags & XML_ENT_CHECKED_LT) == 0) {
+-            if ((ent->content != NULL) && (xmlStrchr(ent->content, '<')))
+-                ent->flags |= XML_ENT_CONTAINS_LT;
+-            ent->flags |= XML_ENT_CHECKED_LT;
+-        }
+-        if (ent->flags & XML_ENT_CONTAINS_LT)
+-            xmlFatalErrMsgStr(ctxt, XML_ERR_LT_IN_ATTRIBUTE,
+-                    "'<' in entity '%s' is not allowed in attributes "
+-                    "values\n", name);
+-    }
+-
+-    /*
+-     * Internal check, no parameter entities here ...
+-     */
+-    else {
+-	switch (ent->etype) {
+-	    case XML_INTERNAL_PARAMETER_ENTITY:
+-	    case XML_EXTERNAL_PARAMETER_ENTITY:
+-		xmlFatalErrMsgStr(ctxt, XML_ERR_ENTITY_IS_PARAMETER,
+-	     "Attempt to reference the parameter entity '%s'\n",
+-				  name);
+-	    break;
+-	    default:
+-	    break;
+-	}
++	        "Attribute references external entity '%s'\n", name);
++        ent = NULL;
+     }
+ 
+     /*
+      * [ WFC: No Recursion ]
+      * A parsed entity must not contain a recursive reference
+      * to itself, either directly or indirectly.
+      * Done somewhere else
+      */
+ 
+     xmlFree(name);
+     *str = ptr;
+     return(ent);
+ }
+ 
+ /**
+  * xmlParsePEReference:
+  * @ctxt:  an XML parser context
+  *
+  * DEPRECATED: Internal function, don't use.
+  *
+  * Parse a parameter entity reference. Always consumes '%'.
+  *
+  * The entity content is handled directly by pushing it's content as
+  * a new input stream.
+  *
+  * [69] PEReference ::= '%' Name ';'
+  *
+  * [ WFC: No Recursion ]
+  * A parsed entity must not contain a recursive
+  * reference to itself, either directly or indirectly.
+  *
+  * [ WFC: Entity Declared ]
+  * In a document without any DTD, a document with only an internal DTD
+  * subset which contains no parameter entity references, or a document
+  * with "standalone='yes'", ...  ... The declaration of a parameter
+  * entity must precede any reference to it...
+  *
+  * [ VC: Entity Declared ]
+  * In a document with an external subset or external parameter entities
+  * with "standalone='no'", ...  ... The declaration of a parameter entity
+  * must precede any reference to it...
+  *
+  * [ WFC: In DTD ]
+  * Parameter-entity references may only appear in the DTD.
+  * NOTE: misleading but this is handled.
+  */
+@@ -8454,251 +8680,56 @@ static const xmlChar *
+ xmlParseQNameAndCompare(xmlParserCtxtPtr ctxt, xmlChar const *name,
+                         xmlChar const *prefix) {
+     const xmlChar *cmp;
+     const xmlChar *in;
+     const xmlChar *ret;
+     const xmlChar *prefix2;
+ 
+     if (prefix == NULL) return(xmlParseNameAndCompare(ctxt, name));
+ 
+     GROW;
+     in = ctxt->input->cur;
+ 
+     cmp = prefix;
+     while (*in != 0 && *in == *cmp) {
+ 	++in;
+ 	++cmp;
+     }
+     if ((*cmp == 0) && (*in == ':')) {
+         in++;
+ 	cmp = name;
+ 	while (*in != 0 && *in == *cmp) {
+ 	    ++in;
+ 	    ++cmp;
+ 	}
+ 	if (*cmp == 0 && (*in == '>' || IS_BLANK_CH (*in))) {
+ 	    /* success */
+             ctxt->input->col += in - ctxt->input->cur;
+ 	    ctxt->input->cur = in;
+ 	    return((const xmlChar*) 1);
+ 	}
+     }
+     /*
+      * all strings coms from the dictionary, equality can be done directly
+      */
+     ret = xmlParseQName (ctxt, &prefix2);
+     if (ret == NULL)
+         return(NULL);
+     if ((ret == name) && (prefix == prefix2))
+ 	return((const xmlChar*) 1);
+     return ret;
+ }
+ 
+-/**
+- * xmlParseAttValueInternal:
+- * @ctxt:  an XML parser context
+- * @len:  attribute len result
+- * @alloc:  whether the attribute was reallocated as a new string
+- * @normalize:  if 1 then further non-CDATA normalization must be done
+- *
+- * parse a value for an attribute.
+- * NOTE: if no normalization is needed, the routine will return pointers
+- *       directly from the data buffer.
+- *
+- * 3.3.3 Attribute-Value Normalization:
+- * Before the value of an attribute is passed to the application or
+- * checked for validity, the XML processor must normalize it as follows:
+- * - a character reference is processed by appending the referenced
+- *   character to the attribute value
+- * - an entity reference is processed by recursively processing the
+- *   replacement text of the entity
+- * - a whitespace character (#x20, #xD, #xA, #x9) is processed by
+- *   appending #x20 to the normalized value, except that only a single
+- *   #x20 is appended for a "#xD#xA" sequence that is part of an external
+- *   parsed entity or the literal entity value of an internal parsed entity
+- * - other characters are processed by appending them to the normalized value
+- * If the declared value is not CDATA, then the XML processor must further
+- * process the normalized attribute value by discarding any leading and
+- * trailing space (#x20) characters, and by replacing sequences of space
+- * (#x20) characters by a single space (#x20) character.
+- * All attributes for which no declaration has been read should be treated
+- * by a non-validating parser as if declared CDATA.
+- *
+- * Returns the AttValue parsed or NULL. The value has to be freed by the
+- *     caller if it was copied, this can be detected by val[*len] == 0.
+- */
+-
+-#define GROW_PARSE_ATT_VALUE_INTERNAL(ctxt, in, start, end) \
+-    const xmlChar *oldbase = ctxt->input->base;\
+-    GROW;\
+-    if (oldbase != ctxt->input->base) {\
+-        ptrdiff_t delta = ctxt->input->base - oldbase;\
+-        start = start + delta;\
+-        in = in + delta;\
+-    }\
+-    end = ctxt->input->end;
+-
+-static xmlChar *
+-xmlParseAttValueInternal(xmlParserCtxtPtr ctxt, int *len, int *alloc,
+-                         int normalize)
+-{
+-    xmlChar limit = 0;
+-    const xmlChar *in = NULL, *start, *end, *last;
+-    xmlChar *ret = NULL;
+-    int line, col;
+-    int maxLength = (ctxt->options & XML_PARSE_HUGE) ?
+-                    XML_MAX_HUGE_LENGTH :
+-                    XML_MAX_TEXT_LENGTH;
+-
+-    GROW;
+-    in = (xmlChar *) CUR_PTR;
+-    line = ctxt->input->line;
+-    col = ctxt->input->col;
+-    if (*in != '"' && *in != '\'') {
+-        xmlFatalErr(ctxt, XML_ERR_ATTRIBUTE_NOT_STARTED, NULL);
+-        return (NULL);
+-    }
+-
+-    /*
+-     * try to handle in this routine the most common case where no
+-     * allocation of a new string is required and where content is
+-     * pure ASCII.
+-     */
+-    limit = *in++;
+-    col++;
+-    end = ctxt->input->end;
+-    start = in;
+-    if (in >= end) {
+-        GROW_PARSE_ATT_VALUE_INTERNAL(ctxt, in, start, end)
+-    }
+-    if (normalize) {
+-        /*
+-	 * Skip any leading spaces
+-	 */
+-	while ((in < end) && (*in != limit) &&
+-	       ((*in == 0x20) || (*in == 0x9) ||
+-	        (*in == 0xA) || (*in == 0xD))) {
+-	    if (*in == 0xA) {
+-	        line++; col = 1;
+-	    } else {
+-	        col++;
+-	    }
+-	    in++;
+-	    start = in;
+-	    if (in >= end) {
+-                GROW_PARSE_ATT_VALUE_INTERNAL(ctxt, in, start, end)
+-                if ((in - start) > maxLength) {
+-                    xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                                   "AttValue length too long\n");
+-                    return(NULL);
+-                }
+-	    }
+-	}
+-	while ((in < end) && (*in != limit) && (*in >= 0x20) &&
+-	       (*in <= 0x7f) && (*in != '&') && (*in != '<')) {
+-	    col++;
+-	    if ((*in++ == 0x20) && (*in == 0x20)) break;
+-	    if (in >= end) {
+-                GROW_PARSE_ATT_VALUE_INTERNAL(ctxt, in, start, end)
+-                if ((in - start) > maxLength) {
+-                    xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                                   "AttValue length too long\n");
+-                    return(NULL);
+-                }
+-	    }
+-	}
+-	last = in;
+-	/*
+-	 * skip the trailing blanks
+-	 */
+-	while ((last[-1] == 0x20) && (last > start)) last--;
+-	while ((in < end) && (*in != limit) &&
+-	       ((*in == 0x20) || (*in == 0x9) ||
+-	        (*in == 0xA) || (*in == 0xD))) {
+-	    if (*in == 0xA) {
+-	        line++, col = 1;
+-	    } else {
+-	        col++;
+-	    }
+-	    in++;
+-	    if (in >= end) {
+-		const xmlChar *oldbase = ctxt->input->base;
+-		GROW;
+-		if (oldbase != ctxt->input->base) {
+-		    ptrdiff_t delta = ctxt->input->base - oldbase;
+-		    start = start + delta;
+-		    in = in + delta;
+-		    last = last + delta;
+-		}
+-		end = ctxt->input->end;
+-                if ((in - start) > maxLength) {
+-                    xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                                   "AttValue length too long\n");
+-                    return(NULL);
+-                }
+-	    }
+-	}
+-        if ((in - start) > maxLength) {
+-            xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                           "AttValue length too long\n");
+-            return(NULL);
+-        }
+-	if (*in != limit) goto need_complex;
+-    } else {
+-	while ((in < end) && (*in != limit) && (*in >= 0x20) &&
+-	       (*in <= 0x7f) && (*in != '&') && (*in != '<')) {
+-	    in++;
+-	    col++;
+-	    if (in >= end) {
+-                GROW_PARSE_ATT_VALUE_INTERNAL(ctxt, in, start, end)
+-                if ((in - start) > maxLength) {
+-                    xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                                   "AttValue length too long\n");
+-                    return(NULL);
+-                }
+-	    }
+-	}
+-	last = in;
+-        if ((in - start) > maxLength) {
+-            xmlFatalErrMsg(ctxt, XML_ERR_ATTRIBUTE_NOT_FINISHED,
+-                           "AttValue length too long\n");
+-            return(NULL);
+-        }
+-	if (*in != limit) goto need_complex;
+-    }
+-    in++;
+-    col++;
+-    if (len != NULL) {
+-        if (alloc) *alloc = 0;
+-        *len = last - start;
+-        ret = (xmlChar *) start;
+-    } else {
+-        if (alloc) *alloc = 1;
+-        ret = xmlStrndup(start, last - start);
+-        if (ret == NULL) {
+-            xmlErrMemory(ctxt);
+-            return(NULL);
+-        }
+-    }
+-    CUR_PTR = in;
+-    ctxt->input->line = line;
+-    ctxt->input->col = col;
+-    return ret;
+-need_complex:
+-    if (alloc) *alloc = 1;
+-    return xmlParseAttValueComplex(ctxt, len, normalize);
+-}
+-
+ /**
+  * xmlParseAttribute2:
+  * @ctxt:  an XML parser context
+  * @pref:  the element prefix
+  * @elem:  the element name
+  * @prefix:  a xmlChar ** used to store the value of the attribute prefix
+  * @value:  a xmlChar ** used to store the value of the attribute
+  * @len:  an int * to save the length of the attribute
+  * @alloc:  an int * to indicate if the attribute was allocated
+  *
+  * parse an attribute in the new SAX2 framework.
+  *
+  * Returns the attribute name, and the value in *value, .
+  */
+@@ -8707,112 +8738,95 @@ static xmlHashedString
+ xmlParseAttribute2(xmlParserCtxtPtr ctxt,
+                    const xmlChar * pref, const xmlChar * elem,
+                    xmlHashedString * hprefix, xmlChar ** value,
+                    int *len, int *alloc)
+ {
+     xmlHashedString hname;
+     const xmlChar *prefix, *name;
+     xmlChar *val = NULL, *internal_val = NULL;
+     int normalize = 0;
+ 
+     *value = NULL;
+     GROW;
+     hname = xmlParseQNameHashed(ctxt, hprefix);
+     if (hname.name == NULL) {
+         xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+                        "error parsing attribute name\n");
+         return(hname);
+     }
+     name = hname.name;
+     if (hprefix->name != NULL)
+         prefix = hprefix->name;
+     else
+         prefix = NULL;
+ 
+     /*
+      * get the type if needed
+      */
+     if (ctxt->attsSpecial != NULL) {
+         int type;
+ 
+         type = (int) (ptrdiff_t) xmlHashQLookup2(ctxt->attsSpecial,
+                                                  pref, elem,
+                                                  prefix, name);
+         if (type != 0)
+             normalize = 1;
+     }
+ 
+     /*
+      * read the value
+      */
+     SKIP_BLANKS;
+     if (RAW == '=') {
+         NEXT;
+         SKIP_BLANKS;
+         val = xmlParseAttValueInternal(ctxt, len, alloc, normalize);
+         if (val == NULL)
+             goto error;
+-	if (normalize) {
+-	    /*
+-	     * Sometimes a second normalisation pass for spaces is needed
+-	     * but that only happens if charrefs or entities references
+-	     * have been used in the attribute value, i.e. the attribute
+-	     * value have been extracted in an allocated string already.
+-	     */
+-	    if (*alloc) {
+-	        const xmlChar *val2;
+-
+-	        val2 = xmlAttrNormalizeSpace2(ctxt, val, len);
+-		if ((val2 != NULL) && (val2 != val)) {
+-		    xmlFree(val);
+-		    val = (xmlChar *) val2;
+-		}
+-	    }
+-	}
+     } else {
+         xmlFatalErrMsgStr(ctxt, XML_ERR_ATTRIBUTE_WITHOUT_VALUE,
+                           "Specification mandates value for attribute %s\n",
+                           name);
+         goto error;
+     }
+ 
+     if (prefix == ctxt->str_xml) {
+         /*
+          * Check that xml:lang conforms to the specification
+          * No more registered as an error, just generate a warning now
+          * since this was deprecated in XML second edition
+          */
+         if ((ctxt->pedantic) && (xmlStrEqual(name, BAD_CAST "lang"))) {
+             internal_val = xmlStrndup(val, *len);
+             if (internal_val == NULL)
+                 goto mem_error;
+             if (!xmlCheckLanguageID(internal_val)) {
+                 xmlWarningMsg(ctxt, XML_WAR_LANG_VALUE,
+                               "Malformed value for xml:lang : %s\n",
+                               internal_val, NULL);
+             }
+         }
+ 
+         /*
+          * Check that xml:space conforms to the specification
+          */
+         if (xmlStrEqual(name, BAD_CAST "space")) {
+             internal_val = xmlStrndup(val, *len);
+             if (internal_val == NULL)
+                 goto mem_error;
+             if (xmlStrEqual(internal_val, BAD_CAST "default"))
+                 *(ctxt->space) = 0;
+             else if (xmlStrEqual(internal_val, BAD_CAST "preserve"))
+                 *(ctxt->space) = 1;
+             else {
+                 xmlWarningMsg(ctxt, XML_WAR_SPACE_VALUE,
+                               "Invalid value \"%s\" for xml:space : \"default\" or \"preserve\" expected\n",
+                               internal_val, NULL);
+             }
+         }
+         if (internal_val) {
+             xmlFree(internal_val);
+         }
+     }
+ 
+     *value = val;
+     return (hname);
+diff --git a/result/errors/attr4.xml.ent b/result/errors/attr4.xml.ent
+index 89906a1b..4320586c 100644
+--- a/result/errors/attr4.xml.ent
++++ b/result/errors/attr4.xml.ent
+@@ -1,9 +1,3 @@
+ ./test/errors/attr4.xml:1: parser error : invalid character in attribute value
+ <ROOT attr="XY"/>
+               ^
+-./test/errors/attr4.xml:1: parser error : attributes construct error
+-<ROOT attr="XY"/>
+-              ^
+-./test/errors/attr4.xml:1: parser error : Couldn't find end of Start Tag ROOT line 1
+-<ROOT attr="XY"/>
+-              ^
+diff --git a/result/errors/attr4.xml.err b/result/errors/attr4.xml.err
+index 89906a1b..4320586c 100644
+--- a/result/errors/attr4.xml.err
++++ b/result/errors/attr4.xml.err
+@@ -1,9 +1,3 @@
+ ./test/errors/attr4.xml:1: parser error : invalid character in attribute value
+ <ROOT attr="XY"/>
+               ^
+-./test/errors/attr4.xml:1: parser error : attributes construct error
+-<ROOT attr="XY"/>
+-              ^
+-./test/errors/attr4.xml:1: parser error : Couldn't find end of Start Tag ROOT line 1
+-<ROOT attr="XY"/>
+-              ^
+diff --git a/result/errors/attr4.xml.str b/result/errors/attr4.xml.str
+index eeb9252f..45c722b7 100644
+--- a/result/errors/attr4.xml.str
++++ b/result/errors/attr4.xml.str
+@@ -1,10 +1,4 @@
+ ./test/errors/attr4.xml:1: parser error : invalid character in attribute value
+-<ROOT attr="XY"/>
+-              ^
+-./test/errors/attr4.xml:1: parser error : attributes construct error
+-<ROOT attr="XY"/>
+-              ^
+-./test/errors/attr4.xml:1: parser error : Couldn't find end of Start Tag ROOT
+ <ROOT attr="XY"/>
+               ^
+ ./test/errors/attr4.xml : failed to parse
+diff --git a/result/issue655.xml b/result/issue655.xml
+new file mode 100644
+index 00000000..4b4a1e17
+--- /dev/null
++++ b/result/issue655.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0"?>
++<!DOCTYPE test [
++<!ENTITY newline "&#x26;#xA;">
++]>
++<test newline="&newline;"/>
+diff --git a/result/issue655.xml.rde b/result/issue655.xml.rde
+new file mode 100644
+index 00000000..a309384e
+--- /dev/null
++++ b/result/issue655.xml.rde
+@@ -0,0 +1,2 @@
++0 10 test 0 0
++0 1 test 1 0
+diff --git a/result/issue655.xml.rdr b/result/issue655.xml.rdr
+new file mode 100644
+index 00000000..a309384e
+--- /dev/null
++++ b/result/issue655.xml.rdr
+@@ -0,0 +1,2 @@
++0 10 test 0 0
++0 1 test 1 0
+diff --git a/result/issue655.xml.sax b/result/issue655.xml.sax
+new file mode 100644
+index 00000000..e3598369
+--- /dev/null
++++ b/result/issue655.xml.sax
+@@ -0,0 +1,10 @@
++SAX.setDocumentLocator()
++SAX.startDocument()
++SAX.internalSubset(test, , )
++SAX.entityDecl(newline, 1, (null), (null), &#xA;)
++SAX.getEntity(newline)
++SAX.externalSubset(test, , )
++SAX.getEntity(newline)
++SAX.startElement(test, newline='&newline;')
++SAX.endElement(test)
++SAX.endDocument()
+diff --git a/result/issue655.xml.sax2 b/result/issue655.xml.sax2
+new file mode 100644
+index 00000000..c9594a84
+--- /dev/null
++++ b/result/issue655.xml.sax2
+@@ -0,0 +1,10 @@
++SAX.setDocumentLocator()
++SAX.startDocument()
++SAX.internalSubset(test, , )
++SAX.entityDecl(newline, 1, (null), (null), &#xA;)
++SAX.getEntity(newline)
++SAX.externalSubset(test, , )
++SAX.getEntity(newline)
++SAX.startElementNs(test, NULL, NULL, 0, 1, 0, newline='&new...', 9)
++SAX.endElementNs(test, NULL, NULL)
++SAX.endDocument()
+diff --git a/result/noent/issue655.xml b/result/noent/issue655.xml
+new file mode 100644
+index 00000000..2ae8249e
+--- /dev/null
++++ b/result/noent/issue655.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0"?>
++<!DOCTYPE test [
++<!ENTITY newline "&#x26;#xA;">
++]>
++<test newline="&#10;"/>
+diff --git a/result/noent/issue655.xml.sax2 b/result/noent/issue655.xml.sax2
+new file mode 100644
+index 00000000..804bed6e
+--- /dev/null
++++ b/result/noent/issue655.xml.sax2
+@@ -0,0 +1,11 @@
++SAX.setDocumentLocator()
++SAX.startDocument()
++SAX.internalSubset(test, , )
++SAX.entityDecl(newline, 1, (null), (null), &#xA;)
++SAX.getEntity(newline)
++SAX.externalSubset(test, , )
++SAX.getEntity(newline)
++SAX.startElementNs(test, NULL, NULL, 0, 1, 0, newline='
++...', 1)
++SAX.endElementNs(test, NULL, NULL)
++SAX.endDocument()
+diff --git a/result/valid/index.xml b/result/valid/index.xml
+index ee034b84..959c66b2 100644
+--- a/result/valid/index.xml
++++ b/result/valid/index.xml
+@@ -1,808 +1,808 @@
+ <?xml version="1.0" encoding="iso-8859-1"?>
+ <!DOCTYPE NewsML SYSTEM "dtds/NewsMLv1.2.dtd" [
+ <!ENTITY % nitf SYSTEM "dtds/nitf-2-5.dtd">
+ <!--
+ 	News Industry Text Format
+ 	Document Type Definition - Version 2.5
+ 	http://www.nitf.org/
+ 
+ 	Copyright (c) 2000. All Rights Reserved.
+ 	International Press Telecommunications Council
+ 	http://www.iptc.org
+ 		
+ 	Last changed: 9 August 2000  wb/kr/ak
+ 	
+ 	For the list of modifications from previous releases, see:
+ 		http://www.nitf.org/recent-modifications.html 
+ 
+ 	For the list of proposed modifications, see:
+ 		http://www.nitf.org/proposed-changes.html 
+---><!ENTITY % enriched-text "
+-	#PCDATA
+-	| chron
+-	| copyrite
+-	| event
+-	| function
+-	| location
+-	| money
+-	| num
+-	| object.title
+-	| org
+-	| person
+-	| postaddr
+-	| virtloc
+-	| a
+-	| br
+-	| em
+-	| lang
+-	| pronounce
+-	| q
++--><!ENTITY % enriched-text "
++	#PCDATA
++	| chron
++	| copyrite
++	| event
++	| function
++	| location
++	| money
++	| num
++	| object.title
++	| org
++	| person
++	| postaddr
++	| virtloc
++	| a
++	| br
++	| em
++	| lang
++	| pronounce
++	| q
+ 	">
+ <!ENTITY % block.head "dateline?, copyrite?, abstract?">
+ <!ENTITY % block.content "p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr">
+ <!ENTITY % block.end "datasource?">
+-<!ENTITY % global-attributes "
+-	id 	ID 						#IMPLIED
++<!ENTITY % global-attributes "
++	id 	ID 						#IMPLIED
+ 	">
+-<!ENTITY % common-attributes "
+-	%global-attributes;
+-	class 	NMTOKENS 					#IMPLIED
+-	style 	CDATA 						#IMPLIED
+-	lang 	NMTOKEN 					#IMPLIED
+-	dir 	(ltr | rtl) 					#IMPLIED
++<!ENTITY % common-attributes "
++	%global-attributes;
++	class 	NMTOKENS 					#IMPLIED
++	style 	CDATA 						#IMPLIED
++	lang 	NMTOKEN 					#IMPLIED
++	dir 	(ltr | rtl) 					#IMPLIED
+ 	">
+-<!ENTITY % cell.align "
+-	align 	(left | center | right | justify | char) 	#IMPLIED
+-	char 	CDATA 						#IMPLIED
+-	charoff CDATA 						#IMPLIED
++<!ENTITY % cell.align "
++	align 	(left | center | right | justify | char) 	#IMPLIED
++	char 	CDATA 						#IMPLIED
++	charoff CDATA 						#IMPLIED
+ 	">
+-<!ENTITY % cell.valign "
+-	valign 	(top | middle | bottom | baseline) 		#IMPLIED
++<!ENTITY % cell.valign "
++	valign 	(top | middle | bottom | baseline) 		#IMPLIED
+ 	">
+-<!ENTITY % url.link "
+-	md 	CDATA 						#IMPLIED
++<!ENTITY % url.link "
++	md 	CDATA 						#IMPLIED
+ 	">
+ <!ENTITY % boolean "(true | false)">
+ <!ELEMENT nitf (head , body)>
+ <!ATTLIST nitf id ID #IMPLIED>
+ <!ATTLIST nitf uno CDATA #IMPLIED>
+ <!ATTLIST nitf version CDATA #FIXED "-//IPTC-NAA//DTD NITF-XML 2.1//EN">
+ <!ATTLIST nitf change.date CDATA #FIXED "4 July 2000">
+ <!ATTLIST nitf change.time CDATA #FIXED "1900">
+ <!ATTLIST nitf baselang CDATA #IMPLIED>
+ <!ATTLIST nitf class NMTOKENS #IMPLIED>
+ <!ELEMENT head (title? , meta* , tobject? , iim? , docdata? , pubdata* , revision-history*)>
+ <!ATTLIST head id ID #IMPLIED>
+ <!ELEMENT title (#PCDATA)>
+ <!ATTLIST title id ID #IMPLIED>
+ <!ATTLIST title type (main | subtitle | parttitle | alternate | abbrev | other) #IMPLIED>
+ <!ELEMENT meta EMPTY>
+ <!ATTLIST meta id ID #IMPLIED>
+ <!ATTLIST meta http-equiv NMTOKEN #IMPLIED>
+ <!ATTLIST meta name NMTOKEN #IMPLIED>
+ <!ATTLIST meta content CDATA #REQUIRED>
+ <!ELEMENT tobject (tobject.property* , tobject.subject*)>
+ <!ATTLIST tobject id ID #IMPLIED>
+ <!ATTLIST tobject tobject.type CDATA "news">
+ <!ELEMENT tobject.property EMPTY>
+ <!ATTLIST tobject.property id ID #IMPLIED>
+ <!ATTLIST tobject.property tobject.property.type CDATA "current">
+ <!ELEMENT tobject.subject EMPTY>
+ <!ATTLIST tobject.subject id ID #IMPLIED>
+ <!ATTLIST tobject.subject tobject.subject.ipr CDATA "IPTC">
+ <!ATTLIST tobject.subject tobject.subject.refnum NMTOKEN #REQUIRED>
+ <!ATTLIST tobject.subject tobject.subject.code CDATA #IMPLIED>
+ <!ATTLIST tobject.subject tobject.subject.type CDATA #IMPLIED>
+ <!ATTLIST tobject.subject tobject.subject.matter CDATA #IMPLIED>
+ <!ATTLIST tobject.subject tobject.subject.detail CDATA #IMPLIED>
+ <!ELEMENT iim (ds)*>
+ <!ATTLIST iim id ID #IMPLIED>
+ <!ATTLIST iim ver NMTOKEN #IMPLIED>
+ <!ELEMENT ds EMPTY>
+ <!ATTLIST ds id ID #IMPLIED>
+ <!ATTLIST ds num NMTOKEN #REQUIRED>
+ <!ATTLIST ds value CDATA #IMPLIED>
+ <!ELEMENT docdata (correction | evloc | doc-id | del-list | urgency | fixture | date.issue | date.release | date.expire | doc-scope | series | ed-msg | du-key | doc.copyright | doc.rights | key-list)*>
+ <!ATTLIST docdata id ID #IMPLIED>
+ <!ELEMENT correction EMPTY>
+ <!ATTLIST correction id ID #IMPLIED>
+ <!ATTLIST correction info CDATA #IMPLIED>
+ <!ATTLIST correction id-string CDATA #IMPLIED>
+ <!ATTLIST correction reg-src CDATA #IMPLIED>
+ <!ELEMENT evloc EMPTY>
+ <!ATTLIST evloc id ID #IMPLIED>
+ <!ATTLIST evloc iso-cc CDATA #IMPLIED>
+ <!ATTLIST evloc state-prov CDATA #IMPLIED>
+ <!ATTLIST evloc county-dist CDATA #IMPLIED>
+ <!ATTLIST evloc city CDATA #IMPLIED>
+ <!ELEMENT doc-id EMPTY>
+ <!ATTLIST doc-id id ID #IMPLIED>
+ <!ATTLIST doc-id regsrc CDATA #IMPLIED>
+ <!ATTLIST doc-id id-string CDATA #IMPLIED>
+ <!ELEMENT del-list (from-src)*>
+ <!ATTLIST del-list id ID #IMPLIED>
+ <!ELEMENT from-src EMPTY>
+ <!ATTLIST from-src id ID #IMPLIED>
+ <!ATTLIST from-src src-name CDATA #IMPLIED>
+ <!ATTLIST from-src level-number CDATA #IMPLIED>
+ <!ELEMENT urgency EMPTY>
+ <!ATTLIST urgency id ID #IMPLIED>
+ <!ATTLIST urgency ed-urg NMTOKEN #IMPLIED>
+ <!ELEMENT fixture EMPTY>
+ <!ATTLIST fixture id ID #IMPLIED>
+ <!ATTLIST fixture fix-id CDATA #IMPLIED>
+ <!ELEMENT date.issue EMPTY>
+ <!ATTLIST date.issue id ID #IMPLIED>
+ <!ATTLIST date.issue norm CDATA #IMPLIED>
+ <!ELEMENT date.release EMPTY>
+ <!ATTLIST date.release id ID #IMPLIED>
+ <!ATTLIST date.release norm CDATA #IMPLIED>
+ <!ELEMENT date.expire EMPTY>
+ <!ATTLIST date.expire id ID #IMPLIED>
+ <!ATTLIST date.expire norm CDATA #IMPLIED>
+ <!ELEMENT doc-scope EMPTY>
+ <!ATTLIST doc-scope id ID #IMPLIED>
+ <!ATTLIST doc-scope scope CDATA #IMPLIED>
+ <!ELEMENT series EMPTY>
+ <!ATTLIST series id ID #IMPLIED>
+ <!ATTLIST series series.name CDATA #IMPLIED>
+ <!ATTLIST series series.part NMTOKEN "0">
+ <!ATTLIST series series.totalpart NMTOKEN "0">
+ <!ELEMENT ed-msg EMPTY>
+ <!ATTLIST ed-msg id ID #IMPLIED>
+ <!ATTLIST ed-msg msg-type CDATA #IMPLIED>
+ <!ATTLIST ed-msg info CDATA #IMPLIED>
+ <!ELEMENT du-key EMPTY>
+ <!ATTLIST du-key id ID #IMPLIED>
+ <!ATTLIST du-key generation NMTOKEN #IMPLIED>
+ <!ATTLIST du-key part NMTOKEN #IMPLIED>
+ <!ATTLIST du-key version NMTOKEN #IMPLIED>
+ <!ATTLIST du-key key CDATA #IMPLIED>
+ <!ELEMENT doc.copyright EMPTY>
+ <!ATTLIST doc.copyright id ID #IMPLIED>
+ <!ATTLIST doc.copyright year NMTOKEN #IMPLIED>
+ <!ATTLIST doc.copyright holder CDATA #IMPLIED>
+ <!ELEMENT doc.rights EMPTY>
+ <!ATTLIST doc.rights id ID #IMPLIED>
+ <!ATTLIST doc.rights owner CDATA #IMPLIED>
+ <!ATTLIST doc.rights startdate CDATA #IMPLIED>
+ <!ATTLIST doc.rights enddate CDATA #IMPLIED>
+ <!ATTLIST doc.rights agent CDATA #IMPLIED>
+ <!ATTLIST doc.rights geography CDATA #IMPLIED>
+ <!ATTLIST doc.rights location-code CDATA #IMPLIED>
+ <!ATTLIST doc.rights code-source CDATA #IMPLIED>
+ <!ATTLIST doc.rights type CDATA #IMPLIED>
+ <!ATTLIST doc.rights limitations CDATA #IMPLIED>
+ <!ELEMENT key-list (keyword)*>
+ <!ATTLIST key-list id ID #IMPLIED>
+ <!ELEMENT keyword EMPTY>
+ <!ATTLIST keyword id ID #IMPLIED>
+ <!ATTLIST keyword key CDATA #IMPLIED>
+ <!ELEMENT pubdata EMPTY>
+ <!ATTLIST pubdata id ID #IMPLIED>
+ <!ATTLIST pubdata type (print | audio | video | web | appliance | other) #IMPLIED>
+ <!ATTLIST pubdata item-length CDATA #IMPLIED>
+ <!ATTLIST pubdata unit-of-measure (word | character | byte | inch | pica | cm | hour | minute | second | other) #IMPLIED>
+ <!ATTLIST pubdata date.publication CDATA #IMPLIED>
+ <!ATTLIST pubdata name CDATA #IMPLIED>
+ <!ATTLIST pubdata issn CDATA #IMPLIED>
+ <!ATTLIST pubdata volume CDATA #IMPLIED>
+ <!ATTLIST pubdata number CDATA #IMPLIED>
+ <!ATTLIST pubdata issue CDATA #IMPLIED>
+ <!ATTLIST pubdata edition.name CDATA #IMPLIED>
+ <!ATTLIST pubdata edition.area CDATA #IMPLIED>
+ <!ATTLIST pubdata position.section CDATA #IMPLIED>
+ <!ATTLIST pubdata position.sequence CDATA #IMPLIED>
+ <!ATTLIST pubdata ex-ref CDATA #IMPLIED>
+ <!ELEMENT revision-history EMPTY>
+ <!ATTLIST revision-history id ID #IMPLIED>
+ <!ATTLIST revision-history name CDATA #IMPLIED>
+ <!ATTLIST revision-history function (writer-author | editor | producer | archivist | videographer | graphic-artist | photographer | statistician | other) #IMPLIED>
+ <!ATTLIST revision-history norm CDATA #IMPLIED>
+ <!ATTLIST revision-history comment CDATA #IMPLIED>
+ <!ELEMENT body (body.head? , body.content* , body.end?)>
+ <!ATTLIST body id ID #IMPLIED>
+ <!ATTLIST body class NMTOKENS #IMPLIED>
+ <!ATTLIST body style CDATA #IMPLIED>
+ <!ATTLIST body lang NMTOKEN #IMPLIED>
+ <!ATTLIST body dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST body background CDATA #IMPLIED>
+ <!ELEMENT body.head (hedline? , note* , rights? , byline* , distributor? , dateline* , abstract? , series?)>
+ <!ATTLIST body.head id ID #IMPLIED>
+ <!ELEMENT hedline (hl1 , hl2*)>
+ <!ATTLIST hedline id ID #IMPLIED>
+ <!ELEMENT hl1 (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST hl1 id ID #IMPLIED>
+ <!ATTLIST hl1 class NMTOKENS #IMPLIED>
+ <!ATTLIST hl1 style CDATA #IMPLIED>
+ <!ATTLIST hl1 lang NMTOKEN #IMPLIED>
+ <!ATTLIST hl1 dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT hl2 (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST hl2 id ID #IMPLIED>
+ <!ATTLIST hl2 class NMTOKENS #IMPLIED>
+ <!ATTLIST hl2 style CDATA #IMPLIED>
+ <!ATTLIST hl2 lang NMTOKEN #IMPLIED>
+ <!ATTLIST hl2 dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT note (body.content)+>
+ <!ATTLIST note id ID #IMPLIED>
+ <!ATTLIST note class NMTOKENS #IMPLIED>
+ <!ATTLIST note style CDATA #IMPLIED>
+ <!ATTLIST note lang NMTOKEN #IMPLIED>
+ <!ATTLIST note dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST note noteclass (cpyrt | end | hd | editorsnote | trademk | undef) #IMPLIED>
+ <!ATTLIST note type (std | pa | npa) "std">
+ <!ATTLIST note src CDATA #IMPLIED>
+ <!ATTLIST note md CDATA #IMPLIED>
+ <!ELEMENT rights (#PCDATA | rights.owner | rights.startdate | rights.enddate | rights.agent | rights.geography | rights.type | rights.limitations)*>
+ <!ATTLIST rights id ID #IMPLIED>
+ <!ELEMENT rights.owner (#PCDATA)>
+ <!ATTLIST rights.owner id ID #IMPLIED>
+ <!ATTLIST rights.owner contact CDATA #IMPLIED>
+ <!ELEMENT rights.startdate (#PCDATA)>
+ <!ATTLIST rights.startdate id ID #IMPLIED>
+ <!ATTLIST rights.startdate norm CDATA #IMPLIED>
+ <!ELEMENT rights.enddate (#PCDATA)>
+ <!ATTLIST rights.enddate id ID #IMPLIED>
+ <!ATTLIST rights.enddate norm CDATA #IMPLIED>
+ <!ELEMENT rights.agent (#PCDATA)>
+ <!ATTLIST rights.agent id ID #IMPLIED>
+ <!ATTLIST rights.agent contact CDATA #IMPLIED>
+ <!ELEMENT rights.geography (#PCDATA)>
+ <!ATTLIST rights.geography id ID #IMPLIED>
+ <!ATTLIST rights.geography location-code CDATA #IMPLIED>
+ <!ATTLIST rights.geography code-source CDATA #IMPLIED>
+ <!ELEMENT rights.type (#PCDATA)>
+ <!ATTLIST rights.type id ID #IMPLIED>
+ <!ELEMENT rights.limitations (#PCDATA)>
+ <!ATTLIST rights.limitations id ID #IMPLIED>
+ <!ELEMENT byline (#PCDATA | person | byttl | location | virtloc)*>
+ <!ATTLIST byline id ID #IMPLIED>
+ <!ELEMENT byttl (#PCDATA | org)*>
+ <!ATTLIST byttl id ID #IMPLIED>
+ <!ELEMENT distributor (#PCDATA | org)*>
+ <!ATTLIST distributor id ID #IMPLIED>
+ <!ELEMENT dateline (#PCDATA | location | story.date)*>
+ <!ATTLIST dateline id ID #IMPLIED>
+ <!ATTLIST dateline class NMTOKENS #IMPLIED>
+ <!ATTLIST dateline style CDATA #IMPLIED>
+ <!ATTLIST dateline lang NMTOKEN #IMPLIED>
+ <!ATTLIST dateline dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT story.date (#PCDATA)>
+ <!ATTLIST story.date id ID #IMPLIED>
+ <!ATTLIST story.date norm CDATA #IMPLIED>
+ <!ELEMENT abstract (p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)+>
+ <!ATTLIST abstract id ID #IMPLIED>
+ <!ELEMENT copyrite (#PCDATA | copyrite.year | copyrite.holder)*>
+ <!ATTLIST copyrite id ID #IMPLIED>
+ <!ELEMENT copyrite.year (#PCDATA)>
+ <!ATTLIST copyrite.year id ID #IMPLIED>
+ <!ELEMENT copyrite.holder (#PCDATA)>
+ <!ATTLIST copyrite.holder id ID #IMPLIED>
+ <!ELEMENT body.content (block | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST body.content id ID #IMPLIED>
+ <!ELEMENT block ((dateline? , copyrite? , abstract?)? , (p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)* , datasource?)>
+ <!ATTLIST block id ID #IMPLIED>
+ <!ATTLIST block class NMTOKENS #IMPLIED>
+ <!ATTLIST block style CDATA #IMPLIED>
+ <!ATTLIST block lang NMTOKEN #IMPLIED>
+ <!ATTLIST block dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT p (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST p id ID #IMPLIED>
+ <!ATTLIST p class NMTOKENS #IMPLIED>
+ <!ATTLIST p style CDATA #IMPLIED>
+ <!ATTLIST p lang NMTOKEN #IMPLIED>
+ <!ATTLIST p dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST p lede (true | false) #IMPLIED>
+ <!ATTLIST p summary (true | false) #IMPLIED>
+ <!ATTLIST p optional-text (true | false) #IMPLIED>
+ <!ELEMENT table (caption? , (col* | colgroup*) , thead? , tfoot? , tbody+)>
+ <!ATTLIST table id ID #IMPLIED>
+ <!ATTLIST table class NMTOKENS #IMPLIED>
+ <!ATTLIST table style CDATA #IMPLIED>
+ <!ATTLIST table lang NMTOKEN #IMPLIED>
+ <!ATTLIST table dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST table tabletype ENTITY #IMPLIED>
+ <!ATTLIST table align (left | center | right) #IMPLIED>
+ <!ATTLIST table width CDATA #IMPLIED>
+ <!ATTLIST table cols NMTOKEN #IMPLIED>
+ <!ATTLIST table border CDATA #IMPLIED>
+ <!ATTLIST table frame (void | above | below | hsides | lhs | rhs | vsides | box | border) #IMPLIED>
+ <!ATTLIST table rules (none | basic | rows | cols | all) #IMPLIED>
+ <!ATTLIST table cellspacing CDATA #IMPLIED>
+ <!ATTLIST table cellpadding CDATA #IMPLIED>
+ <!ATTLIST table table.fmt CDATA #IMPLIED>
+ <!ATTLIST table table.domain CDATA #IMPLIED>
+ <!ATTLIST table table.inst CDATA #IMPLIED>
+ <!ELEMENT media (media-metadata* , media-reference , media-object? , media-caption* , media-producer?)>
+ <!ATTLIST media id ID #IMPLIED>
+ <!ATTLIST media class NMTOKENS #IMPLIED>
+ <!ATTLIST media style CDATA #IMPLIED>
+ <!ATTLIST media lang NMTOKEN #IMPLIED>
+ <!ATTLIST media dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST media media-type (text | audio | image | video | data | application | other) #REQUIRED>
+ <!ELEMENT media-reference (#PCDATA)>
+ <!ATTLIST media-reference id ID #IMPLIED>
+ <!ATTLIST media-reference class NMTOKENS #IMPLIED>
+ <!ATTLIST media-reference style CDATA #IMPLIED>
+ <!ATTLIST media-reference lang NMTOKEN #IMPLIED>
+ <!ATTLIST media-reference dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST media-reference data-location CDATA #REQUIRED>
+ <!ATTLIST media-reference name CDATA #IMPLIED>
+ <!ATTLIST media-reference source CDATA #IMPLIED>
+ <!ATTLIST media-reference mime-type CDATA #REQUIRED>
+ <!ATTLIST media-reference coding CDATA #IMPLIED>
+ <!ATTLIST media-reference time CDATA #IMPLIED>
+ <!ATTLIST media-reference time-unit-of-measure CDATA #IMPLIED>
+ <!ATTLIST media-reference outcue CDATA #IMPLIED>
+ <!ATTLIST media-reference source-credit CDATA #IMPLIED>
+ <!ATTLIST media-reference copyright CDATA #IMPLIED>
+ <!ATTLIST media-reference alternate-text CDATA #IMPLIED>
+ <!ATTLIST media-reference height NMTOKEN #IMPLIED>
+ <!ATTLIST media-reference width NMTOKEN #IMPLIED>
+ <!ATTLIST media-reference units (pixels) "pixels">
+ <!ATTLIST media-reference imagemap CDATA #IMPLIED>
+ <!ATTLIST media-reference noflow (noflow) #IMPLIED>
+ <!ELEMENT media-metadata EMPTY>
+ <!ATTLIST media-metadata id ID #IMPLIED>
+ <!ATTLIST media-metadata class NMTOKENS #IMPLIED>
+ <!ATTLIST media-metadata style CDATA #IMPLIED>
+ <!ATTLIST media-metadata lang NMTOKEN #IMPLIED>
+ <!ATTLIST media-metadata dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST media-metadata name CDATA #REQUIRED>
+ <!ATTLIST media-metadata value CDATA #IMPLIED>
+ <!ELEMENT media-object (#PCDATA)>
+ <!ATTLIST media-object id ID #IMPLIED>
+ <!ATTLIST media-object class NMTOKENS #IMPLIED>
+ <!ATTLIST media-object style CDATA #IMPLIED>
+ <!ATTLIST media-object lang NMTOKEN #IMPLIED>
+ <!ATTLIST media-object dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST media-object encoding CDATA #REQUIRED>
+ <!ELEMENT media-caption (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST media-caption id ID #IMPLIED>
+ <!ATTLIST media-caption class NMTOKENS #IMPLIED>
+ <!ATTLIST media-caption style CDATA #IMPLIED>
+ <!ATTLIST media-caption lang NMTOKEN #IMPLIED>
+ <!ATTLIST media-caption dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT media-producer (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST media-producer id ID #IMPLIED>
+ <!ATTLIST media-producer class NMTOKENS #IMPLIED>
+ <!ATTLIST media-producer style CDATA #IMPLIED>
+ <!ATTLIST media-producer lang NMTOKEN #IMPLIED>
+ <!ATTLIST media-producer dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT ol (li)+>
+ <!ATTLIST ol id ID #IMPLIED>
+ <!ATTLIST ol class NMTOKENS #IMPLIED>
+ <!ATTLIST ol style CDATA #IMPLIED>
+ <!ATTLIST ol lang NMTOKEN #IMPLIED>
+ <!ATTLIST ol dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST ol continue (continue) #IMPLIED>
+ <!ATTLIST ol seqnum NMTOKEN #IMPLIED>
+ <!ATTLIST ol compact (compact) #IMPLIED>
+ <!ELEMENT ul (li)+>
+ <!ATTLIST ul id ID #IMPLIED>
+ <!ATTLIST ul class NMTOKENS #IMPLIED>
+ <!ATTLIST ul style CDATA #IMPLIED>
+ <!ATTLIST ul lang NMTOKEN #IMPLIED>
+ <!ATTLIST ul dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST ul wrap (vert | horiz | none) "none">
+ <!ATTLIST ul plain (plain) #IMPLIED>
+ <!ATTLIST ul dingbat ENTITY #IMPLIED>
+ <!ATTLIST ul src CDATA #IMPLIED>
+ <!ATTLIST ul md CDATA #IMPLIED>
+ <!ATTLIST ul compact (compact) #IMPLIED>
+ <!ELEMENT li (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST li id ID #IMPLIED>
+ <!ATTLIST li class NMTOKENS #IMPLIED>
+ <!ATTLIST li style CDATA #IMPLIED>
+ <!ATTLIST li lang NMTOKEN #IMPLIED>
+ <!ATTLIST li dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST li dingbat ENTITY #IMPLIED>
+ <!ATTLIST li src CDATA #IMPLIED>
+ <!ATTLIST li md CDATA #IMPLIED>
+ <!ATTLIST li skip NMTOKEN "0">
+ <!ELEMENT dl (dt | dd)+>
+ <!ATTLIST dl id ID #IMPLIED>
+ <!ATTLIST dl class NMTOKENS #IMPLIED>
+ <!ATTLIST dl style CDATA #IMPLIED>
+ <!ATTLIST dl lang NMTOKEN #IMPLIED>
+ <!ATTLIST dl dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT dt (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST dt id ID #IMPLIED>
+ <!ATTLIST dt class NMTOKENS #IMPLIED>
+ <!ATTLIST dt style CDATA #IMPLIED>
+ <!ATTLIST dt lang NMTOKEN #IMPLIED>
+ <!ATTLIST dt dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT dd (block)*>
+ <!ATTLIST dd id ID #IMPLIED>
+ <!ATTLIST dd class NMTOKENS #IMPLIED>
+ <!ATTLIST dd style CDATA #IMPLIED>
+ <!ATTLIST dd lang NMTOKEN #IMPLIED>
+ <!ATTLIST dd dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT bq (block+ , credit?)*>
+ <!ATTLIST bq id ID #IMPLIED>
+ <!ATTLIST bq class NMTOKENS #IMPLIED>
+ <!ATTLIST bq style CDATA #IMPLIED>
+ <!ATTLIST bq lang NMTOKEN #IMPLIED>
+ <!ATTLIST bq dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST bq nowrap (nowrap) #IMPLIED>
+ <!ATTLIST bq quote-source CDATA #IMPLIED>
+ <!ELEMENT credit (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST credit id ID #IMPLIED>
+ <!ATTLIST credit class NMTOKENS #IMPLIED>
+ <!ATTLIST credit style CDATA #IMPLIED>
+ <!ATTLIST credit lang NMTOKEN #IMPLIED>
+ <!ATTLIST credit dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT fn (body.content)+>
+ <!ATTLIST fn id ID #IMPLIED>
+ <!ATTLIST fn class NMTOKENS #IMPLIED>
+ <!ATTLIST fn style CDATA #IMPLIED>
+ <!ATTLIST fn lang NMTOKEN #IMPLIED>
+ <!ATTLIST fn dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT pre (#PCDATA)>
+ <!ATTLIST pre id ID #IMPLIED>
+ <!ELEMENT hr EMPTY>
+ <!ATTLIST hr id ID #IMPLIED>
+ <!ATTLIST hr src CDATA #IMPLIED>
+ <!ELEMENT datasource (#PCDATA)>
+ <!ATTLIST datasource id ID #IMPLIED>
+ <!ELEMENT caption (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST caption id ID #IMPLIED>
+ <!ATTLIST caption class NMTOKENS #IMPLIED>
+ <!ATTLIST caption style CDATA #IMPLIED>
+ <!ATTLIST caption lang NMTOKEN #IMPLIED>
+ <!ATTLIST caption dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST caption align (top | bottom | left | right) #IMPLIED>
+ <!ELEMENT col EMPTY>
+ <!ATTLIST col id ID #IMPLIED>
+ <!ATTLIST col class NMTOKENS #IMPLIED>
+ <!ATTLIST col style CDATA #IMPLIED>
+ <!ATTLIST col lang NMTOKEN #IMPLIED>
+ <!ATTLIST col dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST col span NMTOKEN "1">
+ <!ATTLIST col width CDATA #IMPLIED>
+ <!ATTLIST col align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST col char CDATA #IMPLIED>
+ <!ATTLIST col charoff CDATA #IMPLIED>
+ <!ATTLIST col valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT colgroup (col)+>
+ <!ATTLIST colgroup id ID #IMPLIED>
+ <!ATTLIST colgroup class NMTOKENS #IMPLIED>
+ <!ATTLIST colgroup style CDATA #IMPLIED>
+ <!ATTLIST colgroup lang NMTOKEN #IMPLIED>
+ <!ATTLIST colgroup dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST colgroup align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST colgroup char CDATA #IMPLIED>
+ <!ATTLIST colgroup charoff CDATA #IMPLIED>
+ <!ATTLIST colgroup valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT thead (tr)+>
+ <!ATTLIST thead id ID #IMPLIED>
+ <!ATTLIST thead class NMTOKENS #IMPLIED>
+ <!ATTLIST thead style CDATA #IMPLIED>
+ <!ATTLIST thead lang NMTOKEN #IMPLIED>
+ <!ATTLIST thead dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST thead align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST thead char CDATA #IMPLIED>
+ <!ATTLIST thead charoff CDATA #IMPLIED>
+ <!ATTLIST thead valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT tbody (tr)+>
+ <!ATTLIST tbody id ID #IMPLIED>
+ <!ATTLIST tbody class NMTOKENS #IMPLIED>
+ <!ATTLIST tbody style CDATA #IMPLIED>
+ <!ATTLIST tbody lang NMTOKEN #IMPLIED>
+ <!ATTLIST tbody dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST tbody align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST tbody char CDATA #IMPLIED>
+ <!ATTLIST tbody charoff CDATA #IMPLIED>
+ <!ATTLIST tbody valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT tfoot (tr)+>
+ <!ATTLIST tfoot id ID #IMPLIED>
+ <!ATTLIST tfoot class NMTOKENS #IMPLIED>
+ <!ATTLIST tfoot style CDATA #IMPLIED>
+ <!ATTLIST tfoot lang NMTOKEN #IMPLIED>
+ <!ATTLIST tfoot dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST tfoot align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST tfoot char CDATA #IMPLIED>
+ <!ATTLIST tfoot charoff CDATA #IMPLIED>
+ <!ATTLIST tfoot valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT tr (th | td)+>
+ <!ATTLIST tr id ID #IMPLIED>
+ <!ATTLIST tr class NMTOKENS #IMPLIED>
+ <!ATTLIST tr style CDATA #IMPLIED>
+ <!ATTLIST tr lang NMTOKEN #IMPLIED>
+ <!ATTLIST tr dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST tr align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST tr char CDATA #IMPLIED>
+ <!ATTLIST tr charoff CDATA #IMPLIED>
+ <!ATTLIST tr valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT th (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST th id ID #IMPLIED>
+ <!ATTLIST th class NMTOKENS #IMPLIED>
+ <!ATTLIST th style CDATA #IMPLIED>
+ <!ATTLIST th lang NMTOKEN #IMPLIED>
+ <!ATTLIST th dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST th axis CDATA #IMPLIED>
+ <!ATTLIST th axes CDATA #IMPLIED>
+ <!ATTLIST th nowrap (nowrap) #IMPLIED>
+ <!ATTLIST th rowspan NMTOKEN "1">
+ <!ATTLIST th colspan NMTOKEN "1">
+ <!ATTLIST th align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST th char CDATA #IMPLIED>
+ <!ATTLIST th charoff CDATA #IMPLIED>
+ <!ATTLIST th valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT td (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q | p | hl2 | table | media | ol | ul | dl | bq | fn | note | pre | hr)*>
+ <!ATTLIST td id ID #IMPLIED>
+ <!ATTLIST td class NMTOKENS #IMPLIED>
+ <!ATTLIST td style CDATA #IMPLIED>
+ <!ATTLIST td lang NMTOKEN #IMPLIED>
+ <!ATTLIST td dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST td axis CDATA #IMPLIED>
+ <!ATTLIST td axes CDATA #IMPLIED>
+ <!ATTLIST td nowrap (nowrap) #IMPLIED>
+ <!ATTLIST td rowspan NMTOKEN "1">
+ <!ATTLIST td colspan NMTOKEN "1">
+ <!ATTLIST td align (left | center | right | justify | char) #IMPLIED>
+ <!ATTLIST td char CDATA #IMPLIED>
+ <!ATTLIST td charoff CDATA #IMPLIED>
+ <!ATTLIST td valign (top | middle | bottom | baseline) #IMPLIED>
+ <!ELEMENT chron (#PCDATA)>
+ <!ATTLIST chron id ID #IMPLIED>
+ <!ATTLIST chron norm CDATA #IMPLIED>
+ <!ELEMENT event (#PCDATA | alt-code)*>
+ <!ATTLIST event id ID #IMPLIED>
+ <!ATTLIST event start-date CDATA #IMPLIED>
+ <!ATTLIST event end-date CDATA #IMPLIED>
+ <!ATTLIST event idsrc CDATA #REQUIRED>
+ <!ATTLIST event value CDATA #REQUIRED>
+ <!ELEMENT function (#PCDATA | alt-code)*>
+ <!ATTLIST function id ID #IMPLIED>
+ <!ATTLIST function idsrc CDATA #REQUIRED>
+ <!ATTLIST function value CDATA #REQUIRED>
+ <!ELEMENT location (#PCDATA | sublocation | city | state | region | country | alt-code)*>
+ <!ATTLIST location id ID #IMPLIED>
+ <!ATTLIST location location-code CDATA #IMPLIED>
+ <!ATTLIST location code-source CDATA #IMPLIED>
+ <!ELEMENT sublocation (#PCDATA | alt-code)*>
+ <!ATTLIST sublocation id ID #IMPLIED>
+ <!ATTLIST sublocation location-code CDATA #IMPLIED>
+ <!ATTLIST sublocation code-source CDATA #IMPLIED>
+ <!ELEMENT city (#PCDATA | alt-code)*>
+ <!ATTLIST city id ID #IMPLIED>
+ <!ATTLIST city city-code CDATA #IMPLIED>
+ <!ATTLIST city code-source CDATA #IMPLIED>
+ <!ELEMENT state (#PCDATA | alt-code)*>
+ <!ATTLIST state id ID #IMPLIED>
+ <!ATTLIST state state-code CDATA #IMPLIED>
+ <!ATTLIST state code-source CDATA #IMPLIED>
+ <!ELEMENT region (#PCDATA | alt-code)*>
+ <!ATTLIST region id ID #IMPLIED>
+ <!ATTLIST region region-code CDATA #IMPLIED>
+ <!ATTLIST region code-source CDATA #IMPLIED>
+ <!ELEMENT country (#PCDATA | alt-code)*>
+ <!ATTLIST country id ID #IMPLIED>
+ <!ATTLIST country iso-cc CDATA #IMPLIED>
+ <!ELEMENT money (#PCDATA)>
+ <!ATTLIST money id ID #IMPLIED>
+ <!ATTLIST money unit CDATA #IMPLIED>
+ <!ATTLIST money date CDATA #IMPLIED>
+ <!ELEMENT num (#PCDATA | frac | sub | sup)*>
+ <!ATTLIST num id ID #IMPLIED>
+ <!ATTLIST num units CDATA #IMPLIED>
+ <!ATTLIST num decimal-ch CDATA #IMPLIED>
+ <!ATTLIST num thousands-ch CDATA #IMPLIED>
+ <!ELEMENT frac (numer , frac-sep? , denom)>
+ <!ATTLIST frac id ID #IMPLIED>
+ <!ELEMENT numer (#PCDATA)>
+ <!ATTLIST numer id ID #IMPLIED>
+ <!ELEMENT frac-sep (#PCDATA)>
+ <!ATTLIST frac-sep id ID #IMPLIED>
+ <!ELEMENT denom (#PCDATA)>
+ <!ATTLIST denom id ID #IMPLIED>
+ <!ELEMENT sub (#PCDATA)>
+ <!ATTLIST sub id ID #IMPLIED>
+ <!ATTLIST sub class NMTOKENS #IMPLIED>
+ <!ATTLIST sub style CDATA #IMPLIED>
+ <!ATTLIST sub lang NMTOKEN #IMPLIED>
+ <!ATTLIST sub dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT sup (#PCDATA)>
+ <!ATTLIST sup id ID #IMPLIED>
+ <!ATTLIST sup class NMTOKENS #IMPLIED>
+ <!ATTLIST sup style CDATA #IMPLIED>
+ <!ATTLIST sup lang NMTOKEN #IMPLIED>
+ <!ATTLIST sup dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT object.title (#PCDATA | alt-code)*>
+ <!ATTLIST object.title id ID #IMPLIED>
+ <!ATTLIST object.title class NMTOKENS #IMPLIED>
+ <!ATTLIST object.title style CDATA #IMPLIED>
+ <!ATTLIST object.title lang NMTOKEN #IMPLIED>
+ <!ATTLIST object.title dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST object.title idsrc CDATA #REQUIRED>
+ <!ATTLIST object.title value CDATA #REQUIRED>
+ <!ELEMENT org (#PCDATA | alt-code)*>
+ <!ATTLIST org id ID #IMPLIED>
+ <!ATTLIST org idsrc CDATA #REQUIRED>
+ <!ATTLIST org value CDATA #REQUIRED>
+ <!ELEMENT alt-code EMPTY>
+ <!ATTLIST alt-code id ID #IMPLIED>
+ <!ATTLIST alt-code idsrc CDATA #REQUIRED>
+ <!ATTLIST alt-code value CDATA #REQUIRED>
+ <!ELEMENT person (#PCDATA | name.given | name.family | function | alt-code)*>
+ <!ATTLIST person id ID #IMPLIED>
+ <!ATTLIST person idsrc CDATA #REQUIRED>
+ <!ATTLIST person value CDATA #REQUIRED>
+ <!ELEMENT name.given (#PCDATA)>
+ <!ATTLIST name.given id ID #IMPLIED>
+ <!ELEMENT name.family (#PCDATA)>
+ <!ATTLIST name.family id ID #IMPLIED>
+ <!ELEMENT postaddr (addressee , delivery.point? , (postcode | delivery.office | region | country)*)>
+ <!ATTLIST postaddr id ID #IMPLIED>
+ <!ELEMENT virtloc (#PCDATA | alt-code)*>
+ <!ATTLIST virtloc id ID #IMPLIED>
+ <!ATTLIST virtloc idsrc CDATA #REQUIRED>
+ <!ATTLIST virtloc value CDATA #REQUIRED>
+ <!ELEMENT a (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST a id ID #IMPLIED>
+ <!ATTLIST a class NMTOKENS #IMPLIED>
+ <!ATTLIST a style CDATA #IMPLIED>
+ <!ATTLIST a lang NMTOKEN #IMPLIED>
+ <!ATTLIST a dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST a href CDATA #IMPLIED>
+ <!ATTLIST a name CDATA #IMPLIED>
+ <!ATTLIST a md CDATA #IMPLIED>
+ <!ATTLIST a rel NMTOKEN #IMPLIED>
+ <!ATTLIST a rev NMTOKEN #IMPLIED>
+ <!ATTLIST a title CDATA #IMPLIED>
+ <!ATTLIST a methods NMTOKENS #IMPLIED>
+ <!ELEMENT br EMPTY>
+ <!ATTLIST br id ID #IMPLIED>
+ <!ELEMENT em (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST em id ID #IMPLIED>
+ <!ATTLIST em class NMTOKENS #IMPLIED>
+ <!ATTLIST em style CDATA #IMPLIED>
+ <!ATTLIST em lang NMTOKEN #IMPLIED>
+ <!ATTLIST em dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT lang (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST lang id ID #IMPLIED>
+ <!ATTLIST lang class NMTOKENS #IMPLIED>
+ <!ATTLIST lang style CDATA #IMPLIED>
+ <!ATTLIST lang lang NMTOKEN #IMPLIED>
+ <!ATTLIST lang dir (ltr | rtl) #IMPLIED>
+ <!ELEMENT pronounce (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST pronounce id ID #IMPLIED>
+ <!ATTLIST pronounce guide CDATA #IMPLIED>
+ <!ATTLIST pronounce phonetic CDATA #IMPLIED>
+ <!ELEMENT q (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST q id ID #IMPLIED>
+ <!ATTLIST q class NMTOKENS #IMPLIED>
+ <!ATTLIST q style CDATA #IMPLIED>
+ <!ATTLIST q lang NMTOKEN #IMPLIED>
+ <!ATTLIST q dir (ltr | rtl) #IMPLIED>
+ <!ATTLIST q quote-source CDATA #IMPLIED>
+ <!ELEMENT addressee (person , function? , care.of?)>
+ <!ATTLIST addressee id ID #IMPLIED>
+ <!ELEMENT care.of (#PCDATA)>
+ <!ATTLIST care.of id ID #IMPLIED>
+ <!ELEMENT delivery.point (#PCDATA | br)*>
+ <!ATTLIST delivery.point id ID #IMPLIED>
+ <!ATTLIST delivery.point point-code CDATA #IMPLIED>
+ <!ATTLIST delivery.point code-source CDATA #IMPLIED>
+ <!ELEMENT postcode (#PCDATA)>
+ <!ATTLIST postcode id ID #IMPLIED>
+ <!ATTLIST postcode code-source CDATA #IMPLIED>
+ <!ELEMENT delivery.office (#PCDATA | br)*>
+ <!ATTLIST delivery.office id ID #IMPLIED>
+ <!ATTLIST delivery.office office-code CDATA #IMPLIED>
+ <!ATTLIST delivery.office code-source CDATA #IMPLIED>
+ <!ELEMENT body.end (tagline? , bibliography?)>
+ <!ATTLIST body.end id ID #IMPLIED>
+ <!ELEMENT tagline (#PCDATA | chron | copyrite | event | function | location | money | num | object.title | org | person | postaddr | virtloc | a | br | em | lang | pronounce | q)*>
+ <!ATTLIST tagline id ID #IMPLIED>
+ <!ATTLIST tagline type (std | pa | npa) "std">
+ <!ELEMENT bibliography (#PCDATA)>
+ <!ATTLIST bibliography id ID #IMPLIED>
+ ]>
+ <NewsML>
+   <Catalog Href="http://www.afp.com/dtd/AFPCatalog.xml"/>
+   <NewsEnvelope>
+     <DateAndTime>20011022T154508Z</DateAndTime>
+   </NewsEnvelope>
+   <NewsItem>
+     <Identification>
+       <NewsIdentifier>
+         <ProviderId>afp.com</ProviderId>
+         <DateId>20011022</DateId>
+         <NewsItemId>mmd--deutsch--journal--spo</NewsItemId>
+         <RevisionId PreviousRevision="0" Update="N">1</RevisionId>
+         <PublicIdentifier>urn:NewsML:afp.com:20011022:mmd--deutsch--journal--spo:1</PublicIdentifier>
+       </NewsIdentifier>
+       <NameLabel>HINTERGRUND</NameLabel>
+     </Identification>
+     <NewsManagement>
+       <NewsItemType FormalName="News"/>
+       <FirstCreated>20011022T154508Z</FirstCreated>
+       <ThisRevisionCreated>20011022T154508Z</ThisRevisionCreated>
+       <Status FormalName="Usable"/>
+     </NewsManagement>
+     <NewsComponent>
+       <AdministrativeMetadata>
+         <Provider>
+           <Party FormalName="AFP"/>
+         </Provider>
+       </AdministrativeMetadata>
+       <DescriptiveMetadata>
+         <Language FormalName="de"/> 
+       </DescriptiveMetadata>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Berliner SPD führt Gespräche mit FDP und Grünen</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022154450.sq80bp9h.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>INFOGRAFIK: Das Berliner Wahlergebnis</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022113032.remo00m7.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Schwierige Koalitionsverhandlungen in Berlin</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022124314.9hv2kozk.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Die Lieblingsfarben des Kanzlers sind Rot Gelb Grün</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022134541.cmmaoim7.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>INFOGRAFIK: Wen wählt Wowereit?</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022122545.hl3z2as6.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>CDU ist auch in kommunalen Rathäusern der Verlierer</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022120205.b8sykfvu.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Gutes Abschneiden der PDS hat verschiedene Gründe</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011022134159.agvne048.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Ans Regieren hat sich Klaus Wowereit gewöhnt</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011021161031.1oq7qyub.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Steffel brachte CDU nicht auf Erfolgskurs</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011021165007.kt9qog9m.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Sibyll Klotz: Vollblutpolitikerin mit "Berliner Schnauze"</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011021184658.lctevest.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Mit Gysi muss weiter gerechnet werden</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011021180441.6tpvgx0y.xml"/>
+       </NewsComponent>
+       <NewsComponent>
+         <NewsLines>
+           <HeadLine>Rexrodt - das Stehaufmännchen der Berliner FDP</HeadLine>
+         </NewsLines>
+         <NewsItemRef NewsItem="011021165558.gujrz59m.xml"/>
+       </NewsComponent>
+     </NewsComponent>
+   </NewsItem>
+ </NewsML>
+diff --git a/test/issue655.xml b/test/issue655.xml
+new file mode 100644
+index 00000000..b07356c1
+--- /dev/null
++++ b/test/issue655.xml
+@@ -0,0 +1,4 @@
++<!DOCTYPE test [
++  <!ENTITY newline "&#x26;#xA;">
++]>
++<test newline="&newline;"/>

@@ -1,0 +1,279 @@
+commit 0451adebdf153eee1f69914141311114a0130982
+Author: James Carter <jwcart2@gmail.com>
+Date:   Mon Feb 8 11:23:42 2021 -0500
+
+    libsepol/cil: Destroy disabled optional blocks after pass is complete
+    
+    Nicolas Iooss reports:
+      I am continuing to investigate OSS-Fuzz crashes and the following one
+      is quite complex. Here is a CIL policy which triggers a
+      heap-use-after-free error in the CIL compiler:
+    
+      (class CLASS (PERM2))
+      (classorder (CLASS))
+      (classpermission CLSPRM)
+      (optional o
+          (mlsvalidatetrans x (domby l1 h1))
+          (common CLSCOMMON (PERM1))
+          (classcommon CLASS CLSCOMMON)
+      )
+      (classpermissionset CLSPRM (CLASS (PERM1)))
+    
+      The issue is that the mlsvalidatetrans fails to resolve in pass
+      CIL_PASS_MISC3, which comes after the resolution of classcommon (in
+      pass CIL_PASS_MISC2). So:
+    
+      * In pass CIL_PASS_MISC2, the optional block still exists, the
+      classcommon is resolved and class CLASS is linked with common
+      CLSCOMMON.
+      * In pass CIL_PASS_MISC3, the optional block is destroyed, including
+      the common CLSCOMMON.
+      * When classpermissionset is resolved, function cil_resolve_classperms
+      uses "common_symtab = &class->common->perms;", which has been freed.
+      The use-after-free issue occurs in __cil_resolve_perms (in
+      libsepol/cil/src/cil_resolve_ast.c):
+    
+        // common_symtab was freed
+        rc = cil_symtab_get_datum(common_symtab, curr->data, &perm_datum);
+    
+    The fundamental problem here is that when the optional block is
+    disabled it is immediately destroyed in the middle of the pass, so
+    the class has not been reset and still refers to the now destroyed
+    common when the classpermissionset is resolved later in the same pass.
+    
+    Added a list, disabled_optionals, to struct cil_args_resolve which is
+    passed when resolving the tree. When optionals are disabled, they are
+    now added to this list and then are destroyed after the tree has been
+    reset between passes.
+    
+    Reported-by: Nicolas Iooss <nicolas.iooss@m4x.org>
+    Signed-off-by: James Carter <jwcart2@gmail.com>
+    Acked-by: Nicolas Iooss <nicolas.iooss@m4x.org>
+
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 208bc01a..0e078561 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -50,15 +50,16 @@
+ struct cil_args_resolve {
+ 	struct cil_db *db;
+ 	enum cil_pass pass;
+ 	uint32_t *changed;
++	struct cil_list *disabled_optionals;
+ 	struct cil_tree_node *optstack;
+ 	struct cil_tree_node *boolif;
+ 	struct cil_tree_node *macro;
+ 	struct cil_tree_node *blockstack;
+ 	struct cil_list *sidorder_lists;
+ 	struct cil_list *classorder_lists;
+ 	struct cil_list *unordered_classorder_lists;
+ 	struct cil_list *catorder_lists;
+ 	struct cil_list *sensitivityorder_lists;
+ 	struct cil_list *in_list;
+ };
+@@ -3925,43 +3926,43 @@ exit:
+ int __cil_resolve_ast_last_child_helper(struct cil_tree_node *current, void *extra_args)
+ {
+ 	int rc = SEPOL_ERR;
+ 	struct cil_args_resolve *args = extra_args;
+ 	struct cil_tree_node *parent = NULL;
+ 	struct cil_tree_node *blockstack = NULL;
+ 
+ 	if (current == NULL ||  extra_args == NULL) {
+ 		goto exit;
+ 	}
+ 
+ 	parent = current->parent;
+ 
+ 	if (parent->flavor == CIL_MACRO) {
+ 		args->macro = NULL;
+ 	} else if (parent->flavor == CIL_OPTIONAL) {
+ 		struct cil_tree_node *optstack;
+ 
+ 		if (((struct cil_optional *)parent->data)->enabled == CIL_FALSE) {
+ 			*(args->changed) = CIL_TRUE;
+-			cil_tree_children_destroy(parent);
++			cil_list_append(args->disabled_optionals, CIL_NODE, parent);
+ 		}
+ 
+ 		/* pop off the stack */
+ 		optstack = args->optstack;
+ 		args->optstack = optstack->cl_head;
+ 		if (optstack->cl_head) {
+ 			optstack->cl_head->parent = NULL;
+ 		}
+ 		free(optstack);
+ 	} else if (parent->flavor == CIL_BOOLEANIF) {
+ 		args->boolif = NULL;
+ 	} else if (parent->flavor == CIL_BLOCK) {
+ 		/* pop off the stack */
+ 		blockstack = args->blockstack;
+ 		args->blockstack = blockstack->cl_head;
+ 		if (blockstack->cl_head) {
+ 			blockstack->cl_head->parent = NULL;
+ 		}
+ 		free(blockstack);
+ 	}
+ 
+ 	return SEPOL_OK;
+@@ -3983,152 +3984,160 @@ static void cil_destroy_tree_node_stack(struct cil_tree_node *curr)
+ int cil_resolve_ast(struct cil_db *db, struct cil_tree_node *current)
+ {
+ 	int rc = SEPOL_ERR;
+ 	struct cil_args_resolve extra_args;
+ 	enum cil_pass pass = CIL_PASS_TIF;
+ 	uint32_t changed = 0;
+ 
+ 	if (db == NULL || current == NULL) {
+ 		return rc;
+ 	}
+ 
+ 	extra_args.db = db;
+ 	extra_args.pass = pass;
+ 	extra_args.changed = &changed;
+ 	extra_args.optstack = NULL;
+ 	extra_args.boolif= NULL;
+ 	extra_args.macro = NULL;
+ 	extra_args.sidorder_lists = NULL;
+ 	extra_args.classorder_lists = NULL;
+ 	extra_args.unordered_classorder_lists = NULL;
+ 	extra_args.catorder_lists = NULL;
+ 	extra_args.sensitivityorder_lists = NULL;
+ 	extra_args.in_list = NULL;
+ 	extra_args.blockstack = NULL;
+ 
++	cil_list_init(&extra_args.disabled_optionals, CIL_NODE);
+ 	cil_list_init(&extra_args.sidorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.classorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.unordered_classorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.catorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.sensitivityorder_lists, CIL_LIST_ITEM);
+ 	cil_list_init(&extra_args.in_list, CIL_IN);
+ 	for (pass = CIL_PASS_TIF; pass < CIL_PASS_NUM; pass++) {
+ 		extra_args.pass = pass;
+ 		rc = cil_tree_walk(current, __cil_resolve_ast_node_helper, __cil_resolve_ast_first_child_helper, __cil_resolve_ast_last_child_helper, &extra_args);
+ 		if (rc != SEPOL_OK) {
+ 			cil_log(CIL_INFO, "Pass %i of resolution failed\n", pass);
+ 			goto exit;
+ 		}
+ 
+ 		if (pass == CIL_PASS_IN) {
+ 			rc = cil_resolve_in_list(&extra_args);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 			cil_list_destroy(&extra_args.in_list, CIL_FALSE);
+ 		}
+ 
+ 		if (pass == CIL_PASS_MISC1) {
+ 			db->sidorder = __cil_ordered_lists_merge_all(&extra_args.sidorder_lists, NULL);
+ 			if (db->sidorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			db->classorder = __cil_ordered_lists_merge_all(&extra_args.classorder_lists, &extra_args.unordered_classorder_lists);
+ 			if (db->classorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			db->catorder = __cil_ordered_lists_merge_all(&extra_args.catorder_lists, NULL);
+ 			if (db->catorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 			cil_set_cat_values(db->catorder, db);
+ 			db->sensitivityorder = __cil_ordered_lists_merge_all(&extra_args.sensitivityorder_lists, NULL);
+ 			if (db->sensitivityorder == NULL) {
+ 				rc = SEPOL_ERR;
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_SID);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_CLASS);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_CAT);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 
+ 			rc = __cil_verify_ordered(current, CIL_SENS);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 		}
+ 
+ 		if (changed && (pass > CIL_PASS_CALL1)) {
++			struct cil_list_item *item;
+ 			/* Need to re-resolve because an optional was disabled that contained
+ 			 * one or more declarations. We only need to reset to the call1 pass 
+ 			 * because things done in the preceding passes aren't allowed in 
+ 			 * optionals, and thus can't be disabled.
+ 			 * Note: set pass to CIL_PASS_CALL1 because the pass++ will increment 
+ 			 * it to CIL_PASS_CALL2
+ 			 */
+ 			cil_log(CIL_INFO, "Resetting declarations\n");
+ 
+ 			if (pass >= CIL_PASS_MISC1) {
+ 				__cil_ordered_lists_reset(&extra_args.sidorder_lists);
+ 				__cil_ordered_lists_reset(&extra_args.classorder_lists);
+ 				__cil_ordered_lists_reset(&extra_args.unordered_classorder_lists);
+ 				__cil_ordered_lists_reset(&extra_args.catorder_lists);
+ 				__cil_ordered_lists_reset(&extra_args.sensitivityorder_lists);
+ 				cil_list_destroy(&db->sidorder, CIL_FALSE);
+ 				cil_list_destroy(&db->classorder, CIL_FALSE);
+ 				cil_list_destroy(&db->catorder, CIL_FALSE);
+ 				cil_list_destroy(&db->sensitivityorder, CIL_FALSE);
+ 			}
+ 
+ 			pass = CIL_PASS_CALL1;
+ 
+ 			rc = cil_reset_ast(current);
+ 			if (rc != SEPOL_OK) {
+ 				cil_log(CIL_ERR, "Failed to reset declarations\n");
+ 				goto exit;
+ 			}
++			cil_list_for_each(item, extra_args.disabled_optionals) {
++				cil_tree_children_destroy(item->data);
++			}
++			cil_list_destroy(&extra_args.disabled_optionals, CIL_FALSE);
++			cil_list_init(&extra_args.disabled_optionals, CIL_NODE);
+ 		}
+ 
+ 		/* reset the arguments */
+ 		changed = 0;
+ 		while (extra_args.optstack != NULL) {
+ 			cil_destroy_tree_node_stack(extra_args.optstack);
+ 			extra_args.optstack = NULL;
+ 		}
+ 		while (extra_args.blockstack!= NULL) {
+ 			cil_destroy_tree_node_stack(extra_args.blockstack);
+ 			extra_args.blockstack = NULL;
+ 		}
+ 	}
+ 
+ 	rc = __cil_verify_initsids(db->sidorder);
+ 	if (rc != SEPOL_OK) {
+ 		goto exit;
+ 	}
+ 
+ 	rc = SEPOL_OK;
+ exit:
+ 	cil_destroy_tree_node_stack(extra_args.optstack);
+ 	cil_destroy_tree_node_stack(extra_args.blockstack);
+ 	__cil_ordered_lists_destroy(&extra_args.sidorder_lists);
+ 	__cil_ordered_lists_destroy(&extra_args.classorder_lists);
+ 	__cil_ordered_lists_destroy(&extra_args.catorder_lists);
+ 	__cil_ordered_lists_destroy(&extra_args.sensitivityorder_lists);
+ 	__cil_ordered_lists_destroy(&extra_args.unordered_classorder_lists);
++	cil_list_destroy(&extra_args.disabled_optionals, CIL_FALSE);
+ 	cil_list_destroy(&extra_args.in_list, CIL_FALSE);
+ 
+ 	return rc;
+ }

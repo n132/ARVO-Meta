@@ -1,0 +1,243 @@
+commit c1baf1516de5fc0cd122e4693f4774b0fd4b627b
+Author: Philippe Antoine <contact@catenacyber.fr>
+Date:   Wed Apr 15 15:50:58 2020 +0200
+
+    Adds bound check for TZSP
+
+diff --git a/example/reader_util.c b/example/reader_util.c
+index 97aa940b..e5aa7478 100644
+--- a/example/reader_util.c
++++ b/example/reader_util.c
+@@ -1591,229 +1591,232 @@ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+ ether_type_check:
+   recheck_type = 0;
+ 
+   /* check ether type */
+   switch(type) {
+   case VLAN:
+     vlan_id = ((packet[ip_offset] << 8) + packet[ip_offset+1]) & 0xFFF;
+     type = (packet[ip_offset+2] << 8) + packet[ip_offset+3];
+     ip_offset += 4;
+     vlan_packet = 1;
+ 
+     // double tagging for 802.1Q
+     while((type == 0x8100) && (((bpf_u_int32)ip_offset) < header->caplen)) {
+       vlan_id = ((packet[ip_offset] << 8) + packet[ip_offset+1]) & 0xFFF;
+       type = (packet[ip_offset+2] << 8) + packet[ip_offset+3];
+       ip_offset += 4;
+     }
+     recheck_type = 1;
+     break;
+ 
+   case MPLS_UNI:
+   case MPLS_MULTI:
+     mpls.u32 = *((uint32_t *) &packet[ip_offset]);
+     mpls.u32 = ntohl(mpls.u32);
+     workflow->stats.mpls_count++;
+     type = ETH_P_IP, ip_offset += 4;
+ 
+     while(!mpls.mpls.s) {
+       mpls.u32 = *((uint32_t *) &packet[ip_offset]);
+       mpls.u32 = ntohl(mpls.u32);
+       ip_offset += 4;
+     }
+     recheck_type = 1;
+     break;
+ 
+   case PPPoE:
+     workflow->stats.pppoe_count++;
+     type = ETH_P_IP;
+     ip_offset += 8;
+     recheck_type = 1;
+     break;
+ 
+   default:
+     break;
+   }
+ 
+   if(recheck_type)
+     goto ether_type_check;
+ 
+   workflow->stats.vlan_count += vlan_packet;
+ 
+  iph_check:
+   /* Check and set IP header size and total packet length */
+   if (header->caplen < ip_offset + sizeof(struct ndpi_iphdr))
+     return(nproto); /* Too short for next IP header*/
+ 
+   iph = (struct ndpi_iphdr *) &packet[ip_offset];
+ 
+   /* just work on Ethernet packets that contain IP */
+   if(type == ETH_P_IP && header->caplen >= ip_offset) {
+     frag_off = ntohs(iph->frag_off);
+ 
+     proto = iph->protocol;
+     if(header->caplen < header->len) {
+       static u_int8_t cap_warning_used = 0;
+ 
+       if(cap_warning_used == 0) {
+ 	if(!workflow->prefs.quiet_mode)
+ 	  NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG,
+ 		   "\n\nWARNING: packet capture size is smaller than packet size, DETECTION MIGHT NOT WORK CORRECTLY\n\n");
+ 	cap_warning_used = 1;
+       }
+     }
+   }
+ 
+   if(iph->version == IPVERSION) {
+     ip_len = ((u_int16_t)iph->ihl * 4);
+     iph6 = NULL;
+ 
+     if(iph->protocol == IPPROTO_IPV6) {
+       ip_offset += ip_len;
+       if (ip_len > 0)
+         goto iph_check;
+     }
+ 
+     if((frag_off & 0x1FFF) != 0) {
+       static u_int8_t ipv4_frags_warning_used = 0;
+       workflow->stats.fragmented_count++;
+ 
+       if(ipv4_frags_warning_used == 0) {
+ 	if(!workflow->prefs.quiet_mode)
+ 	  NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG, "\n\nWARNING: IPv4 fragments are not handled by this demo (nDPI supports them)\n");
+ 	ipv4_frags_warning_used = 1;
+       }
+ 
+       workflow->stats.total_discarded_bytes +=  header->len;
+       return(nproto);
+     }
+   } else if(iph->version == 6) {
+     if (header->caplen < ip_offset + sizeof(struct ndpi_ipv6hdr))
+       return(nproto); /* Too short for IPv6 header*/
+     iph6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+     proto = iph6->ip6_hdr.ip6_un1_nxt;
+     ip_len = sizeof(struct ndpi_ipv6hdr);
+ 
+     if(proto == IPPROTO_DSTOPTS /* IPv6 destination option */) {
+       u_int8_t *options = (u_int8_t*)&packet[ip_offset+ip_len];
+       proto = options[0];
+       ip_len += 8 * (options[1] + 1);
+     }
+ 
+     iph = NULL;
+   } else {
+     static u_int8_t ipv4_warning_used = 0;
+ 
+   v4_warning:
+     if(ipv4_warning_used == 0) {
+       if(!workflow->prefs.quiet_mode)
+         NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG,
+ 		 "\n\nWARNING: only IPv4/IPv6 packets are supported in this demo (nDPI supports both IPv4 and IPv6), all other packets will be discarded\n\n");
+       ipv4_warning_used = 1;
+     }
+     workflow->stats.total_discarded_bytes +=  header->len;
+     return(nproto);
+   }
+ 
+   if(workflow->prefs.decode_tunnels && (proto == IPPROTO_UDP)) {
+     if (header->caplen < ip_offset + ip_len + sizeof(struct ndpi_udphdr))
+       return(nproto); /* Too short for UDP header*/
+     struct ndpi_udphdr *udp = (struct ndpi_udphdr *)&packet[ip_offset+ip_len];
+     u_int16_t sport = ntohs(udp->source), dport = ntohs(udp->dest);
+ 
+     if((sport == GTP_U_V1_PORT) || (dport == GTP_U_V1_PORT)) {
+       /* Check if it's GTPv1 */
+       u_int offset = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+       u_int8_t flags = packet[offset];
+       u_int8_t message_type = packet[offset+1];
+ 
+       tunnel_type = ndpi_gtp_tunnel;
+ 
+       if((((flags & 0xE0) >> 5) == 1 /* GTPv1 */) &&
+ 	 (message_type == 0xFF /* T-PDU */)) {
+ 
+ 	ip_offset = ip_offset+ip_len+sizeof(struct ndpi_udphdr)+8; /* GTPv1 header len */
+ 	if(flags & 0x04) ip_offset += 1; /* next_ext_header is present */
+ 	if(flags & 0x02) ip_offset += 4; /* sequence_number is present (it also includes next_ext_header and pdu_number) */
+ 	if(flags & 0x01) ip_offset += 1; /* pdu_number is present */
+ 
+ 	iph = (struct ndpi_iphdr *) &packet[ip_offset];
+ 
+ 	if(iph->version != IPVERSION) {
+ 	  // printf("WARNING: not good (packet_id=%u)!\n", (unsigned int)workflow->stats.raw_packet_count);
+ 	  goto v4_warning;
+ 	}
+       }
+     } else if((sport == TZSP_PORT) || (dport == TZSP_PORT)) {
+       /* https://en.wikipedia.org/wiki/TZSP */
++      if (header->caplen < ip_offset + ip_len + sizeof(struct ndpi_udphdr) + 4)
++        return(nproto); /* Too short for TZSP*/
++
+       u_int offset           = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+       u_int8_t version       = packet[offset];
+       u_int8_t ts_type       = packet[offset+1];
+       u_int16_t encapsulates = ntohs(*((u_int16_t*)&packet[offset+2]));
+ 
+       tunnel_type = ndpi_tzsp_tunnel;
+ 
+       if((version == 1) && (ts_type == 0) && (encapsulates == 1)) {
+ 	u_int8_t stop = 0;
+ 
+ 	offset += 4;
+ 
+ 	while((!stop) && (offset < header->caplen)) {
+ 	  u_int8_t tag_type = packet[offset];
+ 	  u_int8_t tag_len;
+ 
+ 	  switch(tag_type) {
+ 	  case 0: /* PADDING Tag */
+ 	    tag_len = 1;
+ 	    break;
+ 	  case 1: /* END Tag */
+ 	    tag_len = 1, stop = 1;
+ 	    break;
+ 	  default:
+ 	    tag_len = packet[offset+1];
+ 	    break;
+ 	  }
+ 
+ 	  offset += tag_len;
+ 
+ 	  if(offset >= header->caplen)
+ 	    return(nproto); /* Invalid packet */
+ 	  else {
+ 	    eth_offset = offset;
+ 	    goto datalink_check;
+ 	  }
+ 	}
+       }
+     } else if(sport == NDPI_CAPWAP_DATA_PORT) {
+       /* We dissect ONLY CAPWAP traffic */
+       u_int offset           = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+ 
+       if((offset+40) < header->caplen) {
+ 	u_int16_t msg_len = packet[offset+1] >> 1;
+ 
+ 	offset += msg_len;
+ 
+ 	if(packet[offset] == 0x02) {
+ 	  /* IEEE 802.11 Data */
+ 
+ 	  offset += 24;
+ 	  /* LLC header is 8 bytes */
+ 	  type = ntohs((u_int16_t)*((u_int16_t*)&packet[offset+6]));
+ 
+ 	  ip_offset = offset + 8;
+ 
+ 	  tunnel_type = ndpi_capwap_tunnel;
+ 	  goto iph_check;
+ 	}
+       }
+     }
+   }
+ 
+   /* process the packet */
+   return(packet_processing(workflow, time, vlan_id, tunnel_type, iph, iph6,
+ 			   ip_offset, header->caplen - ip_offset,
+ 			   header->caplen, header, packet, header->ts));
+ }
+ 
+ /* ********************************************************** */
+ /*       http://home.thep.lu.se/~bjorn/crc/crc32_fast.c       */
+ /* ********************************************************** */

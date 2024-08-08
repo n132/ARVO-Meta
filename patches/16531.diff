@@ -1,0 +1,3471 @@
+commit de29341638833ba7717bd6b5e6850998454b044b
+Author: Kevin Atkinson <kevina@gnu.org>
+Date:   Sat Aug 17 17:06:53 2019 -0400
+
+    Don't allow null-terminated UCS-2/4 strings using the original API.
+    
+    Detect if the encoding is UCS-2/4 and the length is -1 in affected API
+    functions and refuse to convert the string.  If the string ends up
+    being converted somehow, abort with an error message in DecodeDirect
+    and ConvDirect.  To convert a null terminated string in
+    Decode/ConvDirect, a negative number corresponding to the width of the
+    underlying character type for the encoding is expected; for example,
+    if the encoding is "ucs-2" then a the size is expected to be -2.
+    
+    Also fix a 1-3 byte over-read in DecodeDirect when reading UCS-2/4
+    strings when a size is provided (found by OSS-Fuzz).
+    
+    Also fix a bug in DecodeDirect that caused DocumentChecker to return
+    the wrong offsets when working with UCS-2/4 strings.
+
+diff --git a/auto/MkSrc/CcHelper.pm b/auto/MkSrc/CcHelper.pm
+index f2de991..0044335 100644
+--- a/auto/MkSrc/CcHelper.pm
++++ b/auto/MkSrc/CcHelper.pm
+@@ -9,9 +9,9 @@ package MkSrc::CcHelper;
+ BEGIN {
+   use Exporter;
+   our @ISA = qw(Exporter);
+   our @EXPORT = qw(to_c_return_type c_error_cond
+-		   to_type_name make_desc make_func call_func
+-		   make_c_method call_c_method form_c_method
++		   to_type_name make_desc make_func call_func get_c_func_name
++		   make_c_method make_wide_macro call_c_method form_c_method
+ 		   make_cxx_method);
+ }
+ 
+@@ -80,16 +80,79 @@ Parms can be any of:
+ sub make_func ( $ \@ $ ; \% ) {
+   my ($name, $d, $p, $accum) = @_;
+   $accum = {} unless defined $accum;
+   my @d = @$d;
+   return (join '', 
+ 	  (to_type_name(shift @d, {%$p,pos=>'return'}, %$accum),
+ 	   ' ',
+ 	   to_lower $name,
+ 	   '(',
+ 	   (join ', ', map {to_type_name $_, {%$p,pos=>'parm'}, %$accum} @d),
+ 	   ')'));
+ }
+ 
++=item make_wide_version NAME @TYPES PARMS ; %ACCUM
++
++Creates the wide character version of the function if needed
++
++=cut
++
++sub make_wide_version ( $ \@ $ ; \% ) {
++  my ($name, $d, $p, $accum) = @_;
++  my @d = @$d;
++  shift @d;
++  return '' unless grep {$_->{type} eq 'encoded string'} @d;
++  $accum->{sys_headers}{'stddef.h'} = true;
++  $accum->{suffix}[5] = <<'---';
++
++/******************* private implemantion details *********************/
++
++#ifdef __cplusplus
++#  define aspell_cast_(type, expr) (static_cast<type>(expr))
++#  define aspell_cast_from_wide_(str) (static_cast<const void *>(str))
++#else
++#  define aspell_cast_(type, expr) ((type)(expr))
++#  define aspell_cast_from_wide_(str) ((const char *)(str))
++#endif
++---
++  my @parms = map {$_->{type} eq 'encoded string'
++                       ? ($_->{name}, $_->{name}.'_size')
++                       : $_->{name}} @d;
++  $name = to_lower $name;
++  $accum->{suffix}[0] = <<'---';
++/**********************************************************************/
++
++#ifdef ASPELL_ENCODE_SETTING_SECURE
++---
++  $accum->{suffix}[2] = "#endif\n";
++  my @args = map  {$_->{type} eq 'encoded string'
++                       ? ($_->{name}, "$_->{name}_size", '-1')
++                       : $_->{name}} @d;
++  $accum->{suffix}[1] .=
++      (join '',
++       "#define $name",
++       '(', join(', ', @parms), ')',
++       "\\\n    ",
++       $name, '_wide',
++       '(', join(', ', @args), ')',
++       "\n");
++  @args = map  {$_->{type} eq 'encoded string'
++                    ? ("aspell_cast_from_wide_($_->{name})",
++                       "$_->{name}_size*aspell_cast_(int,sizeof(*($_->{name})))",
++                       "sizeof(*($_->{name}))")
++                    : $_->{name}} @d;
++  return (join '',
++          "\n",
++          "/* version of $name that is safe to use with (null terminated) wide characters */\n",
++          '#define ',
++          $name, '_w',
++          '(', join(', ', @parms), ')', 
++          "\\\n    ",
++          $name, '_wide',
++          '(', join(', ', @args), ')',
++          "\n");
++}
++
++
+ =item call_func NAME @TYPES PARMS ; %ACCUM
+ 
+ Return a string to call a func.  Will prefix the function with return
+@@ -103,16 +166,15 @@ Parms can be any of:
+ 
+ sub call_func ( $ \@ $ ; \% ) {
+   my ($name, $d, $p, $accum) = @_;
+-  $accum = {} unless defined $accum;
+   my @d = @$d;
+   my $func_ret = to_type_name(shift @d, {%$p,pos=>'return'}, %$accum);
+   return (join '',
+ 	  (($func_ret eq 'void' ? '' : 'return '),
+ 	   to_lower $name,
+ 	   '(',
+ 	   (join ', ', map {to_type_name $_, 
+ 			    {%$p,pos=>'parm',use_type=>false}, %$accum} @d),
+ 	   ')'));
+ }
+ 
+ =item to_type_name ITEM PARMS ; %ACCUM
+@@ -131,89 +193,96 @@ Parms can be any of:
+ sub to_type_name ( $ $ ; \% ) {
+   my ($d, $p, $accum) = @_;
+   $accum = {} unless defined $accum;
+ 
+   my $mode = $p->{mode};
+   die unless one_of $mode, qw(cc cc_cxx cxx native native_no_err);
+   my $is_cc = one_of $mode, qw(cc cc_cxx cxx);
+   my $is_native = one_of $mode, qw(native native_no_err);
+ 
+   my $pos  = $p->{pos};
+   my $t = finalized_type($pos eq 'return' && $is_cc
+ 			 ? to_c_return_type $d
+ 			 : $d->{type});
+   $p->{use_type} = true    unless exists $p->{use_type};
+   $p->{use_name} = true    unless exists $p->{use_name};
+   $p->{pos}      = 'other' unless exists $p->{pos};
+ 
+   my $name = $t->{name};
+   my $type = $t->{type};
+ 
+-  return ( (to_type_name {%$d, type=>'string'}, $p, %$accum) ,
+-	   (to_type_name {%$d, type=>'int', name=>"$d->{name}_size"}, $p, %$accum) )
++  if ($name eq 'encoded string' && $is_cc && $pos eq 'parm') {
++    my @types = ((to_type_name {%$d, type=>($p->{wide}?'const void pointer':'string')}, $p, %$accum),
++                 (to_type_name {%$d, type=>'int', name=>"$d->{name}_size"}, $p, %$accum));
++    push @types, (to_type_name {%$d, type=>'int', name=>"$d->{name}_type_width"}, $p, %$accum) if $p->{wide};
++    return @types;
++  }
++  return ( (to_type_name {%$d, type=>($p->{wide}?'const void pointer':'string')}, $p, %$accum) ,
++           (to_type_name {%$d, type=>'int', name=>"$d->{name}_size"}, $p, %$accum) )
+       if $name eq 'encoded string' && $is_cc && $pos eq 'parm';
+ 
+   my $str;
+ 
+   if ($p->{use_type}) 
+   {
+     $str .= "const " if $t->{const};
+ 
+     if ($name eq 'string') {
+       if ($is_native && $pos eq 'parm') {
+ 	$accum->{headers}{'parm string'} = true;
+ 	$str .= "ParmString";
+       } else {
+ 	$str .= "const char *";
+       }
+     } elsif ($name eq 'string obj') {
+       die unless $pos eq 'return';
+       if ($is_cc) {
+ 	$str .= "const char *";
+       } else {
+ 	$accum->{headers}{'string'} = true;
+ 	$str .= "String";
+       }
+     } elsif ($name eq 'encoded string') {
+-      $str .= "const char *";
++      $str .= $p->{wide} ? "const void *" : "const char *";
+     } elsif ($name eq '') {
+       $str .= "void";
+     } elsif ($name eq 'bool' && $is_cc) {
+       $str .= "int";
+     } elsif ($type eq 'basic') {
+       $str .= $name;
+     } elsif (one_of $type, qw(enum class struct union)) {
+       my $c_type = $type eq 'class' ? 'struct' : $type;
+       if ($t->{pointer}) {
+ 	$accum->{types}->{$name} = $t;
+       } else {
+-	$accum->{headers}->{$t->{created_in}} = true;
++        $accum->{headers}->{$t->{created_in}} = true unless $mode eq 'cc';
+       }
+       $str .= "$c_type Aspell" if $mode eq 'cc';
+       $str .= to_mixed($name);
+     } else {
+       print STDERR "Warning: Unknown Type: $name\n";
+       $str .= "{unknown type: $name}";
+     }
+ 
+     if ($t->{pointer} && $type eq 'class' && $mode eq 'cxx') {
+       $str .= "Ptr";
+     } elsif ($t->{pointer}) {
+       $str .= " *";
+     }
+ 
+   }
+ 
+   if (defined $d->{name} && $p->{use_name})
+   {
+     $str .= " " unless $str eq '';
+     $str .= to_lower($d->{name});
+   }
+ 
+   $str .= "[$t->{array}]" if $t->{array} && $p->{use_type};
+ 
+   return $str;
+ }
+ 
++
+ =item make_desc DESC ; LEVEL
+ 
+ Make a C comment out of DESC optionally indenting it LEVEL spaces.
+@@ -261,40 +330,41 @@ empty array if it can not make a method from ITEM.
+ sub form_c_method ($ $ $ ; \% ) 
+ {
+   my ($class, $d, $p, $accum) = @_;
+   $accum = {} unless defined $accum;
+   my $mode = $p->{mode};
+   my $this_name = defined $p->{this_name} ? $p->{this_name} : 'ths';
+   my $name = $d->{name};
+   my $func = '';
+   my @data = ();
+   @data = @{$d->{data}} if defined $d->{data};
+   if ($d->{type} eq 'constructor') {
+     if (defined $name) {
+       $func = $name;
+     } else {
+       $func = "new aspell $class";
+     }
+     splice @data, 0, 0, {type => $class} unless exists $d->{'returns alt type'};
+   } elsif ($d->{type} eq 'destructor') {
+     $func = "delete aspell $class";
+     splice @data, 0, 0, ({type => 'void'}, {type=>$class, name=>$this_name});
+   } elsif ($d->{type} eq 'method') {
+     if (exists $d->{'c func'}) {
+       $func = $d->{'c func'};
+     } elsif (exists $d->{'prefix'}) {
+       $func = "$d->{prefix} $name";
+     } else {
+       $func = "aspell $class $name";
+     }
++    $func .= " wide" if $p->{wide};
+     if (exists $d->{'const'}) {
+       splice @data, 1, 0, {type => "const $class", name=> $this_name};
+     } else {
+       splice @data, 1, 0, {type => "$class", name=> $this_name};
+     }
+   } else {
+     return ();
+   }
+   $func = "aspell $func" unless $func =~ /aspell/;
+   $func =~ s/aspell\ ?// if exists $p->{no_aspell};
+   return ($func, \@data, $p, $accum);
+ }
+@@ -306,6 +376,21 @@ sub make_c_method ($ $ $ ; \%)
+   return &make_func(@ret);
+ }
+ 
++sub get_c_func_name ($ $ $)
++{
++  my @ret = &form_c_method(@_);
++  return undef unless @ret > 0;
++  return to_lower $ret[0];
++}
++
++sub make_wide_macro ($ $ $ ; \%)
++{
++  my @ret = &form_c_method(@_);
++  return undef unless @ret > 0;
++  my $str = &make_wide_version(@ret);
++  return $str;
++}
++
+ sub call_c_method ($ $ $ ; \%)
+ {
+   my @ret = &form_c_method(@_);
+diff --git a/auto/MkSrc/Create.pm b/auto/MkSrc/Create.pm
+index d39b60e..630ede5 100644
+--- a/auto/MkSrc/Create.pm
++++ b/auto/MkSrc/Create.pm
+@@ -52,42 +52,45 @@ sub create_file ( $ $ );
+ sub create_cc_file ( % )  {
+   my (%p) = @_;
+   $p{name} = $p{data}{name} unless exists $p{name};
+   $p{ext} = $p{cxx} ? ($p{header} ? 'hpp' : 'cpp') : 'h';
+   my $body;
+   my %accum = exists $p{accum} ? (%{$p{accum}}) : ();
+   foreach my $d (@{$p{data}{data}}) {
+     next unless exists $info{$d->{type}}{proc}{$p{type}};
+     $body .= $info{$d->{type}}{proc}{$p{type}}->($d, \%accum);
+   }
+   return unless length($body) > 0;
+   my $file = <<'---';
+ /* Automatically generated file.  Do not edit directly. */
+ 
+ /* This file is part of The New Aspell
+  * Copyright (C) 2001-2002 by Kevin Atkinson under the GNU LGPL
+  * license version 2.0 or 2.1.  You should have received a copy of the
+  * LGPL license along with this library if you did not you can find it
+  * at http://www.gnu.org/.                                              */
+ 
+ ---
+   my $hm = "ASPELL_". to_upper($p{name})."__".to_upper($p{ext});
+   $file .= "#ifndef $hm\n#define $hm\n\n" if $p{header} && $p{name} ne 'errors';
+   # hack to avoid including aerror_* symbols as two different type of symbols
+   $file .= "#if !defined($hm) && !defined(ASPELL_ASPELL__H)\n#define $hm\n\n" if $p{header} && $p{name} eq 'errors';
+   $file .= "#include \"aspell.h\"\n" if $p{type} eq 'cxx';
+   $file .= "#include \"settings.h\"\n" if $p{type} eq 'native_impl' && $p{name} eq 'errors';
+   $file .= "#include \"gettext.h\"\n" if $p{type} eq 'native_impl' && $p{name} eq 'errors';
++  $file .= cmap {"#include <$_>\n"} sort keys %{$accum{sys_headers}};
+   $file .= cmap {"#include \"".to_lower($_).".hpp\"\n"} sort keys %{$accum{headers}};
+-  $file .= "#ifdef __cplusplus\nextern \"C\" {\n#endif\n" if $p{header} && !$p{cxx};
++  $file .= "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n" if $p{header} && !$p{cxx};
++  $file .= join('', grep {defined $_} @{$accum{prefix}});
+   $file .= "\nnamespace $p{namespace} {\n\n" if $p{cxx};
+   if (defined $info{forward}{proc}{$p{type}}) {
+     my @types = sort {$a->{name} cmp $b->{name}} (values %{$accum{types}});
+     $file .= cmap {$info{forward}{proc}{$p{type}}->($_)} @types;
+   }
+   $file .= "\n";
+   $file .= $body;
++  $file .= join('', grep {defined $_} @{$accum{suffix}});
+   $file .= "\n\n}\n\n" if $p{cxx};
+   $file .= "#ifdef __cplusplus\n}\n#endif\n" if $p{header} && !$p{cxx};
+   $file .= "#endif /* $hm */\n" if $p{header};
+   create_file $p{dir}.'/'.to_lower($p{name}).$p{pre_ext}.'.'.$p{ext}, $file;
+ }
+diff --git a/auto/MkSrc/Info.pm b/auto/MkSrc/Info.pm
+index c644028..ace8e21 100644
+--- a/auto/MkSrc/Info.pm
++++ b/auto/MkSrc/Info.pm
+@@ -43,79 +43,80 @@ where <impl type> is one of:
+ each proc sub should take the following argv
+ 
+    $data: a subtree of $master_data
+    $accum: 
+ 
+ <options> is one of:
+ 
+   desc: description of the object
+   prefix:
+   posib err: the method may return an error condition
+   c func:
+   const: the method is a const member
+   c only: only include in the external interface
+   c impl headers: extra headers that need to be included in the C impl
+   c impl: use this as the c impl instead of the default
+   cxx impl: use this as the cxx impl instead of the default
+   returns alt type: the constructor returns some type other than
+     the object from which it is a member of
+   no native: do not attempt to create a native implementation
+   treat as object: treat as a object rather than a pointer
++  no conv: do not converted an encoded string
+ 
+ The %info structure is initialized as follows:
+ 
+ =cut
+ 
+ #pod
+  our %info =
+  (
+   root => { 
+     options => [],
+     groups => ['methods', 'group']},
+   methods => {
+     # methods is a collection of methods which will be inserted into
+     # a class after some simple substation rules.  A $ will be
+     # replaced with name of the class.
+     options => ['strip', 'prefix', 'c impl headers'],
+     groups => undef},
+   group => {
+     # a group is a colection of objects which should be grouped together
+     # this generally means they will be in the same source file
+     options => ['no native'],
+     groups => ['enum', 'struct', 'union', 'func', 'class', 'errors']},
+   enum => {
+     # basic C enum
+     options => ['desc', 'prefix'],
+     creates_type => 'enum'},
+   struct => {
+     # basic c struct
+     options => ['desc', 'treat as object'],
+     groups => undef,
+     creates_type => 'struct',},
+   union => {
+     # basic C union
+     options => ['desc', 'treat as object'],
+     groups => undef,
+     creates_type => 'union'},
+   class => {
+     # C++ class
+     options => ['c impl headers'],
+     groups => undef,
+     creates_type => 'class'},
+   errors => {}, # possible errors
+   method => {
+     # A class method
+-    options => ['desc', 'posib err', 'c func', 'const',
+-		'c only', 'c impl', 'cxx impl'],
++    options => ['desc', 'posib err', 'c func', 'const', 'no conv', 'on conv error',
++		'c only', 'c impl', 'cxx impl', 'cc extra'],
+     groups => undef},
+   constructor => {
+     # A class constructor
+     options => ['returns alt type', 'c impl', 'desc'],
+     groups => 'types'},
+   destructor => {
+     # A class destructor
+     options => [],
+     groups => undef},
+   );
+ #cut
+ 
+ =pod
+diff --git a/auto/MkSrc/ProcCc.pm b/auto/MkSrc/ProcCc.pm
+index 47c4338..98cc435 100644
+--- a/auto/MkSrc/ProcCc.pm
++++ b/auto/MkSrc/ProcCc.pm
+@@ -23,32 +23,32 @@ use MkSrc::Info;
+ sub make_c_object ( $ @ );
+ 
+ $info{group}{proc}{cc} = sub {
+-  my ($data) = @_;
++  my ($data,@rest) = @_;
+   my $ret;
+   my $stars = (70 - length $data->{name})/2;
+   $ret .= "/";
+   $ret .= '*'x$stars;
+   $ret .= " $data->{name} ";
+   $ret .= '*'x$stars;
+   $ret .= "/\n";
+   foreach my $d (@{$data->{data}}) {
+     $ret .= "\n\n";
+-    $ret .= $info{$d->{type}}{proc}{cc}->($d);
++    $ret .= $info{$d->{type}}{proc}{cc}->($d,@rest);
+   }
+   $ret .= "\n\n";
+   return $ret;
+ };
+ 
+ $info{enum}{proc}{cc} = sub {
+-  my ($d) = @_;
++  my ($d,@rest) = @_;
+   my $n = "Aspell".to_mixed($d->{name});
+   return ("\n".
+ 	  make_desc($d->{desc}).
+ 	  "enum $n {" .
+ 	  join(', ',
+ 	       map {"Aspell".to_mixed($d->{prefix}).to_mixed($_->{type})}
+ 	       @{$d->{data}}).
+ 	  "};\n" .
+ 	  "typedef enum $n $n;\n"
+ 	  );
+ };
+@@ -58,22 +58,27 @@ $info{struct}{proc}{cc} = sub {
+ };
+ 
+ $info{union}{proc}{cc} = sub {
+-  return make_c_object "union", $_[0];
++  return make_c_object "union", @_;
+ };
+ 
+ $info{class}{proc}{cc} = sub {
+-  my ($d) = @_;
++  my ($d,$accum) = @_;
+   my $class = $d->{name};
+   my $classname = "Aspell".to_mixed($class);
+   my $ret = "";
+   $ret .= "typedef struct $classname $classname;\n\n";
+   foreach (@{$d->{data}}) {
+-    my $s = make_c_method($class, $_, {mode=>'cc'});
++    my $s = make_c_method($class, $_, {mode=>'cc'}, %$accum);
+     next unless defined $s;
+     $ret .= "\n";
+     $ret .= make_desc($_->{desc});
+-    $ret .= make_c_method($class, $_, {mode=>'cc'}).";\n";
++    $ret .= make_c_method($class, $_, {mode=>'cc'}, %$accum).";\n";
++    if (grep {$_->{type} eq 'encoded string'} @{$_->{data}}) {
++      $ret .= make_c_method($class, $_, {mode=>'cc', wide=>true}, %$accum).";\n";
++      $ret .= make_wide_macro($class, $_, {mode=>'cc'}, %$accum);
++    }
++    $ret .= "\n".$_->{'cc extra'}."\n" if defined $_->{'cc extra'};
+   }
+   $ret .= "\n";
+   return $ret;
+ };
+@@ -105,25 +110,26 @@ $info{errors}{proc}{cc} = sub {
+ };
+ 
+ sub make_c_object ( $ @ ) {
+-  my ($t, $d) = @_;
++  my ($t, $d, $accum) = @_;
++  $accum = {} unless defined $accum;
+   my $struct;
+   $struct .= "Aspell";
+   $struct .= to_mixed($d->{name});
+   return (join "\n\n", grep {$_ ne ''}
+ 	  join ('',
+ 		"$t $struct {\n",
+ 		(map {"\n".make_desc($_->{desc},2).
+ 			  "  ".to_type_name($_, {mode=>'cc'}). ";\n"}
+ 		 grep {$_->{type} ne 'method'
+ 			   && $_->{type} ne 'cxx constructor'}
+ 		 @{$d->{data}}),
+ 		"\n};\n"),
+ 	  "typedef $t $struct $struct;",
+ 	  join ("\n",
+-		map {make_c_method($d->{name}, $_, {mode=>'cc'}).";"}
++		map {make_c_method($d->{name}, $_, {mode=>'cc'}, %$accum).";"}
+ 		grep {$_->{type} eq 'method'}
+ 		@{$d->{data}})
+ 	  )."\n";
+ }
+ 
+ 1;
+diff --git a/auto/MkSrc/ProcImpl.pm b/auto/MkSrc/ProcImpl.pm
+index b8628fd..3d0f220 100644
+--- a/auto/MkSrc/ProcImpl.pm
++++ b/auto/MkSrc/ProcImpl.pm
+@@ -42,82 +42,111 @@ $info{group}{proc}{impl} = sub {
+ $info{class}{proc}{impl} = sub {
+   my ($data, $accum) = @_;
+   my $ret;
+   foreach (grep {$_ ne ''} split /\s*,\s*/, $data->{'c impl headers'}) {
+     $accum->{headers}{$_} = true;
+   }
+-  foreach my $d (@{$data->{data}}) {
++  my @d = @{$data->{data}};
++  while (@d) {
++    my $d = shift @d;
++    my $need_wide = false;
+     next unless one_of $d->{type}, qw(method constructor destructor);
+     my @parms = @{$d->{data}} if exists $d->{data};
+-    my $m = make_c_method $data->{name}, $d, {mode=>'cc_cxx', use_name=>true}, %$accum;
++    my $m = make_c_method $data->{name}, $d, {mode=>'cc_cxx', use_name=>true, wide=>$d->{wide}}, %$accum;
+     next unless defined $m;
+     $ret .= "extern \"C\" $m\n";
+     $ret .= "{\n";
+     if (exists $d->{'c impl'}) {
+       $ret .= cmap {"  $_\n"} split /\n/, $d->{'c impl'};
+     } else {
+       if ($d->{type} eq 'method') {
+ 	my $ret_type = shift @parms;
+-	my $ret_native = to_type_name $ret_type, {mode=>'native_no_err', pos=>'return'}, %$accum;
++	my $ret_native = to_type_name $ret_type, {mode=>'native_no_err', pos=>'return', wide=>$d->{wide}}, %$accum;
+ 	my $snum = 0;
++        my $call_fun = $d->{name};
++        my @call_parms;
+ 	foreach (@parms) {
+ 	  my $n = to_lower($_->{name});
+-	  if ($_->{type} eq 'encoded string') {
+-	    $accum->{headers}{'mutable string'} = true;
+-	    $accum->{headers}{'convert'} = true;
+-	    $ret .= "  ths->temp_str_$snum.clear();\n";
+-	    $ret .= "  ths->to_internal_->convert($n, ${n}_size, ths->temp_str_$snum);\n";
+-	    $ret .= "  unsigned int s$snum = ths->temp_str_$snum.size();\n";
+-	    $_ = "MutableString(ths->temp_str_$snum.mstr(), s$snum)";
+-	    $snum++;
++	  if ($_->{type} eq 'encoded string' && !exists($d->{'no conv'})) {
++            $need_wide = true unless $d->{wide};
++            die unless exists $d->{'posib err'};
++            $accum->{headers}{'mutable string'} = true;
++            $accum->{headers}{'convert'} = true;
++            my $name = get_c_func_name $data->{name}, $d, {mode=>'cc_cxx', use_name=>true, wide=>$d->{wide}};
++            $ret .= "  ths->temp_str_$snum.clear();\n";
++            if ($d->{wide}) {
++              $ret .= "  ${n}_size = get_correct_size(\"$name\", ths->to_internal_->in_type_width(), ${n}_size, ${n}_type_width);\n";
++            } else {
++              $ret .= "  PosibErr<int> ${n}_fixed_size = get_correct_size(\"$name\", ths->to_internal_->in_type_width(), ${n}_size);\n";
++              if (exists($d->{'on conv error'})) {
++                $ret .= "  if (${n}_fixed_size.get_err()) {\n";
++                $ret .= "    ".$d->{'on conv error'}."\n";
++                $ret .= "  } else {\n";
++                $ret .= "    ${n}_size = ${n}_fixed_size;\n";
++                $ret .= "  }\n";
++              } else {
++                $ret .= "  ths->err_.reset(${n}_fixed_size.release_err());\n";
++                $ret .= "  if (ths->err_ != 0) return ".(c_error_cond $ret_type).";\n";
++              }
++            }
++            $ret .= "  ths->to_internal_->convert($n, ${n}_size, ths->temp_str_$snum);\n";
++            $ret .= "  unsigned int s$snum = ths->temp_str_$snum.size();\n";
++            push @call_parms, "MutableString(ths->temp_str_$snum.mstr(), s$snum)";
++            $snum++;
++          } elsif ($_->{type} eq 'encoded string') {
++            $need_wide = true unless $d->{wide};
++            push @call_parms, $n, "${n}_size";
++            push @call_parms, "${n}_type_width" if $d->{wide};
++            $call_fun .= " wide" if $d->{wide};
+ 	  } else {
+-	    $_ = $n;
++	    push @call_parms, $n;
+ 	  }
+ 	}
+-	my $parms = '('.(join ', ', @parms).')';
+-	my $exp = "ths->".to_lower($d->{name})."$parms";
++	my $parms = '('.(join ', ', @call_parms).')';
++	my $exp = "ths->".to_lower($call_fun)."$parms";
+ 	if (exists $d->{'posib err'}) {
+ 	  $accum->{headers}{'posib err'} = true;
+ 	  $ret .= "  PosibErr<$ret_native> ret = $exp;\n";
+ 	  $ret .= "  ths->err_.reset(ret.release_err());\n";
+ 	  $ret .= "  if (ths->err_ != 0) return ".(c_error_cond $ret_type).";\n";
+ 	  if ($ret_type->{type} eq 'void') {
+ 	    $ret_type = {type=>'special'};
+ 	    $exp = "1";
+ 	  } else {
+ 	    $exp = "ret.data";
+ 	  }
+ 	}
+ 	if ($ret_type->{type} eq 'string obj') {
+ 	  $ret .= "  ths->temp_str = $exp;\n";
+ 	  $exp = "ths->temp_str.c_str()";
+ 	} elsif ($ret_type->{type} eq 'encoded string') {
+ 	  die; 
+ 	  # This is not used and also not implemented right
+ 	  $ret .= "  if (to_encoded_ != 0) (*to_encoded)($exp,temp_str_);\n";
+ 	  $ret .= "  else                  temp_str_ = $exp;\n";
+ 	  $exp = "temp_str_0.data()";
+ 	}
+ 	if ($ret_type->{type} eq 'const word list') {
+ 	  $accum->{headers}{'word list'} = true;
+           $ret .= "  if (ret.data)\n";
+ 	  $ret .= "    const_cast<WordList *>(ret.data)->from_internal_ = ths->from_internal_;\n";
+ 	}
+ 	$ret .= "  ";
+ 	$ret .= "return " unless $ret_type->{type} eq 'void';
+ 	$ret .= $exp;
+ 	$ret .= ";\n";
+       } elsif ($d->{type} eq 'constructor') {
+ 	my $name = $d->{name} ? $d->{name} : "new $data->{name}";
+ 	$name =~ s/aspell\ ?//; # FIXME: Abstract this in a function
+ 	$name = to_lower($name);
+ 	shift @parms if exists $d->{'returns alt type'}; # FIXME: Abstract this in a function
+ 	my $parms = '('.(join ', ', map {$_->{name}} @parms).')';
+ 	$ret .= "  return $name$parms;\n";
+       } elsif ($d->{type} eq 'destructor') {
+ 	$ret .= "  delete ths;\n";
+       }
+     }
+     $ret .= "}\n\n";
++    unshift @d,{%$d, wide=>true} if $need_wide;
+   }
+   return $ret;
+ };
+diff --git a/auto/MkSrc/Read.pm b/auto/MkSrc/Read.pm
+index 4b3d1d0..4bf640e 100644
+--- a/auto/MkSrc/Read.pm
++++ b/auto/MkSrc/Read.pm
+@@ -83,18 +83,18 @@ sub store_group ( $ $ );
+ sub advance ( ) {
+   $line = undef;
+   do {
+     $line = <IN>;
+     return unless defined $line;
+     $in_pod = $1 if $line =~ /^\=(\w+)/;
+     $line = '' if $in_pod;
+     $in_pod = undef if $in_pod && $in_pod eq 'cut';
+-    $line =~ s/\#.*$//;
++    $line =~ s/(?<!\\)\#.*$//;
+     $line =~ s/^(\t*)//;
+     $level = $base_level + length($1);
+       $line =~ s/\s*$//;
+     ++$base_level if $line =~ s/^\{$//;
+     --$base_level if $line =~ s/^\}$//;
+-    $line =~ s/\\([{}])/$1/g;
++    $line =~ s/\\([{}#\\])/$1/g;
+   } while ($line eq '');
+   #print "$level:$line\n";
+ }
+diff --git a/auto/mk-src.in b/auto/mk-src.in
+index 2ad713d..4aa5b60 100644
+--- a/auto/mk-src.in
++++ b/auto/mk-src.in
+@@ -405,209 +405,210 @@ group: errors
+ {
+ /
+ errors:
+ 	/
+ 	other
+ 	operation not supported
+ 		mesg => Operation Not Supported: %what
+ 		parms => what
+ 		/
+ 		cant copy
+ 		unimplemented method
+ 			mesg => The method "%what" is unimplemented in "%where".
+ 			parms => where
+ 	file
+ 		mesg => %file:
+ 		parms => file
+ 		/
+ 		cant open file
+ 			mesg => The file "%file" can not be opened
+ 			/
+ 			cant read file
+ 				mesg => The file "%file" can not be opened for reading.
+ 			cant write file
+ 				mesg => The file "%file" can not be opened for writing.
+ 		invalid name
+ 			mesg => The file name "%file" is invalid.
+ 		bad file format
+ 			mesg => The file "%file" is not in the proper format.
+ 	dir
+ 		parms => dir
+ 		/
+ 		cant read dir
+ 			mesg => The directory "%dir" can not be opened for reading.
+ 
+ 	config
+ 		parms => key
+ 		/
+ 		unknown key
+ 			mesg => The key "%key" is unknown.
+ 		cant change value
+ 			mesg => The value for option "%key" can not be changed.
+ 		bad key
+ 			mesg => The key "%key" is not %accepted and is thus invalid.
+ 			parms => accepted
+ 		bad value
+ 			mesg => The value "%value" is not %accepted and is thus invalid for the key "%key".
+ 			parms => value, accepted
+ 		duplicate
+ 		key not string
+ 			mesg => The key "%key" is not a string.
+ 		key not int
+ 			mesg => The key "%key" is not an integer.
+ 		key not bool
+ 			mesg => The key "%key" is not a boolean.
+ 		key not list
+ 			mesg => The key "%key" is not a list.
+ 		no_value_reset
+ 			mesg => The key "%key" does not take any parameters when prefixed by a "reset-".
+ 		no_value_enable
+ 			mesg => The key "%key" does not take any parameters when prefixed by an "enable-".
+ 		no_value_disable
+ 			mesg => The key "%key" does not take any parameters when prefixed by a "dont-" or "disable-".
+ 		no_value_clear
+ 			mesg => The key "%key" does not take any parameters when prefixed by a "clear-".
+ 
+ 	language related
+ 		parms => lang
+ 		/
+ 		unknown language
+ 			mesg => The language "%lang" is not known.
+ 		unknown soundslike
+ 			mesg => The soundslike "%sl" is not known.
+ 			parms => sl
+ 		language not supported
+ 			mesg => The language "%lang" is not supported.
+ 		no wordlist for lang
+ 			mesg => No word lists can be found for the language "%lang".
+ 		mismatched language
+ 			mesg => Expected language "%lang" but got "%prev".
+ 			parms => prev
+ 	affix
+ 		/
+ 		corrupt affix
+ 			mesg => Affix '%aff' is corrupt.
+ 			parms => aff
+ 		invalid cond
+ 			mesg => The condition "%cond" is invalid.
+ 			parms => cond
+ 		invalid cond strip
+ 			mesg => The condition "%cond" does not guarantee that "%strip" can always be stripped.
+ 			parms => cond, strip
+ 		incorrect encoding
+ 			mesg => The file "%file" is not in the proper format. Expected the file to be in "%exp" not "%got".
+ 			parms => file, exp, got
+ 	encoding
+ 		parms => encod
+ 		/
+ 		unknown encoding
+ 			mesg => The encoding "%encod" is not known.
+ 		encoding not supported
+ 			mesg => The encoding "%encod" is not supported.
+ 		conversion not supported
+ 			mesg => The conversion from "%encod" to "%encod2" is not supported.
+ 			parms => encod2
+ 	pipe
+ 		/
+ 		cant create pipe
+ 		process died
+ 	bad input
+ 		/
+ 		invalid string
+ 			mesg => The string "%str" is invalid.
+ 			parms => str
+ 		invalid word
+ 			mesg => The word "%word" is invalid.
+ 			parms => word
+ 		invalid affix
+ 			mesg => The affix flag '%aff' is invalid for word "%word".
+ 			parms => aff, word
+ 		inapplicable affix
+ 			mesg => The affix flag '%aff' can not be applied to word "%word".
+ 			parms => aff, word
+ 		unknown unichar
+ 			mesg =>
+ 		word list flags
+ 			/
+ 			invalid flag
+ 			conflicting flags
+ 	version control
+ 		/
+ 		bad version string
+ 			mesg => not a version number
+ 	filter
+ 		/
+ 		cant dlopen file
+ 			mesg => dlopen returned "%return".
+ 			parms => return
+ 		empty filter
+ 			mesg => The file "%filter" does not contain any filters.
+ 			parms => filter
+ 		no such filter
+ 			mesg => The filter "%filter" does not exist.
+ 			parms => filter
+ 		confusing version
+ 			mesg => Confused by version control.
+ 		bad version
+ 			mesg => Aspell version does not match filter's requirement.
+ 		identical option
+ 			mesg => Filter option already exists.
+ 		options only
+ 			mesg => Use option modifiers only within named option.
+ 		invalid option modifier
+ 			mesg => Option modifier unknown.
+ 		cant describe filter
+ 			mesg => Error setting filter description.
+ 	filter mode file
+ 		/
+ 		mode option name
+ 			mesg => Empty option specifier.
+ 		no filter to option
+ 			mesg => Option "%option" possibly specified prior to filter.
+ 			parms => option
+ 		bad mode key
+ 			mesg => Unknown mode description key "%key".
+ 			parms => key
+ 		expect mode key
+ 			mesg => Expecting "%modekey" key.
+ 			parms => modekey
+ 		mode version requirement
+ 			mesg => Version specifier missing key: "aspell".
+ 		confusing mode version
+ 			mesg => Confused by version control.
+ 		bad mode version
+ 			mesg => Aspell version does not match mode's requirement.
+ 		missing magic expression
+ 			mesg => Missing magic mode expression.
+ 		empty file ext
+ 			mesg => Empty extension at char %char.
+ 			parms => char
+ 	filter mode expand
+ 		mesg => "%mode" error
+ 		parms => mode
+ 		/
+ 		unknown mode
+ 			mesg => Unknown mode: "%mode".
+ 		mode extend expand
+ 			mesg => "%mode" error while extend Aspell modes. (out of memory?)
+ 	filter mode magic
+ 		mesg = "%mode": bad magic "%magic"
+ 		parms => mode, magic
+ 		/
+ 		file magic pos
+ 			mesg => "%mode": no start for magic search given for magic "%magic".
+ 		file magic range
+ 			mesg => "%mode": no range for magic search given for magic "%magic".
+ 		missing magic
+ 			mesg => "%mode": no magic expression available for magic "%magic".
+ 		bad magic
+ 			mesg => "%mode": Magic "%magic": bad regular expression after location specifier; regexp reports: "%regerr".
+ 			parms => regerr
+ 
+ 	expression
+ 		/
+ 		invalid expression
+ 			mesg => "%expression" is not a valid regular expression.
+ 			parms => expression
++
+ }
+ group: speller
+ {
+@@ -615,116 +616,119 @@ no native
+ /
+ class: speller
+ 	c impl headers => error
+ 	/
+ 	# FIXME: make a "methods" of the next two contractors
+ 	#      which will probably involve modifying mk-src.pl
+ 
+ 	constructor: new aspell speller
+ 		returns alt type
+ 		c impl =>
+ 			PosibErr<Speller *> ret = new_speller(config);
+ 			if (ret.has_err()) \{
+ 			  return new CanHaveError(ret.release_err());
+ 			\} else \{
+ 			  return ret;
+ 			\}
+ 		/
+ 		can have error
+ 		config: config
+ 
+ 	constructor: to aspell speller
+ 		c impl => return static_cast<Speller *>(obj);
+ 		/
+ 		can have error: obj
+ 
+ 	destructible methods
+ 
+ 	can have error methods
+ 
+ 	method: config
+ 		/
+ 		config
+ 
+ 	method: check
+ 
+ 		posib err
+ 		desc => Returns 0 if it is not in the dictionary,
+ 			1 if it is, or -1 on error.
++		on conv error => return 0;
+ 		/
+ 		bool
+ 		encoded string: word
+ 
+ 	method: add to personal
+ 
+ 		posib err
+ 		desc => Add this word to your own personal word list.
+ 		/
+ 		void
+ 		encoded string: word
+ 
+ 	method: add to session
+ 
+ 		posib err
+ 		desc => Add this word to the current spelling session.
+ 		/
+ 		void
+ 		encoded string: word
+ 
+ 	method: personal word list
+ 
+ 		posib err
+ 		desc => This is your own personal word list file plus
+ 			any extra words added during this session to
+ 			your own personal word list.
+ 		/
+ 		const word list
+ 
+ 	method: session word list
+ 
+ 		posib err
+ 		desc => This is a list of words added to this session
+ 			that are not in the main word list or in your
+ 			own personal list but are considered valid for
+ 			this spelling session.
+ 		/
+ 		const word list
+ 
+ 	method: main word list
+ 
+ 		posib err
+ 		desc => This is the main list of words used during this
+ 			spelling session.
+ 		/
+ 		const word list
+ 
+ 	method: save all word lists
+ 
+ 		posib err
+ 		/
+ 		void
+ 
+ 	method: clear session
+ 
+ 		posib err
+ 		/
+ 		void
+ 
+ 	method: suggest
+ 
+ 		posib err
+ 		desc => Return NULL on error.
+ 			The word list returned by suggest is only
+ 			valid until the next call to suggest.
++		on conv error =>
++			word = NULL; word_size = 0;
+ 		/
+ 		const word list
+ 		encoded string: word
+ 
+ 	method: store replacement
+ 
+ 		posib err
+ 		/
+ 		bool
+ 		encoded string: mis
+ 		encoded string: cor
+ 
+ }
+@@ -798,77 +802,90 @@ struct: token
+ class: document checker
+ 	c impl headers => error
+ 	/
+ 	destructible methods
+ 
+ 	can have error methods
+ 
+ 	# FIXME: make a "methods" of the next two contractors
+ 
+ 	constructor: new aspell document checker
+ 		returns alt type
+ 		c impl =>
+ 			PosibErr<DocumentChecker *> ret = new_document_checker(speller);
+ 			if (ret.has_err()) \{
+ 			  return new CanHaveError(ret.release_err());
+ 			\} else \{
+ 			  return ret;
+ 			\}
+ 		desc => Creates a new document checker.
+ 			The speller class is expected to last until
+ 			this class is destroyed.
+ 			If config is given it will be used to override
+ 			any relevant options set by this speller class.
+ 			The config class is not once this function is done.
+ 			If filter is given then it will take ownership of
+ 			the filter class and use it to do the filtering.
+ 			You are expected to free the checker when done.
+ 		/
+ 		can have error
+ 		speller: speller
+ 
+ 	constructor: to aspell document checker
+ 		c impl => return static_cast<DocumentChecker *>(obj);
+ 		/
+ 		can have error: obj
+ 
+ 	method: reset
+ 
+ 		desc => Reset the internal state of the filter.
+ 			Should be called whenever a new document is
+ 			being filtered.
+ 		/
+ 		void
+ 
+ 	method: process
+-
+ 		desc => Process a string.
+ 			The document is expected to be passed in one or more
+ 			lines at a time.  Splitting the document on
+ 			white space characters instead of new lines is
+ 			permissible but some filters which are line based
+ 			may give incorrect results.  Furthermore, between
+ 			calls to reset, each string should be passed
+ 			in exactly once and in the order they appeared
+ 			in the document.  Passing in strings out of
+ 			order, skipping strings or passing them in
+ 			more than once may lead to undefined results.
++		no conv
+ 		/
+ 		void
+-		string: str
+-		int: size
++		encoded string: str
+ 
+ 	method: next misspelling
+ 
+ 		desc => Returns the next misspelled word in the
+ 			processed string.  If there are no more
+ 			misspelled words, then token.word will be
+ 			NULL and token.size will be 0
++		cc extra =>
++			\#define aspell_document_checker_next_misspelling_w(type, ths) \\
++			    aspell_document_checker_next_misspelling_adj(ths, sizeof(type))
+ 		/
+ 		token object
+ 
++	method: next misspelling adj
++		desc => internal: do not use
++		c impl =>
++			Token res = ths->next_misspelling();
++			res.offset /= type_width;
++			res.len /= type_width;
++			return res;
++		/
++		token object
++		int: type_width
++
+ 	method: filter
+ 
+ 		desc => Returns the underlying filter class.
+ 		/
+ 		filter
+ }
+@@ -906,28 +923,49 @@ group: string enumeration
+ {
+ /
+ class: string enumeration
+ 	c impl headers => convert
+ 	/
+ 	copyable methods
+ 	method: at end
+ 		const
+ 		/
+ 		bool
+ 
+ 	method: next
+ 		c impl =>
+ 			const char * s = ths->next();
+ 			if (s == 0 || ths->from_internal_ == 0) \{
+ 			  return s;
+ 			\} else \{
+ 			  ths->temp_str.clear();
+ 			  ths->from_internal_->convert(s,-1,ths->temp_str);
+ 			  ths->from_internal_->append_null(ths->temp_str);
+ 			  return ths->temp_str.data();
+ 			\}
++		cc extra =>
++			\#define aspell_string_enumeration_next_w(type, ths) \\
++			    aspell_cast_(const type *, aspell_string_enumeration_next_wide(ths, sizeof(type)))
+ 		/
+ 		const string
+ 
++	method: next wide
++		c impl =>
++			const char * s = ths->next();
++			if (s == 0) {
++			  return s;
++			} else if (ths->from_internal_ == 0) \{
++			  assert(type_width == 1);
++			  return s;
++			\} else \{
++			  assert(type_width == ths->from_internal_->out_type_width());
++			  ths->temp_str.clear();
++			  ths->from_internal_->convert(s,-1,ths->temp_str);
++			  ths->from_internal_->append_null(ths->temp_str);
++			  return ths->temp_str.data();
++			\}
++		/
++		const void pointer
++		int: type_width
+ }
+ group: info
+ {
+diff --git a/common/convert.cpp b/common/convert.cpp
+index e6d665b..e345773 100644
+--- a/common/convert.cpp
++++ b/common/convert.cpp
+@@ -27,1100 +27,1127 @@
+ namespace acommon {
+ 
+   typedef unsigned char  byte;
+   typedef unsigned char  Uni8;
+   typedef unsigned short Uni16;
+   typedef unsigned int   Uni32;
+ 
+ 
+   //////////////////////////////////////////////////////////////////////
+   //////////////////////////////////////////////////////////////////////
+   //
+   // Lookups
+   //
+   //////////////////////////////////////////////////////////////////////
+   //////////////////////////////////////////////////////////////////////
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // ToUniLookup
+   //
+ 
+   class ToUniLookup 
+   {
+     Uni32 data[256];
+     static const Uni32 npos = (Uni32)(-1);
+   public:
+     void reset();
+     Uni32 operator[] (char key) const {return data[(unsigned char)key];}
+     bool have(char key) const {return data[(unsigned char)key] != npos;}
+     bool insert(char key, Uni32 value);
+   };
+ 
+   void ToUniLookup::reset() 
+   {
+     for (int i = 0; i != 256; ++i)
+       data[i] = npos;
+   }
+ 
+   bool ToUniLookup::insert(char key, Uni32 value)
+   {
+     if (data[(unsigned char)key] != npos) 
+       return false;
+     data[(unsigned char)key] = value;
+     return true;
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // FromUniLookup
+   //
+ 
+   // Assumes that the maximum number of items in the table is 256
+   // Also assumes (unsigned char)i == i % 256
+ 
+   // Based on the iso-8859-* character sets it is very fast, almost all
+   // lookups involving no more than 2 comparisons.
+   // NO looks ups involded more than 3 compassions.
+   // Also, no division (or modules) is done whatsoever.
+ 
+ 
+   struct UniItem {
+     Uni32 key;
+     char  value;
+   };
+ 
+   class FromUniLookup 
+   {
+   private:
+     static const Uni32 npos = (Uni32)(-1);
+     UniItem * overflow_end;
+   
+     UniItem data[256*4];
+ 
+     UniItem overflow[256]; // you can never be too careful;
+   
+   public:
+     FromUniLookup() {}
+     void reset();
+     inline char operator() (Uni32 key, char unknown = '?') const;
+     bool insert(Uni32 key, char value);
+   };
+ 
+   void FromUniLookup::reset()
+   {
+     for (unsigned i = 0; i != 256*4; ++i)
+       data[i].key = npos;
+     overflow_end = overflow;
+   }
+ 
+   inline char FromUniLookup::operator() (Uni32 k, char unknown) const
+   {
+     const UniItem * i = data + (unsigned char)k * 4;
+ 
+     if (i->key == k) return i->value;
+     ++i;
+     if (i->key == k) return i->value;
+     ++i;
+     if (i->key == k) return i->value;
+     ++i;
+     if (i->key == k) return i->value;
+   
+     if (i->key == npos) return unknown;
+   
+     for(i = overflow; i != overflow_end; ++i)
+       if (i->key == k) return i->value;
+ 
+     return unknown;
+   }
+ 
+   bool FromUniLookup::insert(Uni32 k, char v) 
+   {
+     UniItem * i = data + (unsigned char)k * 4;
+     UniItem * e = i + 4;
+     while (i != e && i->key != npos) {
+       if (i->key == k)
+         return false;
+       ++i;
+     }
+     if (i == e) {
+       for(i = overflow; i != overflow_end; ++i)
+         if (i->key == k) return false;
+     }
+     i->key = k;
+     i->value = v;
+     return true;
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // CharLookup
+   //
+ 
+   class CharLookup 
+   {
+   private:
+     int data[256];
+   public:
+     void reset();
+     char operator[] (char key) const {return data[(unsigned char)key];}
+     bool insert(char key, char value);
+   };
+ 
+   void CharLookup::reset() {
+     for (int i = 0; i != 256; ++i) 
+       data[i] = -1;
+   }
+ 
+   bool CharLookup::insert(char key, char value) 
+   {
+     if (data[(unsigned char)key] != -1)
+       return false;
+     data[(unsigned char)key] = value;
+     return true;
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // NormLookup
+   //
+ 
+   template <class T>
+   struct NormTable
+   {
+     static const unsigned struct_size;
+     unsigned mask;
+     unsigned height;
+     unsigned width;
+     unsigned size;
+     T * end;
+     T data[1]; // hack for data[]
+   };
+ 
+   template <class T>
+   const unsigned NormTable<T>::struct_size = sizeof(NormTable<T>) - 1;
+ 
+   template <class T, class From>
+   struct NormLookupRet
+   {
+     const typename T::To   * to;
+     const From * last;
+     NormLookupRet(const typename T::To * t, From * l) 
+       : to(t), last(l) {}
+   };
+   
+   template <class T, class From>
+   static inline NormLookupRet<T,From> norm_lookup(const NormTable<T> * d, 
+                                                   From * s, From * stop,
+                                                   const typename T::To * def,
+                                                   From * prev) 
+   {
+   loop:
+     if (s != stop) {
+       const T * i = d->data + (static_cast<typename T::From>(*s) & d->mask);
+       for (;;) {
+         if (i->from == static_cast<typename T::From>(*s)) {
+           if (i->sub_table) {
+             // really tail recursion
+             if (i->to[1] != T::to_non_char) {def = i->to; prev = s;}
+             d = (const NormTable<T> *)(i->sub_table);
+             s++;
+             goto loop;
+           } else {
+             return NormLookupRet<T,From>(i->to, s);
+           }
+         } else {
+           i += d->height;
+           if (i >= d->end) break;
+         }
+       }
+     }
+     return NormLookupRet<T,From>(def, prev);
+   }
+ 
+   template <class T>
+   void free_norm_table(NormTable<T> * d)
+   {
+     for (T * cur = d->data; cur != d->end; ++cur) {
+       if (cur->sub_table) 
+         free_norm_table<T>(static_cast<NormTable<T> *>(cur->sub_table));
+     }
+     free(d);
+   }
+ 
+   struct FromUniNormEntry
+   {
+     typedef Uni32 From;
+     Uni32 from;
+     typedef byte To;
+     byte  to[4];
+     static const From from_non_char = (From)(-1);
+     static const To   to_non_char   = 0x10;
+     static const unsigned max_to = 4;
+     void * sub_table;
+   } 
+ #ifdef __GNUC__    
+     __attribute__ ((aligned (16)))
+ #endif
+   ;
+ 
+   struct ToUniNormEntry
+   {
+     typedef byte From;
+     byte from;
+     typedef Uni16 To;
+     Uni16 to[3];
+     static const From from_non_char = 0x10;
+     static const To   to_non_char   = 0x10;
+     static const unsigned max_to = 3;
+     void * sub_table;
+   } 
+ #ifdef __GNUC__    
+     __attribute__ ((aligned (16)))
+ #endif
+   ;
+   
+   //////////////////////////////////////////////////////////////////////
+   //
+   // read in char data
+   //
+ 
+   PosibErr<void> read_in_char_data (const Config & config,
+                                     ParmStr encoding,
+                                     ToUniLookup & to,
+                                     FromUniLookup & from)
+   {
+     to.reset();
+     from.reset();
+     
+     String dir1,dir2,file_name;
+     fill_data_dir(&config, dir1, dir2);
+     find_file(file_name,dir1,dir2,encoding,".cset");
+ 
+     FStream data;
+     PosibErrBase err = data.open(file_name, "r");
+     if (err.get_err()) { 
+       char mesg[300];
+       snprintf(mesg, 300, _("This could also mean that the file \"%s\" could not be opened for reading or does not exist."),
+                file_name.c_str());
+       return make_err(unknown_encoding, encoding, mesg);
+     }
+     unsigned chr;
+     Uni32 uni;
+     String line;
+     char * p;
+     do {
+       p = get_nb_line(data, line);
+     } while (*p != '/');
+     for (chr = 0; chr != 256; ++chr) {
+       p = get_nb_line(data, line);
+       if (strtoul(p, 0, 16) != chr)
+         return make_err(bad_file_format, file_name);
+       uni = strtoul(p + 3, 0, 16);
+       to.insert(chr, uni);
+       from.insert(uni, chr);
+     }
+   
+     return no_err;
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // read in norm data
+   //
+ 
+   struct Tally 
+   {
+     int size;
+     Uni32 mask;
+     int max;
+     int * data;
+     Tally(int s, int * d) : size(s), mask(s - 1), max(0), data(d) {
+       memset(data, 0, sizeof(int)*size);
+     }
+     void add(Uni32 chr) {
+       Uni32 p = chr & mask;
+       data[p]++;
+       if (data[p] > max) max = data[p];
+     }
+   };
+ 
+ # define sanity(check) \
+     if (!(check)) return sanity_fail(__FILE__, FUNC, __LINE__, #check)
+ 
+   static PosibErrBase sanity_fail(const char * file, const char * func, 
+                                   unsigned line, const char * check_str) 
+   {
+     char mesg[500];
+     snprintf(mesg, 500, "%s:%d: %s: Assertion \"%s\" failed.",
+              file,  line, func, check_str);
+     return make_err(bad_input_error, mesg);
+   }
+ # define CREATE_NORM_TABLE(T, in, buf, res) \
+   do { PosibErr<NormTable<T> *> pe( create_norm_table<T>(in,buf) );\
+        if (pe.has_err()) return PosibErrBase(pe); \
+        res = pe.data; } while(false)
+ 
+   template <class T>
+   static PosibErr< NormTable<T> * > create_norm_table(IStream & in, String & buf)
+   {
+     const char FUNC[] = "create_norm_table";
+     const char * p = get_nb_line(in, buf);
+     sanity(*p == 'N');
+     ++p;
+     int size = strtoul(p, (char **)&p, 10);
+     VARARRAY(T, d, size);
+     memset(d, 0, sizeof(T) * size);
+     int sz = 1 << (unsigned)floor(log(size <= 1 ? 1.0 : size - 1)/log(2.0));
+     VARARRAY(int, tally0_d, sz);   Tally tally0(sz,   tally0_d);
+     VARARRAY(int, tally1_d, sz*2); Tally tally1(sz*2, tally1_d);
+     VARARRAY(int, tally2_d, sz*4); Tally tally2(sz*4, tally2_d);
+     T * cur = d;
+     while (p = get_nb_line(in, buf), *p != '.') {
+       Uni32 f = strtoul(p, (char **)&p, 16);
+       cur->from = static_cast<typename T::From>(f);
+       sanity(f == cur->from);
+       tally0.add(f);
+       tally1.add(f);
+       tally2.add(f);
+       ++p;
+       sanity(*p == '>');
+       ++p;
+       sanity(*p == ' ');
+       ++p;
+       unsigned i = 0;
+       if (*p != '-') {
+         for (;; ++i) {
+           const char * q = p;
+           Uni32 t = strtoul(p, (char **)&p, 16);
+           if (q == p) break;
+           sanity(i < d->max_to);
+           cur->to[i] = static_cast<typename T::To>(t);
+           sanity(t == static_cast<Uni32>(cur->to[i]));
+         } 
+       } else {
+         cur->to[0] = 0;
+         cur->to[1] = T::to_non_char;
+       }
+       if (*p == ' ') ++p;
+       if (*p == '/') CREATE_NORM_TABLE(T, in, buf, cur->sub_table);
+       ++cur;
+     }
+     sanity(cur - d == size);
+     Tally * which = &tally0;
+     if (which->max > tally1.max) which = &tally1;
+     if (which->max > tally2.max) which = &tally2;
+     NormTable<T> * final = (NormTable<T> *)calloc(1, NormTable<T>::struct_size + 
+                                                   sizeof(T) * which->size * which->max);
+     memset(final, 0, NormTable<T>::struct_size + sizeof(T) * which->size * which->max);
+     final->mask = which->size - 1;
+     final->height = which->size;
+     final->width = which->max;
+     final->end = final->data + which->size * which->max;
+     final->size = size;
+     for (cur = d; cur != d + size; ++cur) {
+       T * dest = final->data + (cur->from & final->mask);
+       while (dest->from != 0) dest += final->height;
+       *dest = *cur;
+       if (dest->from == 0) dest->from = T::from_non_char;
+     }
+     for (T * dest = final->data; dest < final->end; dest += final->height) {
+       if (dest->from == 0 || (dest->from == T::from_non_char && dest->to[0] == 0)) {
+         dest->from = T::from_non_char;
+         dest->to[0] = T::to_non_char;
+       }
+     }
+     return final;
+   }
+ 
+   static PosibErr<void> init_norm_tables(FStream & in, NormTables * d) 
+   {
+     const char FUNC[] = "init_norm_tables";
+     String l;
+     get_nb_line(in, l);
+     remove_comments(l);
+     sanity (l == "INTERNAL");
+     get_nb_line(in, l);
+     remove_comments(l);
+     sanity (l == "/");
+     CREATE_NORM_TABLE(FromUniNormEntry, in, l, d->internal);
+     get_nb_line(in, l);
+     remove_comments(l);
+     sanity (l == "STRICT");
+     char * p = get_nb_line(in, l);
+     remove_comments(l);
+     if (l == "/") {
+       CREATE_NORM_TABLE(FromUniNormEntry, in, l, d->strict_d);
+       d->strict = d->strict_d;
+     } else {
+       sanity(*p == '=');
+       ++p; ++p;
+       sanity(strcmp(p, "INTERNAL") == 0);
+       d->strict = d->internal;
+     }
+     while (get_nb_line(in, l)) {
+       remove_comments(l);
+       d->to_uni.push_back(NormTables::ToUniTable());
+       NormTables::ToUniTable & e = d->to_uni.back();
+       e.name.resize(l.size());
+       for (unsigned i = 0; i != l.size(); ++i)
+         e.name[i] = asc_tolower(l[i]);
+       char * p = get_nb_line(in, l);
+       remove_comments(l);
+       if (l == "/") {
+         CREATE_NORM_TABLE(ToUniNormEntry, in, l, e.data);
+         e.ptr = e.data;
+       } else {
+         sanity(*p == '=');
+         ++p; ++p;
+         for (char * q = p; *q; ++q) *q = asc_tolower(*q);
+         Vector<NormTables::ToUniTable>::iterator i = d->to_uni.begin();
+         while (i->name != p && i != d->to_uni.end()) ++i;
+         sanity(i != d->to_uni.end());
+         e.ptr = i->ptr;
+         get_nb_line(in, l);
+       }
+     }  
+     return no_err;
+   }
+ 
+   PosibErr<NormTables *> NormTables::get_new(const String & encoding, 
+                                              const Config * config)
+   {
+     String dir1,dir2,file_name;
+     fill_data_dir(config, dir1, dir2);
+     find_file(file_name,dir1,dir2,encoding,".cmap");
+     
+     FStream in;
+     PosibErrBase err = in.open(file_name, "r");
+     if (err.get_err()) { 
+       char mesg[300];
+       snprintf(mesg, 300, _("This could also mean that the file \"%s\" could not be opened for reading or does not exist."),
+                file_name.c_str());
+       return make_err(unknown_encoding, encoding, mesg); // FIXME
+     }
+ 
+     NormTables * d = new NormTables;
+     d->key = encoding;
+     err = init_norm_tables(in, d);
+     if (err.has_err()) {
+       return make_err(bad_file_format, file_name, err.get_err()->mesg);
+     }
+ 
+     return d;
+ 
+   }
+ 
+   NormTables::~NormTables()
+   {
+     free_norm_table<FromUniNormEntry>(internal);
+     if (strict_d)
+       free_norm_table<FromUniNormEntry>(strict_d);
+     for (unsigned i = 0; i != to_uni.size(); ++i) {
+       if (to_uni[i].data)
+         free_norm_table<ToUniNormEntry>(to_uni[i].data);
+     }
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //////////////////////////////////////////////////////////////////////
+   //
+   //  Convert
+   //
+   //////////////////////////////////////////////////////////////////////
+   //////////////////////////////////////////////////////////////////////
+ 
+ 
+   bool operator== (const Convert & rhs, const Convert & lhs)
+   {
+     return strcmp(rhs.in_code(), lhs.in_code()) == 0
+       && strcmp(rhs.out_code(), lhs.out_code()) == 0;
+   }
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // Trivial Conversion
+   //
+ 
++  const char * unsupported_null_term_wide_string_msg =
++    "Null-terminated wide-character strings unsupported when used this way.";
++
+   template <typename Chr>
+   struct DecodeDirect : public Decode 
+   {
++    DecodeDirect() {type_width = sizeof(Chr);}
+     void decode(const char * in0, int size, FilterCharVector & out) const {
+       const Chr * in = reinterpret_cast<const Chr *>(in0);
+-      if (size == -1) {
++      if (size == -sizeof(Chr)) {
+         for (;*in; ++in)
+-          out.append(*in);
++          out.append(*in, sizeof(Chr));
++      } else if (size <= -1) {
++        fprintf(stderr, "%s\n", unsupported_null_term_wide_string_msg);
++        abort();
+       } else {
+-        const Chr * stop = reinterpret_cast<const Chr *>(in0 +size);
++        const Chr * stop = reinterpret_cast<const Chr *>(in0) + size/sizeof(Chr);
+         for (;in != stop; ++in)
+-          out.append(*in);
++          out.append(*in, sizeof(Chr));
+       }
+     }
+     PosibErr<void> decode_ec(const char * in0, int size, 
+                              FilterCharVector & out, ParmStr) const {
+       DecodeDirect::decode(in0, size, out);
+       return no_err;
+     }
+   };
+ 
+   template <typename Chr>
+   struct EncodeDirect : public Encode
+   {
++    EncodeDirect() {type_width = sizeof(Chr);}
+     void encode(const FilterChar * in, const FilterChar * stop, 
+                 CharVector & out) const {
+       for (; in != stop; ++in) {
+         Chr c = in->chr;
+         if (c != in->chr) c = '?';
+         out.append(&c, sizeof(Chr));
+       }
+     }
+     PosibErr<void> encode_ec(const FilterChar * in, const FilterChar * stop, 
+                              CharVector & out, ParmStr orig) const {
+       for (; in != stop; ++in) {
+         Chr c = in->chr;
+         if (c != in->chr) {
+           char m[70];
+           snprintf(m, 70, _("The Unicode code point U+%04X is unsupported."), in->chr);
+           return make_err(invalid_string, orig, m);
+         }
+         out.append(&c, sizeof(Chr));
+       }
+       return no_err;
+     }
+     bool encode(FilterChar * &, FilterChar * &, FilterCharVector &) const {
+       return true;
+     }
+   };
+ 
+   template <typename Chr>
+   struct ConvDirect : public DirectConv
+   {
++    ConvDirect() {type_width = sizeof(Chr);}
+     void convert(const char * in0, int size, CharVector & out) const {
+-      if (size == -1) {
++      if (size == -sizeof(Chr)) {
+         const Chr * in = reinterpret_cast<const Chr *>(in0);
+         for (;*in != 0; ++in)
+           out.append(in, sizeof(Chr));
++      } else if (size <= -1) {
++        fprintf(stderr, "%s\n", unsupported_null_term_wide_string_msg);
++        abort();
+       } else {
+         out.append(in0, size);
+       }
+     }
+     PosibErr<void> convert_ec(const char * in0, int size, 
+                               CharVector & out, ParmStr) const {
+       ConvDirect::convert(in0, size, out);
+       return no_err;
+     }
+   };
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   //  Lookup Conversion
+   //
+ 
+   struct DecodeLookup : public Decode 
+   {
+     ToUniLookup lookup;
+     PosibErr<void> init(ParmStr code, const Config & c) {
+       FromUniLookup unused;
+       return read_in_char_data(c, code, lookup, unused);
+     }
+     void decode(const char * in, int size, FilterCharVector & out) const {
+       if (size == -1) {
+         for (;*in; ++in)
+           out.append(lookup[*in]);
+       } else {
+         const char * stop = in + size;
+         for (;in != stop; ++in)
+           out.append(lookup[*in]);
+       }
+     }
+     PosibErr<void> decode_ec(const char * in, int size, 
+                              FilterCharVector & out, ParmStr) const {
+       DecodeLookup::decode(in, size, out);
+       return no_err;
+     }
+   };
+ 
+   struct DecodeNormLookup : public Decode 
+   {
+     typedef ToUniNormEntry E;
+     NormTable<E> * data;
+     DecodeNormLookup(NormTable<E> * d) : data(d) {}
+     // must be null terminated
+     // FIXME: Why must it be null terminated?
+     void decode(const char * in, int size, FilterCharVector & out) const {
+       const char * stop = in + size; // will word even if size -1
+       while (in != stop) {
+         if (*in == 0) {
+           if (size == -1) break;
+           out.append(0);
+           ++in;
+         } else {
+           NormLookupRet<E,const char> ret = norm_lookup<E>(data, in, stop, 0, in);
+           for (unsigned i = 0; ret.to[i] && i < E::max_to; ++i)
+             out.append(ret.to[i]);
+           in = ret.last + 1;
+         }
+       }
+     }
+     PosibErr<void> decode_ec(const char * in, int size, 
+                              FilterCharVector & out, ParmStr) const {
+       DecodeNormLookup::decode(in, size, out);
+       return no_err;
+     }
+   };
+ 
+   struct EncodeLookup : public Encode 
+   {
+     FromUniLookup lookup;
+     PosibErr<void> init(ParmStr code, const Config & c) 
+       {ToUniLookup unused;
+       return read_in_char_data(c, code, unused, lookup);}
+     void encode(const FilterChar * in, const FilterChar * stop, 
+                 CharVector & out) const {
+       for (; in != stop; ++in) {
+         out.append(lookup(*in));
+       }
+     }
+     PosibErr<void> encode_ec(const FilterChar * in, const FilterChar * stop, 
+                              CharVector & out, ParmStr orig) const {
+       for (; in != stop; ++in) {
+         char c = lookup(*in, '\0');
+         if (c == '\0' && in->chr != 0) {
+           char m[70];
+           snprintf(m, 70, _("The Unicode code point U+%04X is unsupported."), in->chr);
+           return make_err(invalid_string, orig, m);
+         }
+         out.append(c);
+       }
+       return no_err;
+     }
+     bool encode(FilterChar * & in0, FilterChar * & stop,
+                 FilterCharVector & out) const {
+       FilterChar * in = in0;
+       for (; in != stop; ++in)
+         *in = lookup(*in);
+       return true;
+     }
+   };
+ 
+   struct EncodeNormLookup : public Encode 
+   {
+     typedef FromUniNormEntry E;
+     NormTable<E> * data;
+     EncodeNormLookup(NormTable<E> * d) : data(d) {}
+     // *stop must equal 0
+     void encode(const FilterChar * in, const FilterChar * stop, 
+                 CharVector & out) const {
+       while (in < stop) {
+         if (*in == 0) {
+           out.append('\0');
+           ++in;
+         } else {
+           NormLookupRet<E,const FilterChar> ret = norm_lookup<E>(data, in, stop, (const byte *)"?", in);
+           for (unsigned i = 0; i < E::max_to && ret.to[i]; ++i)
+             out.append(ret.to[i]);
+           in = ret.last + 1;
+         }
+       }
+     }
+     PosibErr<void> encode_ec(const FilterChar * in, const FilterChar * stop, 
+                              CharVector & out, ParmStr orig) const {
+       while (in < stop) {
+         if (*in == 0) {
+           out.append('\0');
+           ++in;
+         } else {
+           NormLookupRet<E,const FilterChar> ret = norm_lookup<E>(data, in, stop, 0, in);
+           if (ret.to == 0) {
+             char m[70];
+             snprintf(m, 70, _("The Unicode code point U+%04X is unsupported."), in->chr);
+             return make_err(invalid_string, orig, m);
+           }
+           for (unsigned i = 0; i < E::max_to && ret.to[i]; ++i)
+             out.append(ret.to[i]);
+           in = ret.last + 1;
+         }
+       }
+       return no_err;
+     }
+     bool encode(FilterChar * & in, FilterChar * & stop,
+                 FilterCharVector & buf) const {
+       buf.clear();
+       while (in < stop) {
+         if (*in == 0) {
+           buf.append(FilterChar(0));
+           ++in;
+         } else {
+           NormLookupRet<E,FilterChar> ret = norm_lookup<E>(data, in, stop, (const byte *)"?", in);
+           const FilterChar * end = ret.last + 1;
+           unsigned width = 0;
+           for (; in != end; ++in) width += in->width;
+           buf.append(FilterChar(ret.to[0], width));
+           for (unsigned i = 1; i < E::max_to && ret.to[i]; ++i) {
+             buf.append(FilterChar(ret.to[i],0));
+           }
+         }
+       }
+       buf.append(0);
+       in = buf.pbegin();
+       stop = buf.pend();
+       return true;
+     }
+   };
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   //  UTF8
+   //
+   
+ #define get_check_next \
+   if (in == stop) goto error;          \
+   c = *in;                             \
+   if ((c & 0xC0) != 0x80) goto error;  \
+   ++in;                                \
+   u <<= 6;                             \
+   u |= c & 0x3F;                       \
+   ++w;
+ 
+   static inline FilterChar from_utf8 (const char * & in, const char * stop, 
+                                       Uni32 err_char = '?')
+   {
+     Uni32 u = (Uni32)(-1);
+     FilterChar::Width w = 1;
+ 
+     // the first char is guaranteed not to be off the end
+     char c = *in;
+     ++in;
+ 
+     while (in != stop && (c & 0xC0) == 0x80) {c = *in; ++in; ++w;}
+     if ((c & 0x80) == 0x00) { // 1-byte wide
+       u = c;
+     } else if ((c & 0xE0) == 0xC0) { // 2-byte wide
+       u  = c & 0x1F;
+       get_check_next;
+     } else if ((c & 0xF0) == 0xE0) { // 3-byte wide
+       u  = c & 0x0F;
+       get_check_next;
+       get_check_next;
+     } else if ((c & 0xF8) == 0xF0) { // 4-byte wide
+       u  = c & 0x07;
+       get_check_next;
+       get_check_next;
+       get_check_next;
+     } else {
+       goto error;
+     }
+ 
+     return FilterChar(u, w);
+   error:
+     return FilterChar(err_char, w);
+   }
+ 
+   static inline void to_utf8 (FilterChar in, CharVector & out)
+   {
+     FilterChar::Chr c = in;
+     
+     if (c < 0x80) {
+       out.append(c);
+     }
+     else if (c < 0x800) {
+       out.append(0xC0 | (c>>6));
+       out.append(0x80 | (c & 0x3F));
+     }
+     else if (c < 0x10000) {
+       out.append(0xE0 | (c>>12));
+       out.append(0x80 | (c>>6 & 0x3F));
+       out.append(0x80 | (c & 0x3F));
+     }
+     else if (c < 0x200000) {
+       out.append(0xF0 | (c>>18));
+       out.append(0x80 | (c>>12 & 0x3F));
+       out.append(0x80 | (c>>6 & 0x3F));
+       out.append(0x80 | (c & 0x3F));
+     }
+   }
+   
+   struct DecodeUtf8 : public Decode 
+   {
+     ToUniLookup lookup;
+     void decode(const char * in, int size, FilterCharVector & out) const {
+       const char * stop = in + size; // this is OK even if size == -1
+       while (in != stop && *in) {
+         out.append(from_utf8(in, stop));
+       }
+     }
+     PosibErr<void> decode_ec(const char * in, int size, 
+                              FilterCharVector & out, ParmStr orig) const {
+       const char * begin = in;
+       const char * stop = in + size; // this is OK even if size == -1
+       while (in != stop && *in) {
+         FilterChar c = from_utf8(in, stop, (Uni32)-1);
+         if (c == (Uni32)-1) {
+           char m[70];
+           snprintf(m, 70, _("Invalid UTF-8 sequence at position %ld."), (long)(in - begin));
+           return make_err(invalid_string, orig, m);
+         }
+         out.append(c);
+       }
+       return no_err;
+     }
+   };
+ 
+   struct EncodeUtf8 : public Encode 
+   {
+     FromUniLookup lookup;
+     void encode(const FilterChar * in, const FilterChar * stop, 
+                 CharVector & out) const {
+       for (; in != stop; ++in) {
+         to_utf8(*in, out);
+       }
+     }
+     PosibErr<void> encode_ec(const FilterChar * in, const FilterChar * stop, 
+                              CharVector & out, ParmStr) const {
+       for (; in != stop; ++in) {
+         to_utf8(*in, out);
+       }
+       return no_err;
+     }
+   };
+ 
+   //////////////////////////////////////////////////////////////////////
+   //
+   // Cache
+   //
+ 
+   static GlobalCache<Decode> decode_cache("decode");
+   static GlobalCache<Encode> encode_cache("encode");
+   static GlobalCache<NormTables> norm_tables_cache("norm_tables");
+   
+   //////////////////////////////////////////////////////////////////////
+   //
+   // new_aspell_convert
+   //
+ 
+   void Convert::generic_convert(const char * in, int size, CharVector & out)
+   {
+     buf_.clear();
+     decode_->decode(in, size, buf_);
+     FilterChar * start = buf_.pbegin();
+     FilterChar * stop = buf_.pend();
+     if (!filter.empty())
+       filter.process(start, stop);
+     encode_->encode(start, stop, out);
+   }
+ 
+   const char * fix_encoding_str(ParmStr enc, String & buf)
+   {
+     buf.clear();
+     buf.reserve(enc.size() + 1);
+     for (size_t i = 0; i != enc.size(); ++i)
+       buf.push_back(asc_tolower(enc[i]));
+ 
+     if (strncmp(buf.c_str(), "iso8859", 7) == 0)
+       buf.insert(buf.begin() + 3, '-'); // For backwards compatibility
+     
+     if (buf == "ascii" || buf == "ansi_x3.4-1968")
+       return "iso-8859-1";
+     else if (buf == "machine unsigned 16" || buf == "utf-16")
+       return "ucs-2";
+     else if (buf == "machine unsigned 32" || buf == "utf-32")
+       return "ucs-4";
+     else
+       return buf.c_str();
+   }
+ 
+   bool ascii_encoding(const Config & c, ParmStr enc0)
+   {
+     if (enc0.empty()) return true;
+     if (enc0 == "ANSI_X3.4-1968" 
+         || enc0 == "ASCII" || enc0 == "ascii") return true;
+     String buf;
+     const char * enc = fix_encoding_str(enc0, buf);
+     if (strcmp(enc, "utf-8") == 0 
+         || strcmp(enc, "ucs-2") == 0 
+         || strcmp(enc, "ucs-4") == 0) return false;
+     String dir1,dir2,file_name;
+     fill_data_dir(&c, dir1, dir2);
+     file_name << dir1 << enc << ".cset";
+     if (file_exists(file_name)) return false;
+     if (dir1 == dir2) return true;
+     file_name.clear();
+     file_name << dir2 << enc << ".cset";
+     return !file_exists(file_name);
+   }
+ 
+   PosibErr<Convert *> internal_new_convert(const Config & c,
+                                            ParmString in, 
+                                            ParmString out,
+                                            bool if_needed,
+                                            Normalize norm)
+   {
+     String in_s;
+     in = fix_encoding_str(in, in_s);
+ 
+     String out_s;
+     out = fix_encoding_str(out, out_s); 
+ 
+     if (if_needed && in == out) return 0;
+ 
+     StackPtr<Convert> conv(new Convert);
+     switch (norm) {
+     case NormNone:
+       RET_ON_ERR(conv->init(c, in, out)); break;
+     case NormFrom:
+       RET_ON_ERR(conv->init_norm_from(c, in, out)); break;
+     case NormTo:
+       RET_ON_ERR(conv->init_norm_to(c, in, out)); break;
+     }
+     return conv.release();
+   }
+ 
+   PosibErr<Decode *> Decode::get_new(const String & key, const Config * c)
+   {
+     StackPtr<Decode> ptr;
+     if (key == "iso-8859-1")
+       ptr.reset(new DecodeDirect<Uni8>);
+     else if (key == "ucs-2")
+       ptr.reset(new DecodeDirect<Uni16>);
+     else if (key == "ucs-4")
+       ptr.reset(new DecodeDirect<Uni32>);
+     else if (key == "utf-8")
+       ptr.reset(new DecodeUtf8);
+     else
+       ptr.reset(new DecodeLookup);
+     RET_ON_ERR(ptr->init(key, *c));
+     ptr->key = key;
+     return ptr.release();
+   }
+ 
+   PosibErr<Encode *> Encode::get_new(const String & key, const Config * c)
+   {
+     StackPtr<Encode> ptr;
+     if (key == "iso-8859-1")
+       ptr.reset(new EncodeDirect<Uni8>);
+     else if (key == "ucs-2")
+       ptr.reset(new EncodeDirect<Uni16>);
+     else if (key == "ucs-4")
+       ptr.reset(new EncodeDirect<Uni32>);
+     else if (key == "utf-8")
+       ptr.reset(new EncodeUtf8);
+     else
+       ptr.reset(new EncodeLookup);
+     RET_ON_ERR(ptr->init(key, *c));
+     ptr->key = key;
+     return ptr.release();
+   }
+ 
+   Convert::~Convert() {}
+ 
+   PosibErr<void> Convert::init(const Config & c, ParmStr in, ParmStr out)
+   {
+     RET_ON_ERR(setup(decode_c, &decode_cache, &c, in));
+     decode_ = decode_c.get();
+     RET_ON_ERR(setup(encode_c, &encode_cache, &c, out));
+     encode_ = encode_c.get();
+ 
+     conv_ = 0;
+     if (in == out) {
+       if (in == "ucs-2") {
+         conv_ = new ConvDirect<Uni16>;
+       } else if (in == "ucs-4") {
+         conv_ = new ConvDirect<Uni32>;
+       } else {
+         conv_ = new ConvDirect<char>;
+       }
+     }
+ 
+     if (conv_)
+       RET_ON_ERR(conv_->init(decode_, encode_, c));
+ 
+     return no_err;
+   }
+ 
+   
+   PosibErr<void> Convert::init_norm_from(const Config & c, ParmStr in, ParmStr out)
+   {
+     if (!c.retrieve_bool("normalize") && !c.retrieve_bool("norm-required")) 
+       return init(c,in,out);
+ 
+     RET_ON_ERR(setup(norm_tables_, &norm_tables_cache, &c, out));
+ 
+     RET_ON_ERR(setup(decode_c, &decode_cache, &c, in));
+     decode_ = decode_c.get();
+ 
+     if (c.retrieve_bool("norm-strict")) {
+       encode_s = new EncodeNormLookup(norm_tables_->strict);
+       encode_ = encode_s;
+       encode_->key = out;
+       encode_->key += ":strict";
+     } else {
+       encode_s = new EncodeNormLookup(norm_tables_->internal);
+       encode_ = encode_s;
+       encode_->key = out;
+       encode_->key += ":internal";
+     }
+     conv_ = 0;
+ 
+     return no_err;
+   }
+ 
+   PosibErr<void> Convert::init_norm_to(const Config & c, ParmStr in, ParmStr out)
+   {
+     String norm_form = c.retrieve("norm-form");
+     if ((!c.retrieve_bool("normalize") || norm_form == "none")
+         && !c.retrieve_bool("norm-required"))
+       return init(c,in,out);
+     if (norm_form == "none" && c.retrieve_bool("norm-required"))
+       norm_form = "nfc";
+ 
+     RET_ON_ERR(setup(norm_tables_, &norm_tables_cache, &c, in));
+ 
+     RET_ON_ERR(setup(encode_c, &encode_cache, &c, out));
+     encode_ = encode_c.get();
+ 
+     NormTables::ToUni::const_iterator i = norm_tables_->to_uni.begin();
+     for (; i != norm_tables_->to_uni.end() && i->name != norm_form; ++i);
+     if (i == norm_tables_->to_uni.end())
+       return make_err(aerror_bad_value, "norm-form", norm_form, "one of none, nfd, nfc, or comp");
+ 
+     decode_s = new DecodeNormLookup(i->ptr);
+     decode_ = decode_s;
+     decode_->key = in;
+     decode_->key += ':';
+     decode_->key += i->name;
+ 
+     conv_ = 0;
+ 
+     return no_err;
+   }
+ 
+   PosibErr<void> MBLen::setup(const Config &, ParmStr enc0)
+   {
+     String buf;
+     const char * enc = fix_encoding_str(enc0,buf);
+     if      (strcmp(enc, "utf-8") == 0) encoding = UTF8;
+     else if (strcmp(enc, "ucs-2") == 0) encoding = UCS2;
+     else if (strcmp(enc, "ucs-4") == 0) encoding = UCS4;
+     else                                encoding = Other;
+     return no_err;
+   }
+ 
+   unsigned MBLen::operator()(const char * str, const char * stop)
+   {
+     unsigned size = 0;
+     switch (encoding) {
+     case Other: 
+       return stop - str;
+     case UTF8:
+       for (; str != stop; ++str) {
+         if ((*str & 0x80) == 0 || (*str & 0xC0) == 0xC0) ++size;
+       }
+       return size;
+     case UCS2:
+       return (stop - str)/2;
+     case UCS4:
+       return (stop - str)/4;
+     }
+     return 0;
+   }
+-  
++
++  PosibErr<void> unsupported_null_term_wide_string_err_(const char * func) {
++    static bool reported_to_stderr = false;
++    PosibErr<void> err = make_err(other_error, unsupported_null_term_wide_string_msg);
++    if (!reported_to_stderr) {
++      CERR.printf("ERROR: %s: %s\n", func, unsupported_null_term_wide_string_msg);
++      reported_to_stderr = true;
++    }
++    return err;
++  }
++
++  void unsupported_null_term_wide_string_abort_(const char * func) {
++    CERR.printf("%s: %s\n", unsupported_null_term_wide_string_msg);
++    abort();
++  }
++ 
+ }
+diff --git a/common/convert.hpp b/common/convert.hpp
+index 76332ee..c948973 100644
+--- a/common/convert.hpp
++++ b/common/convert.hpp
+@@ -1,17 +1,19 @@
+ // This file is part of The New Aspell
+ // Copyright (C) 2001 by Kevin Atkinson under the GNU LGPL license
+ // version 2.0 or 2.1.  You should have received a copy of the LGPL
+ // license along with this library if you did not you can find
+ // it at http://www.gnu.org/.
+ 
+ #ifndef ASPELL_CONVERT__HPP
+ #define ASPELL_CONVERT__HPP
+ 
++#include "settings.h"
++
+ #include "string.hpp"
+ #include "posib_err.hpp"
+ #include "char_vector.hpp"
+ #include "filter_char.hpp"
+ #include "filter_char_vector.hpp"
+ #include "stack_ptr.hpp"
+ #include "filter.hpp"
+ #include "cache.hpp"
+@@ -19,399 +21,433 @@
+ namespace acommon {
+ 
+   class OStream;
+   class Config;
+ 
+   struct ConvBase : public Cacheable {
+     typedef const Config CacheConfig;
+     typedef const char * CacheKey;
+     String key;
++    int type_width; // type width in bytes
+     bool cache_key_eq(const char * l) const  {return key == l;}
+-    ConvBase() {}
++    ConvBase() : type_width(1) {}
+   private:
+     ConvBase(const ConvBase &);
+     void operator=(const ConvBase &);
+   };
+ 
+   struct Decode : public ConvBase {
+     virtual PosibErr<void> init(ParmStr code, const Config &) {return no_err;}
+     virtual void decode(const char * in, int size,
+ 			FilterCharVector & out) const = 0;
+     virtual PosibErr<void> decode_ec(const char * in, int size,
+                                      FilterCharVector & out, ParmStr orig) const = 0;
+     static PosibErr<Decode *> get_new(const String &, const Config *);
+     virtual ~Decode() {}
+   };
+   struct Encode : public ConvBase {
+     // null characters should be treated like any other character
+     // by the encoder.
+     virtual PosibErr<void> init(ParmStr, const Config &) {return no_err;}
+     virtual void encode(const FilterChar * in, const FilterChar * stop, 
+                         CharVector & out) const = 0;
+     virtual PosibErr<void> encode_ec(const FilterChar * in, const FilterChar * stop, 
+                                      CharVector & out, ParmStr orig) const = 0;
+     // may convert inplace
+     virtual bool encode(FilterChar * & in, FilterChar * & stop, 
+                         FilterCharVector & buf) const {return false;}
+     static PosibErr<Encode *> get_new(const String &, const Config *);
+     virtual ~Encode() {}
+   };
+   struct DirectConv { // convert directly from in_code to out_code.
++    int type_width; // type width in bytes
++    DirectConv() : type_width(1) {}
+     // should not take ownership of decode and encode.
+     // decode and encode guaranteed to stick around for the life
+     // of the object.
+     virtual PosibErr<void> init(const Decode *, const Encode *, 
+ 				const Config &) {return no_err;}
+     virtual void convert(const char * in, int size, 
+ 			 CharVector & out) const = 0;
+     virtual PosibErr<void> convert_ec(const char * in, int size, 
+                                       CharVector & out, ParmStr orig) const = 0;
+     virtual ~DirectConv() {}
+   };
+   template <class T> struct NormTable;
+   struct FromUniNormEntry;
+   struct ToUniNormEntry;
+   struct NormTables : public Cacheable {
+     typedef const Config CacheConfig;
+     typedef const char * CacheKey;
+     String key;
+     bool cache_key_eq(const char * l) const  {return key == l;}
+     static PosibErr<NormTables *> get_new(const String &, const Config *);
+     NormTable<FromUniNormEntry> * internal;
+     NormTable<FromUniNormEntry> * strict_d;
+     NormTable<FromUniNormEntry> * strict;
+     struct ToUniTable {
+       String name;
+       NormTable<ToUniNormEntry> * data;
+       NormTable<ToUniNormEntry> * ptr;
+       ToUniTable() : data(), ptr() {}
+     };
+     typedef Vector<ToUniTable> ToUni;
+     Vector<ToUniTable> to_uni;
+     ~NormTables();
+   };
+ 
+   typedef FilterCharVector ConvertBuffer;
+ 
+   class Convert {
+   private:
+     CachePtr<Decode> decode_c;
+     StackPtr<Decode> decode_s;
+     Decode * decode_;
+     CachePtr<Encode> encode_c;
+     StackPtr<Encode> encode_s;
+     Encode * encode_;
+     CachePtr<NormTables> norm_tables_;
+     StackPtr<DirectConv> conv_;
+ 
+     ConvertBuffer buf_;
+ 
+     static const unsigned int null_len_ = 4; // POSIB FIXME: Be more precise
+ 
+     Convert(const Convert &);
+     void operator=(const Convert &);
+ 
+   public:
+     Convert() {}
+     ~Convert();
+ 
+     // This filter is used when the convert method is called.  It must
+     // be set up by an external entity as this class does not set up
+     // this class in any way.
+     Filter filter;
+ 
+     PosibErr<void> init(const Config &, ParmStr in, ParmStr out);
+     PosibErr<void> init_norm_to(const Config &, ParmStr in, ParmStr out);
+     PosibErr<void> init_norm_from(const Config &, ParmStr in, ParmStr out);
+     
+     const char * in_code() const   {return decode_->key.c_str();}
+     const char * out_code() const  {return encode_->key.c_str();}
+ 
++    int in_type_width() const {return decode_->type_width;}
++    int out_type_width() const {return encode_->type_width;}
++
+     void append_null(CharVector & out) const
+     {
+       const char nul[4] = {0,0,0,0}; // 4 should be enough
+       out.write(nul, null_len_);
+     }
+ 
+     unsigned int null_len() const {return null_len_;}
+   
+     // this filters will generally not translate null characters
+     // if you need a null character at the end, add it yourself
+     // with append_null
+ 
+     void decode(const char * in, int size, FilterCharVector & out) const 
+       {decode_->decode(in,size,out);}
+     
+     void encode(const FilterChar * in, const FilterChar * stop, 
+ 		CharVector & out) const
+       {encode_->encode(in,stop,out);}
+ 
+     bool encode(FilterChar * & in, FilterChar * & stop, 
+                 FilterCharVector & buf) const
+       {return encode_->encode(in,stop,buf);}
+ 
+     // does NOT pass it through filters
+     // DOES NOT use an internal state
+     void convert(const char * in, int size, CharVector & out, ConvertBuffer & buf) const
+     {
+       if (conv_) {
+ 	conv_->convert(in,size,out);
+       } else {
+         buf.clear();
+         decode_->decode(in, size, buf);
+         encode_->encode(buf.pbegin(), buf.pend(), out);
+       }
+     }
+ 
+     // does NOT pass it through filters
+     // DOES NOT use an internal state
+     PosibErr<void> convert_ec(const char * in, int size, CharVector & out, 
+                               ConvertBuffer & buf, ParmStr orig) const
+     {
+       if (conv_) {
+ 	RET_ON_ERR(conv_->convert_ec(in,size,out, orig));
+       } else {
+         buf.clear();
+         RET_ON_ERR(decode_->decode_ec(in, size, buf, orig));
+        RET_ON_ERR(encode_->encode_ec(buf.pbegin(), buf.pend(), 
+                                       out, orig));
+       }
+       return no_err;
+     }
+ 
+ 
+     // convert has the potential to use internal buffers and
+     // is therefore not const.  It is also not thread safe
+     // and I have no intention to make it thus.
+ 
+     void convert(const char * in, int size, CharVector & out) {
+       if (filter.empty()) {
+         convert(in,size,out,buf_);
+       } else {
+         generic_convert(in,size,out);
+       }
+     }
+ 
++    void convert(const void * in, int size, CharVector & out) {
++      convert(static_cast<const char *>(in), size, out);
++    }
++
+     void generic_convert(const char * in, int size, CharVector & out);
+     
+   };
+ 
+   bool operator== (const Convert & rhs, const Convert & lhs);
+ 
+   const char * fix_encoding_str(ParmStr enc, String & buf);
+ 
+   // also returns true if the encoding is unknown
+   bool ascii_encoding(const Config & c, ParmStr enc0);
+ 
+   enum Normalize {NormNone, NormFrom, NormTo};
+ 
+   PosibErr<Convert *> internal_new_convert(const Config & c, 
+                                            ParmString in, ParmString out,
+                                            bool if_needed,
+                                            Normalize n);
+   
+   static inline PosibErr<Convert *> new_convert(const Config & c,
+                                                 ParmStr in, ParmStr out,
+                                                 Normalize n)
+   {
+     return internal_new_convert(c,in,out,false,n);
+   }
+   
+   static inline PosibErr<Convert *> new_convert_if_needed(const Config & c,
+                                                           ParmStr in, ParmStr out,
+                                                           Normalize n)
+   {
+     return internal_new_convert(c,in,out,true,n);
+   }
+ 
+   struct ConvObj {
+     Convert * ptr;
+     ConvObj(Convert * c = 0) : ptr(c) {}
+     ~ConvObj() {delete ptr;}
+     PosibErr<void> setup(const Config & c, ParmStr from, ParmStr to, Normalize norm)
+     {
+       delete ptr;
+       ptr = 0;
+       PosibErr<Convert *> pe = new_convert_if_needed(c, from, to, norm);
+       if (pe.has_err()) return pe;
+       ptr = pe.data;
+       return no_err;
+     }
+     operator const Convert * () const {return ptr;}
+   private:
+     ConvObj(const ConvObj &);
+     void operator=(const ConvObj &);
+   };
+ 
+   struct ConvP {
+     const Convert * conv;
+     ConvertBuffer buf0;
+     CharVector buf;
+     operator bool() const {return conv;}
+     ConvP(const Convert * c = 0) : conv(c) {}
+     ConvP(const ConvObj & c) : conv(c.ptr) {}
+     ConvP(const ConvP & c) : conv(c.conv) {}
+     void operator=(const ConvP & c) { conv = c.conv; }
+     PosibErr<void> setup(const Config & c, ParmStr from, ParmStr to, 
+                          Normalize norm)
+     {
+       delete conv;
+       conv = 0;
+       PosibErr<Convert *> pe = new_convert_if_needed(c, from, to, norm);
+       if (pe.has_err()) return pe;
+       conv = pe.data;
+       return no_err;
+     }
+     char * operator() (char * str, size_t sz)
+     {
+       if (conv) {
+         buf.clear();
+         conv->convert(str, sz, buf, buf0);
+         return buf.mstr();
+       } else {
+         return str;
+       }
+     }
+     const char * operator() (const char * str, size_t sz)
+     {
+       if (conv) {
+         buf.clear();
+         conv->convert(str, sz, buf, buf0);
+         return buf.str();
+       } else {
+         return str;
+       }
+     }
+     char * operator() (MutableString str)
+     {
+       return operator()(str.str, str.size);
+     }
+     char * operator() (char * str)
+     {
+       if (conv) {
+         buf.clear();
+         conv->convert(str, -1, buf, buf0);
+         return buf.mstr();
+       } else {
+         return str;
+       }
+     }
+     const char * operator() (ParmStr str)
+     {
+       if (conv) {
+         buf.clear();
+         conv->convert(str, -1, buf, buf0);
+         return buf.mstr();
+       } else {
+         return str;
+       }
+     }
+     char * operator() (char c)
+     {
+       buf.clear();
+       if (conv) {
+         char str[2] = {c, 0};
+         conv->convert(str, 1, buf, buf0);
+       } else {
+         buf.append(c);
+       }
+       return buf.mstr();
+     }
+   };
+ 
+   struct Conv : public ConvP
+   {
+     ConvObj conv_obj;
+     Conv(Convert * c = 0) : ConvP(c), conv_obj(c) {}
+     PosibErr<void> setup(const Config & c, ParmStr from, ParmStr to, Normalize norm)
+     {
+       RET_ON_ERR(conv_obj.setup(c,from,to,norm));
+       conv = conv_obj.ptr;
+       return no_err;
+     }
+   };
+ 
+   struct ConvECP {
+     const Convert * conv;
+     ConvertBuffer buf0;
+     CharVector buf;
+     operator bool() const {return conv;}
+     ConvECP(const Convert * c = 0) : conv(c) {}
+     ConvECP(const ConvObj & c) : conv(c.ptr) {}
+     ConvECP(const ConvECP & c) : conv(c.conv) {}
+     void operator=(const ConvECP & c) { conv = c.conv; }
+     PosibErr<void> setup(const Config & c, ParmStr from, ParmStr to, Normalize norm)
+     {
+       delete conv;
+       conv = 0;
+       PosibErr<Convert *> pe = new_convert_if_needed(c, from, to, norm);
+       if (pe.has_err()) return pe;
+       conv = pe.data;
+       return no_err;
+     }
+     PosibErr<char *> operator() (char * str, size_t sz)
+     {
+       if (conv) {
+         buf.clear();
+         RET_ON_ERR(conv->convert_ec(str, sz, buf, buf0, str));
+         return buf.mstr();
+       } else {
+         return str;
+       }
+     }
+     PosibErr<char *> operator() (MutableString str)
+     {
+       return operator()(str.str, str.size);
+     }
+     PosibErr<char *> operator() (char * str)
+     {
+       if (conv) {
+         buf.clear();
+         RET_ON_ERR(conv->convert_ec(str, -1, buf, buf0, str));
+         return buf.mstr();
+       } else {
+         return str;
+       }
+     }
+ 
+     PosibErr<const char *> operator() (ParmStr str)
+     {
+       if (conv) {
+         buf.clear();
+         RET_ON_ERR(conv->convert_ec(str, -1, buf, buf0, str));
+         return buf.mstr();
+       } else {
+         return str.str();
+       }
+     }
+     PosibErr<const char *> operator() (char c)
+     {
+       char buf2[2] = {c, 0};
+       return operator()(ParmString(buf2,1));
+     }
+   };
+ 
+   struct ConvEC : public ConvECP
+   {
+     ConvObj conv_obj;
+     ConvEC(Convert * c = 0) : ConvECP(c), conv_obj(c) {}
+     PosibErr<void> setup(const Config & c, ParmStr from, ParmStr to, Normalize norm)
+     {
+       RET_ON_ERR(conv_obj.setup(c,from,to,norm));
+       conv = conv_obj.ptr;
+       return no_err;
+     }
+   };
+ 
+   struct MBLen 
+   {
+     enum Encoding {Other, UTF8, UCS2, UCS4} encoding;
+     MBLen() : encoding(Other) {}
+     PosibErr<void> setup(const Config &, ParmStr enc);
+     unsigned operator()(const char * str, const char * stop);
+     unsigned operator()(const char * str, unsigned byte_size) {
+       return operator()(str, str + byte_size);}
+   };
+ 
++#ifdef SLOPPY_NULL_TERM_STRINGS
++  static const bool sloppy_null_term_strings = true;
++#else
++  static const bool sloppy_null_term_strings = false;
++#endif
++  
++  PosibErr<void> unsupported_null_term_wide_string_err_(const char * func);
++  void unsupported_null_term_wide_string_abort_(const char * func);
++    
++  static inline PosibErr<int> get_correct_size(const char * func, int conv_type_width, int size) {
++    if (sloppy_null_term_strings && size <= -1)
++      return -conv_type_width;
++    if (size <= -1 && -conv_type_width != size)
++      return unsupported_null_term_wide_string_err_(func);
++    return size;
++  }
++  static inline int get_correct_size(const char * func, int conv_type_width, int size, int type_width) {
++    if ((sloppy_null_term_strings || type_width <= -1) && size <= -1)
++      return -conv_type_width;
++    if (size <= -1 && conv_type_width != type_width)
++      unsupported_null_term_wide_string_abort_(func);
++    return size;
++  }
++
+ }
+ 
+ #endif
+diff --git a/common/document_checker.cpp b/common/document_checker.cpp
+index 5e510c4..0ccf1cd 100644
+--- a/common/document_checker.cpp
++++ b/common/document_checker.cpp
+@@ -13,65 +13,80 @@
+ namespace acommon {
+ 
+   DocumentChecker::DocumentChecker() 
+     : status_fun_(0), speller_(0) {}
+   DocumentChecker::~DocumentChecker() 
+   {
+   }
+ 
+   PosibErr<void> DocumentChecker
+   ::setup(Tokenizer * tokenizer, Speller * speller, Filter * filter)
+   {
+     tokenizer_.reset(tokenizer);
+     filter_.reset(filter);
+     speller_ = speller;
+     conv_ = speller->to_internal_;
+     return no_err;
+   }
+ 
+   void DocumentChecker::set_status_fun(void (* sf)(void *, Token, int), 
+ 				       void * d)
+   {
+     status_fun_ = sf;
+     status_fun_data_ = d;
+   }
+ 
+   void DocumentChecker::reset()
+   {
+     if (filter_)
+       filter_->reset();
+   }
+ 
+   void DocumentChecker::process(const char * str, int size)
+   {
+     proc_str_.clear();
+-    conv_->decode(str, size, proc_str_);
++    PosibErr<int> fixed_size = get_correct_size("aspell_document_checker_process", conv_->in_type_width(), size);
++    if (!fixed_size.has_err())
++      conv_->decode(str, fixed_size, proc_str_);
+     proc_str_.append(0);
+     FilterChar * begin = proc_str_.pbegin();
+     FilterChar * end   = proc_str_.pend() - 1;
+     if (filter_)
+       filter_->process(begin, end);
+     tokenizer_->reset(begin, end);
+   }
+ 
++  void DocumentChecker::process_wide(const void * str, int size, int type_width)
++  {
++    proc_str_.clear();
++    int fixed_size = get_correct_size("aspell_document_checker_process", conv_->in_type_width(), size, type_width);
++    conv_->decode(static_cast<const char *>(str), fixed_size, proc_str_);
++    proc_str_.append(0);
++    FilterChar * begin = proc_str_.pbegin();
++    FilterChar * end   = proc_str_.pend() - 1;
++    if (filter_)
++      filter_->process(begin, end);
++    tokenizer_->reset(begin, end);
++  }
++  
+   Token DocumentChecker::next_misspelling()
+   {
+     bool correct;
+     Token tok;
+     do {
+       if (!tokenizer_->advance()) {
+ 	tok.offset = proc_str_.size();
+ 	tok.len = 0;
+ 	return tok;
+       }
+       correct = speller_->check(MutableString(tokenizer_->word.data(),
+ 					      tokenizer_->word.size() - 1));
+       tok.len  = tokenizer_->end_pos - tokenizer_->begin_pos;
+       tok.offset = tokenizer_->begin_pos;
+       if (status_fun_)
+ 	(*status_fun_)(status_fun_data_, tok, correct);
+     } while (correct);
+     return tok;
+   }
+ 
+ }
+ 
+diff --git a/common/document_checker.hpp b/common/document_checker.hpp
+index d35bb88..11a3c73 100644
+--- a/common/document_checker.hpp
++++ b/common/document_checker.hpp
+@@ -17,46 +17,47 @@
+ namespace acommon {
+ 
+   class Config;
+   class Speller;
+   class Tokenizer;
+   class Convert;
+ 
+   struct Token {
+     unsigned int offset;
+     unsigned int len;
+     operator bool () const {return len != 0;}
+   };
+   
+   
+   class DocumentChecker : public CanHaveError {
+   public:
+     // will take ownership of tokenizer and filter (even if there is an error)
+     // config only used for this method.
+     // speller expected to stick around.
+     PosibErr<void> setup(Tokenizer *, Speller *, Filter *);
+     void reset();
+     void process(const char * str, int size);
++    void process_wide(const void * str, int size, int type_width);
+     Token next_misspelling();
+     
+     Filter * filter() {return filter_;}
+ 
+     void set_status_fun(void (*)(void *, Token, int), void *); 
+    
+     DocumentChecker();
+     ~DocumentChecker();
+     
+   private:
+     CopyPtr<Filter> filter_;
+     CopyPtr<Tokenizer> tokenizer_;
+     void (* status_fun_)(void *, Token, int);
+     void * status_fun_data_;
+     Speller * speller_;
+     Convert * conv_;
+     FilterCharVector proc_str_;
+   };
+ 
+   PosibErr<DocumentChecker *> new_document_checker(Speller *);
+ 
+ }
+ 
+ #endif /* ASPELL_DOCUMENT_CHECKER__HPP */
+diff --git a/common/version.cpp b/common/version.cpp
+index 414d938..9e60b75 100644
+--- a/common/version.cpp
++++ b/common/version.cpp
+@@ -1,8 +1,17 @@
+ #include "settings.h"
+ 
+-extern "C" const char * aspell_version_string() {
+ #ifdef NDEBUG
+-  return VERSION " NDEBUG";
++#  define NDEBUG_STR " NDEBUG"
++#else
++#  define NDEBUG_STR
++#endif
++
++#ifdef SLOPPY_NULL_TERM_STRINGS
++#  define SLOPPY_STR " SLOPPY"
++#else
++#  define SLOPPY_STR
+ #endif
+-  return VERSION;
++
++extern "C" const char * aspell_version_string() {
++  return VERSION NDEBUG_STR SLOPPY_STR;
+ }
+diff --git a/configure.ac b/configure.ac
+index 9c36ae6..e83afd8 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -73,6 +73,9 @@ AC_ARG_ENABLE(filter-version-control,
+ AC_ARG_ENABLE(32-bit-hash-fun,
+   AS_HELP_STRING([--enable-32-bit-hash-fun],[use 32-bit hash function for compiled dictionaries]))
+ 
++AC_ARG_ENABLE(sloppy-null-term-strings,
++  AS_HELP_STRING([--enable-sloppy-null-term-strings],[allows allow null terminated UCS-2 and UCS-4 strings]))
++
+ AC_ARG_ENABLE(pspell-compatibility,
+   AS_HELP_STRING([--disable-pspell-compatibility],[don't install pspell compatibility libraries]))
+ 
+@@ -141,6 +144,11 @@ then
+   AC_DEFINE(USE_32_BIT_HASH_FUN, 1, [Defined if 32-bit hash function should be used for compiled dictionaries.])
+ fi
+ 
++if test "$enable_sloppy_null_term_strings" = "yes"
++then
++  AC_DEFINE(SLOPPY_NULL_TERM_STRINGS, 1, [Defined if null-terminated UCS-2 and UCS-4 strings should always be allowed.])
++fi
++
+ AM_CONDITIONAL(PSPELL_COMPATIBILITY,  
+   [test "$enable_pspell_compatibility" != "no"])
+ AM_CONDITIONAL(INCREMENTED_SONAME,    
+diff --git a/manual/aspell.texi b/manual/aspell.texi
+index 8d848d4..72796e7 100644
+--- a/manual/aspell.texi
++++ b/manual/aspell.texi
+@@ -157,10 +157,11 @@ Notes on Various Items
+ Installing
+ 
+ * Generic Install Instructions::  
+ * HTML Manuals and "make clean"::  
+-* Curses Notes::                
++* Curses Notes::
++* Upgrading from Aspell 0.60.7::
+ * Loadable Filter Notes::       
+ * Upgrading from Aspell 0.50::  
+ * Upgrading from Aspell .33/Pspell .12::  
+ * Upgrading from a Pre-0.50 snapshot::  
+ * WIN32 Notes::                 
+@@ -2270,20 +2271,28 @@ to see if a word in the document is correct like so:
+ @smallexample
+ int correct = aspell_speller_check(spell_checker, @var{word}, @var{size});
+ @end smallexample
+ 
+ @noindent
+-@var{word} is expected to be a @code{const char *} character
+-string.  If the encoding is set to be @code{ucs-2} or
+-@code{ucs-4} @var{word} is expected to be a cast
+-from either @code{const u16int *} or @code{const u32int *}
+-respectively.  @code{u16int} and @code{u32int} are generally
+-@code{unsigned short} and @code{unsigned int} respectively.
+-@var{size} is the length of the string or @code{-1} if the string
+-is null terminated.  If the string is a cast from @code{const u16int
+-*} or @code{const u32int *} then @code{@i{size}} is the amount of
+-space in bytes the string takes up after being cast to @code{const
+-char *} and not the true size of the string.  @code{sspell_speller_check}
+-will return @code{0} if it is not found and non-zero otherwise.
++@var{word} is expected to be a @code{const char *} character string.
++@var{size} is the length of the string or @code{-1} if the string is
++null terminated.  @code{aspell_speller_check} will return @code{0} if it is not found
++and non-zero otherwise.
++
++If you are using the @code{ucs-2} or @code{ucs-4} encoding then the
++string is expected to be either a 2 or 4 byte wide integer
++(respectively) and the @code{_w} macro vesion should be used:
++
++@smallexample
++int correct = aspell_speller_check_w(spell_checker, @var{word}, @var{size});
++@end smallexample
++
++The macro will cast the string to to the correct type and convert
++@var{size} into bytes for you and then a call the special wide version of the
++function that will make sure the encoding is correct for the type
++passed in.  For compatibility with older versions of Aspell the normal
++non-wide functions can still be used provided that the size of the
++string, in bytes, is also passed in.  Null terminated @code{ucs-2} or
++@code{ucs-4} are no longer supported when using the non-wide functions.
+ 
+ If the word is not correct, then the @code{suggest} method can be used
+ to come up with likely replacements.
+@@ -2302,7 +2311,28 @@ delete_aspell_string_enumeration(elements);
+ 
+ Notice how @code{elements} is deleted but @code{suggestions} is not.
+ The value returned by @code{suggestions} is only valid to the next
+-call to @code{suggest}.  Once a replacement is made the
++call to @code{suggest}.
++
++If you are using the @code{ucs-2} or @code{ucs-4} encoding then, in
++addition to using the @code{_w} macro for the @code{suggest} method, you
++should also use the @code{_w} macro with the @code{next} method which
++will cast the string to the correct type for you.  For example, if you
++are using the @code{ucs-2} encoding and the string is a @code{const
++uint16_t *} then you should use:
++
++@smallexample
++AspellWordList * suggestions = aspell_speller_suggest_w(spell_checker,
++                                                        @var{word}, @var{size});
++AspellStringEnumeration * elements = aspell_word_list_elements(suggestions);
++const uint16_t * word;
++while ( (word = aspell_string_enumeration_next_w(uint16_t, aspell_elements)) != NULL )
++@{
++  // add to suggestion list
++@}
++delete_aspell_string_enumeration(elements);
++@end smallexample
++
++Once a replacement is made the
+ @code{store_repl} method should be used to communicate the replacement
+ pair back to the spell checker (for the reason, @pxref{Notes on
+ Storing Replacement Pairs}).  Its usage is as follows:
+@@ -4338,14 +4368,21 @@ a C++ program.
+ @heading Changes from 0.60.7 to 0.68.8 (???)
+ @itemize @bullet
+ @item
+-When typo analysis is used ensure that possible typos are listed
++Add Markdown filter.
++@item
++When typo analysis is used, ensure that possible typos are listed
+ before other suggestions.  Also fix a bug so that suggestions that split
+ a word using a space or hyphen are not always first.
+ @item
+ Change @code{ultra} suggestion mode to only find words that are within
+ one-edit distance or have the same soundslike.
+ @item
+-Add Markdown filter.
++To prevent a potentially unbounded buffer over-read Aspell no longer
++supports null-terminated UCS-2 and UCS-4 encoded strings with the
++original C API. @xref{Upgrading from Aspell 0.60.7}.
++@item
++Fix a bug in @code{AspellDocumentChecker} that prevented it from
++working with UCS-2 and UCS-4 encoded strings.
+ @item
+ Implement @code{aspell filter} command.
+ @item
+diff --git a/manual/readme.texi b/manual/readme.texi
+index 669ab8e..531721f 100644
+--- a/manual/readme.texi
++++ b/manual/readme.texi
+@@ -14,21 +14,22 @@ functions when necessary.
+ The latest version can always be found at GNU Aspell's home page at
+ @uref{http://aspell.net}.
+ 
+ @menu
+-* Generic Install Instructions::  
+-* HTML Manuals and "make clean"::  
+-* Curses Notes::                
+-* Loadable Filter Notes::       
+-* Using 32-Bit Dictionaries on a 64-Bit System::  
+-* Upgrading from Aspell 0.50::  
+-* Upgrading from Aspell .33/Pspell .12::  
+-* Upgrading from a Pre-0.50 snapshot::  
+-* WIN32 Notes::                 
++* Generic Install Instructions::
++* HTML Manuals and "make clean"::
++* Curses Notes::
++* Upgrading from Aspell 0.60.7::
++* Loadable Filter Notes::
++* Using 32-Bit Dictionaries on a 64-Bit System::
++* Upgrading from Aspell 0.50::
++* Upgrading from Aspell .33/Pspell .12::
++* Upgrading from a Pre-0.50 snapshot::
++* WIN32 Notes::
+ @end menu
+ 
+ @node Generic Install Instructions
+ @appendixsec Generic Install Instructions
+ 
+ @example
+ ./configure && make
+ @end example
+@@ -121,17 +122,62 @@ In addition your system must also support the @code{mblen} function.
+ Although this function was defined in the ISO C89 standard (ANSI
+ X3.159-1989), not all systems have it.
+ 
++@node Upgrading from Aspell 0.60.7
++@appendixsec Upgrading from Aspell 0.60.7
++
++To prevent a potentially unbounded buffer over-read, Aspell no longer
++supports null-terminated UCS-2 and UCS-4 encoded strings with the
++original C API.  Null-termianted 8-bit or UTF-8 encoded strings are
++still supported, as are UCS-2 and UCS-4 encoded strings when the
++length is passed in.
++
++As of Aspell 0.60.8 a function from the original API that expects an
++encoded string as a parameter will return meaningless results (or an
++error code) if string is null terminated and the encoding is set to
++@code{ucs-2} or @code{ucs-4}.  In addition, a single:
++@example
++ERROR: aspell_speller_check: Null-terminated wide-character strings unsupported when used this way.
++@end example
++will be printed to standard error the first time one of those
++functions is called.
++
++Application that use null-terminated UCS-2/4 strings should either (1)
++use the interface intended for working with wide-characters
++(@xref{Through the C API}); or (2) define
++@code{ASPELL_ENCODE_SETTING_SECURE} before including @code{aspell.h}.
++In the latter case is is important that the application explicitly
++sets the encoding to a known value.  Defining
++@code{ASPELL_ENCODE_SETTING_SECURE} and not setting the encoding
++explicitly or allowing user of the application to set the encoding
++could result in an unbounded buffer over-read.
++
++If it is necessary to preserve binary compatibility with older
++versions of Aspell, the easiest thing would be to determine the length
++of the UCS-2/4 string---in bytes---and pass that in.  Due to an
++implemenation detail, existing API functions can be made to work with
++null-terminated UCS-2/4 strings safely by passing in either @code{-2}
++or @code{-4} (corresponding to the width of the character type) as the
++size.  Doing so, however, will cause a buffer over-read for unpatched
++version of Aspell.  To avoid this it will be necessary to parse the
++version string to determine the correct value to use.  However, no
++official support will be provided for the latter method.
++
++If the application can not be recompiled, then Aspell can be configured
++to preserve the old behavior by passing
++@option{--enable-sloppy-null-term-strings} to @command{configure}.  When Aspell
++is compiled this way the version string will include the string
++@samp{ SLOPPY}.
++
+ @node Loadable Filter Notes
+ @appendixsec Loadable Filter Notes
+-
++             
+ Support for being able to load additional filter modules at run-time
+ has only been verified to work on Linux platforms.  If you get linker
+ errors when trying to use a filter, then it is likely that loadable
+ filter support is not working yet on your platform.  Thus, in order to
+ get Aspell to work correctly you will need to avoid compiling the
+ filters as individual modules by using the
+-@option{--enable-compile-in-filters} when configuring Aspell with
+-@command{./configure}.
++@option{--enable-compile-in-filters} @command{configure} option.
+ 
+ @node Using 32-Bit Dictionaries on a 64-Bit System
+ @appendixsec Using 32-Bit Dictionaries on a 64-Bit System
+diff --git a/test/Makefile b/test/Makefile
+index 14e45fb..0472cec 100644
+--- a/test/Makefile
++++ b/test/Makefile
+@@ -1,10 +1,11 @@
+ CXXFLAGS = -O -g
+-CFLAGS   = -O -g
++CFLAGS   = -O -g -Wall
+ export ASPELL = ${CURDIR}/inst/bin/aspell
+ export PREZIP = ${CURDIR}/inst/bin/prezip-bin
+ MAKE := ${MAKE} "CXXFLAGS=${CXXFLAGS}" "CFLAGS=${CFLAGS}"
++EXTRA_CONFIG_FLAGS =
+ 
+-all:: prep sanity filter-test suggest
++all:: prep sanity filter-test suggest wide cxx_warnings
+ 	cat test-res
+ 
+ prep:: inst/bin/aspell inst/lib/aspell-0.60/en.multi tmp
+@@ -35,7 +36,7 @@ inst/lib/aspell-0.60/en.multi: inst/bin/aspell aspell6-en-2018.04.16-0.tar.bz2
+ 
+ build/Makefile:
+ 	mkdir -p build
+-	cd build && ../../configure --enable-maintainer-mode --disable-shared --disable-pspell-compatibility --prefix="${CURDIR}/inst"
++	cd build && ../../configure --enable-maintainer-mode --disable-shared --disable-pspell-compatibility --prefix="${CURDIR}/inst" $(EXTRA_CONFIG_FLAGS)
+ 
+ aspell6-en-2018.04.16-0.tar.bz2:
+ 	curl -O ftp://ftp.gnu.org/gnu/aspell/dict/en/aspell6-en-2018.04.16-0.tar.bz2
+@@ -48,5 +49,32 @@ suggest.mk: suggest/mkmk
+ 
+ include suggest.mk
+ 
++wide:: wide_test_invalid wide_test_invalid-but_ok wide_test_valid
++
++wide_test_invalid: wide_test_invalid.c prep
++	$(CC) $(CFLAGS) -Iinst/include -c $< -o tmp/$@.o
++	$(CXX) tmp/$@.o inst/lib/libaspell.a -ldl -o $@
++	./$@ 2> tmp/$@.log || true
++	fgrep -q 'Null-terminated wide-character strings unsupported when used this way.' tmp/$@.log
++
++wide_test_valid: wide_test_valid.c prep
++	$(CC) $(CFLAGS) -Iinst/include -c $< -o tmp/$@.o
++	$(CXX) tmp/$@.o inst/lib/libaspell.a -ldl -o $@
++	./$@
++
++wide_test_invalid-but_ok: wide_test_invalid.c prep
++	$(CC) $(CFLAGS) -DASPELL_ENCODE_SETTING_SECURE -Iinst/include -c $< -o tmp/$@.o
++	$(CXX) tmp/$@.o inst/lib/libaspell.a -ldl -o $@
++	./$@
++
++cxx_warnings:  cxx_warnings_test.cpp prep
++	$(CXX) $(CXXFLAGS) -Wall -Wconversion -Werror -Iinst/include -c $<
++
++## this target is only true if configured with --enable-sloppy-null-term-strings
++wide_test_invalid-but_allowed: wide_test_invalid.c prep
++	$(CC) $(CFLAGS) -Iinst/include -c $< inst/lib/libaspell.a -ldl -o tmp/obj.o
++	$(CXX) tmp/obj.o inst/lib/libaspell.a -ldl -o $@
++	./$@
++
+ .PHONY: phony
+ phony:
+diff --git a/test/cxx_warnings_test.cpp b/test/cxx_warnings_test.cpp
+new file mode 100644
+index 0000000..923bfc8
+--- /dev/null
++++ b/test/cxx_warnings_test.cpp
+@@ -0,0 +1,84 @@
++ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <aspell.h>
++
++const uint16_t test_word[] = {'c','a','f', 0x00E9, 0};
++const uint16_t test_incorrect[] = {'c','a','f', 'e', 0};
++const uint16_t test_doc[] = {'T', 'h', 'e', ' ', 'c','a','f', 0x00E9, '.', 0};
++
++int fail = 0;
++
++void f1() {
++  AspellConfig * spell_config = new_aspell_config();
++  aspell_config_replace(spell_config, "master", "en_US-w_accents");
++  aspell_config_replace(spell_config, "encoding", "ucs-2");
++  AspellCanHaveError * possible_err = new_aspell_speller(spell_config);
++  AspellSpeller * spell_checker = 0;
++  if (aspell_error_number(possible_err) != 0) {
++    fprintf(stderr, "%s", aspell_error_message(possible_err));
++    exit(0);
++  } else {
++    spell_checker = to_aspell_speller(possible_err);
++  }
++  int correct = aspell_speller_check_w(spell_checker, test_word, -1);
++  if (!correct) {
++    fprintf(stderr, "%s", "fail: expected word to be correct\n");
++    fail = 1;
++  }
++  correct = aspell_speller_check_w(spell_checker, test_incorrect, -1);
++  if (correct) {
++    fprintf(stderr, "%s", "fail: expected word to be incorrect\n");
++    fail = 1;
++  }
++  const AspellWordList * suggestions = aspell_speller_suggest_w(spell_checker, test_incorrect, -1);
++  AspellStringEnumeration * elements = aspell_word_list_elements(suggestions);
++  const uint16_t * word = aspell_string_enumeration_next_w(uint16_t, elements);
++  if (memcmp(word, test_word, sizeof(test_incorrect)) != 0) {
++    fprintf(stderr, "%s", "fail: first suggesion is not what is expected\n");
++    fail = 1;
++  delete_aspell_string_enumeration(elements);
++  }
++  if (fail)
++    printf("not ok\n");
++  else
++    printf("ok\n");
++}
++
++void f2() {
++  AspellConfig * spell_config = new_aspell_config();
++  aspell_config_replace(spell_config, "master", "en_US-w_accents");
++  aspell_config_replace(spell_config, "encoding", "ucs-2");
++  AspellCanHaveError * possible_err = new_aspell_speller(spell_config);
++  AspellSpeller * spell_checker = 0;
++  if (aspell_error_number(possible_err) != 0) {
++    fprintf(stderr, "%s", aspell_error_message(possible_err));
++    exit(0);
++  } else {
++    spell_checker = to_aspell_speller(possible_err);
++  }
++  int correct = aspell_speller_check_w(spell_checker, test_word, -1);
++  if (!correct) {
++    fprintf(stderr, "%s", "fail: expected word to be correct\n");
++    fail = 1;
++  }
++  correct = aspell_speller_check_w(spell_checker, test_incorrect, -1);
++  if (correct) {
++    fprintf(stderr, "%s", "fail: expected word to be incorrect\n");
++    fail = 1;
++  }
++  const AspellWordList * suggestions = aspell_speller_suggest_w(spell_checker, test_incorrect, -1);
++  AspellStringEnumeration * elements = aspell_word_list_elements(suggestions);
++  const uint16_t * word = aspell_string_enumeration_next_w(uint16_t, elements);
++  if (memcmp(word, test_word, sizeof(test_incorrect)) != 0) {
++    fprintf(stderr, "%s", "fail: first suggesion is not what is expected\n");
++    fail = 1;
++  delete_aspell_string_enumeration(elements);
++  }
++  if (fail)
++    printf("not ok\n");
++  else
++    printf("ok\n");
++}
+diff --git a/test/wide_test_invalid.c b/test/wide_test_invalid.c
+new file mode 100644
+index 0000000..d5e2ed7
+--- /dev/null
++++ b/test/wide_test_invalid.c
+@@ -0,0 +1,69 @@
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <aspell.h>
++
++const uint16_t test_word[] = {'c','a','f', 0x00E9, 0};
++const uint16_t test_incorrect[] = {'c','a','f', 'e', 0};
++const uint16_t test_doc[] = {'T', 'h', 'e', ' ', 'c','a','f', 'e', '.', 0};
++
++int fail = 0;
++
++int main() {
++  AspellConfig * spell_config = new_aspell_config();
++  aspell_config_replace(spell_config, "master", "en_US-w_accents");
++  aspell_config_replace(spell_config, "encoding", "ucs-2");
++  AspellCanHaveError * possible_err = new_aspell_speller(spell_config);
++  AspellSpeller * spell_checker = 0;
++  if (aspell_error_number(possible_err) != 0) {
++    fprintf(stderr, "%s", aspell_error_message(possible_err));
++    return 2;
++  } else {
++    spell_checker = to_aspell_speller(possible_err);
++  }
++  int correct = aspell_speller_check(spell_checker, (const char *)test_word, -1);
++  if (!correct) {
++    fprintf(stderr, "%s", "fail: expected word to be correct\n");
++    fail = 1;
++  }
++  correct = aspell_speller_check(spell_checker, (const char *)test_incorrect, -1);
++  if (correct) {
++    fprintf(stderr, "%s", "fail: expected word to be incorrect\n");
++    fail = 1;
++  }
++  const AspellWordList * suggestions = aspell_speller_suggest(spell_checker, (const char *)test_incorrect, -1);
++  AspellStringEnumeration * elements = aspell_word_list_elements(suggestions);
++  const char * word = aspell_string_enumeration_next(elements);
++  if (memcmp(word, test_word, sizeof(test_incorrect)) != 0) {
++    fprintf(stderr, "%s", "fail: first suggesion is not what is expected\n");
++    fail = 1;
++  }
++  delete_aspell_string_enumeration(elements);
++
++  possible_err = new_aspell_document_checker(spell_checker);
++  if (aspell_error(possible_err) != 0) {
++    fprintf(stderr, "Error: %s\n",aspell_error_message(possible_err));
++    return 2;
++  }
++  AspellDocumentChecker * checker = to_aspell_document_checker(possible_err);
++  aspell_document_checker_process(checker, (const char *)test_doc, -1);
++
++  AspellToken token = aspell_document_checker_next_misspelling(checker);
++  if (sizeof(test_incorrect) - sizeof(uint16_t) != token.len) {
++    fprintf(stderr, "fail: size of first misspelling (%d) is not what is expected (%lu)\n",
++            token.len, sizeof(test_incorrect) - sizeof(uint16_t));
++    fail = 1;
++  } else if (memcmp(test_incorrect, (const char *)test_doc + token.offset, token.len) != 0) {
++    fprintf(stderr, "%s", "fail: first misspelling is not what is expected\n");
++    fail = 1;
++  }
++  if (fail) {
++    printf("not ok\n");
++    return 1;
++  } else {
++    printf("ok\n");
++    return 0;
++  }
++}
+diff --git a/test/wide_test_valid.c b/test/wide_test_valid.c
+new file mode 100644
+index 0000000..bc3006d
+--- /dev/null
++++ b/test/wide_test_valid.c
+@@ -0,0 +1,69 @@
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <aspell.h>
++
++const uint16_t test_word[] = {'c','a','f', 0x00E9, 0};
++const uint16_t test_incorrect[] = {'c','a','f', 'e', 0};
++const uint16_t test_doc[] = {'T', 'h', 'e', ' ', 'c','a','f', 'e', '.', 0};
++
++int fail = 0;
++
++int main() {
++  AspellConfig * spell_config = new_aspell_config();
++  aspell_config_replace(spell_config, "master", "en_US-w_accents");
++  aspell_config_replace(spell_config, "encoding", "ucs-2");
++  AspellCanHaveError * possible_err = new_aspell_speller(spell_config);
++  AspellSpeller * spell_checker = 0;
++  if (aspell_error_number(possible_err) != 0) {
++    fprintf(stderr, "%s", aspell_error_message(possible_err));
++    return 2;
++  } else {
++    spell_checker = to_aspell_speller(possible_err);
++  }
++  int correct = aspell_speller_check_w(spell_checker, test_word, -1);
++  if (!correct) {
++    fprintf(stderr, "%s", "fail: expected word to be correct\n");
++    fail = 1;
++  }
++  correct = aspell_speller_check_w(spell_checker, test_incorrect, -1);
++  if (correct) {
++    fprintf(stderr, "%s", "fail: expected word to be incorrect\n");
++    fail = 1;
++  }
++  const AspellWordList * suggestions = aspell_speller_suggest_w(spell_checker, test_incorrect, -1);
++  AspellStringEnumeration * elements = aspell_word_list_elements(suggestions);
++  const uint16_t * word = aspell_string_enumeration_next_w(uint16_t, elements);
++  if (memcmp(word, test_word, sizeof(test_incorrect)) != 0) {
++    fprintf(stderr, "%s", "fail: first suggesion is not what is expected\n");
++    fail = 1;
++  }
++  delete_aspell_string_enumeration(elements);
++  
++  possible_err = new_aspell_document_checker(spell_checker);
++  if (aspell_error(possible_err) != 0) {
++    fprintf(stderr, "Error: %s\n",aspell_error_message(possible_err));
++    return 2;
++  }
++  AspellDocumentChecker * checker = to_aspell_document_checker(possible_err);
++  aspell_document_checker_process_w(checker, test_doc, -1);
++
++  AspellToken token = aspell_document_checker_next_misspelling_w(uint16_t, checker);
++  if (4 != token.len) {
++    fprintf(stderr, "fail: size of first misspelling (%d) is not what is expected (%d)\n",
++            token.len, 4);
++    fail = 1;
++  } else if (memcmp(test_incorrect, test_doc + token.offset, token.len) != 0) {
++    fprintf(stderr, "%s", "fail: first misspelling is not what is expected\n");
++    fail = 1;
++  }
++  if (fail) {
++    printf("not ok\n");
++    return 1;
++  } else {
++    printf("ok\n");
++    return 0;
++  }
++}

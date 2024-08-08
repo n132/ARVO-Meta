@@ -1,0 +1,256 @@
+commit 87fe61a8e118aa932e8876d6eb49372c615cec88
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Thu Oct 24 19:58:33 2019 +0200
+
+    K7Zip: Fix memory use in readAndDecodePackedStreams
+    
+    Summary:
+    oss-fuzz has created a file in which inflated size was smaller than unpackSize and thus crc32 was using wrong memory
+    oss-fuzz warns about uninitialized because QByteArray probably allocates a bit more than asked, but this could very well be a out of bounds memory read
+    
+    Reviewers: vkrause
+    
+    Reviewed By: vkrause
+    
+    Subscribers: kde-frameworks-devel, apol, dfaure
+    
+    Tags: #frameworks
+    
+    Differential Revision: https://phabricator.kde.org/D24902
+
+diff --git a/src/k7zip.cpp b/src/k7zip.cpp
+index f583804..c7e633a 100644
+--- a/src/k7zip.cpp
++++ b/src/k7zip.cpp
+@@ -1473,227 +1473,231 @@ static QByteArray decodeBCJ2(const QByteArray &mainStream, const QByteArray &cal
+ QByteArray K7Zip::K7ZipPrivate::readAndDecodePackedStreams(bool readMainStreamInfo)
+ {
+     if (!buffer) {
+         return QByteArray();
+     }
+ 
+     if (readMainStreamInfo) {
+         readMainStreamsInfo();
+     }
+ 
+     QByteArray inflatedData;
+ 
+     quint64 startPos = 32 + packPos;
+     for (int i = 0; i < folders.size(); i++) {
+         const Folder *folder = folders.at(i);
+         quint64 unpackSize64 = folder->getUnpackSize();;
+         size_t unpackSize = (size_t)unpackSize64;
+         if (unpackSize != unpackSize64) {
+             qCDebug(KArchiveLog) << "unsupported";
+             return inflatedData;
+         }
+ 
+         // Find main coder
+         quint32 mainCoderIndex = 0;
+         QVector<int> outStreamIndexed;
+         int outStreamIndex = 0;
+         for (int j = 0; j < folder->folderInfos.size(); j++) {
+             const Folder::FolderInfo *info = folder->folderInfos[j];
+             for (int k = 0; k < info->numOutStreams; k++, outStreamIndex++) {
+                 if (folder->findBindPairForOutStream(outStreamIndex) < 0) {
+                     outStreamIndexed.append(outStreamIndex);
+                     break;
+                 }
+             }
+         }
+ 
+         quint32 temp = 0;
+         if (!outStreamIndexed.isEmpty()) {
+             folder->findOutStream(outStreamIndexed[0], mainCoderIndex, temp);
+         }
+ 
+         quint32 startInIndex = folder->getCoderInStreamIndex(mainCoderIndex);
+         quint32 startOutIndex = folder->getCoderOutStreamIndex(mainCoderIndex);
+ 
+         Folder::FolderInfo *mainCoder = folder->folderInfos[mainCoderIndex];
+ 
+         QVector<int> seqInStreams;
+         QVector<quint32> coderIndexes;
+         seqInStreams.reserve(mainCoder->numInStreams);
+         coderIndexes.reserve(mainCoder->numInStreams);
+         for (int j = 0; j < (int)mainCoder->numInStreams; j++) {
+             int seqInStream;
+             quint32 coderIndex;
+             getInStream(folder, startInIndex + j, seqInStream, coderIndex);
+             seqInStreams.append(seqInStream);
+             coderIndexes.append(coderIndex);
+         }
+ 
+         QVector<int> seqOutStreams;
+         seqOutStreams.reserve(mainCoder->numOutStreams);
+         for (int j = 0; j < (int)mainCoder->numOutStreams; j++) {
+             int seqOutStream;
+             getOutStream(folder, startOutIndex + j, seqOutStream);
+             seqOutStreams.append(seqOutStream);
+         }
+ 
+         QVector<QByteArray> datas;
+         for (int j = 0; j < (int)mainCoder->numInStreams; j++) {
+             int size = packSizes[j + i];
+             std::unique_ptr<char[]> encodedBuffer(new char[size]);
+             QIODevice *dev = q->device();
+             dev->seek(startPos);
+             quint64 n = dev->read(encodedBuffer.get(), size);
+             if (n != (quint64)size) {
+                 qCDebug(KArchiveLog) << "Failed read next size, should read " << size << ", read " << n;
+                 return inflatedData;
+             }
+             QByteArray deflatedData(encodedBuffer.get(), size);
+             datas.append(deflatedData);
+             startPos += size;
+             pos += size;
+             headerSize += size;
+         }
+ 
+         QVector<QByteArray> inflatedDatas;
+         QByteArray deflatedData;
+         for (int j = 0; j < seqInStreams.size(); ++j) {
+             Folder::FolderInfo *coder = nullptr;
+             if ((quint32)j != mainCoderIndex) {
+                 coder = folder->folderInfos[coderIndexes[j]];
+             } else {
+                 coder = folder->folderInfos[mainCoderIndex];
+             }
+ 
+             deflatedData = datas[seqInStreams[j]];
+ 
+             KFilterBase *filter = nullptr;
+ 
+             switch (coder->methodID) {
+             case k_LZMA:
+                 filter = KCompressionDevice::filterForCompressionType(KCompressionDevice::Xz);
+                 if (!filter) {
+                     qCDebug(KArchiveLog) << "filter not found";
+                     return QByteArray();
+                 }
+                 static_cast<KXzFilter *>(filter)->init(QIODevice::ReadOnly, KXzFilter::LZMA, coder->properties);
+                 break;
+             case k_LZMA2:
+                 filter = KCompressionDevice::filterForCompressionType(KCompressionDevice::Xz);
+                 if (!filter) {
+                     qCDebug(KArchiveLog) << "filter not found";
+                     return QByteArray();
+                 }
+                 static_cast<KXzFilter *>(filter)->init(QIODevice::ReadOnly, KXzFilter::LZMA2, coder->properties);
+                 break;
+             case k_PPMD: {
+                 /*if (coder->properties.size() == 5) {
+                     //Byte order = *(const Byte *)coder.Props;
+                     qint32 dicSize = ((unsigned char)coder->properties[1]        |
+                                      (((unsigned char)coder->properties[2]) <<  8) |
+                                      (((unsigned char)coder->properties[3]) << 16) |
+                                      (((unsigned char)coder->properties[4]) << 24));
+                 }*/
+                 break;
+             }
+             case k_AES:
+                 if (coder->properties.size() >= 1) {
+                     //const Byte *data = (const Byte *)coder.Props;
+                     //Byte firstByte = *data++;
+                     //UInt32 numCyclesPower = firstByte & 0x3F;
+                 }
+                 break;
+             case k_BCJ:
+                 filter = KCompressionDevice::filterForCompressionType(KCompressionDevice::Xz);
+                 if (!filter) {
+                     qCDebug(KArchiveLog) << "filter not found";
+                     return QByteArray();
+                 }
+                 static_cast<KXzFilter *>(filter)->init(QIODevice::ReadOnly, KXzFilter::BCJ, coder->properties);
+                 break;
+             case k_BCJ2: {
+                 QByteArray bcj2 = decodeBCJ2(inflatedDatas[0], inflatedDatas[1], inflatedDatas[2], deflatedData);
+                 inflatedDatas.clear();
+                 inflatedDatas.append(bcj2);
+                 break;
+             }
+             case k_BZip2:
+                 filter = KCompressionDevice::filterForCompressionType(KCompressionDevice::BZip2);
+                 if (!filter) {
+                     qCDebug(KArchiveLog) << "filter not found";
+                     return QByteArray();
+                 }
+                 filter->init(QIODevice::ReadOnly);
+                 break;
+             }
+ 
+             if (coder->methodID == k_BCJ2) {
+                 continue;
+             }
+ 
+             if (!filter) {
+                 return QByteArray();
+             }
+ 
+             filter->setInBuffer(deflatedData.data(), deflatedData.size());
+ 
+             QByteArray outBuffer;
+             // reserve memory
+             outBuffer.resize(unpackSize);
+ 
+             KFilterBase::Result result = KFilterBase::Ok;
+             QByteArray inflatedDataTmp;
+             while (result != KFilterBase::End && result != KFilterBase::Error && !filter->inBufferEmpty()) {
+                 filter->setOutBuffer(outBuffer.data(), outBuffer.size());
+                 result = filter->uncompress();
+                 if (result == KFilterBase::Error) {
+                     qCDebug(KArchiveLog) << " decode error";
+                     filter->terminate();
+                     delete filter;
+                     return QByteArray();
+                 }
+                 int uncompressedBytes = outBuffer.size() - filter->outBufferAvailable();
+ 
+                 // append the uncompressed data to inflate buffer
+                 inflatedDataTmp.append(outBuffer.data(), uncompressedBytes);
+ 
+                 if (result == KFilterBase::End) {
+                     //qCDebug(KArchiveLog) << "Finished unpacking";
+                     break; // Finished.
+                 }
+             }
+ 
+             if (result != KFilterBase::End && !filter->inBufferEmpty()) {
+                 qCDebug(KArchiveLog) << "decode failed result" << result;
+                 filter->terminate();
+                 delete filter;
+                 return QByteArray();
+             }
+ 
+             filter->terminate();
+             delete filter;
+ 
+             inflatedDatas.append(inflatedDataTmp);
+         }
+ 
+         QByteArray inflated;
+         for (const QByteArray& data : qAsConst(inflatedDatas)) {
+             inflated.append(data);
+         }
+ 
+         inflatedDatas.clear();
+ 
+         if (folder->unpackCRCDefined) {
++            if ((size_t)inflated.size() < unpackSize) {
++                qCDebug(KArchiveLog) << "wrong crc size data";
++                return QByteArray();
++            }
+             quint32 crc = crc32(0, (Bytef *)(inflated.data()), unpackSize);
+             if (crc != folder->unpackCRC) {
+                 qCDebug(KArchiveLog) << "wrong crc";
+                 return QByteArray();
+             }
+         }
+ 
+         inflatedData.append(inflated);
+     }
+ 
+     return inflatedData;
+ }
+ 
+ ///////////////// Write ////////////////////

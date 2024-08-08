@@ -1,0 +1,1257 @@
+commit 8f440b4e1e22ab95386b48dc0e1250704864aa74
+Author: John Stiles <johnstiles@google.com>
+Date:   Fri Mar 5 16:48:56 2021 -0500
+
+    Optimize away no-op arithmetic in ConstantFolder.
+    
+    Expressions like `x * 1`, `x *= 1`, `x + 0`, `x * 0`, or `0 / x` don't
+    actually do anything, and can be simplified to just `x` or `0`. (The
+    zero case must also check that `x` doesn't have side effects, because
+    `0 * myFunction()` still needs to call `myFunction`.)
+    
+    `0 - x` is also detected and rewritten as `-x`.
+    `0 / 0` is left as-is.
+    
+    This logic works for scalars and vectors; matrices are left as-is.
+    
+    A similar optimization also occurs in the constant-propagation pass, so
+    we see almost no diffs in the tests. If control-flow analysis is turned
+    off, we do see some improvements. (I didn't reuse the existing code at
+    all, since it was designed around rewriting the CFG tree, but the
+    concept was identical.)
+    
+    Change-Id: Ia99cd81f1d4cd3dafaa43ccac6a2261e3257a185
+    Bug: skia:11343
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/380356
+    Reviewed-by: Brian Osman <brianosman@google.com>
+    Commit-Queue: John Stiles <johnstiles@google.com>
+    Auto-Submit: John Stiles <johnstiles@google.com>
+
+diff --git a/src/sksl/SkSLCompiler.cpp b/src/sksl/SkSLCompiler.cpp
+index 9223766b5d..8adad8eaa0 100644
+--- a/src/sksl/SkSLCompiler.cpp
++++ b/src/sksl/SkSLCompiler.cpp
+@@ -685,477 +685,480 @@ static void vectorize_right(BasicBlock* b,
+ void Compiler::simplifyExpression(DefinitionMap& definitions,
+                                   BasicBlock& b,
+                                   std::vector<BasicBlock::Node>::iterator* iter,
+                                   OptimizationContext* optimizationContext) {
+     Expression* expr = (*iter)->expression()->get();
+     SkASSERT(expr);
+ 
+     if ((*iter)->fConstantPropagation) {
+         std::unique_ptr<Expression> optimized = expr->constantPropagate(*fIRGenerator,
+                                                                         definitions);
+         if (optimized) {
+             optimizationContext->fUpdated = true;
+             optimized = fIRGenerator->coerce(std::move(optimized), expr->type());
+             SkASSERT(optimized);
+             // Remove references within 'expr', add references within 'optimized'
+             optimizationContext->fUsage->replace(expr, optimized.get());
+             if (!try_replace_expression(&b, iter, &optimized)) {
+                 optimizationContext->fNeedsRescan = true;
+                 return;
+             }
+             SkASSERT((*iter)->isExpression());
+             expr = (*iter)->expression()->get();
+         }
+     }
+     switch (expr->kind()) {
+         case Expression::Kind::kVariableReference: {
+             const VariableReference& ref = expr->as<VariableReference>();
+             const Variable* var = ref.variable();
+             if (gSkSLControlFlowAnalysis &&
+                 fContext->fConfig->fSettings.fDeadCodeElimination &&
+                 ref.refKind() != VariableReference::RefKind::kWrite &&
+                 ref.refKind() != VariableReference::RefKind::kPointer &&
+                 var->storage() == Variable::Storage::kLocal && !definitions.get(var) &&
+                 optimizationContext->fSilences.find(var) == optimizationContext->fSilences.end()) {
+                 optimizationContext->fSilences.insert(var);
+                 this->error(expr->fOffset,
+                             "'" + var->name() + "' has not been assigned");
+             }
+             break;
+         }
+         case Expression::Kind::kTernary: {
+             // TODO(skia:11319): this optimization logic is redundant with the optimization code
+             // found in SkSLTernaryExpression.cpp.
+ 
+             TernaryExpression* t = &expr->as<TernaryExpression>();
+             if (t->test()->is<BoolLiteral>()) {
+                 // ternary has a constant test, replace it with either the true or
+                 // false branch
+                 if (t->test()->as<BoolLiteral>().value()) {
+                     (*iter)->setExpression(std::move(t->ifTrue()), optimizationContext->fUsage);
+                 } else {
+                     (*iter)->setExpression(std::move(t->ifFalse()), optimizationContext->fUsage);
+                 }
+                 optimizationContext->fUpdated = true;
+                 optimizationContext->fNeedsRescan = true;
+             }
+             break;
+         }
+         case Expression::Kind::kBinary: {
+             BinaryExpression* bin = &expr->as<BinaryExpression>();
+             if (dead_assignment(*bin, optimizationContext->fUsage) || self_assignment(*bin)) {
+                 delete_left(&b, iter, optimizationContext);
+                 break;
+             }
++
++            // TODO(skia:11319): this optimization logic is redundant with the optimization code
++            // found in ConstantFolder.cpp.
+             Expression& left = *bin->left();
+             Expression& right = *bin->right();
+             const Type& leftType = left.type();
+             const Type& rightType = right.type();
+             // collapse useless expressions like x * 1 or x + 0
+             if ((!leftType.isScalar() && !leftType.isVector()) ||
+                 (!rightType.isScalar() && !rightType.isVector())) {
+                 break;
+             }
+             switch (bin->getOperator().kind()) {
+                 case Token::Kind::TK_STAR:
+                     if (is_constant(left, 1)) {
+                         if (leftType.isVector() && rightType.isScalar()) {
+                             // float4(1) * x -> float4(x)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // 1 * x -> x
+                             // 1 * float4(x) -> float4(x)
+                             // float4(1) * float4(x) -> float4(x)
+                             delete_left(&b, iter, optimizationContext);
+                         }
+                     }
+                     else if (is_constant(left, 0)) {
+                         if (leftType.isScalar() && rightType.isVector() &&
+                             !right.hasSideEffects()) {
+                             // 0 * float4(x) -> float4(0)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // 0 * x -> 0
+                             // float4(0) * x -> float4(0)
+                             // float4(0) * float4(x) -> float4(0)
+                             if (!right.hasSideEffects()) {
+                                 delete_right(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     else if (is_constant(right, 1)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x * float4(1) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x * 1 -> x
+                             // float4(x) * 1 -> float4(x)
+                             // float4(x) * float4(1) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     else if (is_constant(right, 0)) {
+                         if (leftType.isVector() && rightType.isScalar() && !left.hasSideEffects()) {
+                             // float4(x) * 0 -> float4(0)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // x * 0 -> 0
+                             // x * float4(0) -> float4(0)
+                             // float4(x) * float4(0) -> float4(0)
+                             if (!left.hasSideEffects()) {
+                                 delete_left(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_PLUS:
+                     if (is_constant(left, 0)) {
+                         if (leftType.isVector() && rightType.isScalar()) {
+                             // float4(0) + x -> float4(x)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // 0 + x -> x
+                             // 0 + float4(x) -> float4(x)
+                             // float4(0) + float4(x) -> float4(x)
+                             delete_left(&b, iter, optimizationContext);
+                         }
+                     } else if (is_constant(right, 0)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x + float4(0) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x + 0 -> x
+                             // float4(x) + 0 -> float4(x)
+                             // float4(x) + float4(0) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_MINUS:
+                     if (is_constant(right, 0)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x - float4(0) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x - 0 -> x
+                             // float4(x) - 0 -> float4(x)
+                             // float4(x) - float4(0) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_SLASH:
+                     if (is_constant(right, 1)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x / float4(1) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x / 1 -> x
+                             // float4(x) / 1 -> float4(x)
+                             // float4(x) / float4(1) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     } else if (is_constant(left, 0)) {
+                         if (leftType.isScalar() && rightType.isVector() &&
+                             !right.hasSideEffects()) {
+                             // 0 / float4(x) -> float4(0)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // 0 / x -> 0
+                             // float4(0) / x -> float4(0)
+                             // float4(0) / float4(x) -> float4(0)
+                             if (!right.hasSideEffects()) {
+                                 delete_right(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_PLUSEQ:
+                     if (is_constant(right, 0)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_MINUSEQ:
+                     if (is_constant(right, 0)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_STAREQ:
+                     if (is_constant(right, 1)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_SLASHEQ:
+                     if (is_constant(right, 1)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 default:
+                     break;
+             }
+             break;
+         }
+         case Expression::Kind::kConstructor: {
+             // TODO(skia:11319): this optimization logic is redundant with the optimization code
+             // found in SkSLConstructor.cpp.
+ 
+             // Find constructors embedded inside constructors and flatten them out where possible.
+             //   -  float4(float2(1, 2), 3, 4)                -->  float4(1, 2, 3, 4)
+             //   -  float4(w, float3(sin(x), cos(y), tan(z))) -->  float4(w, sin(x), cos(y), tan(z))
+             // Leave single-argument constructors alone, though. These might be casts or splats.
+             Constructor& c = expr->as<Constructor>();
+             if (c.type().columns() > 1) {
+                 // Inspect each constructor argument to see if it's a candidate for flattening.
+                 // Remember matched arguments in a bitfield, "argsToOptimize".
+                 int argsToOptimize = 0;
+                 int currBit = 1;
+                 for (const std::unique_ptr<Expression>& arg : c.arguments()) {
+                     if (arg->is<Constructor>()) {
+                         Constructor& inner = arg->as<Constructor>();
+                         if (inner.arguments().size() > 1 &&
+                             inner.type().componentType() == c.type().componentType()) {
+                             argsToOptimize |= currBit;
+                         }
+                     }
+                     currBit <<= 1;
+                 }
+                 if (argsToOptimize) {
+                     // We found at least one argument that could be flattened out. Re-walk the
+                     // constructor args and flatten the candidates we found during our initial pass.
+                     ExpressionArray flattened;
+                     flattened.reserve_back(c.type().columns());
+                     currBit = 1;
+                     for (const std::unique_ptr<Expression>& arg : c.arguments()) {
+                         if (argsToOptimize & currBit) {
+                             Constructor& inner = arg->as<Constructor>();
+                             for (const std::unique_ptr<Expression>& innerArg : inner.arguments()) {
+                                 flattened.push_back(innerArg->clone());
+                             }
+                         } else {
+                             flattened.push_back(arg->clone());
+                         }
+                         currBit <<= 1;
+                     }
+                     std::unique_ptr<Expression> replacement = std::make_unique<Constructor>(
+                             c.fOffset, c.type(), std::move(flattened));
+                     // We're replacing an expression with a cloned version; we'll need a rescan.
+                     // No fUsage change: `float2(float(x), y)` and `float2(x, y)` have equivalent
+                     // reference counts.
+                     try_replace_expression(&b, iter, &replacement);
+                     optimizationContext->fUpdated = true;
+                     optimizationContext->fNeedsRescan = true;
+                     break;
+                 }
+             }
+             break;
+         }
+         case Expression::Kind::kSwizzle: {
+             // TODO(skia:11319): this optimization logic is redundant with the optimization code
+             // found in SkSLSwizzle.cpp.
+ 
+             Swizzle& s = expr->as<Swizzle>();
+             // Detect identity swizzles like `foo.rgba`.
+             if ((int) s.components().size() == s.base()->type().columns()) {
+                 bool identity = true;
+                 for (int i = 0; i < (int) s.components().size(); ++i) {
+                     if (s.components()[i] != i) {
+                         identity = false;
+                         break;
+                     }
+                 }
+                 if (identity) {
+                     optimizationContext->fUpdated = true;
+                     // No fUsage change: foo.rgba and foo have equivalent reference counts
+                     if (!try_replace_expression(&b, iter, &s.base())) {
+                         optimizationContext->fNeedsRescan = true;
+                         return;
+                     }
+                     SkASSERT((*iter)->isExpression());
+                     break;
+                 }
+             }
+             // Detect swizzles of swizzles, e.g. replace `foo.argb.r000` with `foo.a000`.
+             if (s.base()->is<Swizzle>()) {
+                 Swizzle& base = s.base()->as<Swizzle>();
+                 ComponentArray final;
+                 for (int c : s.components()) {
+                     final.push_back(base.components()[c]);
+                 }
+                 std::unique_ptr<Expression> replacement(new Swizzle(*fContext, base.base()->clone(),
+                                                                     final));
+                 // We're replacing an expression with a cloned version; we'll need a rescan.
+                 // No fUsage change: `foo.gbr.gbr` and `foo.brg` have equivalent reference counts
+                 try_replace_expression(&b, iter, &replacement);
+                 optimizationContext->fUpdated = true;
+                 optimizationContext->fNeedsRescan = true;
+                 break;
+             }
+             // Optimize swizzles of constructors.
+             if (s.base()->is<Constructor>()) {
+                 Constructor& base = s.base()->as<Constructor>();
+                 std::unique_ptr<Expression> replacement;
+                 const Type& componentType = base.type().componentType();
+                 int swizzleSize = s.components().size();
+ 
+                 // The IR generator has already converted any zero/one swizzle components into
+                 // constructors containing zero/one args. Confirm that this is true by checking that
+                 // our swizzle components are all `xyzw` (values 0 through 3).
+                 SkASSERT(std::all_of(s.components().begin(), s.components().end(),
+                                      [](int8_t c) { return c >= 0 && c <= 3; }));
+ 
+                 if (base.arguments().size() == 1 && base.arguments().front()->type().isScalar()) {
+                     // `half4(scalar).zyy` can be optimized to `half3(scalar)`. The swizzle
+                     // components don't actually matter since all fields are the same.
+                     const Expression& argument = *base.arguments().front();
+                     const Type& constructorType = componentType.toCompound(*fContext, swizzleSize,
+                                                                            /*rows=*/1);
+                     replacement = Constructor::SimplifyConversion(constructorType, argument);
+                     if (!replacement) {
+                         ExpressionArray newArgs;
+                         newArgs.push_back(argument.clone());
+                         replacement = std::make_unique<Constructor>(base.fOffset, constructorType,
+                                                                     std::move(newArgs));
+                     }
+ 
+                     // We're replacing an expression with a cloned version; we'll need a rescan.
+                     // There's no fUsage change: `half4(foo).xy` and `half2(foo)` have equivalent
+                     // reference counts.
+                     try_replace_expression(&b, iter, &replacement);
+                     optimizationContext->fUpdated = true;
+                     optimizationContext->fNeedsRescan = true;
+                     break;
+                 }
+ 
+                 // Swizzles can duplicate some elements and discard others, e.g.
+                 // `half4(1, 2, 3, 4).xxz` --> `half3(1, 1, 3)`. However, there are constraints:
+                 // - Expressions with side effects need to occur exactly once, even if they
+                 //   would otherwise be swizzle-eliminated
+                 // - Non-trivial expressions should not be repeated, but elimination is OK.
+                 //
+                 // Look up the argument for the constructor at each index. This is typically simple
+                 // but for weird cases like `half4(bar.yz, half2(foo))`, it can be harder than it
+                 // seems. This example would result in:
+                 //     argMap[0] = {.fArgIndex = 0, .fComponent = 0}   (bar.yz     .x)
+                 //     argMap[1] = {.fArgIndex = 0, .fComponent = 1}   (bar.yz     .y)
+                 //     argMap[2] = {.fArgIndex = 1, .fComponent = 0}   (half2(foo) .x)
+                 //     argMap[3] = {.fArgIndex = 1, .fComponent = 1}   (half2(foo) .y)
+                 struct ConstructorArgMap {
+                     int8_t fArgIndex;
+                     int8_t fComponent;
+                 };
+ 
+                 int numConstructorArgs = base.type().columns();
+                 ConstructorArgMap argMap[4] = {};
+                 int writeIdx = 0;
+                 for (int argIdx = 0; argIdx < (int) base.arguments().size(); ++argIdx) {
+                     const Expression& expr = *base.arguments()[argIdx];
+                     int argWidth = expr.type().columns();
+                     for (int componentIdx = 0; componentIdx < argWidth; ++componentIdx) {
+                         argMap[writeIdx].fArgIndex = argIdx;
+                         argMap[writeIdx].fComponent = componentIdx;
+                         ++writeIdx;
+                     }
+                 }
+                 SkASSERT(writeIdx == numConstructorArgs);
+ 
+                 // Count up the number of times each constructor argument is used by the
+                 // swizzle.
+                 //    `half4(bar.yz, half2(foo)).xwxy` -> { 3, 1 }
+                 // - bar.yz    is referenced 3 times, by `.x_xy`
+                 // - half(foo) is referenced 1 time,  by `._w__`
+                 int8_t exprUsed[4] = {};
+                 for (int c : s.components()) {
+                     exprUsed[argMap[c].fArgIndex]++;
+                 }
+ 
+                 bool safeToOptimize = true;
+                 for (int index = 0; index < numConstructorArgs; ++index) {
+                     int8_t constructorArgIndex = argMap[index].fArgIndex;
+                     const Expression& baseArg = *base.arguments()[constructorArgIndex];
+ 
+                     // Check that non-trivial expressions are not swizzled in more than once.
+                     if (exprUsed[constructorArgIndex] > 1 &&
+                             !Analysis::IsTrivialExpression(baseArg)) {
+                         safeToOptimize = false;
+                         break;
+                     }
+                     // Check that side-effect-bearing expressions are swizzled in exactly once.
+                     if (exprUsed[constructorArgIndex] != 1 && baseArg.hasSideEffects()) {
+                         safeToOptimize = false;
+                         break;
+                     }
+                 }
+ 
+                 if (safeToOptimize) {
+                     struct ReorderedArgument {
+                         int8_t fArgIndex;
+                         ComponentArray fComponents;
+                     };
+                     SkSTArray<4, ReorderedArgument> reorderedArgs;
+                     for (int c : s.components()) {
+                         const ConstructorArgMap& argument = argMap[c];
+                         const Expression& baseArg = *base.arguments()[argument.fArgIndex];
+ 
+                         if (baseArg.type().isScalar()) {
+                             // This argument is a scalar; add it to the list as-is.
+                             SkASSERT(argument.fComponent == 0);
+                             reorderedArgs.push_back({argument.fArgIndex,
+                                                      ComponentArray{}});
+                         } else {
+                             // This argument is a component from a vector.
+                             SkASSERT(argument.fComponent < baseArg.type().columns());
+                             if (reorderedArgs.empty() ||
+                                 reorderedArgs.back().fArgIndex != argument.fArgIndex) {
+                                 // This can't be combined with the previous argument. Add a new one.
+                                 reorderedArgs.push_back({argument.fArgIndex,
+                                                          ComponentArray{argument.fComponent}});
+                             } else {
+                                 // Since we know this argument uses components, it should already
+                                 // have at least one component set.
+                                 SkASSERT(!reorderedArgs.back().fComponents.empty());
+                                 // Build up the current argument with one more component.
+                                 reorderedArgs.back().fComponents.push_back(argument.fComponent);
+                             }
+                         }
+                     }
+ 
+                     // Convert our reordered argument list to an actual array of expressions, with
+                     // the new order and any new inner swizzles that need to be applied. Note that
+                     // we expect followup passes to clean up the inner swizzles.
+                     ExpressionArray newArgs;
+                     newArgs.reserve_back(swizzleSize);
+                     for (const ReorderedArgument& reorderedArg : reorderedArgs) {
+                         const Expression& baseArg = *base.arguments()[reorderedArg.fArgIndex];
+                         if (reorderedArg.fComponents.empty()) {
+                             newArgs.push_back(baseArg.clone());
+                         } else {
+                             newArgs.push_back(std::make_unique<Swizzle>(*fContext, baseArg.clone(),
+                                                                         reorderedArg.fComponents));
+                         }
+                     }
+ 
+                     // Create a new constructor.
+                     replacement = std::make_unique<Constructor>(
+                             base.fOffset,
+                             componentType.toCompound(*fContext, swizzleSize, /*rows=*/1),
+                             std::move(newArgs));
+ 
+                     // Remove references within 'expr', add references within 'replacement.'
+                     optimizationContext->fUsage->replace(expr, replacement.get());
+ 
+                     // We're replacing an expression with a cloned version; we'll need a rescan.
+                     try_replace_expression(&b, iter, &replacement);
+                     optimizationContext->fUpdated = true;
+                     optimizationContext->fNeedsRescan = true;
+                 }
+                 break;
+             }
+             break;
+         }
+         default:
+             break;
+     }
+ }
+diff --git a/src/sksl/SkSLConstantFolder.cpp b/src/sksl/SkSLConstantFolder.cpp
+index 887bc69fc6..d6900275a2 100644
+--- a/src/sksl/SkSLConstantFolder.cpp
++++ b/src/sksl/SkSLConstantFolder.cpp
+@@ -1,22 +1,23 @@
+ /*
+  * Copyright 2020 Google LLC
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #include "src/sksl/SkSLConstantFolder.h"
+ 
+ #include <limits>
+ 
+ #include "src/sksl/SkSLContext.h"
+ #include "src/sksl/SkSLErrorReporter.h"
+ #include "src/sksl/ir/SkSLBinaryExpression.h"
+ #include "src/sksl/ir/SkSLBoolLiteral.h"
+ #include "src/sksl/ir/SkSLConstructor.h"
+ #include "src/sksl/ir/SkSLExpression.h"
+ #include "src/sksl/ir/SkSLFloatLiteral.h"
+ #include "src/sksl/ir/SkSLIntLiteral.h"
++#include "src/sksl/ir/SkSLPrefixExpression.h"
+ #include "src/sksl/ir/SkSLType.h"
+ #include "src/sksl/ir/SkSLVariable.h"
+ #include "src/sksl/ir/SkSLVariableReference.h"
+@@ -114,6 +115,17 @@ static std::unique_ptr<Expression> simplify_vector(const Context& context,
+     }
+ }
+ 
++static std::unique_ptr<Expression> cast_expression(const Context& context,
++                                                   const Expression& expr,
++                                                   const Type& type) {
++    ExpressionArray ctorArgs;
++    ctorArgs.push_back(expr.clone());
++    std::unique_ptr<Expression> ctor = Constructor::Convert(context, expr.fOffset, type,
++                                                            std::move(ctorArgs));
++    SkASSERT(ctor);
++    return ctor;
++}
++
+ static Constructor splat_scalar(const Expression& scalar, const Type& type) {
+     SkASSERT(type.isVector());
+     SkASSERT(type.componentType() == scalar.type());
+@@ -142,18 +154,37 @@ bool ConstantFolder::GetConstantFloat(const Expression& value, SKSL_FLOAT* out)
+     return true;
+ }
+ 
++static bool is_constant_scalar_value(const Expression& inExpr, float match) {
++    const Expression* expr = ConstantFolder::GetConstantValueForVariable(inExpr);
++    return (expr->is<IntLiteral>()   && expr->as<IntLiteral>().value()   == match) ||
++           (expr->is<FloatLiteral>() && expr->as<FloatLiteral>().value() == match);
++}
++
+ static bool contains_constant_zero(const Expression& expr) {
+     if (expr.is<Constructor>()) {
+         for (const auto& arg : expr.as<Constructor>().arguments()) {
+             if (contains_constant_zero(*arg)) {
+                 return true;
+             }
+         }
+         return false;
+     }
+-    const Expression* value = ConstantFolder::GetConstantValueForVariable(expr);
+-    return (value->is<IntLiteral>()   && value->as<IntLiteral>().value()   == 0.0) ||
+-           (value->is<FloatLiteral>() && value->as<FloatLiteral>().value() == 0.0);
++    return is_constant_scalar_value(expr, 0.0);
++}
++
++static bool is_constant_value(const Expression& expr, float value) {
++    // This check only supports scalars and vectors (and in particular, not matrices).
++    SkASSERT(expr.type().isScalar() || expr.type().isVector());
++
++    if (expr.is<Constructor>()) {
++        for (const auto& arg : expr.as<Constructor>().arguments()) {
++            if (!is_constant_value(*arg, value)) {
++                return false;
++            }
++        }
++        return true;
++    }
++    return is_constant_scalar_value(expr, value);
+ }
+ 
+ bool ConstantFolder::ErrorOnDivideByZero(const Context& context, int offset, Operator op,
+@@ -199,216 +230,303 @@ const Expression* ConstantFolder::GetConstantValueForVariable(const Expression&
+     return &inExpr;
+ }
+ 
++static std::unique_ptr<Expression> simplify_no_op_arithmetic(const Context& context,
++                                                             const Expression& left,
++                                                             Operator op,
++                                                             const Expression& right,
++                                                             const Type& resultType) {
++    switch (op.kind()) {
++        case Token::Kind::TK_PLUS:
++            if (is_constant_value(right, 0.0)) {  // x + 0
++                return cast_expression(context, left, resultType);
++            }
++            if (is_constant_value(left, 0.0)) {   // 0 + x
++                return cast_expression(context, right, resultType);
++            }
++            break;
++
++        case Token::Kind::TK_STAR:
++            if (is_constant_value(right, 1.0)) {  // x * 1
++                return cast_expression(context, left, resultType);
++            }
++            if (is_constant_value(left, 1.0)) {   // 1 * x
++                return cast_expression(context, right, resultType);
++            }
++            if (is_constant_value(right, 0.0) && !left.hasSideEffects()) {  // x * 0
++                return cast_expression(context, right, resultType);
++            }
++            if (is_constant_value(left, 0.0) && !right.hasSideEffects()) {  // 0 * x
++                return cast_expression(context, left, resultType);
++            }
++            break;
++
++        case Token::Kind::TK_MINUS:
++            if (is_constant_value(right, 0.0)) {  // x - 0
++                return cast_expression(context, left, resultType);
++            }
++            if (is_constant_value(left, 0.0)) {   // 0 - x (to `-x`)
++                return PrefixExpression::Make(context, Token::Kind::TK_MINUS,
++                                              cast_expression(context, right, resultType));
++            }
++            break;
++
++        case Token::Kind::TK_SLASH:
++            if (is_constant_value(right, 1.0)) {  // x / 1
++                return cast_expression(context, left, resultType);
++            }
++            if (is_constant_value(left, 0.0) &&
++                !is_constant_value(right, 0.0) &&
++                !right.hasSideEffects()) {        // 0 / x (where x is not 0)
++                return cast_expression(context, left, resultType);
++            }
++            break;
++
++        case Token::Kind::TK_PLUSEQ:
++        case Token::Kind::TK_MINUSEQ:
++            if (is_constant_value(right, 0.0)) {  // x += 0, x -= 0
++                std::unique_ptr<Expression> result = cast_expression(context, left, resultType);
++                Analysis::UpdateRefKind(result.get(), VariableRefKind::kRead);
++                return result;
++            }
++            break;
++
++        case Token::Kind::TK_STAREQ:
++        case Token::Kind::TK_SLASHEQ:
++            if (is_constant_value(right, 1.0)) {  // x *= 1, x /= 1
++                std::unique_ptr<Expression> result = cast_expression(context, left, resultType);
++                Analysis::UpdateRefKind(result.get(), VariableRefKind::kRead);
++                return result;
++            }
++            break;
++
++        default:
++            break;
++    }
++
++    return nullptr;
++}
++
+ std::unique_ptr<Expression> ConstantFolder::Simplify(const Context& context,
+                                                      int offset,
+                                                      const Expression& leftExpr,
+                                                      Operator op,
+-                                                     const Expression& rightExpr) {
++                                                     const Expression& rightExpr,
++                                                     const Type& resultType) {
+     // Replace constant variables with trivial initial-values.
+     const Expression* left = GetConstantValueForVariable(leftExpr);
+     const Expression* right = GetConstantValueForVariable(rightExpr);
+ 
+     // If this is the comma operator, the left side is evaluated but not otherwise used in any way.
+     // So if the left side has no side effects, it can just be eliminated entirely.
+     if (op.kind() == Token::Kind::TK_COMMA && !left->hasSideEffects()) {
+         return right->clone();
+     }
+ 
+     // If this is the assignment operator, and both sides are the same trivial expression, this is
+     // self-assignment (i.e., `var = var`) and can be reduced to just a variable reference (`var`).
+     // This can happen when other parts of the assignment are optimized away.
+     if (op.kind() == Token::Kind::TK_EQ && Analysis::IsSelfAssignment(*left, *right)) {
+         return right->clone();
+     }
+ 
+     // Simplify the expression when both sides are constant Boolean literals.
+     if (left->is<BoolLiteral>() && right->is<BoolLiteral>()) {
+         bool leftVal  = left->as<BoolLiteral>().value();
+         bool rightVal = right->as<BoolLiteral>().value();
+         bool result;
+         switch (op.kind()) {
+             case Token::Kind::TK_LOGICALAND: result = leftVal && rightVal; break;
+             case Token::Kind::TK_LOGICALOR:  result = leftVal || rightVal; break;
+             case Token::Kind::TK_LOGICALXOR: result = leftVal ^  rightVal; break;
+             case Token::Kind::TK_EQEQ:       result = leftVal == rightVal; break;
+             case Token::Kind::TK_NEQ:        result = leftVal != rightVal; break;
+             default: return nullptr;
+         }
+         return std::make_unique<BoolLiteral>(context, offset, result);
+     }
+ 
+     // If the left side is a Boolean literal, apply short-circuit optimizations.
+     if (left->is<BoolLiteral>()) {
+         return short_circuit_boolean(*left, op, *right);
+     }
+ 
+     // If the right side is a Boolean literal...
+     if (right->is<BoolLiteral>()) {
+         // ... and the left side has no side effects...
+         if (!left->hasSideEffects()) {
+             // We can reverse the expressions and short-circuit optimizations are still valid.
+             return short_circuit_boolean(*right, op, *left);
+         }
+ 
+         // We can't use short-circuiting, but we can still optimize away no-op Boolean expressions.
+         return eliminate_no_op_boolean(*left, op, *right);
+     }
+ 
+     if (ErrorOnDivideByZero(context, offset, op, *right)) {
+         return nullptr;
+     }
+ 
+-    // Other than the short-circuit cases above, constant folding requires both sides to be constant
++    // Optimize away no-op arithmetic like `x * 1`, `x *= 1`, `x + 0`, `x * 0`, `0 / x`, etc.
++    const Type& leftType = left->type();
++    const Type& rightType = right->type();
++    if ((leftType.isScalar() || leftType.isVector()) &&
++        (rightType.isScalar() || rightType.isVector())) {
++        std::unique_ptr<Expression> expr = simplify_no_op_arithmetic(context, *left, op, *right,
++                                                                     resultType);
++        if (expr) {
++            return expr;
++        }
++    }
++
++    // Other than the cases above, constant folding requires both sides to be constant.
+     if (!left->isCompileTimeConstant() || !right->isCompileTimeConstant()) {
+         return nullptr;
+     }
+ 
+     // Note that we expressly do not worry about precision and overflow here -- we use the maximum
+     // precision to calculate the results and hope the result makes sense.
+     // TODO: detect and handle integer overflow properly.
+     using SKSL_UINT = uint64_t;
+     #define RESULT(t, op) std::make_unique<t ## Literal>(context, offset, \
+                                                          leftVal op rightVal)
+     #define URESULT(t, op) std::make_unique<t ## Literal>(context, offset,       \
+                                                           (SKSL_UINT) leftVal op \
+                                                           (SKSL_UINT) rightVal)
+     if (left->is<IntLiteral>() && right->is<IntLiteral>()) {
+         SKSL_INT leftVal  = left->as<IntLiteral>().value();
+         SKSL_INT rightVal = right->as<IntLiteral>().value();
+         switch (op.kind()) {
+             case Token::Kind::TK_PLUS:       return URESULT(Int, +);
+             case Token::Kind::TK_MINUS:      return URESULT(Int, -);
+             case Token::Kind::TK_STAR:       return URESULT(Int, *);
+             case Token::Kind::TK_SLASH:
+                 if (leftVal == std::numeric_limits<SKSL_INT>::min() && rightVal == -1) {
+                     context.fErrors.error(offset, "arithmetic overflow");
+                     return nullptr;
+                 }
+                 return RESULT(Int, /);
+             case Token::Kind::TK_PERCENT:
+                 if (leftVal == std::numeric_limits<SKSL_INT>::min() && rightVal == -1) {
+                     context.fErrors.error(offset, "arithmetic overflow");
+                     return nullptr;
+                 }
+                 return RESULT(Int, %);
+             case Token::Kind::TK_BITWISEAND: return RESULT(Int,  &);
+             case Token::Kind::TK_BITWISEOR:  return RESULT(Int,  |);
+             case Token::Kind::TK_BITWISEXOR: return RESULT(Int,  ^);
+             case Token::Kind::TK_EQEQ:       return RESULT(Bool, ==);
+             case Token::Kind::TK_NEQ:        return RESULT(Bool, !=);
+             case Token::Kind::TK_GT:         return RESULT(Bool, >);
+             case Token::Kind::TK_GTEQ:       return RESULT(Bool, >=);
+             case Token::Kind::TK_LT:         return RESULT(Bool, <);
+             case Token::Kind::TK_LTEQ:       return RESULT(Bool, <=);
+             case Token::Kind::TK_SHL:
+                 if (rightVal >= 0 && rightVal <= 31) {
+                     // Left-shifting a negative (or really, any signed) value is undefined behavior
+                     // in C++, but not GLSL. Do the shift on unsigned values, to avoid UBSAN.
+                     return URESULT(Int,  <<);
+                 }
+                 context.fErrors.error(offset, "shift value out of range");
+                 return nullptr;
+             case Token::Kind::TK_SHR:
+                 if (rightVal >= 0 && rightVal <= 31) {
+                     return RESULT(Int,  >>);
+                 }
+                 context.fErrors.error(offset, "shift value out of range");
+                 return nullptr;
+ 
+             default:
+                 return nullptr;
+         }
+     }
+ 
+     // Perform constant folding on pairs of floating-point literals.
+     if (left->is<FloatLiteral>() && right->is<FloatLiteral>()) {
+         SKSL_FLOAT leftVal  = left->as<FloatLiteral>().value();
+         SKSL_FLOAT rightVal = right->as<FloatLiteral>().value();
+         switch (op.kind()) {
+             case Token::Kind::TK_PLUS:  return RESULT(Float, +);
+             case Token::Kind::TK_MINUS: return RESULT(Float, -);
+             case Token::Kind::TK_STAR:  return RESULT(Float, *);
+             case Token::Kind::TK_SLASH: return RESULT(Float, /);
+             case Token::Kind::TK_EQEQ: return RESULT(Bool, ==);
+             case Token::Kind::TK_NEQ:  return RESULT(Bool, !=);
+             case Token::Kind::TK_GT:   return RESULT(Bool, >);
+             case Token::Kind::TK_GTEQ: return RESULT(Bool, >=);
+             case Token::Kind::TK_LT:   return RESULT(Bool, <);
+             case Token::Kind::TK_LTEQ: return RESULT(Bool, <=);
+             default:                   return nullptr;
+         }
+     }
+ 
+     // Perform constant folding on pairs of vectors.
+-    const Type& leftType = left->type();
+-    const Type& rightType = right->type();
+     if (leftType.isVector() && leftType == rightType) {
+         if (leftType.componentType().isFloat()) {
+             return simplify_vector<SKSL_FLOAT>(context, *left, op, *right);
+         }
+         if (leftType.componentType().isInteger()) {
+             return simplify_vector<SKSL_INT, SKSL_UINT>(context, *left, op, *right);
+         }
+         return nullptr;
+     }
+ 
+     // Perform constant folding on vectors against scalars, e.g.: half4(2) + 2
+     if (leftType.isVector() && leftType.componentType() == rightType) {
+         if (rightType.isFloat()) {
+             return simplify_vector<SKSL_FLOAT>(context, *left, op,
+                                                splat_scalar(*right, left->type()));
+         }
+         if (rightType.isInteger()) {
+             return simplify_vector<SKSL_INT, SKSL_UINT>(context, *left, op,
+                                                         splat_scalar(*right, left->type()));
+         }
+         return nullptr;
+     }
+ 
+     // Perform constant folding on scalars against vectors, e.g.: 2 + half4(2)
+     if (rightType.isVector() && rightType.componentType() == leftType) {
+         if (leftType.isFloat()) {
+             return simplify_vector<SKSL_FLOAT>(context, splat_scalar(*left, right->type()), op,
+                                                *right);
+         }
+         if (leftType.isInteger()) {
+             return simplify_vector<SKSL_INT, SKSL_UINT>(context, splat_scalar(*left, right->type()),
+                                                         op, *right);
+         }
+         return nullptr;
+     }
+ 
+     // Perform constant folding on pairs of matrices.
+     if (leftType.isMatrix() && rightType.isMatrix()) {
+         bool equality;
+         switch (op.kind()) {
+             case Token::Kind::TK_EQEQ:
+                 equality = true;
+                 break;
+             case Token::Kind::TK_NEQ:
+                 equality = false;
+                 break;
+             default:
+                 return nullptr;
+         }
+ 
+         switch (left->compareConstant(*right)) {
+             case Expression::ComparisonResult::kNotEqual:
+                 equality = !equality;
+                 [[fallthrough]];
+ 
+             case Expression::ComparisonResult::kEqual:
+                 return std::make_unique<BoolLiteral>(context, offset, equality);
+ 
+             case Expression::ComparisonResult::kUnknown:
+                 return nullptr;
+         }
+     }
+ 
+     // We aren't able to constant-fold.
+     #undef RESULT
+     #undef URESULT
+     return nullptr;
+ }
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/SkSLConstantFolder.h b/src/sksl/SkSLConstantFolder.h
+index 36cb1b5b45..d82f3a3404 100644
+--- a/src/sksl/SkSLConstantFolder.h
++++ b/src/sksl/SkSLConstantFolder.h
+@@ -27,37 +27,38 @@ class ConstantFolder {
+ public:
+     /**
+      * If value is an int literal or const int variable with a known value, returns true and stores
+      * the value in out. Otherwise returns false.
+      */
+     static bool GetConstantInt(const Expression& value, SKSL_INT* out);
+ 
+     /**
+      * If value is a float literal or const float variable with a known value, returns true and
+      * stores the value in out. Otherwise returns false.
+      */
+     static bool GetConstantFloat(const Expression& value, SKSL_FLOAT* out);
+ 
+     /**
+      * If the expression is a const variable with a known compile-time-constant value, returns that
+      * value. If not, returns the original expression as-is.
+      */
+     static const Expression* GetConstantValueForVariable(const Expression& value);
+ 
+     /**
+      * Reports an error and returns true if op is a division / mod operator and right is zero or
+      * contains a zero element.
+      */
+     static bool ErrorOnDivideByZero(const Context& context, int offset, Operator op,
+                                     const Expression& right);
+ 
+     /** Simplifies the binary expression `left OP right`. Returns null if it can't be simplified. */
+     static std::unique_ptr<Expression> Simplify(const Context& context,
+                                                 int offset,
+                                                 const Expression& left,
+                                                 Operator op,
+-                                                const Expression& right);
++                                                const Expression& right,
++                                                const Type& resultType);
+ };
+ 
+ }  // namespace SkSL
+ 
+ #endif  // SKSL_CONSTANT_FOLDER
+diff --git a/src/sksl/ir/SkSLBinaryExpression.cpp b/src/sksl/ir/SkSLBinaryExpression.cpp
+index 6d1fe9e495..858d44f9b5 100644
+--- a/src/sksl/ir/SkSLBinaryExpression.cpp
++++ b/src/sksl/ir/SkSLBinaryExpression.cpp
+@@ -103,27 +103,27 @@ std::unique_ptr<Expression> BinaryExpression::Make(const Context& context,
+ std::unique_ptr<Expression> BinaryExpression::Make(const Context& context,
+                                                    std::unique_ptr<Expression> left,
+                                                    Operator op,
+                                                    std::unique_ptr<Expression> right,
+                                                    const Type* resultType) {
+     // We should have detected non-ES2 compliant behavior in Convert.
+     SkASSERT(!context.fConfig->strictES2Mode() || op.isAllowedInStrictES2Mode());
+     SkASSERT(!context.fConfig->strictES2Mode() || !left->type().isOrContainsArray());
+ 
+     // We should have detected non-assignable assignment expressions in Convert.
+     SkASSERT(!op.isAssignment() || Analysis::IsAssignable(*left));
+     SkASSERT(!op.isAssignment() || !left->type().componentType().isOpaque());
+ 
+     // If we can detect division-by-zero, we should synthesize an error, but our caller is still
+     // expecting to receive a binary expression back; don't return nullptr.
+     const int offset = left->fOffset;
+     if (!ConstantFolder::ErrorOnDivideByZero(context, offset, op, *right)) {
+-        std::unique_ptr<Expression> result =
+-                ConstantFolder::Simplify(context, offset, *left, op, *right);
++        std::unique_ptr<Expression> result = ConstantFolder::Simplify(context, offset, *left,
++                                                                      op, *right, *resultType);
+         if (result) {
+             return result;
+         }
+     }
+ 
+     return std::make_unique<BinaryExpression>(offset, std::move(left), op, std::move(right),
+                                               resultType);
+ }
+diff --git a/src/sksl/ir/SkSLBinaryExpression.h b/src/sksl/ir/SkSLBinaryExpression.h
+index a77cd0e675..6525538804 100644
+--- a/src/sksl/ir/SkSLBinaryExpression.h
++++ b/src/sksl/ir/SkSLBinaryExpression.h
+@@ -29,75 +29,75 @@ class BinaryExpression final : public Expression {
+ public:
+     static constexpr Kind kExpressionKind = Kind::kBinary;
+ 
+     BinaryExpression(int offset, std::unique_ptr<Expression> left, Operator op,
+                      std::unique_ptr<Expression> right, const Type* type)
+         : INHERITED(offset, kExpressionKind, type)
+         , fLeft(std::move(left))
+         , fOperator(op)
+         , fRight(std::move(right)) {
+         // If we are assigning to a VariableReference, ensure that it is set to Write or ReadWrite.
+         SkASSERT(!op.isAssignment() || CheckRef(*this->left()));
+     }
+ 
+     // Creates a potentially-simplified form of the expression. Determines the result type
+     // programmatically. Typechecks and coerces input expressions; reports errors via ErrorReporter.
+     static std::unique_ptr<Expression> Convert(const Context& context,
+                                                std::unique_ptr<Expression> left,
+                                                Operator op,
+                                                std::unique_ptr<Expression> right);
+ 
+     // Creates a potentially-simplified form of the expression. Determines the result type
+     // programmatically. Asserts if the expressions do not typecheck or are otherwise invalid.
+     static std::unique_ptr<Expression> Make(const Context& context,
+                                             std::unique_ptr<Expression> left,
+                                             Operator op,
+                                             std::unique_ptr<Expression> right);
+ 
+     // Creates a potentially-simplified form of the expression. Result type is passed in.
+     // Asserts if the expressions do not typecheck or are otherwise invalid.
+     static std::unique_ptr<Expression> Make(const Context& context,
+                                             std::unique_ptr<Expression> left,
+                                             Operator op,
+                                             std::unique_ptr<Expression> right,
+                                             const Type* resultType);
+ 
+     std::unique_ptr<Expression>& left() {
+         return fLeft;
+     }
+ 
+     const std::unique_ptr<Expression>& left() const {
+         return fLeft;
+     }
+ 
+     std::unique_ptr<Expression>& right() {
+         return fRight;
+     }
+ 
+     const std::unique_ptr<Expression>& right() const {
+         return fRight;
+     }
+ 
+     Operator getOperator() const {
+         return fOperator;
+     }
+ 
+     bool isConstantOrUniform() const override {
+         return this->left()->isConstantOrUniform() && this->right()->isConstantOrUniform();
+     }
+ 
+     std::unique_ptr<Expression> constantPropagate(const IRGenerator& irGenerator,
+                                                   const DefinitionMap& definitions) override {
+         return ConstantFolder::Simplify(irGenerator.fContext, fOffset, *this->left(),
+-                                        this->getOperator(), *this->right());
++                                        this->getOperator(), *this->right(), this->type());
+     }
+ 
+     bool hasProperty(Property property) const override {
+         if (property == Property::kSideEffects && this->getOperator().isAssignment()) {
+             return true;
+         }
+         return this->left()->hasProperty(property) || this->right()->hasProperty(property);
+     }
+ 
+     std::unique_ptr<Expression> clone() const override;
+ 
+     String description() const override;
+diff --git a/tests/SkSLDSLTest.cpp b/tests/SkSLDSLTest.cpp
+index a701533e75..c4bfeb49dd 100644
+--- a/tests/SkSLDSLTest.cpp
++++ b/tests/SkSLDSLTest.cpp
+@@ -335,30 +335,28 @@ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLBool, r, ctxInfo) {
+ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLPlus, r, ctxInfo) {
+     AutoDSLContext context(ctxInfo.directContext()->priv().getGpu());
+     Var a(kFloat, "a"), b(kFloat, "b");
+-    Expression e1 = a + b;
+-    EXPECT_EQUAL(e1, "(a + b)");
+ 
+-    Expression e2 = a + 1;
+-    EXPECT_EQUAL(e2, "(a + 1.0)");
+-
+-    Expression e3 = 0.5 + a + -99;
+-    EXPECT_EQUAL(e3, "((0.5 + a) + -99.0)");
+-
+-    Expression e4 = a += b + 1;
+-    EXPECT_EQUAL(e4, "(a += (b + 1.0))");
++    EXPECT_EQUAL(a + b,
++               "(a + b)");
++    EXPECT_EQUAL(a + 1,
++               "(a + 1.0)");
++    EXPECT_EQUAL(0.5 + a + -99,
++              "((0.5 + a) + -99.0)");
++    EXPECT_EQUAL(a += b + 1,
++               "(a += (b + 1.0))");
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '+' cannot operate on 'bool2', 'float'\n");
+         DSLExpression((Bool2(true) + a)).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '+=' cannot operate on 'float', 'bool2'\n");
+         DSLExpression((a += Bool2(true))).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: cannot assign to this expression\n");
+         DSLExpression((1.0 += a)).release();
+     }
+ }
+@@ -366,30 +364,28 @@ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLPlus, r, ctxInfo) {
+ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLMinus, r, ctxInfo) {
+     AutoDSLContext context(ctxInfo.directContext()->priv().getGpu());
+     Var a(kInt, "a"), b(kInt, "b");
+-    Expression e1 = a - b;
+-    EXPECT_EQUAL(e1, "(a - b)");
+-
+-    Expression e2 = a - 1;
+-    EXPECT_EQUAL(e2, "(a - 1)");
+ 
+-    Expression e3 = 2 - a - b;
+-    EXPECT_EQUAL(e3, "((2 - a) - b)");
+-
+-    Expression e4 = a -= b + 1;
+-    EXPECT_EQUAL(e4, "(a -= (b + 1))");
++    EXPECT_EQUAL(a - b,
++               "(a - b)");
++    EXPECT_EQUAL(a - 1,
++               "(a - 1)");
++    EXPECT_EQUAL(2 - a - b,
++              "((2 - a) - b)");
++    EXPECT_EQUAL(a -= b + 1,
++               "(a -= (b + 1))");
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '-' cannot operate on 'bool2', 'int'\n");
+         DSLExpression(Bool2(true) - a).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '-=' cannot operate on 'int', 'bool2'\n");
+         DSLExpression(a -= Bool2(true)).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: cannot assign to this expression\n");
+         DSLExpression(1.0 -= a).release();
+     }
+ }
+@@ -397,30 +393,28 @@ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLMinus, r, ctxInfo) {
+ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLMultiply, r, ctxInfo) {
+     AutoDSLContext context(ctxInfo.directContext()->priv().getGpu());
+     Var a(kFloat, "a"), b(kFloat, "b");
+-    Expression e1 = a * b;
+-    EXPECT_EQUAL(e1, "(a * b)");
+-
+-    Expression e2 = a * 1;
+-    EXPECT_EQUAL(e2, "(a * 1.0)");
+ 
+-    Expression e3 = 0.5 * a * -99;
+-    EXPECT_EQUAL(e3, "((0.5 * a) * -99.0)");
+-
+-    Expression e4 = a *= b + 1;
+-    EXPECT_EQUAL(e4, "(a *= (b + 1.0))");
++    EXPECT_EQUAL(a * b,
++               "(a * b)");
++    EXPECT_EQUAL(a * 2,
++               "(a * 2.0)");
++    EXPECT_EQUAL(0.5 * a * -99,
++              "((0.5 * a) * -99.0)");
++    EXPECT_EQUAL(a *= b + 1,
++               "(a *= (b + 1.0))");
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '*' cannot operate on 'bool2', 'float'\n");
+         DSLExpression(Bool2(true) * a).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '*=' cannot operate on 'float', 'bool2'\n");
+         DSLExpression(a *= Bool2(true)).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: cannot assign to this expression\n");
+         DSLExpression(1.0 *= a).release();
+     }
+ }
+@@ -428,44 +422,41 @@ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLMultiply, r, ctxInfo) {
+ DEF_GPUTEST_FOR_MOCK_CONTEXT(DSLDivide, r, ctxInfo) {
+     AutoDSLContext context(ctxInfo.directContext()->priv().getGpu());
+     Var a(kFloat, "a"), b(kFloat, "b");
+-    Expression e1 = a / b;
+-    EXPECT_EQUAL(e1, "(a / b)");
+-
+-    Expression e2 = a / 1;
+-    EXPECT_EQUAL(e2, "(a / 1.0)");
+-
+-    Expression e3 = 0.5 / a / -99;
+-    EXPECT_EQUAL(e3, "((0.5 / a) / -99.0)");
+-
+-    Expression e4 = b / (a - 1);
+-    EXPECT_EQUAL(e4, "(b / (a - 1.0))");
+ 
+-    Expression e5 = a /= b + 1;
+-    EXPECT_EQUAL(e5, "(a /= (b + 1.0))");
++    EXPECT_EQUAL(a / b,
++               "(a / b)");
++    EXPECT_EQUAL(a / 2,
++               "(a / 2.0)");
++    EXPECT_EQUAL(0.5 / a / -99,
++              "((0.5 / a) / -99.0)");
++    EXPECT_EQUAL(b / (a - 1),
++               "(b / (a - 1.0))");
++    EXPECT_EQUAL(a /= b + 1,
++               "(a /= (b + 1.0))");
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '/' cannot operate on 'bool2', 'float'\n");
+         DSLExpression(Bool2(true) / a).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: type mismatch: '/=' cannot operate on 'float', 'bool2'\n");
+         DSLExpression(a /= Bool2(true)).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: cannot assign to this expression\n");
+         DSLExpression(1.0 /= a).release();
+     }
+ 
+     {
+         ExpectError error(r, "error: division by zero\n");
+         DSLExpression(a /= 0).release();
+     }
+ 
+     {
+         Var c(kFloat2, "c");
+         ExpectError error(r, "error: division by zero\n");
+         DSLExpression(c /= Float2(Float(0), 1)).release();
+     }
+ }
+diff --git a/tests/sksl/runtime_errors/LoopStructureErrors.skvm b/tests/sksl/runtime_errors/LoopStructureErrors.skvm
+index 851758a8b4..1c169dce80 100644
+--- a/tests/sksl/runtime_errors/LoopStructureErrors.skvm
++++ b/tests/sksl/runtime_errors/LoopStructureErrors.skvm
+@@ -1,7 +1,7 @@
+ ### Compilation failed:
+ 
+ error: 4: loop must guarantee termination in fewer iterations
+-error: 5: loop must guarantee termination in fewer iterations
++error: 5: invalid loop expression
+ error: 10: loop index must not be modified within body of the loop
+ error: 11: loop index must not be modified within body of the loop
+ error: 12: loop index must not be modified within body of the loop

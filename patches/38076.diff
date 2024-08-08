@@ -1,0 +1,145 @@
+commit a590dfc242620fc7bd628e9351cbcf940da0e965
+Author: Paul B Mahol <onemda@gmail.com>
+Date:   Fri Sep 3 23:57:19 2021 +0200
+
+    avcodec/interplayacm: fix draining and last frame number of samples
+
+diff --git a/libavcodec/interplayacm.c b/libavcodec/interplayacm.c
+index 470d6403f3..c11178a9ee 100644
+--- a/libavcodec/interplayacm.c
++++ b/libavcodec/interplayacm.c
+@@ -38,19 +38,20 @@ static int mul_2x11[11  *  11];
+ typedef struct InterplayACMContext {
+     GetBitContext gb;
+     uint8_t *bitstream;
+     int max_framesize;
++    uint64_t max_samples;
+     int bitstream_size;
+     int bitstream_index;
+ 
+     int level;
+     int rows;
+     int cols;
+     int wrapbuf_len;
+     int block_len;
+     int skip;
+ 
+     int *block;
+     int *wrapbuf;
+     int *ampbuf;
+     int *midbuf;
+ } InterplayACMContext;
+@@ -73,39 +74,42 @@ static av_cold void decode_init_static(void)
+ static av_cold int decode_init(AVCodecContext *avctx)
+ {
+     static AVOnce init_static_once = AV_ONCE_INIT;
+     InterplayACMContext *s = avctx->priv_data;
+ 
+     if (avctx->extradata_size < 14)
+         return AVERROR_INVALIDDATA;
+ 
+     if (avctx->channels <= 0) {
+         av_log(avctx, AV_LOG_ERROR, "Invalid number of channels: %d\n", avctx->channels);
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    s->max_samples = AV_RL32(avctx->extradata + 4) / avctx->channels;
++    if (s->max_samples == 0)
++        s->max_samples = UINT64_MAX;
+     s->level = AV_RL16(avctx->extradata + 12) & 0xf;
+     s->rows  = AV_RL16(avctx->extradata + 12) >>  4;
+     s->cols  = 1 << s->level;
+     s->wrapbuf_len = 2 * s->cols - 2;
+     s->block_len = s->rows * s->cols;
+     s->max_framesize = s->block_len;
+ 
+     s->block   = av_calloc(s->block_len, sizeof(int));
+     s->wrapbuf = av_calloc(s->wrapbuf_len, sizeof(int));
+     s->ampbuf  = av_calloc(0x10000, sizeof(int));
+     s->bitstream = av_calloc(s->max_framesize + AV_INPUT_BUFFER_PADDING_SIZE / sizeof(*s->bitstream) + 1, sizeof(*s->bitstream));
+     if (!s->block || !s->wrapbuf || !s->ampbuf || !s->bitstream)
+         return AVERROR(ENOMEM);
+ 
+     s->midbuf  = s->ampbuf + 0x8000;
+     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
+ 
+     ff_thread_once(&init_static_once, decode_init_static);
+ 
+     return 0;
+ }
+ 
+ #define set_pos(s, r, c, idx) do {               \
+         unsigned pos = ((r) << s->level) + (c);  \
+         s->block[pos] = s->midbuf[(idx)];        \
+     } while (0)
+@@ -550,66 +554,67 @@ static int decode_block(InterplayACMContext *s)
+ static int decode_frame(AVCodecContext *avctx, void *data,
+                         int *got_frame_ptr, AVPacket *pkt)
+ {
+     InterplayACMContext *s = avctx->priv_data;
+     GetBitContext *gb = &s->gb;
+     AVFrame *frame = data;
+     const uint8_t *buf;
+     int16_t *samples;
+     int ret, n, buf_size, input_buf_size;
+ 
+     if (!pkt->size && !s->bitstream_size) {
+         *got_frame_ptr = 0;
+         return 0;
+     }
+ 
+     buf_size = FFMIN(pkt->size, s->max_framesize - s->bitstream_size);
+     input_buf_size = buf_size;
+     if (s->bitstream_index + s->bitstream_size + buf_size > s->max_framesize) {
+         memmove(s->bitstream, &s->bitstream[s->bitstream_index], s->bitstream_size);
+         s->bitstream_index = 0;
+     }
+     if (pkt->data)
+         memcpy(&s->bitstream[s->bitstream_index + s->bitstream_size], pkt->data, buf_size);
+     buf                = &s->bitstream[s->bitstream_index];
+     buf_size          += s->bitstream_size;
+     s->bitstream_size  = buf_size;
+     if (buf_size < s->max_framesize && pkt->data) {
+         *got_frame_ptr = 0;
+         return input_buf_size;
+     }
+ 
+     if ((ret = init_get_bits8(gb, buf, buf_size)) < 0)
+         return ret;
+ 
+-    frame->nb_samples = s->block_len / avctx->channels;
++    frame->nb_samples = FFMIN(s->block_len / avctx->channels, s->max_samples);
++    s->max_samples -= FFMIN(frame->nb_samples, s->max_samples);
+     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
+         return ret;
+ 
+     skip_bits(gb, s->skip);
+     ret = decode_block(s);
+     if (ret < 0)
+         return ret;
+ 
+     samples = (int16_t *)frame->data[0];
+     for (n = 0; n < frame->nb_samples * avctx->channels; n++) {
+         int val = s->block[n] >> s->level;
+         *samples++ = val;
+     }
+ 
+     *got_frame_ptr = 1;
+     s->skip = get_bits_count(gb) - 8 * (get_bits_count(gb) / 8);
+     n = get_bits_count(gb) / 8;
+ 
+     if (n > buf_size && pkt->data) {
+         s->bitstream_size = 0;
+         s->bitstream_index = 0;
+         return AVERROR_INVALIDDATA;
+     }
+ 
+-    if (s->bitstream_size) {
++    if (s->bitstream_size > 0) {
+         s->bitstream_index += n;
+-        s->bitstream_size  -= n;
++        s->bitstream_size  -= FFMIN(s->bitstream_size, n);
+         return input_buf_size;
+     }
+     return n;
+ }

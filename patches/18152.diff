@@ -1,0 +1,107 @@
+commit d59c3645f798169f7fde53dbf5c6d3e095465e8c
+Author: Rob Davies <rmd+git@sanger.ac.uk>
+Date:   Mon Oct 14 11:06:20 2019 +0100
+
+    Ensure qname is properly NUL terminated when reading BAM
+    
+    Prevents possible invalid read when printing names.
+    
+    Credit to OSS-Fuzz
+    Fixes oss-fuzz id 18152
+
+diff --git a/sam.c b/sam.c
+index 0fb4df76..ec8bd158 100644
+--- a/sam.c
++++ b/sam.c
+@@ -533,70 +533,91 @@ static inline int aux_type2size(uint8_t type)
+ static void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host)
+ {
+     uint32_t *cigar = (uint32_t*)(data + c->l_qname);
+     uint32_t i;
+     for (i = 0; i < c->n_cigar; ++i) ed_swap_4p(&cigar[i]);
+ }
+ 
++// Fix bad records where qname is not terminated correctly.
++static int fixup_missing_qname_nul(bam1_t *b) {
++    bam1_core_t *c = &b->core;
++
++    // Note this is called before c->l_extranul is added to c->l_qname
++    if (c->l_extranul > 0) {
++        b->data[c->l_qname++] = '\0';
++        c->l_extranul--;
++    } else {
++        if (b->l_data > INT_MAX - 4) return -1;
++        if (realloc_bam_data(b, b->l_data + 4) < 0) return -1;
++        b->l_data += 4;
++        b->data[c->l_qname++] = '\0';
++        c->l_extranul = 3;
++    }
++    return 0;
++}
++
+ /*
+  * Note a second interface that returns a bam pointer instead would avoid bam_copy1
+  * in multi-threaded handling.  This may be worth considering for htslib2.
+  */
+ int bam_read1(BGZF *fp, bam1_t *b)
+ {
+     bam1_core_t *c = &b->core;
+     int32_t block_len, ret, i;
+     uint32_t x[8], new_l_data;
+ 
+     b->l_data = 0;
+ 
+     if ((ret = bgzf_read(fp, &block_len, 4)) != 4) {
+         if (ret == 0) return -1; // normal end-of-file
+         else return -2; // truncated
+     }
+     if (fp->is_be)
+         ed_swap_4p(&block_len);
+     if (block_len < 32) return -4;  // block_len includes core data
+     if (bgzf_read(fp, x, 32) != 32) return -3;
+     if (fp->is_be) {
+         for (i = 0; i < 8; ++i) ed_swap_4p(x + i);
+     }
+     c->tid = x[0]; c->pos = (int32_t)x[1];
+     c->bin = x[2]>>16; c->qual = x[2]>>8&0xff; c->l_qname = x[2]&0xff;
+     c->l_extranul = (c->l_qname%4 != 0)? (4 - c->l_qname%4) : 0;
+     c->flag = x[3]>>16; c->n_cigar = x[3]&0xffff;
+     c->l_qseq = x[4];
+     c->mtid = x[5]; c->mpos = (int32_t)x[6]; c->isize = (int32_t)x[7];
+ 
+     new_l_data = block_len - 32 + c->l_extranul;
+     if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1) return -4;
+     if (((uint64_t) c->n_cigar << 2) + c->l_qname + c->l_extranul
+         + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data)
+         return -4;
+     if (realloc_bam_data(b, new_l_data) < 0) return -4;
+     b->l_data = new_l_data;
+ 
+     if (bgzf_read(fp, b->data, c->l_qname) != c->l_qname) return -4;
++    if (b->data[c->l_qname - 1] != '\0') { // Try to fix missing NUL termination
++        if (fixup_missing_qname_nul(b) < 0) return -4;
++    }
+     for (i = 0; i < c->l_extranul; ++i) b->data[c->l_qname+i] = '\0';
+     c->l_qname += c->l_extranul;
+     if (b->l_data < c->l_qname ||
+         bgzf_read(fp, b->data + c->l_qname, b->l_data - c->l_qname) != b->l_data - c->l_qname)
+         return -4;
+     if (fp->is_be) swap_data(c, b->l_data, b->data, 0);
+     if (bam_tag2cigar(b, 0, 0) < 0)
+         return -4;
+ 
+     if (c->n_cigar > 0) { // recompute "bin" and check CIGAR-qlen consistency
+         int rlen, qlen;
+         bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
+         if ((b->core.flag & BAM_FUNMAP)) rlen=1;
+         b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
+         // Sanity check for broken CIGAR alignments
+         if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq) {
+             hts_log_error("CIGAR and query sequence lengths differ for %s",
+                     bam_get_qname(b));
+             return -4;
+         }
+     }
+ 
+     return 4 + block_len;
+ }

@@ -1,0 +1,595 @@
+commit 29c294e6842a56ba3b9a24a24a5f6de1575b0961
+Author: James Bonfield <jkb@sanger.ac.uk>
+Date:   Tue Mar 10 10:31:45 2020 +0000
+
+    Fixed a raft of integer overflows in VCF land.
+    
+    - Cast data into size_t before multiplication to avoid wrapping around
+      int32.
+    
+    - Added checks for return values to align_mem and ks_resize
+    
+    - Simplified the byzantine calculation in align_mem
+    
+    - Fixed kroundup_size_t and kroundup32 so they cannot wrap around to
+      zero and turn the realloc into a free.
+    
+    - Also added a check for ~2Gb on total length of FORMAT fields, which
+      nullifies the need for some of the above.  We may wish to remove
+      this at some point if we want to cope with truely mammoth
+      multi-sample data, and the above fixes means doing so will not
+      expose bugs.
+    
+      However for now this check adds protection against malformed data
+      creating excessive memory usage and CPU requirements.
+    
+    Credit to OSS-Fuzz
+    Fixes oss-fuzz 21139
+    Fixes oss-fuzz 20881
+
+diff --git a/htslib/kstring.h b/htslib/kstring.h
+index 02da3ed7..a42a0768 100644
+--- a/htslib/kstring.h
++++ b/htslib/kstring.h
+@@ -1,80 +1,80 @@
+ /* The MIT License
+ 
+    Copyright (C) 2011 by Attractive Chaos <attractor@live.co.uk>
+    Copyright (C) 2013-2014, 2016, 2018-2019 Genome Research Ltd.
+ 
+    Permission is hereby granted, free of charge, to any person obtaining
+    a copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+ 
+    The above copyright notice and this permission notice shall be
+    included in all copies or substantial portions of the Software.
+ 
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+    NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+    BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+    ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+ */
+ 
+ #ifndef KSTRING_H
+ #define KSTRING_H
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdarg.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <limits.h>
+ #include <sys/types.h>
+ 
+ #include "hts_defs.h"
+ 
+ #ifndef kroundup32
+-#define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
++#define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x),(x)=(x)?(x):(uint32_t)-1)
+ #endif
+ 
+ #ifndef kroundup_size_t
+ #define kroundup_size_t(x) (--(x),                                       \
+                             (x)|=(x)>>(sizeof(size_t)/8), /*  0 or  1 */ \
+                             (x)|=(x)>>(sizeof(size_t)/4), /*  1 or  2 */ \
+                             (x)|=(x)>>(sizeof(size_t)/2), /*  2 or  4 */ \
+                             (x)|=(x)>>(sizeof(size_t)),   /*  4 or  8 */ \
+                             (x)|=(x)>>(sizeof(size_t)*2), /*  8 or 16 */ \
+                             (x)|=(x)>>(sizeof(size_t)*4), /* 16 or 32 */ \
+-                            ++(x))
++                            ++(x),(x)=(x)?(x):(size_t)-1)
+ #endif
+ 
+ #if defined __GNUC__ && (__GNUC__ > 2 || (__GNUC__ == 2 && __GNUC_MINOR__ > 4))
+ #ifdef __MINGW_PRINTF_FORMAT
+ #define KS_ATTR_PRINTF(fmt, arg) __attribute__((__format__ (__MINGW_PRINTF_FORMAT, fmt, arg)))
+ #else
+ #define KS_ATTR_PRINTF(fmt, arg) __attribute__((__format__ (__printf__, fmt, arg)))
+ #endif // __MINGW_PRINTF_FORMAT
+ #else
+ #define KS_ATTR_PRINTF(fmt, arg)
+ #endif
+ 
+ #ifndef HAVE___BUILTIN_CLZ
+ #if defined __GNUC__ && (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4))
+ #define HAVE___BUILTIN_CLZ 1
+ #endif
+ #endif
+ 
+ /* kstring_t is a simple non-opaque type whose fields are likely to be
+  * used directly by user code (but see also ks_str() and ks_len() below).
+  * A kstring_t object is initialised by either of
+  *       kstring_t str = KS_INITIALIZE;
+  *       kstring_t str; ...; ks_initialize(&str);
+  * and either ownership of the underlying buffer should be given away before
+  * the object disappears (see ks_release() below) or the kstring_t should be
+  * destroyed with  ks_free(&str) or free(str.s) */
+ #ifndef KSTRING_T
+ #define KSTRING_T kstring_t
+diff --git a/vcf.c b/vcf.c
+index 486e1b75..96253065 100644
+--- a/vcf.c
++++ b/vcf.c
+@@ -2191,331 +2191,353 @@ typedef struct {
+ static inline int align_mem(kstring_t *s)
+ {
+     int e = 0;
+     if (s->l&7) {
+         uint64_t zero = 0;
+-        int l = ((s->l + 7)>>3<<3) - s->l;
+-        e = kputsn((char*)&zero, l, s) < 0;
++        e = kputsn((char*)&zero, 8 - (s->l&7), s) < 0;
+     }
+     return e == 0 ? 0 : -1;
+ }
+ 
+ // p,q is the start and the end of the FORMAT field
+ #define MAX_N_FMT 255   /* Limited by size of bcf1_t n_fmt field */
+ static int vcf_parse_format(kstring_t *s, const bcf_hdr_t *h, bcf1_t *v, char *p, char *q)
+ {
+     if ( !bcf_hdr_nsamples(h) ) return 0;
+ 
+     static int extreme_int_warned = 0;
+     char *r, *t;
+     int j, l, m, g;
+     khint_t k;
+     ks_tokaux_t aux1;
+     vdict_t *d = (vdict_t*)h->dict[BCF_DT_ID];
+     kstring_t *mem = (kstring_t*)&h->mem;
+     fmt_aux_t fmt[MAX_N_FMT];
+     mem->l = 0;
+ 
+     char *end = s->s + s->l;
+     if ( q>=end )
+     {
+         hts_log_error("FORMAT column with no sample columns starting at %s:%"PRIhts_pos"", s->s, v->pos+1);
+         v->errcode |= BCF_ERR_NCOLS;
+         return -1;
+     }
+ 
+     v->n_fmt = 0;
+     if ( p[0]=='.' && p[1]==0 ) // FORMAT field is empty "."
+     {
+         v->n_sample = bcf_hdr_nsamples(h);
+         return 0;
+     }
+ 
+     // get format information from the dictionary
+     for (j = 0, t = kstrtok(p, ":", &aux1); t; t = kstrtok(0, 0, &aux1), ++j) {
+         if (j >= MAX_N_FMT) {
+             v->errcode |= BCF_ERR_LIMITS;
+             hts_log_error("FORMAT column at %s:%"PRIhts_pos" lists more identifiers than htslib can handle",
+                 bcf_seqname(h,v), v->pos+1);
+             return -1;
+         }
+ 
+         *(char*)aux1.p = 0;
+         k = kh_get(vdict, d, t);
+         if (k == kh_end(d) || kh_val(d, k).info[BCF_HL_FMT] == 15) {
+             if ( t[0]=='.' && t[1]==0 )
+             {
+                 hts_log_error("Invalid FORMAT tag name '.'");
+                 v->errcode |= BCF_ERR_TAG_INVALID;
+                 return -1;
+             }
+             hts_log_warning("FORMAT '%s' is not defined in the header, assuming Type=String", t);
+             kstring_t tmp = {0,0,0};
+             int l;
+             ksprintf(&tmp, "##FORMAT=<ID=%s,Number=1,Type=String,Description=\"Dummy\">", t);
+             bcf_hrec_t *hrec = bcf_hdr_parse_line(h,tmp.s,&l);
+             free(tmp.s);
+             int res = hrec ? bcf_hdr_add_hrec((bcf_hdr_t*)h, hrec) : -1;
+             if (res < 0) bcf_hrec_destroy(hrec);
+             if (res > 0) res = bcf_hdr_sync((bcf_hdr_t*)h);
+ 
+             k = kh_get(vdict, d, t);
+             v->errcode = BCF_ERR_TAG_UNDEF;
+             if (res || k == kh_end(d)) {
+                 hts_log_error("Could not add dummy header for FORMAT '%s'", t);
+                 v->errcode |= BCF_ERR_TAG_INVALID;
+                 return -1;
+             }
+         }
+         fmt[j].max_l = fmt[j].max_m = fmt[j].max_g = 0;
+         fmt[j].key = kh_val(d, k).id;
+         fmt[j].is_gt = !strcmp(t, "GT");
+         fmt[j].y = h->id[0][fmt[j].key].val->info[BCF_HL_FMT];
+         v->n_fmt++;
+     }
+     // compute max
+     int n_sample_ori = -1;
+     r = q + 1;  // r: position in the format string
+     l = 0, m = g = 1, v->n_sample = 0;  // m: max vector size, l: max field len, g: max number of alleles
+     while ( r<end )
+     {
+         // can we skip some samples?
+         if ( h->keep_samples )
+         {
+             n_sample_ori++;
+             if ( !bit_array_test(h->keep_samples,n_sample_ori) )
+             {
+                 while ( *r!='\t' && r<end ) r++;
+                 if ( *r=='\t' ) { *r = 0; r++; }
+                 continue;
+             }
+         }
+ 
+         // collect fmt stats: max vector size, length, number of alleles
+         j = 0;  // j-th format field
+         for (;;)
+         {
+             if ( *r == '\t' ) *r = 0;
+             if ( *r == ':' || !*r )  // end of field or end of sample
+             {
+                 if (fmt[j].max_m < m) fmt[j].max_m = m;
+                 if (fmt[j].max_l < l) fmt[j].max_l = l;
+                 if (fmt[j].is_gt && fmt[j].max_g < g) fmt[j].max_g = g;
+                 l = 0, m = g = 1;
+                 if ( *r==':' )
+                 {
+                     j++;
+                     if ( j>=v->n_fmt )
+                     {
+                         hts_log_error("Incorrect number of FORMAT fields at %s:%"PRIhts_pos"",
+                             h->id[BCF_DT_CTG][v->rid].key, v->pos+1);
+                         v->errcode |= BCF_ERR_NCOLS;
+                         return -1;
+                     }
+                 }
+                 else break;
+             }
+             else if ( *r== ',' ) m++;
+             else if ( fmt[j].is_gt && (*r == '|' || *r == '/') ) g++;
+             if ( r>=end ) break;
+             r++; l++;
+         }
+         v->n_sample++;
+         if ( v->n_sample == bcf_hdr_nsamples(h) ) break;
+         r++;
+     }
+ 
+     // allocate memory for arrays
+     for (j = 0; j < v->n_fmt; ++j) {
+         fmt_aux_t *f = &fmt[j];
+         if ( !f->max_m ) f->max_m = 1;  // omitted trailing format field
+         if ((f->y>>4&0xf) == BCF_HT_STR) {
+             f->size = f->is_gt? f->max_g << 2 : f->max_l;
+         } else if ((f->y>>4&0xf) == BCF_HT_REAL || (f->y>>4&0xf) == BCF_HT_INT) {
+             f->size = f->max_m << 2;
+         } else
+         {
+             hts_log_error("The format type %d is currently not supported", f->y>>4&0xf);
+             v->errcode |= BCF_ERR_TAG_INVALID;
+             return -1;
+         }
+-        align_mem(mem);
++        if (align_mem(mem) < 0) {
++            hts_log_error("Memory allocation failure");
++            v->errcode |= BCF_ERR_LIMITS;
++            return -1;
++        }
+         f->offset = mem->l;
+-        ks_resize(mem, mem->l + v->n_sample * f->size);
++
++        // Limit the total memory to ~2Gb per VCF row.  This should mean
++        // malformed VCF data is less likely to take excessive memory and/or
++        // time.
++        if (v->n_sample * (uint64_t)f->size > INT_MAX) {
++            hts_log_error("Excessive memory required by FORMAT fields");
++            v->errcode |= BCF_ERR_LIMITS;
++            return -1;
++        }
++        if (ks_resize(mem, mem->l + v->n_sample * (size_t)f->size) < 0) {
++            hts_log_error("Memory allocation failure");
++            v->errcode |= BCF_ERR_LIMITS;
++            return -1;
++        }
+         mem->l += v->n_sample * f->size;
+     }
+     for (j = 0; j < v->n_fmt; ++j)
+         fmt[j].buf = (uint8_t*)mem->s + fmt[j].offset;
+     // fill the sample fields; at beginning of the loop, t points to the first char of a format
+     n_sample_ori = -1;
+     t = q + 1; m = 0;   // m: sample id
+     while ( t<end )
+     {
+         // can we skip some samples?
+         if ( h->keep_samples )
+         {
+             n_sample_ori++;
+             if ( !bit_array_test(h->keep_samples,n_sample_ori) )
+             {
+                 while ( *t && t<end ) t++;
+                 t++;
+                 continue;
+             }
+         }
+         if ( m == bcf_hdr_nsamples(h) ) break;
+ 
+         j = 0; // j-th format field, m-th sample
+         while ( t < end )
+         {
+             fmt_aux_t *z = &fmt[j++];
++            if (!z->buf) {
++                hts_log_error("Memory allocation failure for FORMAT field type %d",
++                              z->y>>4&0xf);
++                v->errcode |= BCF_ERR_LIMITS;
++                return -1;
++            }
+             if ((z->y>>4&0xf) == BCF_HT_STR) {
+                 if (z->is_gt) { // genotypes
+-                    int32_t is_phased = 0, *x = (int32_t*)(z->buf + z->size * m);
++                    int32_t is_phased = 0, *x = (int32_t*)(z->buf + z->size * (size_t)m);
+                     for (l = 0;; ++t) {
+                         if (*t == '.') {
+                             ++t, x[l++] = is_phased;
+                         } else {
+                             char *tt = t;
+                             errno = 0;
+                             long val = strtol(t, &t, 10);
+                             if (errno == ERANGE || val > (INT32_MAX>>1)-1 || val < 0) {
+                                 hts_log_error("Unsupported value:'%s' (too large or negative)", tt);
+                                 return -1;
+                             } else {
+                                 x[l] = (val + 1) << 1 | is_phased;
+                                 l++;
+                             }
+                         }
+                         is_phased = (*t == '|');
+                         if (*t != '|' && *t != '/') break;
+                     }
+                     if ( !l ) x[l++] = 0;   // An empty field, insert missing value
+                     for (; l < z->size>>2; ++l) x[l] = bcf_int32_vector_end;
+                 } else {
+-                    char *x = (char*)z->buf + z->size * m;
++                    char *x = (char*)z->buf + z->size * (size_t)m;
+                     for (r = t, l = 0; *t != ':' && *t; ++t) x[l++] = *t;
+                     for (; l < z->size; ++l) x[l] = 0;
+                 }
+             } else if ((z->y>>4&0xf) == BCF_HT_INT) {
+-                int32_t *x = (int32_t*)(z->buf + z->size * m);
++                int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);
+                 for (l = 0;; ++t) {
+                     if (*t == '.') x[l++] = bcf_int32_missing, ++t; // ++t to skip "."
+                     else
+                     {
+                         errno = 0;
+                         char *te;
+                         long int tmp_val = strtol(t, &te, 10);
+                         if ( te==t || errno!=0 || tmp_val<BCF_MIN_BT_INT32 || tmp_val>BCF_MAX_BT_INT32 )
+                         {
+                             if ( !extreme_int_warned )
+                             {
+                                 hts_log_warning("Extreme FORMAT/%s value encountered and set to missing at %s:%"PRIhts_pos,h->id[BCF_DT_ID][fmt[j-1].key].key,bcf_seqname(h,v), v->pos+1);
+                                 extreme_int_warned = 1;
+                             }
+                             tmp_val = bcf_int32_missing;
+                         }
+                         x[l++] = tmp_val;
+                         t = te;
+                     }
+                     if (*t != ',') break;
+                 }
+                 if ( !l ) x[l++] = bcf_int32_missing;
+                 for (; l < z->size>>2; ++l) x[l] = bcf_int32_vector_end;
+             } else if ((z->y>>4&0xf) == BCF_HT_REAL) {
+-                float *x = (float*)(z->buf + z->size * m);
++                float *x = (float*)(z->buf + z->size * (size_t)m);
+                 for (l = 0;; ++t) {
+                     if (*t == '.' && !isdigit_c(t[1])) bcf_float_set_missing(x[l++]), ++t; // ++t to skip "."
+                     else x[l++] = strtod(t, &t);
+                     if (*t != ',') break;
+                 }
+                 if ( !l ) bcf_float_set_missing(x[l++]);    // An empty field, insert missing value
+                 for (; l < z->size>>2; ++l) bcf_float_set_vector_end(x[l]);
+             } else {
+                 hts_log_error("Unknown FORMAT field type %d", z->y>>4&0xf);
+                 v->errcode |= BCF_ERR_TAG_INVALID;
+                 return -1;
+             }
+ 
+             if (*t == '\0') {
+                 break;
+             }
+             else if (*t == ':') {
+                 t++;
+             }
+             else {
+                 char buffer[8];
+                 hts_log_error("Invalid character '%s' in '%s' FORMAT field at %s:%"PRIhts_pos"",
+                     dump_char(buffer, *t), h->id[BCF_DT_ID][z->key].key, bcf_seqname(h,v), v->pos+1);
+                 v->errcode |= BCF_ERR_CHAR;
+                 return -1;
+             }
+         }
+ 
+         for (; j < v->n_fmt; ++j) { // fill end-of-vector values
+             fmt_aux_t *z = &fmt[j];
+             if ((z->y>>4&0xf) == BCF_HT_STR) {
+                 if (z->is_gt) {
+-                    int32_t *x = (int32_t*)(z->buf + z->size * m);
++                    int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);
+                     if (z->size) x[0] = bcf_int32_missing;
+                     for (l = 1; l < z->size>>2; ++l) x[l] = bcf_int32_vector_end;
+                 } else {
+-                    char *x = (char*)z->buf + z->size * m;
++                    char *x = (char*)z->buf + z->size * (size_t)m;
+                     if ( z->size ) x[0] = '.';
+                     for (l = 1; l < z->size; ++l) x[l] = 0;
+                 }
+             } else if ((z->y>>4&0xf) == BCF_HT_INT) {
+-                int32_t *x = (int32_t*)(z->buf + z->size * m);
++                int32_t *x = (int32_t*)(z->buf + z->size * (size_t)m);
+                 x[0] = bcf_int32_missing;
+                 for (l = 1; l < z->size>>2; ++l) x[l] = bcf_int32_vector_end;
+             } else if ((z->y>>4&0xf) == BCF_HT_REAL) {
+-                float *x = (float*)(z->buf + z->size * m);
++                float *x = (float*)(z->buf + z->size * (size_t)m);
+                 bcf_float_set_missing(x[0]);
+                 for (l = 1; l < z->size>>2; ++l) bcf_float_set_vector_end(x[l]);
+             }
+         }
+ 
+         m++; t++;
+     }
+ 
+     // write individual genotype information
+     kstring_t *str = &v->indiv;
+     int i;
+     if (v->n_sample > 0) {
+         for (i = 0; i < v->n_fmt; ++i) {
+             fmt_aux_t *z = &fmt[i];
+             bcf_enc_int1(str, z->key);
+             if ((z->y>>4&0xf) == BCF_HT_STR && !z->is_gt) {
+                 bcf_enc_size(str, z->size, BCF_BT_CHAR);
+-                kputsn((char*)z->buf, z->size * v->n_sample, str);
++                kputsn((char*)z->buf, z->size * (size_t)v->n_sample, str);
+             } else if ((z->y>>4&0xf) == BCF_HT_INT || z->is_gt) {
+                 bcf_enc_vint(str, (z->size>>2) * v->n_sample, (int32_t*)z->buf, z->size>>2);
+             } else {
+                 bcf_enc_size(str, z->size>>2, BCF_BT_FLOAT);
+-                if (serialize_float_array(str, (z->size>>2) * v->n_sample,
++                if (serialize_float_array(str, (z->size>>2) * (size_t)v->n_sample,
+                                           (float *) z->buf) != 0) {
+                     v->errcode |= BCF_ERR_LIMITS;
+                     hts_log_error("Out of memory");
+                     return -1;
+                 }
+             }
+         }
+     }
+ 
+     if ( v->n_sample!=bcf_hdr_nsamples(h) )
+     {
+         hts_log_error("Number of columns at %s:%"PRIhts_pos" does not match the number of samples (%d vs %d)",
+             bcf_seqname(h,v), v->pos+1, v->n_sample, bcf_hdr_nsamples(h));
+         v->errcode |= BCF_ERR_NCOLS;
+         return -1;
+     }
+     if ( v->indiv.l > 0xffffffff )
+     {
+         hts_log_error("The FORMAT at %s:%"PRIhts_pos" is too long", bcf_seqname(h,v), v->pos+1);
+         v->errcode |= BCF_ERR_LIMITS;
+ 
+         // Error recovery: return -1 if this is a critical error or 0 if we want to ignore the FORMAT and proceed
+         v->n_fmt = 0;
+         return -1;
+     }
+ 
+     return 0;
+ }
+@@ -2948,105 +2970,105 @@ int bcf_unpack(bcf1_t *b, int which)
+ int vcf_format(const bcf_hdr_t *h, const bcf1_t *v, kstring_t *s)
+ {
+     int i;
+     bcf_unpack((bcf1_t*)v, BCF_UN_ALL);
+     kputs(h->id[BCF_DT_CTG][v->rid].key, s); // CHROM
+     kputc('\t', s); kputll(v->pos + 1, s); // POS
+     kputc('\t', s); kputs(v->d.id ? v->d.id : ".", s); // ID
+     kputc('\t', s); // REF
+     if (v->n_allele > 0) kputs(v->d.allele[0], s);
+     else kputc('.', s);
+     kputc('\t', s); // ALT
+     if (v->n_allele > 1) {
+         for (i = 1; i < v->n_allele; ++i) {
+             if (i > 1) kputc(',', s);
+             kputs(v->d.allele[i], s);
+         }
+     } else kputc('.', s);
+     kputc('\t', s); // QUAL
+     if ( bcf_float_is_missing(v->qual) ) kputc('.', s); // QUAL
+     else kputd(v->qual, s);
+     kputc('\t', s); // FILTER
+     if (v->d.n_flt) {
+         for (i = 0; i < v->d.n_flt; ++i) {
+             if (i) kputc(';', s);
+             kputs(h->id[BCF_DT_ID][v->d.flt[i]].key, s);
+         }
+     } else kputc('.', s);
+     kputc('\t', s); // INFO
+     if (v->n_info) {
+         int first = 1;
+         for (i = 0; i < v->n_info; ++i) {
+             bcf_info_t *z = &v->d.info[i];
+             if ( !z->vptr ) continue;
+             if ( !first ) kputc(';', s);
+             first = 0;
+             if (z->key < 0 || z->key >= h->n[BCF_DT_ID]) {
+                 hts_log_error("Invalid BCF, the INFO index %d is %s",
+                               z->key, z->key < 0 ? "negative" : "too large");
+                 errno = EINVAL;
+                 return -1;
+             }
+             kputs(h->id[BCF_DT_ID][z->key].key, s);
+             if (z->len <= 0) continue;
+             kputc('=', s);
+             if (z->len == 1)
+             {
+                 switch (z->type)
+                 {
+                     case BCF_BT_INT8:  if ( z->v1.i==bcf_int8_missing ) kputc('.', s); else kputw(z->v1.i, s); break;
+                     case BCF_BT_INT16: if ( z->v1.i==bcf_int16_missing ) kputc('.', s); else kputw(z->v1.i, s); break;
+                     case BCF_BT_INT32: if ( z->v1.i==bcf_int32_missing ) kputc('.', s); else kputw(z->v1.i, s); break;
+                     case BCF_BT_INT64: if ( z->v1.i==bcf_int64_missing ) kputc('.', s); else kputll(z->v1.i, s); break;
+                     case BCF_BT_FLOAT: if ( bcf_float_is_missing(z->v1.f) ) kputc('.', s); else kputd(z->v1.f, s); break;
+                     case BCF_BT_CHAR:  kputc(z->v1.i, s); break;
+                     default: hts_log_error("Unexpected type %d", z->type); exit(1); break;
+                 }
+             }
+             else bcf_fmt_array(s, z->len, z->type, z->vptr);
+         }
+         if ( first ) kputc('.', s);
+     } else kputc('.', s);
+     // FORMAT and individual information
+     if (v->n_sample)
+     {
+         int i,j;
+         if ( v->n_fmt)
+         {
+             int gt_i = -1;
+             bcf_fmt_t *fmt = v->d.fmt;
+             int first = 1;
+             for (i = 0; i < (int)v->n_fmt; ++i) {
+                 if ( !fmt[i].p ) continue;
+                 kputc(!first ? ':' : '\t', s); first = 0;
+                 if ( fmt[i].id<0 ) //!bcf_hdr_idinfo_exists(h,BCF_HL_FMT,fmt[i].id) )
+                 {
+                     hts_log_error("Invalid BCF, the FORMAT tag id=%d not present in the header", fmt[i].id);
+                     abort();
+                 }
+                 kputs(h->id[BCF_DT_ID][fmt[i].id].key, s);
+                 if (strcmp(h->id[BCF_DT_ID][fmt[i].id].key, "GT") == 0) gt_i = i;
+             }
+             if ( first ) kputs("\t.", s);
+             for (j = 0; j < v->n_sample; ++j) {
+                 kputc('\t', s);
+                 first = 1;
+                 for (i = 0; i < (int)v->n_fmt; ++i) {
+                     bcf_fmt_t *f = &fmt[i];
+                     if ( !f->p ) continue;
+                     if (!first) kputc(':', s);
+                     first = 0;
+                     if (gt_i == i)
+                         bcf_format_gt(f,j,s);
+                     else
+-                        bcf_fmt_array(s, f->n, f->type, f->p + j * f->size);
++                        bcf_fmt_array(s, f->n, f->type, f->p + j * (size_t)f->size);
+                 }
+                 if ( first ) kputc('.', s);
+             }
+         }
+         else
+             for (j=0; j<=v->n_sample; j++)
+                 kputs("\t.", s);
+     }
+     kputc('\n', s);
+     return 0;
+ }

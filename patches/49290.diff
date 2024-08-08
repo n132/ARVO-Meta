@@ -1,0 +1,109 @@
+commit 631aecc58ee697ee514fec9b49cad19f237caa20
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Wed Jul 20 17:33:28 2022 +0100
+
+    OSS-fuzz #49290
+    
+    The problem here is an (I think) corrupted TrueType font. One of the
+    glyphs claims to be a component glyph, and the component GID is
+    larger than the number of glyphs in the font (and so is invalid).
+    
+    When we copy the font (which we only do with pdfwrite and ps2write) we
+    try to copy this glyph which is not otherwise used in the document.
+    As part of trying to copy the glyph we try to get the glyph name for
+    both the glyph and the components of the glyph.
+    
+    Normally we walk the font twice, putting the glyph names for each
+    glyph into the name table on the first pass, and then retrieving them
+    on the second. Because the component glyph is not valid, we (obviously)
+    don't find it on the first pass, and don't add it to the name table.
+    
+    On the second pass we use the glyph ID to try and get the name, but
+    because we didn't store it on the first pass there is no such name with
+    that ID, so we get an empty slot back. Which we don't check! We then
+    try to use it which involves dereferencing a NULL pointer, and we
+    crash.
+    
+    This commit checks the GID of the component glyphs and makes sure they
+    are in the valid range so that (hopefully) this can't happen.
+    
+    This also checks the name returned from name_index_ref to ensure it is
+    not an unused name slot, to avoid a crash if we find another route
+    that fails to return a name. We use this a lot in many places and
+    it's not obvious which ones are guaranteed safe and which might not be
+    so I haven't tried to change the other cases.
+
+diff --git a/base/gstype42.c b/base/gstype42.c
+index cdb0d8a92..579a17a4d 100644
+--- a/base/gstype42.c
++++ b/base/gstype42.c
+@@ -1271,34 +1271,39 @@ static int
+ parse_pieces(gs_font_type42 *pfont, gs_glyph glyph, gs_glyph *pieces,
+              int *pnum_pieces)
+ {
+     uint glyph_index = (glyph >= GS_MIN_GLYPH_INDEX
+                         ? glyph - GS_MIN_GLYPH_INDEX
+                         : pfont->data.get_glyph_index(pfont, glyph));
+     gs_glyph_data_t glyph_data;
+     int code;
+ 
+     glyph_data.memory = pfont->memory;
+     code = pfont->data.get_outline(pfont, glyph_index, &glyph_data);
+     if (code < 0)
+         return code;
+     if (glyph_data.bits.size != 0 && S16(glyph_data.bits.data) == -1) {
+         /* This is a composite glyph. */
+         int i = 0;
+         uint flags = TT_CG_MORE_COMPONENTS;
+         const byte *gdata = glyph_data.bits.data + 10;
+         gs_matrix_fixed mat;
+ 
+         memset(&mat, 0, sizeof(mat)); /* arbitrary */
+         for (i = 0; flags & TT_CG_MORE_COMPONENTS; ++i) {
+-            if (pieces)
++            if (pieces) {
+                 pieces[i] = U16(gdata + 2) + GS_MIN_GLYPH_INDEX;
++                if (U16(gdata + 2) > pfont->data.numGlyphs) {
++                    *pnum_pieces = 0;
++                    return_error(gs_error_invalidfont);
++                }
++            }
+             gs_type42_parse_component(&gdata, &flags, &mat, NULL, pfont, &mat);
+         }
+         *pnum_pieces = i;
+     } else
+         *pnum_pieces = 0;
+     gs_glyph_data_free(&glyph_data, "parse_pieces");
+     return 0;
+ }
+ 
+ /* Define the font procedures for a Type 42 font. */
+diff --git a/psi/zbfont.c b/psi/zbfont.c
+index 044f58a12..bcf38aced 100644
+--- a/psi/zbfont.c
++++ b/psi/zbfont.c
+@@ -126,20 +126,23 @@ static int
+ zfont_glyph_name(gs_font *font, gs_glyph index, gs_const_string *pstr)
+ {
+     ref nref, sref;
+ 
+     if (index >= GS_MIN_CID_GLYPH) {	/* Fabricate a numeric name. */
+         char cid_name[sizeof(gs_glyph) * 3 + 1];
+         int code;
+ 
+         gs_snprintf(cid_name, sizeof(cid_name), "%lu", (ulong) index);
+         code = name_ref(font->memory, (const byte *)cid_name, strlen(cid_name),
+                         &nref, 1);
+         if (code < 0)
+             return code;
+-    } else
++    } else {
+         name_index_ref(font->memory, index, &nref);
++        if (nref.value.pname == NULL)
++            return_error(gs_error_unknownerror);
++    }
+     name_string_ref(font->memory, &nref, &sref);
+     pstr->data = sref.value.const_bytes;
+     pstr->size = r_size(&sref);
+     return 0;
+ }

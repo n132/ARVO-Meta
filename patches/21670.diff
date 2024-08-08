@@ -1,0 +1,657 @@
+commit 3639f1fe932d8374dd482de4e01457afe3e43a34
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Mon Apr 13 15:51:08 2020 +0200
+
+    Make sure we don't read uninitialized memory from text
+    
+    oss-fuzz/21670
+
+diff --git a/libspectre/ps.c b/libspectre/ps.c
+index bb45c9a..03d462a 100644
+--- a/libspectre/ps.c
++++ b/libspectre/ps.c
+@@ -371,640 +371,644 @@ struct document *
+ psscan(FILE *file, const char *filename, int scanstyle)
+ {
+     struct document *doc;
+     int bb_set = NONE;
+     int pages_set = NONE;
+     int page_order_set = NONE;
+     int orientation_set = NONE;
+     int page_bb_set = NONE;
+     int page_media_set = NONE;
+     int preread;		/* flag which tells the readline isn't needed */
+     unsigned int i;
+     unsigned int maxpages = 0;
+     unsigned int nextpage = 1;	/* Next expected page */
+     unsigned int thispage;
+     int ignore = 0;		/* whether to ignore page ordinals */
+     char *label;
+     char *line;
+                            	/* 255 characters + 1 newline + 1 NULL */
+     char text[PSLINELENGTH];	/* Temporary storage for text */
+     long position;		/* Position of the current line */
+     long beginsection;		/* Position of the beginning of the section */
+     unsigned int line_len; 	/* Length of the current line */
+     unsigned int section_len = 0; /* Place to accumulate the section length */
+     char *next_char;		/* 1st char after text returned by ps_gettext() */
+     char *cp;
+     ConstMedia dmp;
+     long enddoseps;             /* zero of not DOS EPS, otherwise position of end of ps section */
+     DOSEPS doseps;
+     FileData fd;
+     int respect_eof;            /* Derived from the scanstyle argument.
+                                    If set to 0 EOF comments will be ignored,
+                                    if set to 1 they will be taken seriously.
+                                    Purpose; Out there are many documents which 
+                                    include other DSC conforming documents without
+                                    without enclosing them by 'BeginDocument' and
+                                    'EndDocument' comments. This may cause fake EOF 
+ 				   comments to appear in the body of a page.
+ 				   Similarly, if respect_eof is set to false
+ 				   'Trailer' comments are ignored except of the
+ 				   last one found in the document.
+ 				*/
+     int ignore_dsc;             /* Derived from scanstyle.
+ 				   If set the document structure will be ignored.
+ 				*/
+     BEGINMESSAGE(psscan)
+ 
+     respect_eof = (scanstyle & SCANSTYLE_IGNORE_EOF) ? 0 : 1;
+     ignore_dsc = (scanstyle & SCANSTYLE_IGNORE_DSC) ? 1 : 0;
+ 
+     if (ignore_dsc) {
+       INFMESSAGE(ignoring DSC)
+       ENDMESSAGE(psscan)
+       return(NULL);
+     }
+ 
+     fd = ps_io_init(file);
+     
+     /* rjl: check for DOS EPS files and almost DSC files that start with ^D */
+     enddoseps = ps_read_doseps (fd, &doseps);
+     if (!readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	fprintf(stderr, "Warning: empty file.\n");
+         ENDMESSAGE(psscan)
+         ps_io_exit(fd);
+ 	return(NULL);
+     }
+ 
+     /* HP printer job language data follows. Some printer drivers add pjl
+      * commands to switch a pjl printer to postscript mode. If no PS header
+      * follows, this seems to be a real pjl file. */
+     if(iscomment(line, "\033%-12345X@PJL")) {
+         /* read until first DSC comment */
+         readlineuntil(fd, enddoseps, &line, &position, &line_len, '%');
+ 	if(line[0] != '%') {
+ 	    fprintf(stderr, "psscan error: input files seems to be a PJL file.\n");
+ 	    ENDMESSAGE(psscan)
+ 	    ps_io_exit(fd);
+ 	    return (NULL);
+ 	}
+     }
+ 
++    // Initialize text so that all the strcmp we do after sscanf don't
++    // end up reading uninitialized memory if the sscanf fails
++    text[0] = '\0';
++
+     /* Header comments */
+     
+     /* Header should start with "%!PS-Adobe-", but some programms omit
+      * parts of this or add a ^D at the beginning. */
+     if ((iscomment(line,"%!PS") || iscomment(line, "\004%!PS"))) {
+       INFMESSAGE(found "PS-Adobe-" comment)
+ 
+       doc = (struct document *) PS_calloc(1, sizeof(struct document));
+       CHECK_MALLOCED(doc);
+ 
+       /* ignore possible leading ^D */
+       if (*line == '\004') {
+ 	  position++;
+ 	  line_len--;
+       }
+ 
+       doc->ref_count = 1;
+       doc->filename = _spectre_strdup (filename);
+       doc->beginheader = position;
+       section_len = line_len;
+ 
+       text[0] = '\0';
+       sscanf(line, "%%!%256s %*s", text);
+       doc->format = _spectre_strdup (text);
+       
+       text[0] = '\0';
+       sscanf(line, "%*s %256s", text);
+       doc->epsf = iscomment(text, "EPSF");
+     } else {
+ 	/* There are postscript documents that do not have
+ 	   %PS at the beginning, usually unstructured. We should GS decide
+ 	   For instance, the tech reports at this university:
+ 
+ 	   http://svrc.it.uq.edu.au/Bibliography/svrc-tr.html?94-45
+ 
+ 	   add ugly PostScript before the actual document. 
+ 
+ 	   GS and gv is
+ 	   able to display them correctly as unstructured PS.
+ 
+ 	   In a way, this makes sense, a program PostScript does not need
+ 	   the !PS at the beginning.
+ 	*/
+ 	doc = (struct document *) PS_calloc(1, sizeof(struct document));
+ 	CHECK_MALLOCED(doc);
+ 	doc->ref_count = 1;
+ 	doc->filename = _spectre_strdup (filename);
+ 	doc->default_page_orientation = NONE;
+ 	doc->orientation = NONE;
+     }
+ 
+     if (enddoseps) { /* rjl: add doseps header */
+         doc->doseps = (DOSEPS *) malloc(sizeof(DOSEPS));
+ 	*(doc->doseps) = doseps;
+     }
+     
+     preread = 0;
+     while (preread || readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	if (!preread) section_len += line_len;
+ 	preread = 0;
+ 	if (line[0] != '%' ||
+ 	    iscomment(line+1, "%EndComments") ||
+ 	    line[1] == ' ' || line[1] == '\t' || line[1] == '\n' ||
+ 	    !isprint(line[1])) {
+ 	    break;
+ 	} else if (line[1] != '%') {
+ 	    /* Do nothing */
+ 	} else if (doc->title == NULL && iscomment(line+2, "Title:")) {
+ 	    doc->title = gettextline(line+length("%%Title:"));
+ 	} else if (doc->date == NULL && iscomment(line+2, "CreationDate:")) {
+ 	    doc->date = gettextline(line+length("%%CreationDate:"));
+ 	} else if (doc->languagelevel == NULL && iscomment(line+2, "LanguageLevel:")) {
+ 	    doc->languagelevel = gettextline(line+length("%%LanguageLevel:"));
+ 	} else if(doc->creator == NULL && iscomment(line + 2, "Creator:")) {
+ 	    doc->creator = gettextline(line + length("%%Creator:"));
+ 	} else if(doc->fortext == NULL && iscomment(line + 2, "For:")) {
+ 	    doc->fortext = gettextline(line + length("%%For:"));
+ 	} else if (bb_set == NONE && iscomment(line+2, "BoundingBox:")) {
+ 	    sscanf(line+length("%%BoundingBox:"), "%256s", text);
+ 	    if (strcmp(text, "(atend)") == 0) {
+ 		bb_set = ATEND;
+ 	    } else {
+ 		if (scan_boundingbox(doc->boundingbox,
+ 				line + length("%%BoundingBox:")))
+ 		    bb_set = 1;
+ 	    }
+ 	} else if (orientation_set == NONE &&
+ 		   iscomment(line+2, "Orientation:")) {
+ 	    sscanf(line+length("%%Orientation:"), "%256s", text);
+ 	    if (strcmp(text, "(atend)") == 0 || strcmp(text, "atend") == 0) {
+ 		orientation_set = ATEND;
+ 	    } else if (strcmp(text, "Portrait") == 0) {
+ 		doc->orientation = PORTRAIT;
+ 		orientation_set = 1;
+ 	    } else if (strcmp(text, "Landscape") == 0) {
+ 		doc->orientation = LANDSCAPE;
+ 		orientation_set = 1;
+ 	    } else if (strcmp(text, "Seascape") == 0) {
+ 	        doc->orientation = SEASCAPE;
+ 		orientation_set = 1;
+ 	    } else if (strcmp(text, "UpsideDown") == 0) {
+ 	        doc->orientation = UPSIDEDOWN;
+ 		orientation_set = 1;
+ 	    }
+ 	} else if (page_order_set == NONE && iscomment(line+2, "PageOrder:")) {
+ 	    sscanf(line+length("%%PageOrder:"), "%256s", text);
+ 	    if (strcmp(text, "(atend)") == 0 || strcmp(text, "atend") == 0) {
+ 		page_order_set = ATEND;
+ 	    } else if (strcmp(text, "Ascend") == 0) {
+ 		doc->pageorder = ASCEND;
+ 		page_order_set = 1;
+ 	    } else if (strcmp(text, "Descend") == 0) {
+ 		doc->pageorder = DESCEND;
+ 		page_order_set = 1;
+ 	    } else if (strcmp(text, "Special") == 0) {
+ 		doc->pageorder = SPECIAL;
+ 		page_order_set = 1;
+ 	    }
+ 	} else if (pages_set == NONE && iscomment(line+2, "Pages:")) {
+ 	    sscanf(line+length("%%Pages:"), "%256s", text);
+ 	    if (strcmp(text, "(atend)") == 0 || strcmp(text, "atend") == 0) {
+ 		pages_set = ATEND;
+ 	    } else {
+ 		int page_order;
+ 		
+ 		switch (sscanf(line+length("%%Pages:"), "%u %d",
+ 			       &maxpages, &page_order)) {
+ 		    case 2:
+ 			if (page_order_set == NONE) {
+ 			    if (page_order == -1) {
+ 				doc->pageorder = DESCEND;
+ 			    } else if (page_order == 0) {
+ 				doc->pageorder = SPECIAL;
+ 			    } else if (page_order == 1) {
+ 				doc->pageorder = ASCEND;
+ 			    }
+ 			}
+ 			// fall-through
+ 		    case 1:
+ 			if (maxpages > 0) {
+ 			    PS_free(doc->pages);
+ 			    doc->pages = (struct page *) PS_calloc(maxpages,
+ 							   sizeof(struct page));
+ 			    if (!doc->pages)
+ 			        maxpages = 0;
+ 			    CHECK_MALLOCED(doc->pages);
+ 			}
+ 		}
+ 	    }
+ 	} else if (doc->nummedia == NONE &&
+ 		   iscomment(line+2, "DocumentMedia:")) {
+ 	    char w[21], h[21];
+ 	    PS_free(doc->media);
+ 	    doc->media = (Media) PS_calloc(1, sizeof (MediaStruct));
+             CHECK_MALLOCED(doc->media);
+ 	    doc->media[0].name = ps_gettext(line+length("%%DocumentMedia:"),
+ 					    &next_char);
+ 	    if (doc->media[0].name != NULL) {
+ 		if (sscanf(next_char, "%20s %20s", w, h) == 2) {
+ 		    doc->media[0].width = _spectre_strtod (w, NULL) + 0.5;
+ 		    doc->media[0].height = _spectre_strtod (h, NULL) + 0.5;
+ 		}
+ 		if (doc->media[0].width != 0 && doc->media[0].height != 0) {
+ 		    doc->nummedia = 1;
+ 		} else {
+ 		    PS_free(doc->media[0].name);
+ 		    doc->media[0].name = NULL;
+ 		}
+ 	    }
+ 	    preread=1;
+ 	    while (readline(fd, enddoseps, &line, &position, &line_len) &&
+ 		   DSCcomment(line) && iscomment(line+2, "+")) {
+ 		section_len += line_len;
+ 		doc->media = (Media)
+ 			     PS_realloc(doc->media,
+ 				     (doc->nummedia+1)*
+ 				     sizeof (MediaStruct));
+ 		CHECK_MALLOCED(doc->media);
+ 		memset (doc->media + doc->nummedia, 0, sizeof (MediaStruct));
+ 		doc->media[doc->nummedia].name = ps_gettext(line+length("%%+"),
+ 							    &next_char);
+ 		if (doc->media[doc->nummedia].name != NULL) {
+ 		    if (sscanf(next_char, "%20s %20s", w, h) == 2) {
+ 		        doc->media[doc->nummedia].width = _spectre_strtod (w, NULL) + 0.5;
+ 			doc->media[doc->nummedia].height = _spectre_strtod (h, NULL) + 0.5;
+ 		    }
+ 		    if (doc->media[doc->nummedia].width != 0 &&	doc->media[doc->nummedia].height != 0) {
+ 		        doc->nummedia++;
+ 		    } else {
+ 			PS_free(doc->media[doc->nummedia].name);
+ 			doc->media[doc->nummedia].name = NULL;
+ 		    }
+ 		}
+ 	    }
+ 	    section_len += line_len;
+ 	    if (doc->nummedia != 0) doc->default_page_media = doc->media;
+ 	} else if (doc->nummedia == NONE &&
+ 		   iscomment(line+2, "DocumentPaperSizes:")) {
+ 
+ 	    PS_free(doc->media);
+ 	    doc->media = (Media) PS_calloc(1, sizeof (MediaStruct));
+             CHECK_MALLOCED(doc->media);
+ 	    doc->media[0].name = ps_gettext(line+length("%%DocumentPaperSizes:"),
+ 					    &next_char);
+ 	    if (doc->media[0].name != NULL) {
+ 		for (i=0; papersizes[i].name; i++) {
+ 			dmp = (Media)&papersizes[i];
+ 		    /* Note: Paper size comment uses down cased paper size
+ 		     * name.  Case insensitive compares are only used for
+ 		     * PaperSize comments.
+ 		     */
+ 		    if (_spectre_strcasecmp(doc->media[0].name, dmp->name) == 0) {
+ 			PS_free(doc->media[0].name);
+ 			doc->media[0].name = (char *)PS_malloc(strlen(dmp->name)+1);
+                         CHECK_MALLOCED(doc->media[0].name);
+ 			strcpy(doc->media[0].name, dmp->name);
+ 			doc->media[0].width = dmp->width;
+ 			doc->media[0].height = dmp->height;
+ 			break;
+ 		    }
+ 		}
+ 		if (doc->media[0].width != 0 && doc->media[0].height != 0) {
+ 		    doc->nummedia = 1;
+ 		} else {
+ 		    PS_free(doc->media[0].name);
+ 		    doc->media[0].name = NULL;
+ 		}
+ 	    }
+ 	    while ((cp = ps_gettext(next_char, &next_char))) {
+ 		doc->media = (Media)
+ 			     PS_realloc(doc->media,
+ 				     (doc->nummedia+1)*
+ 				     sizeof (MediaStruct));
+                 CHECK_MALLOCED(doc->media);
+ 		memset (doc->media + doc->nummedia, 0, sizeof (MediaStruct));
+ 		doc->media[doc->nummedia].name = cp;
+ 		for (i=0; papersizes[i].name; i++) {
+ 			dmp = (Media)&papersizes[i];
+ 		    /* Note: Paper size comment uses down cased paper size
+ 		     * name.  Case insensitive compares are only used for
+ 		     * PaperSize comments.
+ 		     */
+ 		    if (_spectre_strcasecmp(doc->media[doc->nummedia].name,
+ 					    dmp->name) == 0) {
+ 			PS_free(doc->media[doc->nummedia].name);
+ 			doc->media[doc->nummedia].name =
+ 				(char *)PS_malloc(strlen(dmp->name)+1);
+                         CHECK_MALLOCED(doc->media[doc->nummedia].name);
+ 			strcpy(doc->media[doc->nummedia].name, dmp->name);
+ 			doc->media[doc->nummedia].width = dmp->width;
+ 			doc->media[doc->nummedia].height = dmp->height;
+ 			break;
+ 		    }
+ 		}
+ 		if (doc->media[doc->nummedia].width != 0 && doc->media[doc->nummedia].height != 0) {
+ 		    doc->nummedia++;
+ 		} else {
+ 		    PS_free(doc->media[doc->nummedia].name);
+ 		    doc->media[doc->nummedia].name = NULL;
+ 		}
+ 	    }
+ 	    preread=1;
+ 	    while (readline(fd, enddoseps, &line, &position, &line_len) &&
+ 		   DSCcomment(line) && iscomment(line+2, "+")) {
+ 		section_len += line_len;
+ 		next_char = line + length("%%+");
+ 		while ((cp = ps_gettext(next_char, &next_char))) {
+ 		    doc->media = (Media)
+ 				 PS_realloc(doc->media,
+ 					 (doc->nummedia+1)*
+ 					 sizeof (MediaStruct));
+                     CHECK_MALLOCED(doc->media);
+ 		    memset (doc->media + doc->nummedia, 0, sizeof (MediaStruct));
+ 		    doc->media[doc->nummedia].name = cp;
+ 		    for (i=0; papersizes[i].name; i++) {
+ 			    dmp = (Media)&papersizes[i];
+ 			/* Note: Paper size comment uses down cased paper size
+ 			 * name.  Case insensitive compares are only used for
+ 			 * PaperSize comments.
+ 			 */
+ 			if (_spectre_strcasecmp(doc->media[doc->nummedia].name,
+ 						dmp->name) == 0) {
+ 			    doc->media[doc->nummedia].width = dmp->width;
+ 			    doc->media[doc->nummedia].height = dmp->height;
+ 			    break;
+ 			}
+ 		    }
+ 		    if (doc->media[doc->nummedia].width != 0 && doc->media[doc->nummedia].height != 0) {
+ 		        doc->nummedia++;
+ 		    } else {
+ 			PS_free(doc->media[doc->nummedia].name);
+ 			doc->media[doc->nummedia].name = NULL;
+ 		    }
+ 		}
+ 	    }
+ 	    section_len += line_len;
+ 	    if (doc->nummedia != 0) doc->default_page_media = doc->media;
+ 	}
+     }
+ 
+     if (DSCcomment(line) && iscomment(line+2, "EndComments")) {
+ 	    readline(fd, enddoseps, &line, &position, &line_len);
+ 	section_len += line_len;
+     }
+     doc->endheader = position;
+     doc->lenheader = section_len - line_len;
+ 
+     /* Optional Preview comments for encapsulated PostScript files */ 
+ 
+     beginsection = position;
+     section_len = line_len;
+     while (blank(line) && readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	section_len += line_len;
+     }
+ 
+     if (doc->epsf && DSCcomment(line) && iscomment(line+2, "BeginPreview")) {
+ 	doc->beginpreview = beginsection;
+ 	beginsection = 0;
+ 	while (readline(fd, enddoseps, &line, &position, &line_len) &&
+ 	       !(DSCcomment(line) && iscomment(line+2, "EndPreview"))) {
+ 	    section_len += line_len;
+ 	}
+ 	section_len += line_len;
+ 	readline(fd, enddoseps, &line, &position, &line_len);
+ 	section_len += line_len;
+ 	doc->endpreview = position;
+ 	doc->lenpreview = section_len - line_len;
+     }
+ 
+     /* Page Defaults for Version 3.0 files */
+ 
+     if (beginsection == 0) {
+ 	beginsection = position;
+ 	section_len = line_len;
+     }
+     while (blank(line) && readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	section_len += line_len;
+     }
+ 
+     if (DSCcomment(line) && iscomment(line+2, "BeginDefaults")) {
+ 	doc->begindefaults = beginsection;
+ 	beginsection = 0;
+ 	while (readline(fd, enddoseps, &line, &position, &line_len) &&
+ 	       !(DSCcomment(line) && iscomment(line+2, "EndDefaults"))) {
+ 	    section_len += line_len;
+ 	    if (!DSCcomment(line)) {
+ 		/* Do nothing */
+ 	    } else if (doc->default_page_orientation == NONE &&
+ 		iscomment(line+2, "PageOrientation:")) {
+ 		sscanf(line+length("%%PageOrientation:"), "%256s", text);
+ 		if (strcmp(text, "Portrait") == 0) {
+ 		    doc->default_page_orientation = PORTRAIT;
+ 		} else if (strcmp(text, "Landscape") == 0) {
+ 		    doc->default_page_orientation = LANDSCAPE;
+ 		} else if (strcmp(text, "Seascape") == 0) {
+ 		    doc->default_page_orientation = SEASCAPE;
+ 		} else if (strcmp(text, "UpsideDown") == 0) {
+ 		    doc->default_page_orientation = UPSIDEDOWN;
+ 		}
+ 	    } else if (page_media_set == NONE &&
+ 		       iscomment(line+2, "PageMedia:")) {
+ 		cp = ps_gettext(line+length("%%PageMedia:"), NULL);
+ 		if (cp) {
+ 		    for (dmp = doc->media, i=0; i<doc->nummedia; i++, dmp++) {
+ 			if (strcmp(cp, dmp->name) == 0) {
+ 			    doc->default_page_media = dmp;
+ 			    page_media_set = 1;
+ 			    break;
+ 			}
+ 		    }
+ 		    PS_free(cp);
+ 		}
+ 	    } else if (page_bb_set == NONE &&
+ 		       iscomment(line+2, "PageBoundingBox:")) {
+ 		if (scan_boundingbox(doc->default_page_boundingbox,
+ 			    line+length("%%PageBoundingBox:")))
+ 		    page_bb_set = 1;
+ 	    }
+ 	}
+ 	section_len += line_len;
+ 	readline(fd, enddoseps, &line, &position, &line_len);
+ 	section_len += line_len;
+ 	doc->enddefaults = position;
+ 	doc->lendefaults = section_len - line_len;
+     }
+ 
+     /* Document Prolog */
+ 
+     if (beginsection == 0) {
+ 	beginsection = position;
+ 	section_len = line_len;
+     }
+     while (blank(line) && readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	section_len += line_len;
+     }
+ 
+     if (!(DSCcomment(line) &&
+ 	  (iscomment(line+2, "BeginSetup") ||
+ 	   iscomment(line+2, "Page:") ||
+ 	   iscomment(line+2, "Trailer") ||
+ 	   iscomment(line+2, "EOF")))) {
+ 	doc->beginprolog = beginsection;
+ 	beginsection = 0;
+ 	preread = 1;
+ 
+ 	while ((preread ||
+ 		readline(fd, enddoseps, &line, &position, &line_len)) &&
+ 	       !(DSCcomment(line) &&
+ 	         (iscomment(line+2, "EndProlog") ||
+ 	          iscomment(line+2, "BeginSetup") ||
+ 	          iscomment(line+2, "Page:") ||
+ 	          iscomment(line+2, "Trailer") ||
+ 	          iscomment(line+2, "EOF")))) {
+ 	    if (iscomment(line, "%!PS")) {
+ 	        /* Embedded document in Prolog, typically font resources.
+ 		 * Skip until end of resource or Prolog
+ 		 */
+ 		while (readline(fd, enddoseps, &line, &position, &line_len) &&
+ 		       !(DSCcomment(line) &&
+ 			 (iscomment(line+2, "EndProlog") ||
+ 			  iscomment(line+2, "BeginSetup") ||
+ 			  iscomment(line+2, "Page:") ||
+ 			  iscomment(line+2, "Trailer") ||
+ 			  iscomment(line+2, "EOF")))) {
+ 		    section_len += line_len;
+ 		}
+ 	    }
+ 	    if (!preread) section_len += line_len;
+ 	    preread = 0;
+ 	}
+ 	section_len += line_len;
+ 	if (DSCcomment(line) && iscomment(line+2, "EndProlog")) {
+ 		readline(fd, enddoseps, &line, &position, &line_len);
+ 	    section_len += line_len;
+ 	}
+ 	doc->endprolog = position;
+ 	doc->lenprolog = section_len - line_len;
+     }
+ 
+     /* Document Setup,  Page Defaults found here for Version 2 files */
+ 
+     if (beginsection == 0) {
+ 	beginsection = position;
+ 	section_len = line_len;
+     }
+     while (blank(line) && readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	section_len += line_len;
+     }
+ 
+     if (!(DSCcomment(line) &&
+ 	  (iscomment(line+2, "Page:") ||
+ 	   iscomment(line+2, "Trailer") ||
+            (respect_eof && iscomment(line+2, "EOF"))))) {
+ 	doc->beginsetup = beginsection;
+ 	beginsection = 0;
+ 	preread = 1;
+ 	while ((preread ||
+ 		readline(fd, enddoseps, &line, &position, &line_len)) &&
+ 	       !(DSCcomment(line) &&
+ 	         (iscomment(line+2, "EndSetup") ||
+ 	          iscomment(line+2, "Page:") ||
+ 	          iscomment(line+2, "Trailer") ||
+ 	          (respect_eof && iscomment(line+2, "EOF"))))) {
+ 	    if (!preread) section_len += line_len;
+ 	    preread = 0;
+ 	    if (!DSCcomment(line)) {
+ 		/* Do nothing */
+ 	    } else if (doc->default_page_orientation == NONE &&
+ 		iscomment(line+2, "PageOrientation:")) {
+ 		sscanf(line+length("%%PageOrientation:"), "%256s", text);
+ 		if (strcmp(text, "Portrait") == 0) {
+ 		    doc->default_page_orientation = PORTRAIT;
+ 		} else if (strcmp(text, "Landscape") == 0) {
+ 		    doc->default_page_orientation = LANDSCAPE;
+ 		} else if (strcmp(text, "Seascape") == 0) {
+ 		    doc->default_page_orientation = SEASCAPE;
+ 		} else if (strcmp(text, "UpsideDown") == 0) {
+ 		    doc->default_page_orientation = UPSIDEDOWN;
+ 		}
+ 	    } else if (page_media_set == NONE &&
+ 		       iscomment(line+2, "PaperSize:")) {
+ 		cp = ps_gettext(line+length("%%PaperSize:"), NULL);
+ 		for (dmp = doc->media, i=0; i<doc->nummedia; i++, dmp++) {
+ 		    /* Note: Paper size comment uses down cased paper size
+ 		     * name.  Case insensitive compares are only used for
+ 		     * PaperSize comments.
+ 		     */
+ 		    if (cp && _spectre_strcasecmp(cp, dmp->name) == 0) {
+ 			doc->default_page_media = dmp;
+ 			page_media_set = 1;
+ 			break;
+ 		    }
+ 		}
+ 		PS_free(cp);
+ 	    } else if (page_bb_set == NONE &&
+ 		       iscomment(line+2, "PageBoundingBox:")) {
+ 		if (scan_boundingbox(doc->default_page_boundingbox,
+ 			    line+length("%%PageBoundingBox:")))
+ 		    page_bb_set = 1;
+ 	    }
+ 	}
+ 	section_len += line_len;
+ 	if (DSCcomment(line) && iscomment(line+2, "EndSetup")) {
+ 		readline(fd, enddoseps, &line, &position, &line_len);
+ 	    section_len += line_len;
+ 	}
+ 	doc->endsetup = position;
+ 	doc->lensetup = section_len - line_len;
+     }
+     /* BEGIN Mozilla fix. Some documents generated by mozilla
+        have resources between %%EndProlog and the first
+        page and there isn't any setup section. So instead
+        of including such resources in the first page,
+        we add them here as an implicit setup section
+     */
+     else if (doc->endprolog != position) {
+       doc->beginsetup = beginsection;
+       doc->endsetup = position;
+       doc->lensetup = section_len - line_len;
+       beginsection = 0;
+     }
+     /* END Mozilla fix */
+ 
+     /* BEGIN Windows NT fix ###jp###
+        Mark Pfeifer (pfeiferm%ppddev@comet.cmis.abbott.com) told me
+        about problems when viewing Windows NT 3.51 generated postscript
+        files with gv. He found that the relevant postscript files
+        show important postscript code after the '%%EndSetup' and before
+        the first page comment '%%Page: x y'.
+     */
+     if (doc->beginsetup) {
+       while (!(DSCcomment(line) &&
+ 	      (iscomment(line+2, "EndSetup") ||
+ 	      (iscomment(line+2, "Page:") ||
+ 	       iscomment(line+2, "Trailer") ||
+ 	       (respect_eof && iscomment(line+2, "EOF"))))) &&
+              (readline(fd, enddoseps, &line, &position, &line_len))) {
+         section_len += line_len;
+         doc->lensetup = section_len - line_len;
+ 	doc->endsetup = position;
+       }
+     }
+     /* END Windows NT fix ###jp##*/
+ 
+     /* Individual Pages */
+ 
+     if (beginsection == 0) {
+ 	beginsection = position;
+ 	section_len = line_len;
+     }
+     while (blank(line) && readline(fd, enddoseps, &line, &position, &line_len)) {
+ 	section_len += line_len;
+     }
+ 
+     if (maxpages == 0) {
+ 	maxpages = 1;
+ 	PS_free(doc->pages);
+ 	doc->pages = (struct page *) PS_calloc(maxpages, sizeof(struct page));
+ 	CHECK_MALLOCED(doc->pages);
+     }

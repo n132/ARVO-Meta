@@ -1,0 +1,1531 @@
+commit a6307cc8a0127a4852b7d3d2c20940a094eed0d6
+Author: Antoine Pitrou <antoine@python.org>
+Date:   Mon Jan 20 16:13:30 2020 -0600
+
+    ARROW-7618: [C++] Fix crashes or undefined behaviour on corrupt IPC input
+    
+    Should fix those issues:
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20116
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20186
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20199
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20217
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20221
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20241
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20246
+    
+    Closes #6230 from pitrou/ARROW-7618-ipc-fuzz-fixes and squashes the following commits:
+    
+    f7293b782 <Antoine Pitrou> ARROW-7618:  Fix crashes or undefined behaviour on corrupt IPC input
+    
+    Authored-by: Antoine Pitrou <antoine@python.org>
+    Signed-off-by: Wes McKinney <wesm+git@apache.org>
+
+diff --git a/cpp/cmake_modules/san-config.cmake b/cpp/cmake_modules/san-config.cmake
+index 414291ef3..0fbd85542 100644
+--- a/cpp/cmake_modules/san-config.cmake
++++ b/cpp/cmake_modules/san-config.cmake
+@@ -21,19 +21,19 @@ if(${ARROW_USE_ASAN})
+   if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
+      OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+      OR (CMAKE_CXX_COMPILER_ID
+          STREQUAL
+          "GNU"
+          AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER "4.8"))
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -DADDRESS_SANITIZER")
+   else()
+     message(SEND_ERROR "Cannot use ASAN without clang or gcc >= 4.8")
+   endif()
+ endif()
+ 
+ # Flag to enable clang undefined behavior sanitizer
+ # We explicitly don't enable all of the sanitizer flags:
+-# - disable 'vptr' because it currently crashes somewhere in boost::intrusive::list code
++# - disable 'vptr' because of RTTI issues accross shared libraries (?)
+ # - disable 'alignment' because unaligned access is really OK on Nehalem and we do it
+ #   all over the place.
+ # - disable 'function' because it appears to give a false positive https://github.com/google/sanitizers/issues/911
+ #   Note: GCC does not support the 'function' flag.
+diff --git a/cpp/src/arrow/array/validate.cc b/cpp/src/arrow/array/validate.cc
+index 038971891..c70bd4bfe 100644
+--- a/cpp/src/arrow/array/validate.cc
++++ b/cpp/src/arrow/array/validate.cc
+@@ -1,23 +1,24 @@
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+ // regarding copyright ownership.  The ASF licenses this file
+ // to you under the Apache License, Version 2.0 (the
+ // "License"); you may not use this file except in compliance
+ // with the License.  You may obtain a copy of the License at
+ //
+ //   http://www.apache.org/licenses/LICENSE-2.0
+ //
+ // Unless required by applicable law or agreed to in writing,
+ // software distributed under the License is distributed on an
+ // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ // KIND, either express or implied.  See the License for the
+ // specific language governing permissions and limitations
+ // under the License.
+ 
+ #include "arrow/array/validate.h"
+ 
+ #include "arrow/array.h"
++#include "arrow/util/int_util.h"
+ #include "arrow/util/logging.h"
+ #include "arrow/visitor_inline.h"
+ 
+@@ -32,225 +33,229 @@ namespace {
+ struct ValidateArrayVisitor {
+   Status Visit(const NullArray& array) {
+     ARROW_RETURN_IF(array.null_count() != array.length(),
+                     Status::Invalid("null_count is invalid"));
+     return Status::OK();
+   }
+ 
+   Status Visit(const PrimitiveArray& array) {
+     ARROW_RETURN_IF(array.data()->buffers.size() != 2,
+                     Status::Invalid("number of buffers is != 2"));
+ 
+     if (array.length() > 0 && array.data()->buffers[1] == nullptr) {
+       return Status::Invalid("values buffer is null");
+     }
+     if (array.length() > 0 && array.values() == nullptr) {
+       return Status::Invalid("values is null");
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const Decimal128Array& array) {
+     if (array.data()->buffers.size() != 2) {
+       return Status::Invalid("number of buffers is != 2");
+     }
+     if (array.length() > 0 && array.values() == nullptr) {
+       return Status::Invalid("values is null");
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const StringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const BinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeStringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeBinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const ListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const LargeListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const MapArray& array) {
+     if (!array.keys()) {
+       return Status::Invalid("keys is null");
+     }
+     const Status key_valid = ValidateArray(*array.keys());
+     if (!key_valid.ok()) {
+       return Status::Invalid("key array invalid: ", key_valid.ToString());
+     }
+ 
+     if (array.length() > 0 && !array.values()) {
+       return Status::Invalid("values is null");
+     }
+     const Status values_valid = ValidateArray(*array.values());
+     if (!values_valid.ok()) {
+       return Status::Invalid("values array invalid: ", values_valid.ToString());
+     }
+ 
+     const int32_t last_offset = array.value_offset(array.length());
+     if (array.values()->length() != last_offset) {
+       return Status::Invalid("Final offset invariant not equal to values length: ",
+                              last_offset, "!=", array.values()->length());
+     }
+     if (array.keys()->length() != last_offset) {
+       return Status::Invalid("Final offset invariant not equal to keys length: ",
+                              last_offset, "!=", array.keys()->length());
+     }
+ 
+     return ValidateOffsets(array);
+   }
+ 
+   Status Visit(const FixedSizeListArray& array) {
+     if (array.length() > 0 && !array.values()) {
+       return Status::Invalid("values is null");
+     }
+     if (array.values()->length() != array.length() * array.value_length()) {
+       return Status::Invalid(
+           "Values Length (", array.values()->length(), ") is not equal to the length (",
+           array.length(), ") multiplied by the list size (", array.value_length(), ")");
+     }
+ 
+     return Status::OK();
+   }
+ 
+   Status Visit(const StructArray& array) {
+     const auto& struct_type = checked_cast<const StructType&>(*array.type());
+     // Validate fields
+     for (int i = 0; i < array.num_fields(); ++i) {
+       auto it = array.field(i);
+       if (it->length() != array.length()) {
+         return Status::Invalid("Struct child array #", i,
+                                " has length different from struct array (", it->length(),
+                                " != ", array.length(), ")");
+       }
+ 
+       auto it_type = struct_type.child(i)->type();
+       if (!it->type()->Equals(it_type)) {
+         return Status::Invalid("Struct child array #", i,
+                                " does not match type field: ", it->type()->ToString(),
+                                " vs ", it_type->ToString());
+       }
+ 
+       const Status child_valid = ValidateArray(*it);
+       if (!child_valid.ok()) {
+         return Status::Invalid("Struct child array #", i,
+                                " invalid: ", child_valid.ToString());
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const UnionArray& array) {
+     const auto& union_type = *array.union_type();
+     // Validate fields
+     for (int i = 0; i < array.num_fields(); ++i) {
+       auto it = array.child(i);
+       if (union_type.mode() == UnionMode::SPARSE && it->length() != array.length()) {
+         return Status::Invalid("Sparse union child array #", i,
+                                " has length different from union array (", it->length(),
+                                " != ", array.length(), ")");
+       }
+ 
+       auto it_type = union_type.child(i)->type();
+       if (!it->type()->Equals(it_type)) {
+         return Status::Invalid("Union child array #", i,
+                                " does not match type field: ", it->type()->ToString(),
+                                " vs ", it_type->ToString());
+       }
+ 
+       const Status child_valid = ValidateArray(*it);
+       if (!child_valid.ok()) {
+         return Status::Invalid("Union child array #", i,
+                                " invalid: ", child_valid.ToString());
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const DictionaryArray& array) {
+     Type::type index_type_id = array.indices()->type()->id();
+     if (!is_integer(index_type_id)) {
+       return Status::Invalid("Dictionary indices must be integer type");
+     }
+     if (!array.data()->dictionary) {
+       return Status::Invalid("Dictionary values must be non-null");
+     }
+     const Status dict_valid = ValidateArray(*array.data()->dictionary);
+     if (!dict_valid.ok()) {
+       return Status::Invalid("Dictionary array invalid: ", dict_valid.ToString());
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const ExtensionArray& array) {
+     const auto& ext_type = checked_cast<const ExtensionType&>(*array.type());
+ 
+     if (!array.storage()->type()->Equals(*ext_type.storage_type())) {
+       return Status::Invalid("Extension array of type '", array.type()->ToString(),
+                              "' has storage array of incompatible type '",
+                              array.storage()->type()->ToString(), "'");
+     }
+     return ValidateArray(*array.storage());
+   }
+ 
+  protected:
+   template <typename BinaryArrayType>
+   Status ValidateBinaryArray(const BinaryArrayType& array) {
+     if (array.data()->buffers.size() != 3) {
+       return Status::Invalid("number of buffers is != 3");
+     }
+     return ValidateOffsets(array);
+   }
+ 
+   template <typename ListArrayType>
+   Status ValidateListArray(const ListArrayType& array) {
+     // First validate offsets, to make sure the accesses below are valid
+     RETURN_NOT_OK(ValidateOffsets(array));
+ 
+-    const auto first_offset = array.value_offset(0);
+-    const auto last_offset = array.value_offset(array.length());
+-    const auto data_extent = last_offset - first_offset;
+-    if (data_extent > 0 && !array.values()) {
+-      return Status::Invalid("values is null");
+-    }
+-    const auto values_length = array.values()->length();
+-    if (values_length < data_extent) {
+-      return Status::Invalid("Length spanned by list offsets (", data_extent,
+-                             ") larger than values array (length ", values_length, ")");
++    // An empty list array can have 0 offsets
++    if (array.length() > 0) {
++      const auto first_offset = array.value_offset(0);
++      const auto last_offset = array.value_offset(array.length());
++      const auto data_extent = last_offset - first_offset;
++      if (data_extent > 0 && !array.values()) {
++        return Status::Invalid("values is null");
++      }
++      const auto values_length = array.values()->length();
++      if (values_length < data_extent) {
++        return Status::Invalid("Length spanned by list offsets (", data_extent,
++                               ") larger than values array (length ", values_length, ")");
++      }
+     }
+ 
+     const Status child_valid = ValidateArray(*array.values());
+     if (!child_valid.ok()) {
+       return Status::Invalid("List child array invalid: ", child_valid.ToString());
+     }
+     return Status::OK();
+   }
+ 
+   template <typename ArrayType>
+   Status ValidateOffsets(const ArrayType& array) {
+     using offset_type = typename ArrayType::offset_type;
+ 
+     auto value_offsets = array.value_offsets();
+     if (value_offsets == nullptr) {
+       if (array.length() != 0) {
+         return Status::Invalid("non-empty array but value_offsets_ is null");
+       }
+       return Status::OK();
+     }
++    // An empty list array can have 0 offsets
+     auto required_offsets =
+         (array.length() > 0) ? array.length() + array.offset() + 1 : 0;
+     if (value_offsets->size() / static_cast<int>(sizeof(offset_type)) <
+         required_offsets) {
+       return Status::Invalid("offset buffer size (bytes): ", value_offsets->size(),
+                              " isn't large enough for length: ", array.length());
+     }
+ 
+     if (array.length() > 0 && array.offset() == 0 && array.value_offset(0) != 0) {
+       return Status::Invalid("The first offset isn't zero");
+     }
+     return Status::OK();
+   }
+ };
+ 
+ }  // namespace
+@@ -259,43 +264,70 @@ ARROW_EXPORT
+ Status ValidateArray(const Array& array) {
+   // First check the array layout conforms to the spec
+   const DataType& type = *array.type();
+   const auto layout = type.layout();
+   const ArrayData& data = *array.data();
+ 
+   if (array.length() < 0) {
+     return Status::Invalid("Array length is negative");
+   }
+ 
+-  if (array.null_count() > array.length()) {
+-    return Status::Invalid("Null count exceeds array length");
+-  }
+-
+   if (data.buffers.size() != layout.bit_widths.size()) {
+     return Status::Invalid("Expected ", layout.bit_widths.size(),
+                            " buffers in array "
+                            "of type ",
+                            type.ToString(), ", got ", data.buffers.size());
+   }
++  for (int i = 0; i < static_cast<int>(data.buffers.size()); ++i) {
++    const auto& buffer = data.buffers[i];
++    const auto bit_width = layout.bit_widths[i];
++    if (buffer == nullptr || bit_width <= 0) {
++      continue;
++    }
++    if (internal::HasAdditionOverflow(array.length(), array.offset()) ||
++        internal::HasMultiplyOverflow(array.length() + array.offset(), bit_width)) {
++      return Status::Invalid("Array of type ", type.ToString(),
++                             " has impossibly large length and offset");
++    }
++    const auto min_buffer_size =
++        BitUtil::BytesForBits(bit_width * (array.length() + array.offset()));
++    if (buffer->size() < min_buffer_size) {
++      return Status::Invalid("Buffer #", i, " too small in array of type ",
++                             type.ToString(), " and length ", array.length(),
++                             ": expected at least ", min_buffer_size, " byte(s), got ",
++                             buffer->size());
++    }
++  }
++  if (type.id() != Type::NA && data.null_count > 0 && data.buffers[0] == nullptr) {
++    return Status::Invalid("Array of type ", type.ToString(), " has ", data.null_count,
++                           " nulls but no null bitmap");
++  }
++
++  // Check null_count() *after* validating the buffer sizes, to avoid
++  // reading out of bounds.
++  if (array.null_count() > array.length()) {
++    return Status::Invalid("Null count exceeds array length");
++  }
++
+   if (type.id() != Type::EXTENSION) {
+     if (data.child_data.size() != static_cast<size_t>(type.num_children())) {
+       return Status::Invalid("Expected ", type.num_children(),
+                              " child arrays in array "
+                              "of type ",
+                              type.ToString(), ", got ", data.child_data.size());
+     }
+   }
+   if (layout.has_dictionary && !data.dictionary) {
+     return Status::Invalid("Array of type ", type.ToString(),
+                            " must have dictionary values");
+   }
+   if (!layout.has_dictionary && data.dictionary) {
+     return Status::Invalid("Unexpected dictionary values in array of type ",
+                            type.ToString());
+   }
+ 
+   ValidateArrayVisitor visitor;
+   return VisitArrayInline(array, &visitor);
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////
+ // ValidateArrayData: expensive validation checks
+@@ -329,134 +361,134 @@ struct BoundsCheckVisitor {
+ struct ValidateArrayDataVisitor {
+   // Fallback
+   Status Visit(const Array& array) { return Status::OK(); }
+ 
+   Status Visit(const StringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const BinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeStringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeBinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const ListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const LargeListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const MapArray& array) {
+     // TODO check keys and items individually?
+     return ValidateListArray(array);
+   }
+ 
+   Status Visit(const UnionArray& array) {
+     const auto& child_ids = array.union_type()->child_ids();
+ 
+     const int8_t* type_codes = array.raw_type_codes();
+     for (int64_t i = 0; i < array.length(); ++i) {
+       if (array.IsNull(i)) {
+         continue;
+       }
+       const int32_t code = type_codes[i];
+       if (code < 0 || child_ids[code] == UnionType::kInvalidChildId) {
+         return Status::Invalid("Union value at position ", i, " has invalid type id ",
+                                code);
+       }
+     }
+ 
+     if (array.mode() == UnionMode::DENSE) {
+       // Map logical type id to child length
+       std::vector<int64_t> child_lengths(256);
+       const auto& type_codes_map = array.union_type()->type_codes();
+       for (int child_id = 0; child_id < array.type()->num_children(); ++child_id) {
+         child_lengths[type_codes_map[child_id]] = array.child(child_id)->length();
+       }
+ 
+       // Check offsets
+       const int32_t* offsets = array.raw_value_offsets();
+       for (int64_t i = 0; i < array.length(); ++i) {
+         if (array.IsNull(i)) {
+           continue;
+         }
+         const int32_t code = type_codes[i];
+         const int32_t offset = offsets[i];
+         if (offset < 0) {
+           return Status::Invalid("Union value at position ", i, " has negative offset ",
+                                  offset);
+         }
+         if (offset >= child_lengths[code]) {
+           return Status::Invalid("Union value at position ", i,
+                                  " has offset larger "
+                                  "than child length (",
+                                  offset, " >= ", child_lengths[code], ")");
+         }
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const DictionaryArray& array) {
+     const Status indices_status =
+         CheckBounds(*array.indices(), 0, array.dictionary()->length() - 1);
+     if (!indices_status.ok()) {
+       return Status::Invalid("Dictionary indices invalid: ", indices_status.ToString());
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const ExtensionArray& array) {
+     return ValidateArrayData(*array.storage());
+   }
+ 
+  protected:
+   template <typename BinaryArrayType>
+   Status ValidateBinaryArray(const BinaryArrayType& array) {
+     return ValidateOffsets(array, array.value_data()->size());
+   }
+ 
+   template <typename ListArrayType>
+   Status ValidateListArray(const ListArrayType& array) {
+     const auto& child_array = array.values();
+     const Status child_valid = ValidateArrayData(*child_array);
+     if (!child_valid.ok()) {
+       return Status::Invalid("List child array invalid: ", child_valid.ToString());
+     }
+     return ValidateOffsets(array, child_array->offset() + child_array->length());
+   }
+ 
+   template <typename ArrayType>
+   Status ValidateOffsets(const ArrayType& array, int64_t offset_limit) {
+-    if (array.value_offsets() == nullptr) {
+-      if (array.length() != 0) {
+-        return Status::Invalid("non-empty array but value_offsets_ is null");
+-      }
++    if (array.length() == 0) {
+       return Status::OK();
+     }
++    if (array.value_offsets() == nullptr) {
++      return Status::Invalid("non-empty array but value_offsets_ is null");
++    }
+ 
+     auto prev_offset = array.value_offset(0);
+     if (prev_offset < 0) {
+       return Status::Invalid(
+           "Offset invariant failure: array starts at negative "
+           "offset ",
+           prev_offset);
+     }
+     for (int64_t i = 1; i <= array.length(); ++i) {
+       auto current_offset = array.value_offset(i);
+       if (current_offset < prev_offset) {
+         return Status::Invalid("Offset invariant failure: non-monotonic offset at slot ",
+                                i, ": ", current_offset, " < ", prev_offset);
+       }
+       if (current_offset > offset_limit) {
+         return Status::Invalid("Offset invariant failure: offset for slot ", i,
+                                " out of bounds: ", current_offset, " > ", offset_limit);
+       }
+       prev_offset = current_offset;
+     }
+     return Status::OK();
+   }
+ 
+   Status CheckBounds(const Array& array, int64_t min_value, int64_t max_value) {
+     BoundsCheckVisitor visitor{min_value, max_value};
+     return VisitArrayInline(array, &visitor);
+   }
+ };
+ 
+ }  // namespace
+diff --git a/cpp/src/arrow/array_list_test.cc b/cpp/src/arrow/array_list_test.cc
+index fb6807df9..a8336ccc3 100644
+--- a/cpp/src/arrow/array_list_test.cc
++++ b/cpp/src/arrow/array_list_test.cc
+@@ -46,397 +46,400 @@ template <typename T>
+ class TestListArray : public TestBuilder {
+  public:
+   using TypeClass = T;
+   using offset_type = typename TypeClass::offset_type;
+   using ArrayType = typename TypeTraits<TypeClass>::ArrayType;
+   using BuilderType = typename TypeTraits<TypeClass>::BuilderType;
+   using OffsetType = typename TypeTraits<TypeClass>::OffsetType;
+   using OffsetArrayType = typename TypeTraits<TypeClass>::OffsetArrayType;
+   using OffsetBuilderType = typename TypeTraits<TypeClass>::OffsetBuilderType;
+ 
+   void SetUp() {
+     TestBuilder::SetUp();
+ 
+     value_type_ = int16();
+     type_ = std::make_shared<T>(value_type_);
+ 
+     std::unique_ptr<ArrayBuilder> tmp;
+     ASSERT_OK(MakeBuilder(pool_, type_, &tmp));
+     builder_.reset(checked_cast<BuilderType*>(tmp.release()));
+   }
+ 
+   void Done() {
+     std::shared_ptr<Array> out;
+     FinishAndCheckPadding(builder_.get(), &out);
+     result_ = std::dynamic_pointer_cast<ArrayType>(out);
+   }
+ 
+   void ValidateBasicListArray(const ArrayType* result, const std::vector<int16_t>& values,
+                               const std::vector<uint8_t>& is_valid) {
+     ASSERT_OK(result->ValidateFull());
+     ASSERT_EQ(1, result->null_count());
+     ASSERT_EQ(0, result->values()->null_count());
+ 
+     ASSERT_EQ(3, result->length());
+     std::vector<offset_type> ex_offsets = {0, 3, 3, 7};
+     for (size_t i = 0; i < ex_offsets.size(); ++i) {
+       ASSERT_EQ(ex_offsets[i], result->value_offset(i));
+     }
+ 
+     for (int i = 0; i < result->length(); ++i) {
+       ASSERT_EQ(is_valid[i] == 0, result->IsNull(i));
+     }
+ 
+     ASSERT_EQ(7, result->values()->length());
+     auto varr = std::dynamic_pointer_cast<Int16Array>(result->values());
+ 
+     for (size_t i = 0; i < values.size(); ++i) {
+       ASSERT_EQ(values[i], varr->Value(i));
+     }
+   }
+ 
+   void TestBasics() {
+     std::vector<int16_t> values = {0, 1, 2, 3, 4, 5, 6};
+     std::vector<int> lengths = {3, 0, 4};
+     std::vector<uint8_t> is_valid = {1, 0, 1};
+ 
+     Int16Builder* vb = checked_cast<Int16Builder*>(builder_->value_builder());
+ 
+     ASSERT_OK(builder_->Reserve(lengths.size()));
+     ASSERT_OK(vb->Reserve(values.size()));
+ 
+     int pos = 0;
+     for (size_t i = 0; i < lengths.size(); ++i) {
+       ASSERT_OK(builder_->Append(is_valid[i] > 0));
+       for (int j = 0; j < lengths[i]; ++j) {
+         ASSERT_OK(vb->Append(values[pos++]));
+       }
+     }
+ 
+     Done();
+     ValidateBasicListArray(result_.get(), values, is_valid);
+   }
+ 
+   void TestEquality() {
+     auto vb = checked_cast<Int16Builder*>(builder_->value_builder());
+ 
+     std::shared_ptr<Array> array, equal_array, unequal_array;
+     std::vector<offset_type> equal_offsets = {0, 1, 2, 5, 6, 7, 8, 10};
+     std::vector<int16_t> equal_values = {1, 2, 3, 4, 5, 2, 2, 2, 5, 6};
+     std::vector<offset_type> unequal_offsets = {0, 1, 4, 7};
+     std::vector<int16_t> unequal_values = {1, 2, 2, 2, 3, 4, 5};
+ 
+     // setup two equal arrays
+     ASSERT_OK(builder_->AppendValues(equal_offsets.data(), equal_offsets.size()));
+     ASSERT_OK(vb->AppendValues(equal_values.data(), equal_values.size()));
+ 
+     ASSERT_OK(builder_->Finish(&array));
+     ASSERT_OK(builder_->AppendValues(equal_offsets.data(), equal_offsets.size()));
+     ASSERT_OK(vb->AppendValues(equal_values.data(), equal_values.size()));
+ 
+     ASSERT_OK(builder_->Finish(&equal_array));
+     // now an unequal one
+     ASSERT_OK(builder_->AppendValues(unequal_offsets.data(), unequal_offsets.size()));
+     ASSERT_OK(vb->AppendValues(unequal_values.data(), unequal_values.size()));
+ 
+     ASSERT_OK(builder_->Finish(&unequal_array));
+ 
+     // Test array equality
+     EXPECT_TRUE(array->Equals(array));
+     EXPECT_TRUE(array->Equals(equal_array));
+     EXPECT_TRUE(equal_array->Equals(array));
+     EXPECT_FALSE(equal_array->Equals(unequal_array));
+     EXPECT_FALSE(unequal_array->Equals(equal_array));
+ 
+     // Test range equality
+     EXPECT_TRUE(array->RangeEquals(0, 1, 0, unequal_array));
+     EXPECT_FALSE(array->RangeEquals(0, 2, 0, unequal_array));
+     EXPECT_FALSE(array->RangeEquals(1, 2, 1, unequal_array));
+     EXPECT_TRUE(array->RangeEquals(2, 3, 2, unequal_array));
+ 
+     // Check with slices, ARROW-33
+     std::shared_ptr<Array> slice, slice2;
+ 
+     slice = array->Slice(2);
+     slice2 = array->Slice(2);
+     ASSERT_EQ(array->length() - 2, slice->length());
+ 
+     ASSERT_TRUE(slice->Equals(slice2));
+     ASSERT_TRUE(array->RangeEquals(2, slice->length(), 0, slice));
+ 
+     // Chained slices
+     slice2 = array->Slice(1)->Slice(1);
+     ASSERT_TRUE(slice->Equals(slice2));
+ 
+     slice = array->Slice(1, 4);
+     slice2 = array->Slice(1, 4);
+     ASSERT_EQ(4, slice->length());
+ 
+     ASSERT_TRUE(slice->Equals(slice2));
+     ASSERT_TRUE(array->RangeEquals(1, 5, 0, slice));
+   }
+ 
+   void TestValuesEquality() {
+     auto type = std::make_shared<T>(int32());
+     auto left = ArrayFromJSON(type, "[[1, 2], [3], [0]]");
+     auto right = ArrayFromJSON(type, "[[1, 2], [3], [100000]]");
+     auto offset = 2;
+     EXPECT_FALSE(left->Slice(offset)->Equals(right->Slice(offset)));
+   }
+ 
+   void TestFromArrays() {
+     std::shared_ptr<Array> offsets1, offsets2, offsets3, offsets4, values;
+ 
+     std::vector<bool> offsets_is_valid3 = {true, false, true, true};
+     std::vector<bool> offsets_is_valid4 = {true, true, false, true};
+ 
+     std::vector<bool> values_is_valid = {true, false, true, true, true, true};
+ 
+     std::vector<offset_type> offset1_values = {0, 2, 2, 6};
+     std::vector<offset_type> offset2_values = {0, 2, 6, 6};
+ 
+     std::vector<int8_t> values_values = {0, 1, 2, 3, 4, 5};
+     const int length = 3;
+ 
+     ArrayFromVector<OffsetType, offset_type>(offset1_values, &offsets1);
+     ArrayFromVector<OffsetType, offset_type>(offset2_values, &offsets2);
+ 
+     ArrayFromVector<OffsetType, offset_type>(offsets_is_valid3, offset1_values,
+                                              &offsets3);
+     ArrayFromVector<OffsetType, offset_type>(offsets_is_valid4, offset2_values,
+                                              &offsets4);
+ 
+     ArrayFromVector<Int8Type, int8_t>(values_is_valid, values_values, &values);
+ 
+     auto list_type = std::make_shared<T>(int8());
+ 
+     std::shared_ptr<Array> list1, list3, list4;
+     ASSERT_OK(ArrayType::FromArrays(*offsets1, *values, pool_, &list1));
+     ASSERT_OK(ArrayType::FromArrays(*offsets3, *values, pool_, &list3));
+     ASSERT_OK(ArrayType::FromArrays(*offsets4, *values, pool_, &list4));
+     ASSERT_OK(list1->ValidateFull());
+     ASSERT_OK(list3->ValidateFull());
+     ASSERT_OK(list4->ValidateFull());
+ 
+     ArrayType expected1(list_type, length, offsets1->data()->buffers[1], values,
+                         offsets1->data()->buffers[0], 0);
+     AssertArraysEqual(expected1, *list1);
+ 
+     // Use null bitmap from offsets3, but clean offsets from non-null version
+     ArrayType expected3(list_type, length, offsets1->data()->buffers[1], values,
+                         offsets3->data()->buffers[0], 1);
+     AssertArraysEqual(expected3, *list3);
+ 
+     // Check that the last offset bit is zero
+     ASSERT_FALSE(BitUtil::GetBit(list3->null_bitmap()->data(), length + 1));
+ 
+     ArrayType expected4(list_type, length, offsets2->data()->buffers[1], values,
+                         offsets4->data()->buffers[0], 1);
+     AssertArraysEqual(expected4, *list4);
+ 
+     // Test failure modes
+ 
+     std::shared_ptr<Array> tmp;
+ 
+     // Zero-length offsets
+     ASSERT_RAISES(Invalid,
+                   ArrayType::FromArrays(*offsets1->Slice(0, 0), *values, pool_, &tmp));
+ 
+     // Offsets not the right type
+     ASSERT_RAISES(TypeError, ArrayType::FromArrays(*values, *offsets1, pool_, &tmp));
+   }
+ 
+   void TestAppendNull() {
+     ASSERT_OK(builder_->AppendNull());
+     ASSERT_OK(builder_->AppendNull());
+ 
+     Done();
+ 
+     ASSERT_OK(result_->ValidateFull());
+     ASSERT_TRUE(result_->IsNull(0));
+     ASSERT_TRUE(result_->IsNull(1));
+ 
+     ASSERT_EQ(0, result_->raw_value_offsets()[0]);
+     ASSERT_EQ(0, result_->value_offset(1));
+     ASSERT_EQ(0, result_->value_offset(2));
+ 
+     auto values = result_->values();
+     ASSERT_EQ(0, values->length());
+     // Values buffer should be non-null
+     ASSERT_NE(nullptr, values->data()->buffers[1]);
+   }
+ 
+   void TestAppendNulls() {
+     ASSERT_OK(builder_->AppendNulls(3));
+ 
+     Done();
+ 
+     ASSERT_OK(result_->ValidateFull());
+     ASSERT_EQ(result_->length(), 3);
+     ASSERT_EQ(result_->null_count(), 3);
+     ASSERT_TRUE(result_->IsNull(0));
+     ASSERT_TRUE(result_->IsNull(1));
+     ASSERT_TRUE(result_->IsNull(2));
+ 
+     ASSERT_EQ(0, result_->raw_value_offsets()[0]);
+     ASSERT_EQ(0, result_->value_offset(1));
+     ASSERT_EQ(0, result_->value_offset(2));
+     ASSERT_EQ(0, result_->value_offset(3));
+ 
+     auto values = result_->values();
+     ASSERT_EQ(0, values->length());
+     // Values buffer should be non-null
+     ASSERT_NE(nullptr, values->data()->buffers[1]);
+   }
+ 
+   void TestBulkAppend() {
+     std::vector<int16_t> values = {0, 1, 2, 3, 4, 5, 6};
+     std::vector<uint8_t> is_valid = {1, 0, 1};
+     std::vector<offset_type> offsets = {0, 3, 3};
+ 
+     Int16Builder* vb = checked_cast<Int16Builder*>(builder_->value_builder());
+     ASSERT_OK(vb->Reserve(values.size()));
+ 
+     ASSERT_OK(builder_->AppendValues(offsets.data(), offsets.size(), is_valid.data()));
+     for (int16_t value : values) {
+       ASSERT_OK(vb->Append(value));
+     }
+     Done();
+     ValidateBasicListArray(result_.get(), values, is_valid);
+   }
+ 
+   void TestBulkAppendInvalid() {
+     std::vector<int16_t> values = {0, 1, 2, 3, 4, 5, 6};
+     std::vector<int> lengths = {3, 0, 4};
+     std::vector<uint8_t> is_valid = {1, 0, 1};
+     // Should be {0, 3, 3} given the is_valid array
+     std::vector<offset_type> offsets = {0, 2, 4};
+ 
+     Int16Builder* vb = checked_cast<Int16Builder*>(builder_->value_builder());
+     ASSERT_OK(vb->Reserve(values.size()));
+ 
+     ASSERT_OK(builder_->AppendValues(offsets.data(), offsets.size(), is_valid.data()));
+     ASSERT_OK(builder_->AppendValues(offsets.data(), offsets.size(), is_valid.data()));
+     for (int16_t value : values) {
+       ASSERT_OK(vb->Append(value));
+     }
+ 
+     Done();
+     ASSERT_RAISES(Invalid, result_->ValidateFull());
+   }
+ 
+   void TestZeroLength() {
+     // All buffers are null
+     Done();
+     ASSERT_OK(result_->ValidateFull());
+   }
+ 
+   void TestBuilderPreserveFieldName() {
+     auto list_type_with_name = std::make_shared<T>(field("counts", int16()));
+ 
+     std::unique_ptr<ArrayBuilder> tmp;
+     ASSERT_OK(MakeBuilder(pool_, list_type_with_name, &tmp));
+     builder_.reset(checked_cast<BuilderType*>(tmp.release()));
+ 
+     std::vector<offset_type> offsets = {1, 2, 4, 8};
+     ASSERT_OK(builder_->AppendValues(offsets.data(), offsets.size()));
+ 
+     std::shared_ptr<Array> list_array;
+     ASSERT_OK(builder_->Finish(&list_array));
+ 
+     const auto& type = checked_cast<T&>(*list_array->type());
+     ASSERT_EQ("counts", type.value_field()->name());
+   }
+ 
+   void TestFlattenZeroLength() {
+     Done();
+     ASSERT_OK_AND_ASSIGN(auto flattened, result_->Flatten());
+     ASSERT_OK(flattened->ValidateFull());
+     ASSERT_EQ(0, flattened->length());
+   }
+ 
+   void TestFlattenSimple() {
+     auto type = std::make_shared<T>(int32());
+     auto list_array = std::dynamic_pointer_cast<ArrayType>(
+         ArrayFromJSON(type, "[[1, 2], [3], [4], null, [5], [], [6]]"));
+     ASSERT_OK_AND_ASSIGN(auto flattened, list_array->Flatten());
+     ASSERT_OK(flattened->ValidateFull());
+     EXPECT_TRUE(flattened->Equals(ArrayFromJSON(int32(), "[1, 2, 3, 4, 5, 6]")));
+   }
+ 
+   void TestFlattenSliced() {
+     auto type = std::make_shared<T>(int32());
+     auto list_array = std::dynamic_pointer_cast<ArrayType>(
+         ArrayFromJSON(type, "[[1, 2], [3], [4], null, [5], [], [6]]"));
+     auto sliced_list_array =
+         std::dynamic_pointer_cast<ArrayType>(list_array->Slice(3, 4));
+     ASSERT_OK_AND_ASSIGN(auto flattened, list_array->Flatten());
+     ASSERT_OK(flattened->ValidateFull());
+     // Note the difference between values() and Flatten().
+     EXPECT_TRUE(flattened->Equals(ArrayFromJSON(int32(), "[5, 6]")));
+     EXPECT_TRUE(sliced_list_array->values()->Equals(
+         ArrayFromJSON(int32(), "[1, 2, 3, 4, 5, 6]")));
+   }
+ 
+   void TestFlattenNonEmptyBackingNulls() {
+     auto type = std::make_shared<T>(int32());
+     auto array_data =
+         std::dynamic_pointer_cast<ArrayType>(
+             ArrayFromJSON(type, "[[1, 2], [3], null, [5, 6], [7, 8], [], [9]]"))
+             ->data();
+     ASSERT_EQ(2, array_data->buffers.size());
+     auto null_bitmap_buffer = array_data->buffers[0];
+     ASSERT_NE(nullptr, null_bitmap_buffer);
+     BitUtil::ClearBit(null_bitmap_buffer->mutable_data(), 1);
+     BitUtil::ClearBit(null_bitmap_buffer->mutable_data(), 3);
+     BitUtil::ClearBit(null_bitmap_buffer->mutable_data(), 4);
+     auto list_array = std::dynamic_pointer_cast<ArrayType>(MakeArray(array_data));
+     ASSERT_OK(list_array->ValidateFull());
+     ASSERT_OK_AND_ASSIGN(auto flattened, list_array->Flatten());
+     EXPECT_TRUE(flattened->Equals(ArrayFromJSON(int32(), "[1, 2, 9]")))
+         << flattened->ToString();
+   }
+ 
+   Status ValidateOffsets(int64_t length, std::vector<offset_type> offsets,
+                          const std::shared_ptr<Array>& values, int64_t offset = 0) {
+     auto type = std::make_shared<TypeClass>(values->type());
+     ArrayType arr(type, length, Buffer::Wrap(offsets), values,
+                   /*null_bitmap=*/nullptr, /*null_count=*/0, offset);
+     return arr.ValidateFull();
+   }
+ 
+   void TestValidateOffsets() {
+     auto empty_values = ArrayFromJSON(int16(), "[]");
+     auto values = ArrayFromJSON(int16(), "[1, 2, 3, 4, 5, 6, 7]");
+ 
++    // An empty list array can have omitted or 0-length offsets
++    ASSERT_OK(ValidateOffsets(0, {}, empty_values));
++
+     ASSERT_OK(ValidateOffsets(0, {0}, empty_values));
+     ASSERT_OK(ValidateOffsets(1, {0, 7}, values));
+     ASSERT_OK(ValidateOffsets(2, {0, 4, 7}, values));
+     ASSERT_OK(ValidateOffsets(3, {0, 4, 7, 7}, values));
+ 
+     // Non-zero array offset
+     ASSERT_OK(ValidateOffsets(1, {0, 4, 7}, values, 1));
+     ASSERT_OK(ValidateOffsets(0, {0, 4, 7}, values, 2));
+ 
+     // Not enough offsets
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {0}, values));
+     ASSERT_RAISES(Invalid, ValidateOffsets(2, {0, 0}, values, 1));
+ 
+     // First offset != 0
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {1, 7}, values));
+     // Offset out of bounds
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {0, 8}, values));
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {0, 8, 8}, values, 1));
+     // Negative offset
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {-1, 0}, values));
+     ASSERT_RAISES(Invalid, ValidateOffsets(1, {0, -1}, values));
+     ASSERT_RAISES(Invalid, ValidateOffsets(2, {0, -1, -1}, values, 1));
+     // Offsets non-monotonic
+     ASSERT_RAISES(Invalid, ValidateOffsets(2, {0, 7, 4}, values));
+   }
+ 
+  protected:
+   std::shared_ptr<DataType> value_type_;
+ 
+   std::shared_ptr<BuilderType> builder_;
+   std::shared_ptr<ArrayType> result_;
+ };
+diff --git a/cpp/src/arrow/array_test.cc b/cpp/src/arrow/array_test.cc
+index e8094e462..01302b6da 100644
+--- a/cpp/src/arrow/array_test.cc
++++ b/cpp/src/arrow/array_test.cc
+@@ -284,31 +284,82 @@ TEST_F(TestArray, TestMakeArrayOfNull) {
+ TEST_F(TestArray, TestMakeArrayFromScalar) {
+   auto hello = Buffer::FromString("hello");
+   std::shared_ptr<Scalar> scalars[] = {
+       std::make_shared<BooleanScalar>(false),
+       std::make_shared<Int8Scalar>(3),
+       std::make_shared<UInt16Scalar>(3),
+       std::make_shared<Int32Scalar>(3),
+       std::make_shared<UInt64Scalar>(3),
+       std::make_shared<DoubleScalar>(3.0),
+       std::make_shared<BinaryScalar>(hello),
+       std::make_shared<LargeBinaryScalar>(hello),
+       std::make_shared<FixedSizeBinaryScalar>(
+           hello, fixed_size_binary(static_cast<int32_t>(hello->size()))),
+       std::make_shared<Decimal128Scalar>(Decimal128(10), decimal(16, 4)),
+       std::make_shared<StringScalar>(hello),
+       std::make_shared<LargeStringScalar>(hello)};
+ 
+   for (int64_t length : {16}) {
+     for (auto scalar : scalars) {
+       std::shared_ptr<Array> array;
+       ASSERT_OK(MakeArrayFromScalar(*scalar, length, &array));
+       ASSERT_OK(array->ValidateFull());
+       ASSERT_EQ(array->length(), length);
+       ASSERT_EQ(array->null_count(), 0);
+     }
+   }
+ }
+ 
++TEST_F(TestArray, ValidateBuffersPrimitive) {
++  auto empty_buffer = std::make_shared<Buffer>("");
++  auto null_buffer = Buffer::FromString("\xff");
++  auto data_buffer = Buffer::FromString("123456789abcdef0");
++
++  auto data = ArrayData::Make(int64(), 2, {null_buffer, data_buffer});
++  auto array = MakeArray(data);
++  ASSERT_OK(array->ValidateFull());
++  data = ArrayData::Make(boolean(), 8, {null_buffer, data_buffer});
++  array = MakeArray(data);
++  ASSERT_OK(array->ValidateFull());
++
++  // Null buffer too small
++  data = ArrayData::Make(int64(), 2, {empty_buffer, data_buffer});
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++  data = ArrayData::Make(boolean(), 9, {null_buffer, data_buffer});
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++
++  // Data buffer too small
++  data = ArrayData::Make(int64(), 3, {null_buffer, data_buffer});
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++
++  // Null buffer absent but null_count > 0
++  data = ArrayData::Make(int64(), 2, {nullptr, data_buffer}, 1);
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++
++  //
++  // With offset > 0
++  //
++  data = ArrayData::Make(int64(), 1, {null_buffer, data_buffer}, kUnknownNullCount, 1);
++  array = MakeArray(data);
++  ASSERT_OK(array->ValidateFull());
++  data = ArrayData::Make(boolean(), 6, {null_buffer, data_buffer}, kUnknownNullCount, 2);
++  array = MakeArray(data);
++  ASSERT_OK(array->ValidateFull());
++
++  // Null buffer too small
++  data = ArrayData::Make(boolean(), 7, {null_buffer, data_buffer}, kUnknownNullCount, 2);
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++
++  // Data buffer too small
++  data = ArrayData::Make(int64(), 2, {null_buffer, data_buffer}, kUnknownNullCount, 1);
++  array = MakeArray(data);
++  ASSERT_RAISES(Invalid, array->Validate());
++}
++
+ // ----------------------------------------------------------------------
+ // Null type tests
+ 
+diff --git a/cpp/src/arrow/compute/kernels/util_internal.cc b/cpp/src/arrow/compute/kernels/util_internal.cc
+index 3fee4643b..899f71d72 100644
+--- a/cpp/src/arrow/compute/kernels/util_internal.cc
++++ b/cpp/src/arrow/compute/kernels/util_internal.cc
+@@ -211,27 +211,36 @@ PrimitiveAllocatingUnaryKernel::PrimitiveAllocatingUnaryKernel(UnaryKernel* dele
+ Status PropagateNulls(FunctionContext* ctx, const ArrayData& input, ArrayData* output) {
+   const int64_t length = input.length;
+   if (output->buffers.size() == 0) {
+     // Ensure we can assign a buffer
+     output->buffers.resize(1);
+   }
+ 
+   // Handle validity bitmap
+   output->null_count = input.GetNullCount();
+-  if (input.offset != 0 && output->null_count > 0) {
+-    DCHECK(input.buffers[0]);
+-    const Buffer& validity_bitmap = *input.buffers[0];
+-    std::shared_ptr<Buffer> buffer;
+-    RETURN_NOT_OK(ctx->Allocate(BitUtil::BytesForBits(length), &buffer));
+-    // Per spec all trailing bits should indicate nullness, since
+-    // the last byte might only be partially set, we ensure the
+-    // remaining bit is set.
+-    ZeroLastByte(buffer.get());
+-    buffer->ZeroPadding();
+-    internal::CopyBitmap(validity_bitmap.data(), input.offset, length,
+-                         buffer->mutable_data(), 0 /* destination offset */);
+-    output->buffers[0] = std::move(buffer);
+-  } else if (output->null_count > 0) {
+-    output->buffers[0] = input.buffers[0];
++  if (output->null_count > 0) {
++    if (input.buffers[0] == nullptr) {
++      // Input was null, need to allocate new null bitmap
++      DCHECK_EQ(input.type->id(), Type::NA);
++      std::shared_ptr<Buffer> buffer;
++      RETURN_NOT_OK(ctx->Allocate(BitUtil::BytesForBits(length), &buffer));
++      memset(buffer->mutable_data(), 0, static_cast<size_t>(buffer->size()));
++      output->buffers[0] = std::move(buffer);
++    } else if (input.offset != 0) {
++      // Realign input null bitmap
++      const Buffer& validity_bitmap = *input.buffers[0];
++      std::shared_ptr<Buffer> buffer;
++      RETURN_NOT_OK(ctx->Allocate(BitUtil::BytesForBits(length), &buffer));
++      // Per spec all trailing bits should indicate nullness, since
++      // the last byte might only be partially set, we ensure the
++      // remaining bit is set.
++      ZeroLastByte(buffer.get());
++      internal::CopyBitmap(validity_bitmap.data(), input.offset, length,
++                           buffer->mutable_data(), 0 /* destination offset */);
++      output->buffers[0] = std::move(buffer);
++    } else {
++      // Use input null bitmap as-is
++      output->buffers[0] = input.buffers[0];
++    }
+   }
+   return Status::OK();
+ }
+diff --git a/cpp/src/arrow/ipc/message.cc b/cpp/src/arrow/ipc/message.cc
+index 3de8772a3..9ce2a2225 100644
+--- a/cpp/src/arrow/ipc/message.cc
++++ b/cpp/src/arrow/ipc/message.cc
+@@ -241,50 +241,51 @@ std::string FormatMessageType(Message::Type type) {
+ 
+ Status ReadMessage(int64_t offset, int32_t metadata_length, io::RandomAccessFile* file,
+                    std::unique_ptr<Message>* message) {
+-  ARROW_CHECK_GT(static_cast<size_t>(metadata_length), sizeof(int32_t))
+-      << "metadata_length should be at least 4";
++  if (static_cast<size_t>(metadata_length) < sizeof(int32_t)) {
++    return Status::Invalid("metadata_length should be at least 4");
++  }
+ 
+   ARROW_ASSIGN_OR_RAISE(auto buffer, file->ReadAt(offset, metadata_length));
+ 
+   if (buffer->size() < metadata_length) {
+     return Status::Invalid("Expected to read ", metadata_length,
+                            " metadata bytes but got ", buffer->size());
+   }
+ 
+   const int32_t continuation = util::SafeLoadAs<int32_t>(buffer->data());
+ 
+   // The size of the Flatbuffer including padding
+   int32_t flatbuffer_length = -1;
+   int32_t prefix_size = -1;
+   if (continuation == internal::kIpcContinuationToken) {
+     if (metadata_length < 8) {
+       return Status::Invalid(
+           "Corrupted IPC message, had continuation token "
+           " but length ",
+           metadata_length);
+     }
+ 
+     // Valid IPC message, parse the message length now
+     flatbuffer_length = util::SafeLoadAs<int32_t>(buffer->data() + 4);
+     prefix_size = 8;
+   } else {
+     // ARROW-6314: Backwards compatibility for reading old IPC
+     // messages produced prior to version 0.15.0
+     flatbuffer_length = continuation;
+     prefix_size = 4;
+   }
+ 
+   if (flatbuffer_length == 0) {
+     return Status::Invalid("Unexpected empty message in IPC file format");
+   }
+ 
+-  if (flatbuffer_length + prefix_size != metadata_length) {
++  if (flatbuffer_length != metadata_length - prefix_size) {
+     return Status::Invalid("flatbuffer size ", flatbuffer_length,
+                            " invalid. File offset: ", offset,
+                            ", metadata length: ", metadata_length);
+   }
+ 
+   std::shared_ptr<Buffer> metadata =
+       SliceBuffer(buffer, prefix_size, buffer->size() - prefix_size);
+   return Message::ReadFrom(offset + metadata_length, metadata, file, message);
+ }
+diff --git a/cpp/src/arrow/ipc/metadata_internal.cc b/cpp/src/arrow/ipc/metadata_internal.cc
+index 0cbae9bb5..8eb197e19 100644
+--- a/cpp/src/arrow/ipc/metadata_internal.cc
++++ b/cpp/src/arrow/ipc/metadata_internal.cc
+@@ -153,30 +153,31 @@ Status AppendChildFields(FBB& fbb, const DataType& type,
+ Status UnionFromFlatbuffer(const flatbuf::Union* union_data,
+                            const std::vector<std::shared_ptr<Field>>& children,
+                            std::shared_ptr<DataType>* out) {
+   UnionMode::type mode =
+       (union_data->mode() == flatbuf::UnionMode_Sparse ? UnionMode::SPARSE
+                                                        : UnionMode::DENSE);
+ 
+   std::vector<int8_t> type_codes;
+ 
+   const flatbuffers::Vector<int32_t>* fb_type_ids = union_data->typeIds();
+   if (fb_type_ids == nullptr) {
+-    // TODO validate that children.size() <= 127?
+     for (int8_t i = 0; i < static_cast<int8_t>(children.size()); ++i) {
+       type_codes.push_back(i);
+     }
+   } else {
+     for (int32_t id : (*fb_type_ids)) {
+-      // TODO(wesm): can these values exceed 127?
+-      type_codes.push_back(static_cast<int8_t>(id));
++      const auto type_code = static_cast<int8_t>(id);
++      if (id != type_code) {
++        return Status::Invalid("union type id out of bounds");
++      }
++      type_codes.push_back(type_code);
+     }
+   }
+ 
+-  *out = union_(children, type_codes, mode);
+-  return Status::OK();
++  return UnionType::Make(children, type_codes, mode).Value(out);
+ }
+ 
+ #define INT_TO_FB_CASE(BIT_WIDTH, IS_SIGNED)            \
+   *out_type = flatbuf::Type_Int;                        \
+   *offset = IntToFlatbuffer(fbb, BIT_WIDTH, IS_SIGNED); \
+   break;
+diff --git a/cpp/src/arrow/ipc/reader.cc b/cpp/src/arrow/ipc/reader.cc
+index 584ab92a6..1a800b97d 100644
+--- a/cpp/src/arrow/ipc/reader.cc
++++ b/cpp/src/arrow/ipc/reader.cc
+@@ -620,142 +620,144 @@ Status RecordBatchStreamReader::ReadNext(std::shared_ptr<RecordBatch>* batch) {
+ class RecordBatchFileReader::RecordBatchFileReaderImpl {
+  public:
+   RecordBatchFileReaderImpl() : file_(NULLPTR), footer_offset_(0), footer_(NULLPTR) {}
+ 
+   Status ReadFooter() {
+-    int magic_size = static_cast<int>(strlen(kArrowMagicBytes));
++    const int32_t magic_size = static_cast<int>(strlen(kArrowMagicBytes));
+ 
+     if (footer_offset_ <= magic_size * 2 + 4) {
+       return Status::Invalid("File is too small: ", footer_offset_);
+     }
+ 
+     int file_end_size = static_cast<int>(magic_size + sizeof(int32_t));
+     ARROW_ASSIGN_OR_RAISE(auto buffer,
+                           file_->ReadAt(footer_offset_ - file_end_size, file_end_size));
+ 
+     const int64_t expected_footer_size = magic_size + sizeof(int32_t);
+     if (buffer->size() < expected_footer_size) {
+       return Status::Invalid("Unable to read ", expected_footer_size, "from end of file");
+     }
+ 
+     if (memcmp(buffer->data() + sizeof(int32_t), kArrowMagicBytes, magic_size)) {
+       return Status::Invalid("Not an Arrow file");
+     }
+ 
+     int32_t footer_length = *reinterpret_cast<const int32_t*>(buffer->data());
+ 
+-    if (footer_length <= 0 || footer_length + magic_size * 2 + 4 > footer_offset_) {
++    if (footer_length <= 0 || footer_length > footer_offset_ - magic_size * 2 - 4) {
+       return Status::Invalid("File is smaller than indicated metadata size");
+     }
+ 
+     // Now read the footer
+     ARROW_ASSIGN_OR_RAISE(
+         footer_buffer_,
+         file_->ReadAt(footer_offset_ - footer_length - file_end_size, footer_length));
+ 
+     auto data = footer_buffer_->data();
+     flatbuffers::Verifier verifier(data, footer_buffer_->size(), 128);
+     if (!flatbuf::VerifyFooterBuffer(verifier)) {
+       return Status::IOError("Verification of flatbuffer-encoded Footer failed.");
+     }
+     footer_ = flatbuf::GetFooter(data);
+ 
+     return Status::OK();
+   }
+ 
+   int num_dictionaries() const { return footer_->dictionaries()->size(); }
+ 
+   int num_record_batches() const { return footer_->recordBatches()->size(); }
+ 
+   MetadataVersion version() const {
+     return internal::GetMetadataVersion(footer_->version());
+   }
+ 
+   FileBlock GetRecordBatchBlock(int i) const {
+     return FileBlockFromFlatbuffer(footer_->recordBatches()->Get(i));
+   }
+ 
+   FileBlock GetDictionaryBlock(int i) const {
+     return FileBlockFromFlatbuffer(footer_->dictionaries()->Get(i));
+   }
+ 
+   Status ReadMessageFromBlock(const FileBlock& block, std::unique_ptr<Message>* out) {
+-    DCHECK(BitUtil::IsMultipleOf8(block.offset));
+-    DCHECK(BitUtil::IsMultipleOf8(block.metadata_length));
+-    DCHECK(BitUtil::IsMultipleOf8(block.body_length));
++    if (!BitUtil::IsMultipleOf8(block.offset) ||
++        !BitUtil::IsMultipleOf8(block.metadata_length) ||
++        !BitUtil::IsMultipleOf8(block.body_length)) {
++      return Status::Invalid("Unaligned block in IPC file");
++    }
+ 
+     RETURN_NOT_OK(ReadMessage(block.offset, block.metadata_length, file_, out));
+ 
+     // TODO(wesm): this breaks integration tests, see ARROW-3256
+     // DCHECK_EQ((*out)->body_length(), block.body_length);
+     return Status::OK();
+   }
+ 
+   Status ReadDictionaries() {
+     // Read all the dictionaries
+     for (int i = 0; i < num_dictionaries(); ++i) {
+       std::unique_ptr<Message> message;
+       RETURN_NOT_OK(ReadMessageFromBlock(GetDictionaryBlock(i), &message));
+ 
+       CHECK_HAS_BODY(*message);
+       io::BufferReader reader(message->body());
+       RETURN_NOT_OK(ReadDictionary(*message->metadata(), &dictionary_memo_, &reader));
+     }
+     return Status::OK();
+   }
+ 
+   Status ReadRecordBatch(int i, std::shared_ptr<RecordBatch>* batch) {
+     DCHECK_GE(i, 0);
+     DCHECK_LT(i, num_record_batches());
+ 
+     if (!read_dictionaries_) {
+       RETURN_NOT_OK(ReadDictionaries());
+       read_dictionaries_ = true;
+     }
+ 
+     std::unique_ptr<Message> message;
+     RETURN_NOT_OK(ReadMessageFromBlock(GetRecordBatchBlock(i), &message));
+ 
+     CHECK_HAS_BODY(*message);
+     io::BufferReader reader(message->body());
+     return ::arrow::ipc::ReadRecordBatch(*message->metadata(), schema_, &dictionary_memo_,
+                                          &reader, batch);
+   }
+ 
+   Status ReadSchema() {
+     // Get the schema and record any observed dictionaries
+     return internal::GetSchema(footer_->schema(), &dictionary_memo_, &schema_);
+   }
+ 
+   Status Open(const std::shared_ptr<io::RandomAccessFile>& file, int64_t footer_offset) {
+     owned_file_ = file;
+     return Open(file.get(), footer_offset);
+   }
+ 
+   Status Open(io::RandomAccessFile* file, int64_t footer_offset) {
+     file_ = file;
+     footer_offset_ = footer_offset;
+     RETURN_NOT_OK(ReadFooter());
+     return ReadSchema();
+   }
+ 
+   std::shared_ptr<Schema> schema() const { return schema_; }
+ 
+  private:
+   io::RandomAccessFile* file_;
+ 
+   std::shared_ptr<io::RandomAccessFile> owned_file_;
+ 
+   // The location where the Arrow file layout ends. May be the end of the file
+   // or some other location if embedded in a larger file.
+   int64_t footer_offset_;
+ 
+   // Footer metadata
+   std::shared_ptr<Buffer> footer_buffer_;
+   const flatbuf::Footer* footer_;
+ 
+   bool read_dictionaries_ = false;
+   DictionaryMemo dictionary_memo_;
+ 
+   // Reconstructed schema, including any read dictionaries
+   std::shared_ptr<Schema> schema_;
+ };
+diff --git a/cpp/src/arrow/type.cc b/cpp/src/arrow/type.cc
+index 185bb9303..ae93a3a02 100644
+--- a/cpp/src/arrow/type.cc
++++ b/cpp/src/arrow/type.cc
+@@ -348,21 +348,38 @@ constexpr int UnionType::kInvalidChildId;
+ UnionType::UnionType(const std::vector<std::shared_ptr<Field>>& fields,
+                      const std::vector<int8_t>& type_codes, UnionMode::type mode)
+     : NestedType(Type::UNION),
+       mode_(mode),
+       type_codes_(type_codes),
+       child_ids_(kMaxTypeCode + 1, kInvalidChildId) {
+-  DCHECK_LE(fields.size(), type_codes.size()) << "union field with unknown type id";
+-  DCHECK_GE(fields.size(), type_codes.size())
+-      << "type id provided without corresponding union field";
++  DCHECK_OK(ValidateParameters(fields, type_codes, mode));
+   children_ = fields;
+   for (int child_id = 0; child_id < static_cast<int>(type_codes_.size()); ++child_id) {
+     const auto type_code = type_codes_[child_id];
+-    DCHECK_GE(type_code, 0);
+-    DCHECK_LE(type_code, kMaxTypeCode);
+     child_ids_[type_code] = child_id;
+   }
+ }
+ 
++Result<std::shared_ptr<DataType>> UnionType::Make(
++    const std::vector<std::shared_ptr<Field>>& fields,
++    const std::vector<int8_t>& type_codes, UnionMode::type mode) {
++  RETURN_NOT_OK(ValidateParameters(fields, type_codes, mode));
++  return std::make_shared<UnionType>(fields, type_codes, mode);
++}
++
++Status UnionType::ValidateParameters(const std::vector<std::shared_ptr<Field>>& fields,
++                                     const std::vector<int8_t>& type_codes,
++                                     UnionMode::type mode) {
++  if (fields.size() != type_codes.size()) {
++    return Status::Invalid("Union should get the same number of fields as type codes");
++  }
++  for (const auto type_code : type_codes) {
++    if (type_code < 0 || type_code > kMaxTypeCode) {
++      return Status::Invalid("Union type code out of bounds");
++    }
++  }
++  return Status::OK();
++}
++
+ DataTypeLayout UnionType::layout() const {
+   if (mode_ == UnionMode::SPARSE) {
+     return {{1, CHAR_BIT, DataTypeLayout::kAlwaysNullBuffer}, false};
+diff --git a/cpp/src/arrow/type.h b/cpp/src/arrow/type.h
+index b4175bc2f..cca1d924e 100644
+--- a/cpp/src/arrow/type.h
++++ b/cpp/src/arrow/type.h
+@@ -959,42 +959,51 @@ struct UnionMode {
+ /// \brief Concrete type class for union data
+ class ARROW_EXPORT UnionType : public NestedType {
+  public:
+   static constexpr Type::type type_id = Type::UNION;
+   static constexpr int8_t kMaxTypeCode = 127;
+   static constexpr int kInvalidChildId = -1;
+ 
+   static constexpr const char* type_name() { return "union"; }
+ 
+   UnionType(const std::vector<std::shared_ptr<Field>>& fields,
+             const std::vector<int8_t>& type_codes,
+             UnionMode::type mode = UnionMode::SPARSE);
+ 
++  // A constructor variant that validates input parameters
++  static Result<std::shared_ptr<DataType>> Make(
++      const std::vector<std::shared_ptr<Field>>& fields,
++      const std::vector<int8_t>& type_codes, UnionMode::type mode = UnionMode::SPARSE);
++
+   DataTypeLayout layout() const override;
+ 
+   std::string ToString() const override;
+   std::string name() const override { return "union"; }
+ 
+   /// The array of logical type ids.
+   ///
+   /// For example, the first type in the union might be denoted by the id 5
+   /// (instead of 0).
+   const std::vector<int8_t>& type_codes() const { return type_codes_; }
+ 
+   /// An array mapping logical type ids to physical child ids.
+   const std::vector<int>& child_ids() const { return child_ids_; }
+ 
+   uint8_t max_type_code() const;
+ 
+   UnionMode::type mode() const { return mode_; }
+ 
+  private:
+   std::string ComputeFingerprint() const override;
+ 
++  static Status ValidateParameters(const std::vector<std::shared_ptr<Field>>& fields,
++                                   const std::vector<int8_t>& type_codes,
++                                   UnionMode::type mode);
++
+   UnionMode::type mode_;
+ 
+   std::vector<int8_t> type_codes_;
+   std::vector<int> child_ids_;
+ };
+ 
+ // ----------------------------------------------------------------------
+ // Date and time types
+@@ -1280,41 +1289,41 @@ class ARROW_EXPORT DurationType : public TemporalType, public ParametricType {
+ /// \brief Dictionary-encoded value type with data-dependent
+ /// dictionary
+ class ARROW_EXPORT DictionaryType : public FixedWidthType {
+  public:
+   static constexpr Type::type type_id = Type::DICTIONARY;
+ 
+   static constexpr const char* type_name() { return "dictionary"; }
+ 
+   DictionaryType(const std::shared_ptr<DataType>& index_type,
+                  const std::shared_ptr<DataType>& value_type, bool ordered = false);
+ 
+   // A constructor variant that validates its input parameters
+   static Result<std::shared_ptr<DataType>> Make(
+       const std::shared_ptr<DataType>& index_type,
+       const std::shared_ptr<DataType>& value_type, bool ordered = false);
+ 
+   std::string ToString() const override;
+   std::string name() const override { return "dictionary"; }
+ 
+   int bit_width() const override;
+ 
+   DataTypeLayout layout() const override;
+ 
+   std::shared_ptr<DataType> index_type() const { return index_type_; }
+   std::shared_ptr<DataType> value_type() const { return value_type_; }
+ 
+   bool ordered() const { return ordered_; }
+ 
++ protected:
+   static Status ValidateParameters(const DataType& index_type,
+                                    const DataType& value_type);
+ 
+- protected:
+   std::string ComputeFingerprint() const override;
+ 
+   // Must be an integer type (not currently checked)
+   std::shared_ptr<DataType> index_type_;
+   std::shared_ptr<DataType> value_type_;
+   bool ordered_;
+ };
+ 
+ /// \brief Helper class for incremental dictionary unification
+diff --git a/cpp/src/arrow/util/int_util.h b/cpp/src/arrow/util/int_util.h
+index da4547379..19ee41c76 100644
+--- a/cpp/src/arrow/util/int_util.h
++++ b/cpp/src/arrow/util/int_util.h
+@@ -1,24 +1,25 @@
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+ // regarding copyright ownership.  The ASF licenses this file
+ // to you under the Apache License, Version 2.0 (the
+ // "License"); you may not use this file except in compliance
+ // with the License.  You may obtain a copy of the License at
+ //
+ //   http://www.apache.org/licenses/LICENSE-2.0
+ //
+ // Unless required by applicable law or agreed to in writing,
+ // software distributed under the License is distributed on an
+ // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ // KIND, either express or implied.  See the License for the
+ // specific language governing permissions and limitations
+ // under the License.
+ 
+ #ifndef ARROW_UTIL_INT_UTIL_H
+ #define ARROW_UTIL_INT_UTIL_H
+ 
+ #include <cstdint>
++#include <limits>
+ #include <type_traits>
+ 
+ #include "arrow/util/visibility.h"
+@@ -81,8 +82,21 @@ template <typename SignedInt, typename Shift>
+ SignedInt SafeLeftShift(SignedInt u, Shift shift) {
+   using UnsignedInt = typename std::make_unsigned<SignedInt>::type;
+   return static_cast<SignedInt>(static_cast<UnsignedInt>(u) << shift);
+ }
+ 
++/// Detect multiplication overflow between *positive* integers
++template <typename Integer>
++bool HasMultiplyOverflow(Integer value, Integer multiplicand) {
++  return (multiplicand != 0 &&
++          value > std::numeric_limits<Integer>::max() / multiplicand);
++}
++
++/// Detect addition overflow between *positive* integers
++template <typename Integer>
++bool HasAdditionOverflow(Integer value, Integer addend) {
++  return (value > std::numeric_limits<Integer>::max() - addend);
++}
++
+ /// Upcast an integer to the largest possible width (currently 64 bits)
+ 
+ template <typename Integer>

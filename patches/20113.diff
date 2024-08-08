@@ -1,0 +1,1318 @@
+commit 724da320eaac94003a8f1229d6a820fe8c8c1816
+Author: Antoine Pitrou <antoine@python.org>
+Date:   Thu Jan 16 16:27:57 2020 -0600
+
+    ARROW-7592: [C++] Fix crashes on corrupt IPC input
+    
+    Fix the following issues spotted by OSS-Fuzz:
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20115
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20117
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20124
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20126
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20127
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20133
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20135
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20139
+    
+    Those are basic missing sanity checks when reading an IPC file.
+    
+    Closes #6213 from pitrou/ARROW-7592-ipc-crashes and squashes the following commits:
+    
+    50a1b3065 <Antoine Pitrou> ARROW-7592:  Fix crashes on corrupt IPC input
+    
+    Authored-by: Antoine Pitrou <antoine@python.org>
+    Signed-off-by: Wes McKinney <wesm+git@apache.org>
+
+diff --git a/cpp/src/arrow/buffer.cc b/cpp/src/arrow/buffer.cc
+index ca78922f2..b55cba1bd 100644
+--- a/cpp/src/arrow/buffer.cc
++++ b/cpp/src/arrow/buffer.cc
+@@ -103,54 +103,60 @@ void Buffer::CheckMutable() const { DCHECK(is_mutable()) << "buffer not mutable"
+ /// A Buffer whose lifetime is tied to a particular MemoryPool
+ class PoolBuffer : public ResizableBuffer {
+  public:
+   explicit PoolBuffer(MemoryPool* pool) : ResizableBuffer(nullptr, 0) {
+     if (pool == nullptr) {
+       pool = default_memory_pool();
+     }
+     pool_ = pool;
+   }
+ 
+   ~PoolBuffer() override {
+     if (mutable_data_ != nullptr) {
+       pool_->Free(mutable_data_, capacity_);
+     }
+   }
+ 
+   Status Reserve(const int64_t capacity) override {
++    if (capacity < 0) {
++      return Status::Invalid("Negative buffer capacity: ", capacity);
++    }
+     if (!mutable_data_ || capacity > capacity_) {
+       uint8_t* new_data;
+       int64_t new_capacity = BitUtil::RoundUpToMultipleOf64(capacity);
+       if (mutable_data_) {
+         RETURN_NOT_OK(pool_->Reallocate(capacity_, new_capacity, &mutable_data_));
+       } else {
+         RETURN_NOT_OK(pool_->Allocate(new_capacity, &new_data));
+         mutable_data_ = new_data;
+       }
+       data_ = mutable_data_;
+       capacity_ = new_capacity;
+     }
+     return Status::OK();
+   }
+ 
+   Status Resize(const int64_t new_size, bool shrink_to_fit = true) override {
++    if (new_size < 0) {
++      return Status::Invalid("Negative buffer resize: ", new_size);
++    }
+     if (mutable_data_ && shrink_to_fit && new_size <= size_) {
+       // Buffer is non-null and is not growing, so shrink to the requested size without
+       // excess space.
+       int64_t new_capacity = BitUtil::RoundUpToMultipleOf64(new_size);
+       if (capacity_ != new_capacity) {
+         // Buffer hasn't got yet the requested size.
+         RETURN_NOT_OK(pool_->Reallocate(capacity_, new_capacity, &mutable_data_));
+         data_ = mutable_data_;
+         capacity_ = new_capacity;
+       }
+     } else {
+       RETURN_NOT_OK(Reserve(new_size));
+     }
+     size_ = new_size;
+ 
+     return Status::OK();
+   }
+ 
+  private:
+   MemoryPool* pool_;
+ };
+diff --git a/cpp/src/arrow/compute/kernels/take_internal.h b/cpp/src/arrow/compute/kernels/take_internal.h
+index 20c395f03..d40ff06ff 100644
+--- a/cpp/src/arrow/compute/kernels/take_internal.h
++++ b/cpp/src/arrow/compute/kernels/take_internal.h
+@@ -502,175 +502,175 @@ template <typename IndexSequence>
+ class TakerImpl<IndexSequence, UnionType> : public Taker<IndexSequence> {
+  public:
+   using Taker<IndexSequence>::Taker;
+ 
+   Status Init() override {
+     union_type_ = checked_cast<const UnionType*>(this->type_.get());
+ 
+     if (union_type_->mode() == UnionMode::SPARSE) {
+       sparse_children_.resize(this->type_->num_children());
+     } else {
+       dense_children_.resize(this->type_->num_children());
+       child_length_.resize(union_type_->max_type_code() + 1);
+     }
+ 
+     for (int i = 0; i < this->type_->num_children(); ++i) {
+       if (union_type_->mode() == UnionMode::SPARSE) {
+         RETURN_NOT_OK(Taker<IndexSequence>::Make(this->type_->child(i)->type(),
+                                                  &sparse_children_[i]));
+       } else {
+         RETURN_NOT_OK(Taker<ArrayIndexSequence<Int32Type>>::Make(
+             this->type_->child(i)->type(), &dense_children_[i]));
+       }
+     }
+ 
+     return Status::OK();
+   }
+ 
+   Status SetContext(FunctionContext* ctx) override {
+     pool_ = ctx->memory_pool();
+     null_bitmap_builder_.reset(new TypedBufferBuilder<bool>(pool_));
+     type_code_builder_.reset(new TypedBufferBuilder<int8_t>(pool_));
+ 
+     if (union_type_->mode() == UnionMode::DENSE) {
+       offset_builder_.reset(new TypedBufferBuilder<int32_t>(pool_));
+       std::fill(child_length_.begin(), child_length_.end(), 0);
+     }
+ 
+     for (int i = 0; i < this->type_->num_children(); ++i) {
+       if (union_type_->mode() == UnionMode::SPARSE) {
+         RETURN_NOT_OK(sparse_children_[i]->SetContext(ctx));
+       } else {
+         RETURN_NOT_OK(dense_children_[i]->SetContext(ctx));
+       }
+     }
+ 
+     return Status::OK();
+   }
+ 
+   Status Take(const Array& values, IndexSequence indices) override {
+     DCHECK(this->type_->Equals(values.type()));
+     const auto& union_array = checked_cast<const UnionArray&>(values);
+     auto type_codes = union_array.raw_type_codes();
+ 
+     if (union_type_->mode() == UnionMode::SPARSE) {
+       RETURN_NOT_OK(null_bitmap_builder_->Reserve(indices.length()));
+       RETURN_NOT_OK(type_code_builder_->Reserve(indices.length()));
+       RETURN_NOT_OK(VisitIndices(indices, values, [&](int64_t index, bool is_valid) {
+         null_bitmap_builder_->UnsafeAppend(is_valid);
+         type_code_builder_->UnsafeAppend(type_codes[index]);
+         return Status::OK();
+       }));
+ 
+       // bounds checking was done while appending to the null bitmap
+       indices.set_never_out_of_bounds();
+ 
+       for (int i = 0; i < this->type_->num_children(); ++i) {
+         RETURN_NOT_OK(sparse_children_[i]->Take(*union_array.child(i), indices));
+       }
+     } else {
+       // Gathering from the offsets into child arrays is a bit tricky.
+       std::vector<uint32_t> child_counts(union_type_->max_type_code() + 1);
+       RETURN_NOT_OK(null_bitmap_builder_->Reserve(indices.length()));
+       RETURN_NOT_OK(type_code_builder_->Reserve(indices.length()));
+       RETURN_NOT_OK(VisitIndices(indices, values, [&](int64_t index, bool is_valid) {
+         null_bitmap_builder_->UnsafeAppend(is_valid);
+         type_code_builder_->UnsafeAppend(type_codes[index]);
+         child_counts[type_codes[index]] += is_valid;
+         return Status::OK();
+       }));
+ 
+       // bounds checking was done while appending to the null bitmap
+       indices.set_never_out_of_bounds();
+ 
+       // Allocate temporary storage for the offsets of all valid slots
+-      // NB: Overestimates required space when indices and union_array are
+-      //     not null at identical positions.
+       auto child_offsets_storage_size =
+-          indices.length() - std::max(union_array.null_count(), indices.null_count());
++          std::accumulate(child_counts.begin(), child_counts.end(), 0);
+       std::shared_ptr<Buffer> child_offsets_storage;
+       RETURN_NOT_OK(AllocateBuffer(pool_, child_offsets_storage_size * sizeof(int32_t),
+                                    &child_offsets_storage));
+ 
+       // Partition offsets by type_code: child_offset_partitions[type_code] will
+       // point to storage for child_counts[type_code] offsets
+       std::vector<int32_t*> child_offset_partitions(child_counts.size());
+       auto child_offsets_storage_data = GetInt32(child_offsets_storage);
+       for (auto type_code : union_type_->type_codes()) {
+         child_offset_partitions[type_code] = child_offsets_storage_data;
+         child_offsets_storage_data += child_counts[type_code];
+       }
++      DCHECK_EQ(child_offsets_storage_data - GetInt32(child_offsets_storage),
++                child_offsets_storage_size);
+ 
+       // Fill child_offsets_storage with the taken offsets
+       RETURN_NOT_OK(offset_builder_->Reserve(indices.length()));
+       RETURN_NOT_OK(VisitIndices(indices, values, [&](int64_t index, bool is_valid) {
+         auto type_code = type_codes[index];
+         if (is_valid) {
+           offset_builder_->UnsafeAppend(child_length_[type_code]++);
+           *child_offset_partitions[type_code] = union_array.value_offset(index);
+           ++child_offset_partitions[type_code];
+         } else {
+           offset_builder_->UnsafeAppend(0);
+         }
+         return Status::OK();
+       }));
+ 
+       // Take from each child at those offsets
+       int64_t taken_offset_begin = 0;
+       for (int i = 0; i < this->type_->num_children(); ++i) {
+         auto type_code = union_type_->type_codes()[i];
+         auto length = child_counts[type_code];
+         Int32Array taken_offsets(length, SliceBuffer(child_offsets_storage,
+                                                      sizeof(int32_t) * taken_offset_begin,
+                                                      sizeof(int32_t) * length));
+         ArrayIndexSequence<Int32Type> child_indices(taken_offsets);
+         child_indices.set_never_out_of_bounds();
+         RETURN_NOT_OK(dense_children_[i]->Take(*union_array.child(i), child_indices));
+         taken_offset_begin += length;
+       }
+     }
+ 
+     return Status::OK();
+   }
+ 
+   Status Finish(std::shared_ptr<Array>* out) override {
+     auto null_count = null_bitmap_builder_->false_count();
+     auto length = null_bitmap_builder_->length();
+     std::shared_ptr<Buffer> null_bitmap, type_codes;
+     RETURN_NOT_OK(null_bitmap_builder_->Finish(&null_bitmap));
+     RETURN_NOT_OK(type_code_builder_->Finish(&type_codes));
+ 
+     std::shared_ptr<Buffer> offsets;
+     if (union_type_->mode() == UnionMode::DENSE) {
+       RETURN_NOT_OK(offset_builder_->Finish(&offsets));
+     }
+ 
+     ArrayVector fields(this->type_->num_children());
+     for (int i = 0; i < this->type_->num_children(); ++i) {
+       if (union_type_->mode() == UnionMode::SPARSE) {
+         RETURN_NOT_OK(sparse_children_[i]->Finish(&fields[i]));
+       } else {
+         RETURN_NOT_OK(dense_children_[i]->Finish(&fields[i]));
+       }
+     }
+ 
+     out->reset(new UnionArray(this->type_, length, std::move(fields), type_codes, offsets,
+                               null_bitmap, null_count));
+     return Status::OK();
+   }
+ 
+  protected:
+   int32_t* GetInt32(const std::shared_ptr<Buffer>& b) const {
+     return reinterpret_cast<int32_t*>(b->mutable_data());
+   }
+ 
+   const UnionType* union_type_ = nullptr;
+   MemoryPool* pool_ = nullptr;
+   std::unique_ptr<TypedBufferBuilder<bool>> null_bitmap_builder_;
+   std::unique_ptr<TypedBufferBuilder<int8_t>> type_code_builder_;
+   std::unique_ptr<TypedBufferBuilder<int32_t>> offset_builder_;
+   std::vector<std::unique_ptr<Taker<IndexSequence>>> sparse_children_;
+   std::vector<std::unique_ptr<Taker<ArrayIndexSequence<Int32Type>>>> dense_children_;
+   std::vector<int32_t> child_length_;
+ };
+ 
+ // taking from a DictionaryArray is accomplished by taking from its indices
+diff --git a/cpp/src/arrow/io/file.cc b/cpp/src/arrow/io/file.cc
+index 770364c42..089243581 100644
+--- a/cpp/src/arrow/io/file.cc
++++ b/cpp/src/arrow/io/file.cc
+@@ -59,172 +59,173 @@ namespace io {
+ class OSFile {
+  public:
+   OSFile() : fd_(-1), is_open_(false), size_(-1), need_seeking_(false) {}
+ 
+   ~OSFile() {}
+ 
+   // Note: only one of the Open* methods below may be called on a given instance
+ 
+   Status OpenWritable(const std::string& path, bool truncate, bool append,
+                       bool write_only) {
+     RETURN_NOT_OK(SetFileName(path));
+ 
+     ARROW_ASSIGN_OR_RAISE(fd_, ::arrow::internal::FileOpenWritable(file_name_, write_only,
+                                                                    truncate, append));
+     is_open_ = true;
+     mode_ = write_only ? FileMode::WRITE : FileMode::READWRITE;
+ 
+     if (!truncate) {
+       ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_));
+     } else {
+       size_ = 0;
+     }
+     return Status::OK();
+   }
+ 
+   // This is different from OpenWritable(string, ...) in that it doesn't
+   // truncate nor mandate a seekable file
+   Status OpenWritable(int fd) {
+     auto result = ::arrow::internal::FileGetSize(fd);
+     if (result.ok()) {
+       size_ = *result;
+     } else {
+       // Non-seekable file
+       size_ = -1;
+     }
+     RETURN_NOT_OK(SetFileName(fd));
+     is_open_ = true;
+     mode_ = FileMode::WRITE;
+     fd_ = fd;
+     return Status::OK();
+   }
+ 
+   Status OpenReadable(const std::string& path) {
+     RETURN_NOT_OK(SetFileName(path));
+ 
+     ARROW_ASSIGN_OR_RAISE(fd_, ::arrow::internal::FileOpenReadable(file_name_));
+     ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd_));
+ 
+     is_open_ = true;
+     mode_ = FileMode::READ;
+     return Status::OK();
+   }
+ 
+   Status OpenReadable(int fd) {
+     ARROW_ASSIGN_OR_RAISE(size_, ::arrow::internal::FileGetSize(fd));
+     RETURN_NOT_OK(SetFileName(fd));
+     is_open_ = true;
+     mode_ = FileMode::READ;
+     fd_ = fd;
+     return Status::OK();
+   }
+ 
+   Status CheckClosed() const {
+     if (!is_open_) {
+       return Status::Invalid("Invalid operation on closed file");
+     }
+     return Status::OK();
+   }
+ 
+   Status Close() {
+     if (is_open_) {
+       // Even if closing fails, the fd will likely be closed (perhaps it's
+       // already closed).
+       is_open_ = false;
+       int fd = fd_;
+       fd_ = -1;
+       RETURN_NOT_OK(::arrow::internal::FileClose(fd));
+     }
+     return Status::OK();
+   }
+ 
+   Result<int64_t> Read(int64_t nbytes, void* out) {
+     RETURN_NOT_OK(CheckClosed());
+     RETURN_NOT_OK(CheckPositioned());
+     return ::arrow::internal::FileRead(fd_, reinterpret_cast<uint8_t*>(out), nbytes);
+   }
+ 
+   Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) {
+     RETURN_NOT_OK(CheckClosed());
++    RETURN_NOT_OK(internal::ValidateRegion(position, nbytes));
+     // ReadAt() leaves the file position undefined, so require that we seek
+     // before calling Read() or Write().
+     need_seeking_.store(true);
+     return ::arrow::internal::FileReadAt(fd_, reinterpret_cast<uint8_t*>(out), position,
+                                          nbytes);
+   }
+ 
+   Status Seek(int64_t pos) {
+     RETURN_NOT_OK(CheckClosed());
+     if (pos < 0) {
+       return Status::Invalid("Invalid position");
+     }
+     Status st = ::arrow::internal::FileSeek(fd_, pos);
+     if (st.ok()) {
+       need_seeking_.store(false);
+     }
+     return st;
+   }
+ 
+   Result<int64_t> Tell() const {
+     RETURN_NOT_OK(CheckClosed());
+     return ::arrow::internal::FileTell(fd_);
+   }
+ 
+   Status Write(const void* data, int64_t length) {
+     RETURN_NOT_OK(CheckClosed());
+ 
+     std::lock_guard<std::mutex> guard(lock_);
+     RETURN_NOT_OK(CheckPositioned());
+     if (length < 0) {
+       return Status::IOError("Length must be non-negative");
+     }
+     return ::arrow::internal::FileWrite(fd_, reinterpret_cast<const uint8_t*>(data),
+                                         length);
+   }
+ 
+   int fd() const { return fd_; }
+ 
+   bool is_open() const { return is_open_; }
+ 
+   int64_t size() const { return size_; }
+ 
+   FileMode::type mode() const { return mode_; }
+ 
+   std::mutex& lock() { return lock_; }
+ 
+  protected:
+   Status SetFileName(const std::string& file_name) {
+     return ::arrow::internal::PlatformFilename::FromString(file_name).Value(&file_name_);
+   }
+ 
+   Status SetFileName(int fd) {
+     std::stringstream ss;
+     ss << "<fd " << fd << ">";
+     return SetFileName(ss.str());
+   }
+ 
+   Status CheckPositioned() {
+     if (need_seeking_.load()) {
+       return Status::Invalid(
+           "Need seeking after ReadAt() before "
+           "calling implicitly-positioned operation");
+     }
+     return Status::OK();
+   }
+ 
+   ::arrow::internal::PlatformFilename file_name_;
+ 
+   std::mutex lock_;
+ 
+   // File descriptor
+   int fd_;
+ 
+   FileMode::type mode_;
+ 
+   bool is_open_;
+   int64_t size_;
+   // Whether ReadAt made the file position non-deterministic.
+   std::atomic<bool> need_seeking_;
+ };
+ 
+ // ----------------------------------------------------------------------
+ // ReadableFile implementation
+@@ -687,23 +688,27 @@ bool MemoryMappedFile::closed() const { return memory_map_->closed(); }
+ Result<std::shared_ptr<Buffer>> MemoryMappedFile::ReadAt(int64_t position,
+                                                          int64_t nbytes) {
+   RETURN_NOT_OK(memory_map_->CheckClosed());
+   // if the file is writable, we acquire the lock before creating any slices
+   // in case a resize is triggered concurrently, otherwise we wouldn't detect
+   // a change in the use count
+   auto guard_resize = memory_map_->writable()
+                           ? std::unique_lock<std::mutex>(memory_map_->resize_lock())
+                           : std::unique_lock<std::mutex>();
++
++  ARROW_ASSIGN_OR_RAISE(
++      nbytes, internal::ValidateReadRegion(position, nbytes, memory_map_->size()));
+   return memory_map_->Slice(position, nbytes);
+ }
+ 
+ Result<int64_t> MemoryMappedFile::ReadAt(int64_t position, int64_t nbytes, void* out) {
+   RETURN_NOT_OK(memory_map_->CheckClosed());
+   auto guard_resize = memory_map_->writable()
+                           ? std::unique_lock<std::mutex>(memory_map_->resize_lock())
+                           : std::unique_lock<std::mutex>();
+-  nbytes = std::max<int64_t>(0, std::min(nbytes, memory_map_->size() - position));
++  ARROW_ASSIGN_OR_RAISE(
++      nbytes, internal::ValidateReadRegion(position, nbytes, memory_map_->size()));
+   if (nbytes > 0) {
+     memcpy(out, memory_map_->data() + position, static_cast<size_t>(nbytes));
+   }
+   return nbytes;
+ }
+@@ -727,32 +732,25 @@ bool MemoryMappedFile::supports_zero_copy() const { return true; }
+ Status MemoryMappedFile::WriteAt(int64_t position, const void* data, int64_t nbytes) {
+   RETURN_NOT_OK(memory_map_->CheckClosed());
+   std::lock_guard<std::mutex> guard(memory_map_->write_lock());
+ 
+   if (!memory_map_->opened() || !memory_map_->writable()) {
+     return Status::IOError("Unable to write");
+   }
+-  if (position + nbytes > memory_map_->size()) {
+-    return Status::Invalid("Cannot write past end of memory map");
+-  }
++  RETURN_NOT_OK(internal::ValidateWriteRegion(position, nbytes, memory_map_->size()));
+ 
+   RETURN_NOT_OK(memory_map_->Seek(position));
+-  if (nbytes + memory_map_->position() > memory_map_->size()) {
+-    return Status::Invalid("Cannot write past end of memory map");
+-  }
+-
+   return WriteInternal(data, nbytes);
+ }
+ 
+ Status MemoryMappedFile::Write(const void* data, int64_t nbytes) {
+   RETURN_NOT_OK(memory_map_->CheckClosed());
+   std::lock_guard<std::mutex> guard(memory_map_->write_lock());
+ 
+   if (!memory_map_->opened() || !memory_map_->writable()) {
+     return Status::IOError("Unable to write");
+   }
+-  if (nbytes + memory_map_->position() > memory_map_->size()) {
+-    return Status::Invalid("Cannot write past end of memory map");
+-  }
++  RETURN_NOT_OK(internal::ValidateWriteRegion(memory_map_->position(), nbytes,
++                                              memory_map_->size()));
+ 
+   return WriteInternal(data, nbytes);
+ }
+diff --git a/cpp/src/arrow/io/file_test.cc b/cpp/src/arrow/io/file_test.cc
+index 9d13097ab..c8f5e9755 100644
+--- a/cpp/src/arrow/io/file_test.cc
++++ b/cpp/src/arrow/io/file_test.cc
+@@ -337,23 +337,29 @@ TEST_F(TestReadableFile, Read) {
+ TEST_F(TestReadableFile, ReadAt) {
+   uint8_t buffer[50];
+   const char* test_data = "testdata";
+ 
+   MakeTestFile();
+   OpenFile();
+ 
+   ASSERT_OK_AND_EQ(4, file_->ReadAt(0, 4, buffer));
+   ASSERT_EQ(0, std::memcmp(buffer, "test", 4));
+ 
+   ASSERT_OK_AND_EQ(7, file_->ReadAt(1, 10, buffer));
+   ASSERT_EQ(0, std::memcmp(buffer, "estdata", 7));
+ 
+   // Check buffer API
+   ASSERT_OK_AND_ASSIGN(auto buffer2, file_->ReadAt(2, 5));
+   ASSERT_EQ(5, buffer2->size());
+ 
+   Buffer expected(reinterpret_cast<const uint8_t*>(test_data + 2), 5);
+   ASSERT_TRUE(buffer2->Equals(expected));
+ 
++  // Invalid reads
++  ASSERT_RAISES(Invalid, file_->ReadAt(-1, 1));
++  ASSERT_RAISES(Invalid, file_->ReadAt(1, -1));
++  ASSERT_RAISES(Invalid, file_->ReadAt(-1, 1, buffer));
++  ASSERT_RAISES(Invalid, file_->ReadAt(1, -1, buffer));
++
+   ASSERT_OK(file_->Close());
+   ASSERT_RAISES(Invalid, file_->ReadAt(0, 1));
+ }
+@@ -541,48 +547,48 @@ TEST_F(TestMemoryMappedFile, ZeroSizeFile) {
+ TEST_F(TestMemoryMappedFile, MapPartFile) {
+   const int64_t buffer_size = 1024;
+   const int64_t unalign_offset = 1024;
+   const int64_t offset = 65536;  // make WIN32 happy
+   std::vector<uint8_t> buffer(buffer_size);
+ 
+   random_bytes(1024, 0, buffer.data());
+ 
+   const int reps = 128;
+ 
+   std::string path = "io-memory-map-offset";
+ 
+   // file size = 128k
+   CreateFile(path, reps * buffer_size);
+ 
+   // map failed with unaligned offset
+   ASSERT_RAISES(IOError,
+                 MemoryMappedFile::Open(path, FileMode::READWRITE, unalign_offset, 4096));
+ 
+   // map failed if length is greater than file size
+   ASSERT_RAISES(Invalid,
+                 MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 409600));
+ 
+   // map succeeded with valid file region <64k-68k>
+   ASSERT_OK_AND_ASSIGN(auto result,
+                        MemoryMappedFile::Open(path, FileMode::READWRITE, offset, 4096));
+ 
+   ASSERT_OK_AND_EQ(4096, result->GetSize());
+ 
+   ASSERT_OK_AND_EQ(0, result->Tell());
+ 
+   ASSERT_OK(result->Write(buffer.data(), buffer_size));
+   ASSERT_OK_AND_ASSIGN(auto out_buffer, result->ReadAt(0, buffer_size));
+   ASSERT_EQ(0, memcmp(out_buffer->data(), buffer.data(), buffer_size));
+ 
+   ASSERT_OK_AND_EQ(buffer_size, result->Tell());
+ 
+   ASSERT_OK(result->Seek(4096));
+   ASSERT_OK_AND_EQ(4096, result->Tell());
+ 
+   // Resize is not supported
+   ASSERT_RAISES(IOError, result->Resize(4096));
+ 
+   // Write beyond memory mapped length
+-  ASSERT_RAISES(Invalid, result->WriteAt(4096, buffer.data(), buffer_size));
++  ASSERT_RAISES(IOError, result->WriteAt(4096, buffer.data(), buffer_size));
+ }
+ 
+ TEST_F(TestMemoryMappedFile, WriteRead) {
+@@ -607,6 +613,18 @@ TEST_F(TestMemoryMappedFile, WriteRead) {
+   }
+ }
+ 
++TEST_F(TestMemoryMappedFile, InvalidReads) {
++  std::string path = "io-memory-map-invalid-reads-test";
++  ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(4096, path));
++
++  uint8_t buffer[10];
++
++  ASSERT_RAISES(Invalid, result->ReadAt(-1, 1));
++  ASSERT_RAISES(Invalid, result->ReadAt(1, -1));
++  ASSERT_RAISES(Invalid, result->ReadAt(-1, 1, buffer));
++  ASSERT_RAISES(Invalid, result->ReadAt(1, -1, buffer));
++}
++
+ TEST_F(TestMemoryMappedFile, WriteResizeRead) {
+   const int64_t buffer_size = 1024;
+   const int reps = 5;
+@@ -781,15 +799,15 @@ TEST_F(TestMemoryMappedFile, WriteAt) {
+ TEST_F(TestMemoryMappedFile, WriteBeyondEnd) {
+   const int64_t buffer_size = 1024;
+   std::vector<uint8_t> buffer(buffer_size);
+   random_bytes(buffer_size, 0, buffer.data());
+ 
+   std::string path = "io-memory-map-write-read-test";
+   ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
+ 
+   ASSERT_OK(result->Seek(1));
+   // Attempt to write beyond end of memory map
+-  ASSERT_RAISES(Invalid, result->Write(buffer.data(), buffer_size));
++  ASSERT_RAISES(IOError, result->Write(buffer.data(), buffer_size));
+ 
+   // The position should remain unchanged afterwards
+   ASSERT_OK_AND_EQ(1, result->Tell());
+ }
+@@ -797,14 +815,14 @@ TEST_F(TestMemoryMappedFile, WriteBeyondEnd) {
+ TEST_F(TestMemoryMappedFile, WriteAtBeyondEnd) {
+   const int64_t buffer_size = 1024;
+   std::vector<uint8_t> buffer(buffer_size);
+   random_bytes(buffer_size, 0, buffer.data());
+ 
+   std::string path = "io-memory-map-write-read-test";
+   ASSERT_OK_AND_ASSIGN(auto result, InitMemoryMap(buffer_size, path));
+ 
+   // Attempt to write beyond end of memory map
+-  ASSERT_RAISES(Invalid, result->WriteAt(1, buffer.data(), buffer_size));
++  ASSERT_RAISES(IOError, result->WriteAt(1, buffer.data(), buffer_size));
+ 
+   // The position should remain unchanged afterwards
+   ASSERT_OK_AND_EQ(0, result->Tell());
+ }
+diff --git a/cpp/src/arrow/io/interfaces.cc b/cpp/src/arrow/io/interfaces.cc
+index 99def788e..abca693e0 100644
+--- a/cpp/src/arrow/io/interfaces.cc
++++ b/cpp/src/arrow/io/interfaces.cc
+@@ -214,18 +214,47 @@ namespace internal {
+ void CloseFromDestructor(FileInterface* file) {
+   Status st = file->Close();
+   if (!st.ok()) {
+     auto file_type = typeid(*file).name();
+ #ifdef NDEBUG
+     ARROW_LOG(ERROR) << "Error ignored when destroying file of type " << file_type << ": "
+                      << st;
+ #else
+     std::stringstream ss;
+     ss << "When destroying file of type " << file_type << ": " << st.message();
+     ARROW_LOG(FATAL) << st.WithMessage(ss.str());
+ #endif
+   }
+ }
+ 
++Result<int64_t> ValidateReadRegion(int64_t offset, int64_t size, int64_t file_size) {
++  if (offset < 0 || size < 0) {
++    return Status::Invalid("Invalid read (offset = ", offset, ", size = ", size, ")");
++  }
++  if (offset > file_size) {
++    return Status::IOError("Read out of bounds (offset = ", offset, ", size = ", size,
++                           ") in file of size ", file_size);
++  }
++  return std::min(size, file_size - offset);
++}
++
++Status ValidateWriteRegion(int64_t offset, int64_t size, int64_t file_size) {
++  if (offset < 0 || size < 0) {
++    return Status::Invalid("Invalid write (offset = ", offset, ", size = ", size, ")");
++  }
++  if (offset + size > file_size) {
++    return Status::IOError("Write out of bounds (offset = ", offset, ", size = ", size,
++                           ") in file of size ", file_size);
++  }
++  return Status::OK();
++}
++
++Status ValidateRegion(int64_t offset, int64_t size) {
++  if (offset < 0 || size < 0) {
++    return Status::Invalid("Invalid IO (offset = ", offset, ", size = ", size, ")");
++  }
++  return Status::OK();
++}
++
+ #ifndef NDEBUG
+ 
+ // Debug mode concurrency checking
+diff --git a/cpp/src/arrow/io/memory.cc b/cpp/src/arrow/io/memory.cc
+index 7b469983c..eded4b7c0 100644
+--- a/cpp/src/arrow/io/memory.cc
++++ b/cpp/src/arrow/io/memory.cc
+@@ -161,73 +161,72 @@ static constexpr int64_t kMemcopyDefaultThreshold = 1024 * 1024;
+ class FixedSizeBufferWriter::FixedSizeBufferWriterImpl {
+  public:
+   /// Input buffer must be mutable, will abort if not
+ 
+   /// Input buffer must be mutable, will abort if not
+   explicit FixedSizeBufferWriterImpl(const std::shared_ptr<Buffer>& buffer)
+       : is_open_(true),
+         memcopy_num_threads_(kMemcopyDefaultNumThreads),
+         memcopy_blocksize_(kMemcopyDefaultBlocksize),
+         memcopy_threshold_(kMemcopyDefaultThreshold) {
+     buffer_ = buffer;
+     ARROW_CHECK(buffer->is_mutable()) << "Must pass mutable buffer";
+     mutable_data_ = buffer->mutable_data();
+     size_ = buffer->size();
+     position_ = 0;
+   }
+ 
+   Status Close() {
+     is_open_ = false;
+     return Status::OK();
+   }
+ 
+   bool closed() const { return !is_open_; }
+ 
+   Status Seek(int64_t position) {
+     if (position < 0 || position > size_) {
+       return Status::IOError("Seek out of bounds");
+     }
+     position_ = position;
+     return Status::OK();
+   }
+ 
+   Result<int64_t> Tell() { return position_; }
+ 
+   Status Write(const void* data, int64_t nbytes) {
+-    if (position_ + nbytes > size_) {
+-      return Status::IOError("Write out of bounds");
+-    }
++    RETURN_NOT_OK(internal::ValidateWriteRegion(position_, nbytes, size_));
+     if (nbytes > memcopy_threshold_ && memcopy_num_threads_ > 1) {
+       ::arrow::internal::parallel_memcopy(mutable_data_ + position_,
+                                           reinterpret_cast<const uint8_t*>(data), nbytes,
+                                           memcopy_blocksize_, memcopy_num_threads_);
+     } else {
+       memcpy(mutable_data_ + position_, data, nbytes);
+     }
+     position_ += nbytes;
+     return Status::OK();
+   }
+ 
+   Status WriteAt(int64_t position, const void* data, int64_t nbytes) {
+     std::lock_guard<std::mutex> guard(lock_);
++    RETURN_NOT_OK(internal::ValidateWriteRegion(position, nbytes, size_));
+     RETURN_NOT_OK(Seek(position));
+     return Write(data, nbytes);
+   }
+ 
+   void set_memcopy_threads(int num_threads) { memcopy_num_threads_ = num_threads; }
+ 
+   void set_memcopy_blocksize(int64_t blocksize) { memcopy_blocksize_ = blocksize; }
+ 
+   void set_memcopy_threshold(int64_t threshold) { memcopy_threshold_ = threshold; }
+ 
+  private:
+   std::mutex lock_;
+   std::shared_ptr<Buffer> buffer_;
+   uint8_t* mutable_data_;
+   int64_t size_;
+   int64_t position_;
+   bool is_open_;
+ 
+   int memcopy_num_threads_;
+   int64_t memcopy_blocksize_;
+   int64_t memcopy_threshold_;
+ };
+@@ -318,29 +317,23 @@ bool BufferReader::supports_zero_copy() const { return true; }
+ Result<int64_t> BufferReader::DoReadAt(int64_t position, int64_t nbytes, void* buffer) {
+   RETURN_NOT_OK(CheckClosed());
+ 
+-  if (nbytes < 0) {
+-    return Status::IOError("Cannot read a negative number of bytes from BufferReader.");
+-  }
+-  int64_t bytes_read = std::min(nbytes, size_ - position);
+-  DCHECK_GE(bytes_read, 0);
+-  if (bytes_read) {
+-    memcpy(buffer, data_ + position, bytes_read);
++  ARROW_ASSIGN_OR_RAISE(nbytes, internal::ValidateReadRegion(position, nbytes, size_));
++  DCHECK_GE(nbytes, 0);
++  if (nbytes) {
++    memcpy(buffer, data_ + position, nbytes);
+   }
+-  return bytes_read;
++  return nbytes;
+ }
+ 
+ Result<std::shared_ptr<Buffer>> BufferReader::DoReadAt(int64_t position, int64_t nbytes) {
+   RETURN_NOT_OK(CheckClosed());
+ 
+-  if (nbytes < 0) {
+-    return Status::IOError("Cannot read a negative number of bytes from BufferReader.");
+-  }
+-  int64_t size = std::min(nbytes, size_ - position);
+-
+-  if (size > 0 && buffer_ != nullptr) {
+-    return SliceBuffer(buffer_, position, size);
++  ARROW_ASSIGN_OR_RAISE(nbytes, internal::ValidateReadRegion(position, nbytes, size_));
++  DCHECK_GE(nbytes, 0);
++  if (nbytes > 0 && buffer_ != nullptr) {
++    return SliceBuffer(buffer_, position, nbytes);
+   } else {
+-    return std::make_shared<Buffer>(data_ + position, size);
++    return std::make_shared<Buffer>(data_ + position, nbytes);
+   }
+ }
+ 
+diff --git a/cpp/src/arrow/io/memory_test.cc b/cpp/src/arrow/io/memory_test.cc
+index 0a9620c69..157f07acf 100644
+--- a/cpp/src/arrow/io/memory_test.cc
++++ b/cpp/src/arrow/io/memory_test.cc
+@@ -135,6 +135,16 @@ TEST(TestFixedSizeBufferWriter, Basics) {
+   ASSERT_OK(writer.Close());
+ }
+ 
++TEST(TestFixedSizeBufferWriter, InvalidWrites) {
++  std::shared_ptr<Buffer> buffer;
++  ASSERT_OK(AllocateBuffer(1024, &buffer));
++
++  FixedSizeBufferWriter writer(buffer);
++  const uint8_t data[10]{};
++  ASSERT_RAISES(Invalid, writer.WriteAt(-1, data, 1));
++  ASSERT_RAISES(Invalid, writer.WriteAt(1, data, -1));
++}
++
+ TEST(TestBufferReader, FromStrings) {
+   // ARROW-3291: construct BufferReader from std::string or
+   // arrow::util::string_view
+@@ -187,6 +197,17 @@ TEST(TestBufferReader, Peek) {
+   ASSERT_EQ(data, view.to_string());
+ }
+ 
++TEST(TestBufferReader, InvalidReads) {
++  std::string data = "data123456";
++  BufferReader reader(std::make_shared<Buffer>(data));
++  uint8_t buffer[10];
++
++  ASSERT_RAISES(Invalid, reader.ReadAt(-1, 1));
++  ASSERT_RAISES(Invalid, reader.ReadAt(1, -1));
++  ASSERT_RAISES(Invalid, reader.ReadAt(-1, 1, buffer));
++  ASSERT_RAISES(Invalid, reader.ReadAt(1, -1, buffer));
++}
++
+ TEST(TestBufferReader, RetainParentReference) {
+   // ARROW-387
+   std::string data = "data123456";
+diff --git a/cpp/src/arrow/io/util_internal.h b/cpp/src/arrow/io/util_internal.h
+index 0b3aa6421..f35e7dd86 100644
+--- a/cpp/src/arrow/io/util_internal.h
++++ b/cpp/src/arrow/io/util_internal.h
+@@ -26,6 +26,18 @@ namespace internal {
+ 
+ ARROW_EXPORT void CloseFromDestructor(FileInterface* file);
+ 
++// Validate a (offset, size) region (as given to ReadAt) against
++// the file size.  Return the actual read size.
++ARROW_EXPORT Result<int64_t> ValidateReadRegion(int64_t offset, int64_t size,
++                                                int64_t file_size);
++// Validate a (offset, size) region (as given to WriteAt) against
++// the file size.  Short writes are not allowed.
++ARROW_EXPORT Status ValidateWriteRegion(int64_t offset, int64_t size, int64_t file_size);
++
++// Validate a (offset, size) region (as given to ReadAt or WriteAt), without
++// knowing the file size.
++ARROW_EXPORT Status ValidateRegion(int64_t offset, int64_t size);
++
+ }  // namespace internal
+ }  // namespace io
+ }  // namespace arrow
+diff --git a/cpp/src/arrow/ipc/message.cc b/cpp/src/arrow/ipc/message.cc
+index ab9bd1b3c..3de8772a3 100644
+--- a/cpp/src/arrow/ipc/message.cc
++++ b/cpp/src/arrow/ipc/message.cc
+@@ -242,51 +242,49 @@ std::string FormatMessageType(Message::Type type) {
+ Status ReadMessage(int64_t offset, int32_t metadata_length, io::RandomAccessFile* file,
+                    std::unique_ptr<Message>* message) {
+   ARROW_CHECK_GT(static_cast<size_t>(metadata_length), sizeof(int32_t))
+       << "metadata_length should be at least 4";
+ 
+   ARROW_ASSIGN_OR_RAISE(auto buffer, file->ReadAt(offset, metadata_length));
+ 
+   if (buffer->size() < metadata_length) {
+     return Status::Invalid("Expected to read ", metadata_length,
+                            " metadata bytes but got ", buffer->size());
+   }
+ 
+   const int32_t continuation = util::SafeLoadAs<int32_t>(buffer->data());
+ 
+   // The size of the Flatbuffer including padding
+   int32_t flatbuffer_length = -1;
+   int32_t prefix_size = -1;
+   if (continuation == internal::kIpcContinuationToken) {
+     if (metadata_length < 8) {
+       return Status::Invalid(
+           "Corrupted IPC message, had continuation token "
+           " but length ",
+           metadata_length);
+     }
+ 
+     // Valid IPC message, parse the message length now
+     flatbuffer_length = util::SafeLoadAs<int32_t>(buffer->data() + 4);
+     prefix_size = 8;
+   } else {
+     // ARROW-6314: Backwards compatibility for reading old IPC
+     // messages produced prior to version 0.15.0
+     flatbuffer_length = continuation;
+     prefix_size = 4;
+   }
+ 
+   if (flatbuffer_length == 0) {
+-    // EOS
+-    *message = nullptr;
+-    return Status::OK();
++    return Status::Invalid("Unexpected empty message in IPC file format");
+   }
+ 
+   if (flatbuffer_length + prefix_size != metadata_length) {
+     return Status::Invalid("flatbuffer size ", flatbuffer_length,
+                            " invalid. File offset: ", offset,
+                            ", metadata length: ", metadata_length);
+   }
+ 
+   std::shared_ptr<Buffer> metadata =
+       SliceBuffer(buffer, prefix_size, buffer->size() - prefix_size);
+   return Message::ReadFrom(offset + metadata_length, metadata, file, message);
+ }
+diff --git a/cpp/src/arrow/ipc/metadata_internal.cc b/cpp/src/arrow/ipc/metadata_internal.cc
+index 969348761..0cbae9bb5 100644
+--- a/cpp/src/arrow/ipc/metadata_internal.cc
++++ b/cpp/src/arrow/ipc/metadata_internal.cc
+@@ -769,48 +769,49 @@ Status GetFieldMetadata(const flatbuf::Field* field,
+ Status FieldFromFlatbuffer(const flatbuf::Field* field, DictionaryMemo* dictionary_memo,
+                            std::shared_ptr<Field>* out) {
+   std::shared_ptr<DataType> type;
+ 
+   std::shared_ptr<KeyValueMetadata> metadata;
+   RETURN_NOT_OK(GetFieldMetadata(field, &metadata));
+ 
+   // Reconstruct the data type
+   auto children = field->children();
+   if (children == nullptr) {
+     return Status::IOError("Children-pointer of flatbuffer-encoded Field is null.");
+   }
+   std::vector<std::shared_ptr<Field>> child_fields(children->size());
+   for (int i = 0; i < static_cast<int>(children->size()); ++i) {
+     RETURN_NOT_OK(
+         FieldFromFlatbuffer(children->Get(i), dictionary_memo, &child_fields[i]));
+   }
+   RETURN_NOT_OK(TypeFromFlatbuffer(field, child_fields, metadata.get(), &type));
+ 
+   const flatbuf::DictionaryEncoding* encoding = field->dictionary();
+ 
+   if (encoding != nullptr) {
+     // The field is dictionary-encoded. Construct the DictionaryType
+     // based on the DictionaryEncoding metadata and record in the
+     // dictionary_memo
+     std::shared_ptr<DataType> index_type;
+     auto int_data = encoding->indexType();
+     if (int_data == nullptr) {
+       return Status::IOError(
+           "indexType-pointer in custom metadata of flatbuffer-encoded DictionaryEncoding "
+           "is null.");
+     }
+     RETURN_NOT_OK(IntFromFlatbuffer(int_data, &index_type));
+-    type = ::arrow::dictionary(index_type, type, encoding->isOrdered());
++    ARROW_ASSIGN_OR_RAISE(type,
++                          DictionaryType::Make(index_type, type, encoding->isOrdered()));
+     *out = ::arrow::field(field->name()->str(), type, field->nullable(), metadata);
+     RETURN_NOT_OK(dictionary_memo->AddField(encoding->id(), *out));
+   } else {
+     auto name = field->name();
+     if (name == nullptr) {
+       return Status::IOError("Name-pointer of flatbuffer-encoded Field is null.");
+     }
+     *out = ::arrow::field(name->str(), type, field->nullable(), metadata);
+   }
+   return Status::OK();
+ }
+ 
+ // will return the endianness of the system we are running on
+ // based the NUMPY_API function. See NOTICE.txt
+diff --git a/cpp/src/arrow/ipc/reader.cc b/cpp/src/arrow/ipc/reader.cc
+index e3cf37951..584ab92a6 100644
+--- a/cpp/src/arrow/ipc/reader.cc
++++ b/cpp/src/arrow/ipc/reader.cc
+@@ -620,140 +620,142 @@ Status RecordBatchStreamReader::ReadNext(std::shared_ptr<RecordBatch>* batch) {
+ class RecordBatchFileReader::RecordBatchFileReaderImpl {
+  public:
+   RecordBatchFileReaderImpl() : file_(NULLPTR), footer_offset_(0), footer_(NULLPTR) {}
+ 
+   Status ReadFooter() {
+     int magic_size = static_cast<int>(strlen(kArrowMagicBytes));
+ 
+     if (footer_offset_ <= magic_size * 2 + 4) {
+       return Status::Invalid("File is too small: ", footer_offset_);
+     }
+ 
+     int file_end_size = static_cast<int>(magic_size + sizeof(int32_t));
+     ARROW_ASSIGN_OR_RAISE(auto buffer,
+                           file_->ReadAt(footer_offset_ - file_end_size, file_end_size));
+ 
+     const int64_t expected_footer_size = magic_size + sizeof(int32_t);
+     if (buffer->size() < expected_footer_size) {
+       return Status::Invalid("Unable to read ", expected_footer_size, "from end of file");
+     }
+ 
+     if (memcmp(buffer->data() + sizeof(int32_t), kArrowMagicBytes, magic_size)) {
+       return Status::Invalid("Not an Arrow file");
+     }
+ 
+     int32_t footer_length = *reinterpret_cast<const int32_t*>(buffer->data());
+ 
+     if (footer_length <= 0 || footer_length + magic_size * 2 + 4 > footer_offset_) {
+       return Status::Invalid("File is smaller than indicated metadata size");
+     }
+ 
+     // Now read the footer
+     ARROW_ASSIGN_OR_RAISE(
+         footer_buffer_,
+         file_->ReadAt(footer_offset_ - footer_length - file_end_size, footer_length));
+ 
+     auto data = footer_buffer_->data();
+     flatbuffers::Verifier verifier(data, footer_buffer_->size(), 128);
+     if (!flatbuf::VerifyFooterBuffer(verifier)) {
+       return Status::IOError("Verification of flatbuffer-encoded Footer failed.");
+     }
+     footer_ = flatbuf::GetFooter(data);
+ 
+     return Status::OK();
+   }
+ 
+   int num_dictionaries() const { return footer_->dictionaries()->size(); }
+ 
+   int num_record_batches() const { return footer_->recordBatches()->size(); }
+ 
+   MetadataVersion version() const {
+     return internal::GetMetadataVersion(footer_->version());
+   }
+ 
+   FileBlock GetRecordBatchBlock(int i) const {
+     return FileBlockFromFlatbuffer(footer_->recordBatches()->Get(i));
+   }
+ 
+   FileBlock GetDictionaryBlock(int i) const {
+     return FileBlockFromFlatbuffer(footer_->dictionaries()->Get(i));
+   }
+ 
+   Status ReadMessageFromBlock(const FileBlock& block, std::unique_ptr<Message>* out) {
+     DCHECK(BitUtil::IsMultipleOf8(block.offset));
+     DCHECK(BitUtil::IsMultipleOf8(block.metadata_length));
+     DCHECK(BitUtil::IsMultipleOf8(block.body_length));
+ 
+     RETURN_NOT_OK(ReadMessage(block.offset, block.metadata_length, file_, out));
+ 
+     // TODO(wesm): this breaks integration tests, see ARROW-3256
+     // DCHECK_EQ((*out)->body_length(), block.body_length);
+     return Status::OK();
+   }
+ 
+   Status ReadDictionaries() {
+     // Read all the dictionaries
+     for (int i = 0; i < num_dictionaries(); ++i) {
+       std::unique_ptr<Message> message;
+       RETURN_NOT_OK(ReadMessageFromBlock(GetDictionaryBlock(i), &message));
+ 
++      CHECK_HAS_BODY(*message);
+       io::BufferReader reader(message->body());
+       RETURN_NOT_OK(ReadDictionary(*message->metadata(), &dictionary_memo_, &reader));
+     }
+     return Status::OK();
+   }
+ 
+   Status ReadRecordBatch(int i, std::shared_ptr<RecordBatch>* batch) {
+     DCHECK_GE(i, 0);
+     DCHECK_LT(i, num_record_batches());
+ 
+     if (!read_dictionaries_) {
+       RETURN_NOT_OK(ReadDictionaries());
+       read_dictionaries_ = true;
+     }
+ 
+     std::unique_ptr<Message> message;
+     RETURN_NOT_OK(ReadMessageFromBlock(GetRecordBatchBlock(i), &message));
+ 
++    CHECK_HAS_BODY(*message);
+     io::BufferReader reader(message->body());
+     return ::arrow::ipc::ReadRecordBatch(*message->metadata(), schema_, &dictionary_memo_,
+                                          &reader, batch);
+   }
+ 
+   Status ReadSchema() {
+     // Get the schema and record any observed dictionaries
+     return internal::GetSchema(footer_->schema(), &dictionary_memo_, &schema_);
+   }
+ 
+   Status Open(const std::shared_ptr<io::RandomAccessFile>& file, int64_t footer_offset) {
+     owned_file_ = file;
+     return Open(file.get(), footer_offset);
+   }
+ 
+   Status Open(io::RandomAccessFile* file, int64_t footer_offset) {
+     file_ = file;
+     footer_offset_ = footer_offset;
+     RETURN_NOT_OK(ReadFooter());
+     return ReadSchema();
+   }
+ 
+   std::shared_ptr<Schema> schema() const { return schema_; }
+ 
+  private:
+   io::RandomAccessFile* file_;
+ 
+   std::shared_ptr<io::RandomAccessFile> owned_file_;
+ 
+   // The location where the Arrow file layout ends. May be the end of the file
+   // or some other location if embedded in a larger file.
+   int64_t footer_offset_;
+ 
+   // Footer metadata
+   std::shared_ptr<Buffer> footer_buffer_;
+   const flatbuf::Footer* footer_;
+ 
+   bool read_dictionaries_ = false;
+   DictionaryMemo dictionary_memo_;
+ 
+   // Reconstructed schema, including any read dictionaries
+   std::shared_ptr<Schema> schema_;
+ };
+@@ -832,10 +834,11 @@ Status ReadSchema(const Message& message, DictionaryMemo* dictionary_memo,
+ Status ReadRecordBatch(const std::shared_ptr<Schema>& schema,
+                        const DictionaryMemo* dictionary_memo, io::InputStream* file,
+                        std::shared_ptr<RecordBatch>* out) {
+   auto options = IpcOptions::Defaults();
+   std::unique_ptr<Message> message;
+   RETURN_NOT_OK(ReadContiguousPayload(file, &message));
++  CHECK_HAS_BODY(*message);
+   io::BufferReader buffer_reader(message->body());
+   return ReadRecordBatch(*message->metadata(), schema, dictionary_memo, options,
+                          &buffer_reader, out);
+ }
+@@ -849,9 +852,10 @@ Result<std::shared_ptr<Tensor>> ReadTensor(io::InputStream* file) {
+ Result<std::shared_ptr<Tensor>> ReadTensor(const Message& message) {
+   std::shared_ptr<DataType> type;
+   std::vector<int64_t> shape;
+   std::vector<int64_t> strides;
+   std::vector<std::string> dim_names;
++  CHECK_HAS_BODY(message);
+   RETURN_NOT_OK(internal::GetTensorMetadata(*message.metadata(), &type, &shape, &strides,
+                                             &dim_names));
+   return Tensor::Make(type, message.body(), shape, strides, dim_names);
+ }
+@@ -1133,6 +1137,7 @@ Result<std::shared_ptr<SparseTensor>> ReadSparseTensor(const Buffer& metadata,
+ }
+ 
+ Result<std::shared_ptr<SparseTensor>> ReadSparseTensor(const Message& message) {
++  CHECK_HAS_BODY(message);
+   io::BufferReader buffer_reader(message.body());
+   return ReadSparseTensor(*message.metadata(), &buffer_reader);
+ }
+diff --git a/cpp/src/arrow/type.cc b/cpp/src/arrow/type.cc
+index 95b222f78..ed5849724 100644
+--- a/cpp/src/arrow/type.cc
++++ b/cpp/src/arrow/type.cc
+@@ -501,20 +501,35 @@ Status Decimal128Type::Make(int32_t precision, int32_t scale,
+ // ----------------------------------------------------------------------
+ // Dictionary-encoded type
+ 
++Status DictionaryType::ValidateParameters(const DataType& index_type,
++                                          const DataType& value_type) {
++  const bool index_type_ok = is_integer(index_type.id()) &&
++                             checked_cast<const IntegerType&>(index_type).is_signed();
++  if (!index_type_ok) {
++    return Status::TypeError("Dictionary index type should be signed integer, got ",
++                             index_type.ToString());
++  }
++  return Status::OK();
++}
++
+ int DictionaryType::bit_width() const {
+   return checked_cast<const FixedWidthType&>(*index_type_).bit_width();
+ }
+ 
++Result<std::shared_ptr<DataType>> DictionaryType::Make(
++    const std::shared_ptr<DataType>& index_type,
++    const std::shared_ptr<DataType>& value_type, bool ordered) {
++  RETURN_NOT_OK(ValidateParameters(*index_type, *value_type));
++  return std::make_shared<DictionaryType>(index_type, value_type, ordered);
++}
++
+ DictionaryType::DictionaryType(const std::shared_ptr<DataType>& index_type,
+                                const std::shared_ptr<DataType>& value_type, bool ordered)
+     : FixedWidthType(Type::DICTIONARY),
+       index_type_(index_type),
+       value_type_(value_type),
+       ordered_(ordered) {
+-  ARROW_CHECK(is_integer(index_type->id()))
+-      << "dictionary index type should be signed integer";
+-  const auto& int_type = checked_cast<const IntegerType&>(*index_type);
+-  ARROW_CHECK(int_type.is_signed()) << "dictionary index type should be signed integer";
++  ARROW_CHECK_OK(ValidateParameters(*index_type_, *value_type_));
+ }
+ 
+ DataTypeLayout DictionaryType::layout() const {
+diff --git a/cpp/src/arrow/type.h b/cpp/src/arrow/type.h
+index 129d62649..c8fe309ef 100644
+--- a/cpp/src/arrow/type.h
++++ b/cpp/src/arrow/type.h
+@@ -1268,33 +1268,41 @@ class ARROW_EXPORT DurationType : public TemporalType, public ParametricType {
+ /// \brief Dictionary-encoded value type with data-dependent
+ /// dictionary
+ class ARROW_EXPORT DictionaryType : public FixedWidthType {
+  public:
+   static constexpr Type::type type_id = Type::DICTIONARY;
+ 
+   static constexpr const char* type_name() { return "dictionary"; }
+ 
+   DictionaryType(const std::shared_ptr<DataType>& index_type,
+                  const std::shared_ptr<DataType>& value_type, bool ordered = false);
+ 
++  // A constructor variant that validates its input parameters
++  static Result<std::shared_ptr<DataType>> Make(
++      const std::shared_ptr<DataType>& index_type,
++      const std::shared_ptr<DataType>& value_type, bool ordered = false);
++
+   std::string ToString() const override;
+   std::string name() const override { return "dictionary"; }
+ 
+   int bit_width() const override;
+ 
+   DataTypeLayout layout() const override;
+ 
+   std::shared_ptr<DataType> index_type() const { return index_type_; }
+   std::shared_ptr<DataType> value_type() const { return value_type_; }
+ 
+   bool ordered() const { return ordered_; }
+ 
++  static Status ValidateParameters(const DataType& index_type,
++                                   const DataType& value_type);
++
+  protected:
+   std::string ComputeFingerprint() const override;
+ 
+   // Must be an integer type (not currently checked)
+   std::shared_ptr<DataType> index_type_;
+   std::shared_ptr<DataType> value_type_;
+   bool ordered_;
+ };
+ 
+ /// \brief Helper class for incremental dictionary unification
+diff --git a/python/pyarrow/tests/test_io.py b/python/pyarrow/tests/test_io.py
+index 1e8e213c1..9daa12749 100644
+--- a/python/pyarrow/tests/test_io.py
++++ b/python/pyarrow/tests/test_io.py
+@@ -721,39 +721,42 @@ def sample_disk_data(request, tmpdir):
+     return path, data
+ 
+ 
+-def _check_native_file_reader(FACTORY, sample_data):
++def _check_native_file_reader(FACTORY, sample_data,
++                              allow_read_out_of_bounds=True):
+     path, data = sample_data
+ 
+     f = FACTORY(path, mode='r')
+ 
+     assert f.read(10) == data[:10]
+     assert f.read(0) == b''
+     assert f.tell() == 10
+ 
+     assert f.read() == data[10:]
+ 
+     assert f.size() == len(data)
+ 
+     f.seek(0)
+     assert f.tell() == 0
+ 
+     # Seeking past end of file not supported in memory maps
+-    f.seek(len(data) + 1)
+-    assert f.tell() == len(data) + 1
+-    assert f.read(5) == b''
++    if allow_read_out_of_bounds:
++        f.seek(len(data) + 1)
++        assert f.tell() == len(data) + 1
++        assert f.read(5) == b''
+ 
+     # Test whence argument of seek, ARROW-1287
+     assert f.seek(3) == 3
+     assert f.seek(3, os.SEEK_CUR) == 6
+     assert f.tell() == 6
+ 
+     ex_length = len(data) - 2
+     assert f.seek(-2, os.SEEK_END) == ex_length
+     assert f.tell() == ex_length
+ 
+ 
+ def test_memory_map_reader(sample_disk_data):
+-    _check_native_file_reader(pa.memory_map, sample_disk_data)
++    _check_native_file_reader(pa.memory_map, sample_disk_data,
++                              allow_read_out_of_bounds=False)
+ 
+ 
+ def test_memory_map_retain_buffer_reference(sample_disk_data):

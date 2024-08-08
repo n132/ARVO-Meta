@@ -1,0 +1,282 @@
+commit 86a550dc7e182a53eb950278b42d0243b7185f73
+Author: Behdad Esfahbod <behdad@behdad.org>
+Date:   Sun Jun 25 17:01:40 2023 -0600
+
+    [subset/cff1] Speed up string writing
+
+diff --git a/src/hb-ot-cff1-table.hh b/src/hb-ot-cff1-table.hh
+index 6a9dcc663..8896a6687 100644
+--- a/src/hb-ot-cff1-table.hh
++++ b/src/hb-ot-cff1-table.hh
+@@ -639,26 +639,26 @@ struct Charset
+ struct CFF1StringIndex : CFF1Index
+ {
+   bool serialize (hb_serialize_context_t *c, const CFF1StringIndex &strings,
+-		  const hb_map_t &sidmap)
++		  const hb_vector_t<unsigned> &sidmap)
+   {
+     TRACE_SERIALIZE (this);
+-    if (unlikely ((strings.count == 0) || (sidmap.get_population () == 0)))
++    if (unlikely ((strings.count == 0) || (sidmap.length == 0)))
+     {
+       if (unlikely (!c->extend_min (this->count)))
+ 	return_trace (false);
+       count = 0;
+       return_trace (true);
+     }
+ 
+     if (unlikely (sidmap.in_error ())) return_trace (false);
+ 
+     hb_vector_t<hb_ubytes_t> bytesArray;
+-    if (!bytesArray.resize (sidmap.get_population (), false))
++    if (!bytesArray.resize (sidmap.length, false))
+       return_trace (false);
+-    for (auto _ : sidmap)
+-      bytesArray.arrayZ[_.second] = strings[_.first];
++    for (auto _ : hb_enumerate (sidmap))
++      bytesArray.arrayZ[_.first] = strings[_.second];
+ 
+     bool result = CFF1Index::serialize (c, bytesArray);
+     return_trace (result);
+   }
+ };
+diff --git a/src/hb-subset-cff1.cc b/src/hb-subset-cff1.cc
+index 74cfc5ad3..079352d46 100644
+--- a/src/hb-subset-cff1.cc
++++ b/src/hb-subset-cff1.cc
+@@ -40,36 +40,50 @@ using namespace CFF;
+ 
+ struct remap_sid_t : hb_map_t
+ {
++  void resize (unsigned size)
++  {
++    hb_map_t::resize (size);
++    vector.alloc (size);
++  }
++
++  bool in_error () const
++  { return hb_map_t::in_error () || vector.in_error (); }
++
+   unsigned int add (unsigned int sid)
+   {
+     if ((sid != CFF_UNDEF_SID) && !is_std_std (sid))
+     {
+       sid = unoffset_sid (sid);
+       unsigned v = next;
+       if (set (sid, v, false))
++      {
++        vector.push (sid);
+         next++;
++      }
+       else
+         v = get (sid); // already exists
+       return offset_sid (v);
+     }
+     else
+       return sid;
+   }
+ 
+   unsigned int operator[] (unsigned int sid) const
+   {
+     if (is_std_std (sid) || (sid == CFF_UNDEF_SID))
+       return sid;
+     else
+       return offset_sid (get (unoffset_sid (sid)));
+   }
+ 
+   static const unsigned int num_std_strings = 391;
+ 
+   static bool is_std_std (unsigned int sid) { return sid < num_std_strings; }
+   static unsigned int offset_sid (unsigned int sid) { return sid + num_std_strings; }
+   static unsigned int unoffset_sid (unsigned int sid) { return sid - num_std_strings; }
+   unsigned next = 0;
++
++  hb_vector_t<unsigned> vector;
+ };
+ 
+ struct cff1_sub_table_info_t : cff_sub_table_info_t
+@@ -768,182 +782,183 @@ bool
+ OT::cff1::accelerator_subset_t::serialize (hb_serialize_context_t *c,
+ 					   struct OT::cff1_subset_plan &plan) const
+ {
+   /* private dicts & local subrs */
+   for (int i = (int) privateDicts.length; --i >= 0 ;)
+   {
+     if (plan.fdmap.has (i))
+     {
+       objidx_t	subrs_link = 0;
+       if (plan.subset_localsubrs[i].length > 0)
+       {
+ 	auto *dest = c->push <CFF1Subrs> ();
+ 	if (likely (dest->serialize (c, plan.subset_localsubrs[i])))
+ 	  subrs_link = c->pop_pack ();
+ 	else
+ 	{
+ 	  c->pop_discard ();
+ 	  return false;
+ 	}
+       }
+ 
+       auto *pd = c->push<PrivateDict> ();
+       cff1_private_dict_op_serializer_t privSzr (plan.desubroutinize, plan.drop_hints);
+       /* N.B. local subrs immediately follows its corresponding private dict. i.e., subr offset == private dict size */
+       if (likely (pd->serialize (c, privateDicts[i], privSzr, subrs_link)))
+       {
+ 	unsigned fd = plan.fdmap[i];
+ 	plan.fontdicts_mod[fd].privateDictInfo.size = c->length ();
+ 	plan.fontdicts_mod[fd].privateDictInfo.link = c->pop_pack ();
+       }
+       else
+       {
+ 	c->pop_discard ();
+ 	return false;
+       }
+     }
+   }
+ 
+   if (!is_CID ())
+     plan.info.privateDictInfo = plan.fontdicts_mod[0].privateDictInfo;
+ 
+   /* CharStrings */
+   {
+     c->push<CFF1CharStrings> ();
+ 
+     unsigned data_size = 0;
+     unsigned total_size = CFF1CharStrings::total_size (plan.subset_charstrings, &data_size);
+     if (unlikely (!c->start_zerocopy (total_size)))
+        return false;
+ 
+     auto *cs = c->start_embed<CFF1CharStrings> ();
+     if (likely (cs->serialize (c, plan.subset_charstrings, data_size)))
+       plan.info.char_strings_link = c->pop_pack (false);
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* FDArray (FD Index) */
+   if (fdArray != &Null (CFF1FDArray))
+   {
+     auto *fda = c->push<CFF1FDArray> ();
+     cff1_font_dict_op_serializer_t  fontSzr;
+     auto it = + hb_zip (+ hb_iter (plan.fontdicts_mod), + hb_iter (plan.fontdicts_mod));
+     if (likely (fda->serialize (c, it, fontSzr)))
+       plan.info.fd_array_link = c->pop_pack (false);
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* FDSelect */
+   if (fdSelect != &Null (CFF1FDSelect))
+   {
+     c->push ();
+     if (likely (hb_serialize_cff_fdselect (c, plan.num_glyphs, *fdSelect, fdCount,
+ 					   plan.subset_fdselect_format, plan.info.fd_select.size,
+ 					   plan.subset_fdselect_ranges)))
+       plan.info.fd_select.link = c->pop_pack ();
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* Charset */
+   if (plan.subset_charset)
+   {
+     auto *dest = c->push<Charset> ();
+     if (likely (dest->serialize (c,
+ 				 plan.subset_charset_format,
+ 				 plan.num_glyphs,
+ 				 plan.subset_charset_ranges)))
+       plan.info.charset_link = c->pop_pack ();
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* Encoding */
+   if (plan.subset_encoding)
+   {
+     auto *dest = c->push<Encoding> ();
+     if (likely (dest->serialize (c,
+ 				 plan.subset_enc_format,
+ 				 plan.subset_enc_num_codes,
+ 				 plan.subset_enc_code_ranges,
+ 				 plan.subset_enc_supp_codes)))
+       plan.info.encoding_link = c->pop_pack ();
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* global subrs */
+   {
+     auto *dest = c->push <CFF1Subrs> ();
+     if (likely (dest->serialize (c, plan.subset_globalsubrs)))
+       c->pop_pack (false);
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   /* String INDEX */
+   {
+     auto *dest = c->push<CFF1StringIndex> ();
+-    if (likely (dest->serialize (c, *stringIndex, plan.sidmap)))
++    if (likely (!plan.sidmap.in_error () &&
++		dest->serialize (c, *stringIndex, plan.sidmap.vector)))
+       c->pop_pack ();
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+   }
+ 
+   OT::cff1 *cff = c->allocate_min<OT::cff1> ();
+   if (unlikely (!cff))
+     return false;
+ 
+   /* header */
+   cff->version.major = 0x01;
+   cff->version.minor = 0x00;
+   cff->nameIndex = cff->min_size;
+   cff->offSize = 4; /* unused? */
+ 
+   /* name INDEX */
+   if (unlikely (!c->embed (*nameIndex))) return false;
+ 
+   /* top dict INDEX */
+   {
+     /* serialize singleton TopDict */
+     auto *top = c->push<TopDict> ();
+     cff1_top_dict_op_serializer_t topSzr;
+     unsigned top_size = 0;
+     top_dict_modifiers_t  modifier (plan.info, plan.topDictModSIDs);
+     if (likely (top->serialize (c, plan.topdict_mod, topSzr, modifier)))
+     {
+       top_size = c->length ();
+       c->pop_pack (false);
+     }
+     else
+     {
+       c->pop_discard ();
+       return false;
+     }
+     /* serialize INDEX header for above */
+     auto *dest = c->start_embed<CFF1Index> ();
+     return dest->serialize_header (c, hb_iter (hb_array_t<unsigned> (&top_size, 1)));
+   }
+ }

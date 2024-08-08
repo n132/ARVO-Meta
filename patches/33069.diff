@@ -1,0 +1,148 @@
+commit e7084d13903029784f74706cd8fdd70277d2ecab
+Author: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date:   Tue Apr 13 13:59:08 2021 +0300
+
+    Fix OSS-Fuzz bugs
+
+diff --git a/source/m3_compile.c b/source/m3_compile.c
+index 6fc5e51..78c8588 100644
+--- a/source/m3_compile.c
++++ b/source/m3_compile.c
+@@ -2206,8 +2206,10 @@ const M3OpInfo*  GetOpInfo  (m3opcode_t opcode)
+ M3Result  Compile_BlockStatements  (IM3Compilation o)
+ {
+     M3Result result = m3Err_none;
+ 
++    _throwif("block code underrun", o->wasm >= o->wasmEnd);
++
+     while (o->wasm < o->wasmEnd)
+     {                                                                   emit_stack_dump (o);
+         m3opcode_t opcode;
+         o->lastOpcodeStart = o->wasm;
+diff --git a/source/m3_core.h b/source/m3_core.h
+index ef06459..4e85817 100644
+--- a/source/m3_core.h
++++ b/source/m3_core.h
+@@ -147,27 +147,28 @@ typedef struct M3CodePageHeader
+ # if d_m3RecordBacktraces
+     struct M3CodeMappingPage *    mapping;
+ # endif // d_m3RecordBacktraces
+ }
+ M3CodePageHeader;
+ 
+ 
+ #define d_m3CodePageFreeLinesThreshold      4+2       // max is: select _sss & CallIndirect + 2 for bridge
+ 
+ #define d_m3MemPageSize                     65536
+ 
+ #define d_m3Reg0SlotAlias                   30000
+ #define d_m3Fp0SlotAlias                    30001
+ 
+ #define d_m3MaxSaneTypesCount               100000
+ #define d_m3MaxSaneFunctionsCount           100000
+ #define d_m3MaxSaneImportsCount             10000
+ #define d_m3MaxSaneExportsCount             10000
+ #define d_m3MaxSaneGlobalsCount             100000
++#define d_m3MaxSaneElementSegments          100000
+ #define d_m3MaxSaneDataSegments             100000
+ #define d_m3MaxSaneUtf8Length               2000
+ #define d_m3MaxSaneFunctionArgRetCount      1000    // still insane, but whatever
+ 
+ #define d_externalKind_function             0
+ #define d_externalKind_table                1
+ #define d_externalKind_memory               2
+ #define d_externalKind_global               3
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index d11f3d3..bc3ff38 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -97,22 +97,23 @@ _               (ReadLEB_i7 (& wasmType, & i_bytes, i_end));
+ _               (NormalizeType (& retType, wasmType));
+ 
+                 ftype->types[r] = retType;
+             }
+             memcpy (ftype->types + numRets, argTypes, numArgs);                                 m3log (parse, "    type %2d: %s", i, SPrintFuncTypeSignature (ftype));
+ 
+             Environment_AddFuncType (io_module->environment, & ftype);
+             io_module->funcTypes [i] = ftype;
++            ftype = NULL; // ownership transfered to environment
+         }
+     }
+ 
+ } _catch:
+ 
+     if (result)
+     {
+         m3_Free (ftype);
+         m3_Free (io_module->funcTypes);
+         io_module->numFuncTypes = 0;
+     }
+ 
+     return result;
+ }
+@@ -217,15 +218,15 @@ _               (Module_AddGlobal (io_module, & global, type, isMutable, true /*
+ M3Result  ParseSection_Export  (IM3Module io_module, bytes_t i_bytes, cbytes_t  i_end)
+ {
+     M3Result result = m3Err_none;
++    const char * utf8 = NULL;
+ 
+     u32 numExports;
+ _   (ReadLEB_u32 (& numExports, & i_bytes, i_end));                                 m3log (parse, "** Export [%d]", numExports);
+ 
+     _throwif("too many exports", numExports > d_m3MaxSaneExportsCount);
+ 
+     for (u32 i = 0; i < numExports; ++i)
+     {
+-        const char * utf8;
+         u8 exportKind;
+         u32 index;
+ 
+@@ -234,27 +235,29 @@ _       (Read_u8 (& exportKind, & i_bytes, i_end));
+ _       (ReadLEB_u32 (& index, & i_bytes, i_end));                                  m3log (parse, "    index: %3d; kind: %d; export: '%s'; ", index, (u32) exportKind, utf8);
+ 
+         if (exportKind == d_externalKind_function)
+         {
+             _throwif(m3Err_wasmMalformed, index >= io_module->numFunctions);
+             u16 numNames = io_module->functions [index].numNames;
+             if (numNames < d_m3MaxDuplicateFunctionImpl)
+             {
+                 io_module->functions [index].numNames++;
+                 io_module->functions [index].names[numNames] = utf8;
+                 utf8 = NULL; // ownership transferred to M3Function
+             }
+         }
+         else if (exportKind == d_externalKind_global)
+         {
+             _throwif(m3Err_wasmMalformed, index >= io_module->numGlobals);
+             io_module->globals[index].name = utf8;
+             utf8 = NULL; // ownership transferred to M3Global
+         }
+ 
+         m3_Free (utf8);
+     }
+ 
+-    _catch: return result;
++_catch:
++    m3_Free (utf8);
++    return result;
+ }
+ 
+ 
+@@ -299,15 +302,17 @@ M3Result  Parse_InitExpr  (M3Module * io_module, bytes_t * io_bytes, cbytes_t i_
+ M3Result  ParseSection_Element  (IM3Module io_module, bytes_t i_bytes, cbytes_t i_end)
+ {
+     M3Result result = m3Err_none;
+ 
+     u32 numSegments;
+     result = ReadLEB_u32 (& numSegments, & i_bytes, i_end);                         m3log (parse, "** Element [%d]", numSegments);
+ 
+     _throwif ("error parsing Element section", result);
+ 
++    _throwif("too many element segments", numSegments > d_m3MaxSaneElementSegments);
++
+     io_module->elementSection = i_bytes;
+     io_module->elementSectionEnd = i_end;
+     io_module->numElementSegments = numSegments;
+ 
+     _catch: return result;
+ }

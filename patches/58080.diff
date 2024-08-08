@@ -1,0 +1,295 @@
+commit b340e10d6e32df0ca586e06d0c9406402b47205f
+Author: Ilija Tovilo <ilija.tovilo@me.com>
+Date:   Mon Apr 17 14:15:22 2023 +0200
+
+    Fix uninitialized memory in parse_ini_string()
+    
+    Introduced by GH-11014
+    
+    Fixes oss-fuzz #58080
+    Closes GH-11092
+
+diff --git a/Zend/zend_ini_parser.y b/Zend/zend_ini_parser.y
+index dc635176d4..1699fddd6e 100644
+--- a/Zend/zend_ini_parser.y
++++ b/Zend/zend_ini_parser.y
+@@ -105,12 +105,13 @@ static void zend_ini_do_op(char type, zval *result, zval *op1, zval *op2)
+ /* {{{ zend_ini_init_string() */
+ static void zend_ini_init_string(zval *result)
+ {
+ 	if (ZEND_SYSTEM_INI) {
+ 		ZVAL_EMPTY_PSTRING(result);
+ 	} else {
+ 		ZVAL_EMPTY_STRING(result);
+ 	}
++	Z_EXTRA_P(result) = 0;
+ }
+ /* }}} */
+ 
+ /* {{{ zend_ini_add_string() */
+@@ -304,46 +305,47 @@ static inline zend_result convert_to_number(zval *retval, const char *str, const
+ static void normalize_value(zval *zv)
+ {
+ 	if (INI_SCNG(scanner_mode) != ZEND_INI_SCANNER_TYPED) {
+ 		return;
+ 	}
+ 
++	ZEND_ASSERT(Z_EXTRA_P(zv) == 0 || Z_EXTRA_P(zv) == INI_ZVAL_IS_NUMBER);
+ 	if (Z_EXTRA_P(zv) == INI_ZVAL_IS_NUMBER && Z_TYPE_P(zv) == IS_STRING) {
+ 		zval number_rv;
+ 		if (convert_to_number(&number_rv, Z_STRVAL_P(zv), Z_STRLEN_P(zv)) == SUCCESS) {
+ 			zval_ptr_dtor(zv);
+ 			ZVAL_COPY_VALUE(zv, &number_rv);
+ 		}
+ 	}
+ }
+ 
+ %}
+ 
+ %expect 0
+ %define api.prefix {ini_}
+ %define api.pure full
+ %define api.value.type {zval}
+ %define parse.error verbose
+ 
+ %token END 0 "end of file"
+ %token TC_SECTION
+ %token TC_RAW
+ %token TC_CONSTANT
+ %token TC_NUMBER
+ %token TC_STRING
+ %token TC_WHITESPACE
+ %token TC_LABEL
+ %token TC_OFFSET
+ %token TC_DOLLAR_CURLY
+ %token TC_VARNAME
+ %token TC_QUOTED_STRING
+ %token BOOL_TRUE
+ %token BOOL_FALSE
+ %token NULL_NULL
+ %token END_OF_LINE
+ %token '=' ':' ',' '.' '"' '\'' '^' '+' '-' '/' '*' '%' '$' '~' '<' '>' '?' '@' '{' '}'
+ %left '|' '&' '^'
+ %precedence '~' '!'
+ 
+ %destructor { zval_ini_dtor(&$$); } TC_RAW TC_CONSTANT TC_NUMBER TC_STRING TC_WHITESPACE TC_LABEL TC_OFFSET TC_VARNAME BOOL_TRUE BOOL_FALSE NULL_NULL cfg_var_ref constant_literal constant_string encapsed_list expr option_offset section_string_or_value string_or_value var_string_list var_string_list_section
+ 
+ %%
+diff --git a/Zend/zend_ini_scanner.l b/Zend/zend_ini_scanner.l
+index 534b0e938d..3c4a22ad35 100644
+--- a/Zend/zend_ini_scanner.l
++++ b/Zend/zend_ini_scanner.l
+@@ -108,45 +108,46 @@ ZEND_API size_t ini_scanner_globals_offset;
+ #else
+ ZEND_API zend_ini_scanner_globals ini_scanner_globals;
+ #endif
+ 
+ #define ZEND_SYSTEM_INI CG(ini_parser_unbuffered_errors)
+ 
+ /* Eat leading whitespace */
+ #define EAT_LEADING_WHITESPACE()                     \
+ 	while (yyleng) {                                 \
+ 		if (yytext[0] == ' ' || yytext[0] == '\t') { \
+ 			SCNG(yy_text)++;                         \
+ 			yyleng--;                                \
+ 		} else {                                     \
+ 			break;                                   \
+ 		}                                            \
+ 	}
+ 
+ /* Eat trailing whitespace + extra char */
+ #define EAT_TRAILING_WHITESPACE_EX(ch)              \
+ 	while (yyleng && (                              \
+ 		(ch != 'X' && yytext[yyleng - 1] ==  ch) || \
+ 		yytext[yyleng - 1] == '\n' ||               \
+ 		yytext[yyleng - 1] == '\r' ||               \
+ 		yytext[yyleng - 1] == '\t' ||               \
+ 		yytext[yyleng - 1] == ' ')                  \
+ 	) {                                             \
+ 		yyleng--;                                   \
+ 	}
+ 
+ /* Eat trailing whitespace */
+ #define EAT_TRAILING_WHITESPACE()	EAT_TRAILING_WHITESPACE_EX('X')
+ 
+ #define zend_ini_copy_value(retval, str, len)	\
+ 	ZVAL_NEW_STR(retval, zend_string_init(str, len, ZEND_SYSTEM_INI))
+ 
+ 
+ #define RETURN_TOKEN(type, str, len) {                             \
+ 	if (SCNG(scanner_mode) == ZEND_INI_SCANNER_TYPED &&            \
+ 		(YYSTATE == STATE(ST_VALUE) || YYSTATE == STATE(ST_RAW))) {\
+ 		zend_ini_copy_typed_value(ini_lval, type, str, len);       \
++		Z_EXTRA_P(ini_lval) = 0;                                   \
+ 	} else {                                                       \
+ 		zend_ini_copy_value(ini_lval, str, len);                   \
+ 	}                                                              \
+ 	return type;                                                   \
+ }
+@@ -470,165 +471,166 @@ SECTION_VALUE_CHARS ([^$\n\r;"'\]\\]|("\\"{ANY_CHAR})|{LITERAL_DOLLAR})
+ <ST_RAW>{RAW_VALUE_CHARS} { /* Raw value, only used when SCNG(scanner_mode) == ZEND_INI_SCANNER_RAW. */
+ 	const unsigned char *sc = NULL;
+ 	EAT_LEADING_WHITESPACE();
+ 	while (YYCURSOR < YYLIMIT) {
+ 		switch (*YYCURSOR) {
+ 			case '\n':
+ 			case '\r':
+ 				goto end_raw_value_chars;
+ 				break;
+ 			case ';':
+ 				if (sc == NULL) {
+ 					sc = YYCURSOR;
+ 				}
+ 				YYCURSOR++;
+ 				break;
+ 			case '"':
+ 				if (yytext[0] == '"') {
+ 					sc = NULL;
+ 				}
+ 				YYCURSOR++;
+ 				break;
+ 			default:
+ 				YYCURSOR++;
+ 				break;
+ 		}
+ 	}
+ end_raw_value_chars:
+ 	if (sc) {
+ 		yyleng = sc - SCNG(yy_text);
+ 	} else {
+ 		yyleng = YYCURSOR - SCNG(yy_text);
+ 	}
+ 
+ 	EAT_TRAILING_WHITESPACE();
+ 
+ 	/* Eat leading and trailing double quotes */
+ 	if (yyleng > 1 && yytext[0] == '"' && yytext[yyleng - 1] == '"') {
+ 		SCNG(yy_text)++;
+ 		yyleng = yyleng - 2;
+ 	}
+ 
+ 	RETURN_TOKEN(TC_RAW, yytext, yyleng);
+ }
+ 
+ <ST_SECTION_RAW>{SECTION_RAW_CHARS}+ { /* Raw value, only used when SCNG(scanner_mode) == ZEND_INI_SCANNER_RAW. */
+ 	RETURN_TOKEN(TC_RAW, yytext, yyleng);
+ }
+ 
+ <ST_VALUE,ST_RAW>{TABS_AND_SPACES}*{NEWLINE} { /* End of option value */
+ 	BEGIN(INITIAL);
+ 	SCNG(lineno)++;
+ 	return END_OF_LINE;
+ }
+ 
+ <ST_SECTION_VALUE,ST_VALUE,ST_OFFSET>{CONSTANT} { /* Get constant option value */
+ 	RETURN_TOKEN(TC_CONSTANT, yytext, yyleng);
+ }
+ 
+ <ST_SECTION_VALUE,ST_VALUE,ST_OFFSET>{NUMBER} { /* Get number option value as string */
+ 	RETURN_TOKEN(TC_NUMBER, yytext, yyleng);
+ }
+ 
+ <INITIAL>{TOKENS} { /* Disallow these chars outside option values */
+ 	return yytext[0];
+ }
+ 
+ <ST_VALUE>{OPERATORS}{TABS_AND_SPACES}* { /* Boolean operators */
+ 	return yytext[0];
+ }
+ 
+ <ST_VALUE>[=] { /* Make = used in option value to trigger error */
+ 	yyless(0);
+ 	BEGIN(INITIAL);
+ 	return END_OF_LINE;
+ }
+ 
+ <ST_VALUE>{VALUE_CHARS}+ { /* Get everything else as option/offset value */
+ 	RETURN_TOKEN(TC_STRING, yytext, yyleng);
+ }
+ 
+ <ST_SECTION_VALUE,ST_OFFSET>{SECTION_VALUE_CHARS}+ { /* Get rest as section/offset value */
+ 	RETURN_TOKEN(TC_STRING, yytext, yyleng);
+ }
+ 
+ <ST_SECTION_VALUE,ST_VALUE,ST_OFFSET>{TABS_AND_SPACES}*["] { /* Double quoted '"' string start */
+ 	yy_push_state(ST_DOUBLE_QUOTES);
+ 	return '"';
+ }
+ 
+ <ST_DOUBLE_QUOTES>["]{TABS_AND_SPACES}* { /* Double quoted '"' string ends */
+ 	yy_pop_state();
+ 	return '"';
+ }
+ 
+ <ST_DOUBLE_QUOTES>[^] { /* Escape double quoted string contents */
+ 	if (YYCURSOR > YYLIMIT) {
+ 		return 0;
+ 	}
+ 
+ 	const unsigned char *s = SCNG(yy_text);
+ 
+ 	while (s < YYLIMIT) {
+ 		switch (*s++) {
+ 			case '"':
+ 				break;
+ 			case '$':
+ 				if (s < YYLIMIT && *s == '{') {
+ 					break;
+ 				}
+ 				continue;
+ 			case '\\':
+ 				if (s < YYLIMIT) {
+ 					unsigned char escaped = *s++;
+ 					/* A special case for Windows paths, e.g. key="C:\path\" */
+ 					if (escaped == '"' && (s >= YYLIMIT || *s == '\n' || *s == '\r')) {
+ 						break;
+ 					}
+ 				}
+ 				ZEND_FALLTHROUGH;
+ 			default:
+ 				continue;
+ 		}
+ 
+ 		s--;
+ 		break;
+ 	}
+ 
+ 	YYCURSOR = s;
+ 	yyleng = YYCURSOR - SCNG(yy_text);
+ 
+ 	zend_ini_escape_string(ini_lval, yytext, yyleng, '"');
++	Z_EXTRA_P(ini_lval) = 0;
+ 	return TC_QUOTED_STRING;
+ }
+ 
+ <ST_SECTION_VALUE,ST_VALUE,ST_OFFSET>{WHITESPACE} {
+ 	RETURN_TOKEN(TC_WHITESPACE, yytext, yyleng);
+ }
+ 
+ <INITIAL,ST_RAW>{TABS_AND_SPACES}+ {
+ 	/* eat whitespace */
+ 	goto restart;
+ }
+ 
+ <INITIAL>{TABS_AND_SPACES}*{NEWLINE} {
+ 	SCNG(lineno)++;
+ 	return END_OF_LINE;
+ }
+ 
+ <INITIAL,ST_VALUE,ST_RAW>{TABS_AND_SPACES}*[;][^\r\n]*{NEWLINE} { /* Comment */
+ 	BEGIN(INITIAL);
+ 	SCNG(lineno)++;
+ 	return END_OF_LINE;
+ }
+ 
+ <ST_VALUE,ST_RAW>[^] { /* End of option value (if EOF is reached before EOL */
+ 	BEGIN(INITIAL);
+ 	return END_OF_LINE;
+ }
+ 
+ <*>[^] {
+ 	return 0;
+ }
+ 
+ */
+ }

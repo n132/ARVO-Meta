@@ -1,0 +1,587 @@
+commit 09172c1ca26ad0467d59d3d2566ac5486ae700ea
+Author: danblooomberg <dan.bloomberg@gmail.com>
+Date:   Sat Oct 8 16:18:15 2022 -0600
+
+    Fix oss-fuzz issue 48232: in finditalic_fuzzer: uninit in low-level libz
+    * The main problem is that ptraConcatenatePdfToData() only works with
+      pdf data that was formatted with leptonica.
+    * Handle by rejecting pages with absurdly large asperity ratios.
+    * Add tests on intermediate data.
+
+diff --git a/src/pdfio1.c b/src/pdfio1.c
+index 13ba084..fb26482 100644
+--- a/src/pdfio1.c
++++ b/src/pdfio1.c
+@@ -766,41 +766,41 @@ l_int32   ret;
+ size_t    nbytes;
+ 
+     if (!pixa)
+         return ERROR_INT("pixa not defined", __func__, 1);
+ 
+     ret = pixaConvertToPdfData(pixa, res, scalefactor, type, quality,
+                                title, &data, &nbytes);
+     if (ret) {
+         LEPT_FREE(data);
+         return ERROR_INT("conversion to pdf failed", __func__, 1);
+     }
+ 
+     ret = l_binaryWrite(fileout, "w", data, nbytes);
+     LEPT_FREE(data);
+     if (ret)
+         L_ERROR("pdf data not written to file\n", __func__);
+     return ret;
+ }
+ 
+ 
+ /*!
+  * \brief   pixaConvertToPdfData()
+  *
+  * \param[in]    pixa           containing images all at the same resolution
+  * \param[in]    res            input resolution of all images
+- * \param[in]    scalefactor    scaling factor applied to each image; > 0.0
++ * \param[in]    scalefactor    scaling factor applied to each image; > 0.0; <50
+  * \param[in]    type           encoding type (L_JPEG_ENCODE, L_G4_ENCODE,
+  *                              L_FLATE_ENCODE, L_JP2K_ENCODE, or
+  *                              L_DEFAULT_ENCODE for default)
+  * \param[in]    quality        for jpeg: 1-100; 0 for default (75)
+  *                              for jp2k: 27-45; 0 for default (34)
+  * \param[in]    title          [optional] pdf title; can be null
+  * \param[out]   pdata          output pdf data of all images
+  * \param[out]   pnbytes        size of output pdf data
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) See pixaConvertToPdf().
+  * </pre>
+  */
+@@ -822,138 +822,146 @@ PIX      *pixs, *pix;
+ L_PTRA   *pa_data;
+ 
+     if (!pdata)
+         return ERROR_INT("&data not defined", __func__, 1);
+     *pdata = NULL;
+     if (!pnbytes)
+         return ERROR_INT("&nbytes not defined", __func__, 1);
+     *pnbytes = 0;
+     if (!pixa)
+         return ERROR_INT("pixa not defined", __func__, 1);
+     if (scalefactor <= 0.0) scalefactor = 1.0;
++    if (scalefactor >= 50.0)
++        return ERROR_INT("scalefactor too large", __func__, 1);
+     if (type != L_DEFAULT_ENCODE && type != L_JPEG_ENCODE &&
+         type != L_G4_ENCODE && type != L_FLATE_ENCODE &&
+         type != L_JP2K_ENCODE) {
+         L_WARNING("invalid compression type; using per-page default\n",
+                   __func__);
+         type = L_DEFAULT_ENCODE;
+     }
++    if (quality < 0 || quality > 100)
++        return ERROR_INT("invalid quality", __func__, 1);
+ 
+         /* Generate all the encoded pdf strings */
+     n = pixaGetCount(pixa);
+     pa_data = ptraCreate(n);
+     for (i = 0; i < n; i++) {
+         if ((pixs = pixaGetPix(pixa, i, L_CLONE)) == NULL) {
+-            L_ERROR("pix[%d] not retrieved\n", __func__, i);
++            L_ERROR("pixs[%d] not retrieved\n", __func__, i);
+             continue;
+         }
+         if (scalefactor != 1.0)
+             pix = pixScale(pixs, scalefactor, scalefactor);
+         else
+             pix = pixClone(pixs);
+         pixDestroy(&pixs);
++        if (!pix) {
++            L_ERROR("pix[%d] not made\n", __func__, i);
++            continue;
++        }
+         scaledres = (l_int32)(res * scalefactor);
+ 
+             /* Select the encoding type */
+         if (type != L_DEFAULT_ENCODE) {
+             pagetype = type;
+         } else if (selectDefaultPdfEncoding(pix, &pagetype) != 0) {
+             L_ERROR("encoding type selection failed for pix[%d]\n",
+                         __func__, i);
+             pixDestroy(&pix);
+             continue;
+         }
+ 
+         ret = pixConvertToPdfData(pix, pagetype, quality, &imdata, &imbytes,
+                                   0, 0, scaledres, title, NULL, 0);
+         pixDestroy(&pix);
+         if (ret) {
+             LEPT_FREE(imdata);
+             L_ERROR("pdf encoding failed for pix[%d]\n", __func__, i);
+             continue;
+         }
+         ba = l_byteaInitFromMem(imdata, imbytes);
+         LEPT_FREE(imdata);
+         ptraAdd(pa_data, ba);
+     }
+     ptraGetActualCount(pa_data, &n);
+     if (n == 0) {
+         L_ERROR("no pdf files made\n", __func__);
+         ptraDestroy(&pa_data, FALSE, FALSE);
+         return 1;
+     }
+ 
+         /* Concatenate them */
+     ret = ptraConcatenatePdfToData(pa_data, NULL, pdata, pnbytes);
+ 
+     ptraGetActualCount(pa_data, &n);  /* recalculate in case it changes */
+     for (i = 0; i < n; i++) {
+         ba = (L_BYTEA *)ptraRemove(pa_data, i, L_NO_COMPACTION);
+         l_byteaDestroy(&ba);
+     }
+     ptraDestroy(&pa_data, FALSE, FALSE);
+     return ret;
+ }
+ 
+ 
+ /*---------------------------------------------------------------------*
+  *                Single page, multi-image converters                  *
+  *---------------------------------------------------------------------*/
+ /*!
+  * \brief   convertToPdf()
+  *
+  * \param[in]      filein       input image file -- any format
+  * \param[in]      type         encoding type (L_JPEG_ENCODE, L_G4_ENCODE,
+  *                              L_FLATE_ENCODE, or L_JP2K_ENCODE)
+  * \param[in]      quality      for jpeg: 1-100; 0 for default (75)
+  *                              for jp2k: 27-45; 0 for default (34)
+  * \param[in]      fileout      output pdf file; only required on last
+  *                              image on page
+  * \param[in]      x, y         location of lower-left corner of image,
+  *                              in pixels, relative to the PostScript origin
+  *                              (0,0) at the lower-left corner of the page
+  * \param[in]      res          override the resolution of the input image,
+  *                              in ppi; use 0 to respect the resolution
+  *                              embedded in the input images
+  * \param[in]      title        [optional] pdf title; can be null
+  * \param[in,out]  plpd         ptr to lpd, which is created on the first
+  *                              invocation and returned until last image is
+  *                              processed, at which time it is destroyed
+  * \param[in]      position     in image sequence: L_FIRST_IMAGE, L_NEXT_IMAGE,
+  *                              L_LAST_IMAGE
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) To wrap only one image in pdf, input %plpd = NULL, and
+  *          the value of %position will be ignored:
+  *            convertToPdf(...  type, quality, x, y, res, NULL, 0);
+  *      (2) To wrap multiple images on a single pdf page, this is called
+  *          once for each successive image.  Do it this way:
+  *            L_PDF_DATA   *lpd;
+  *            convertToPdf(...  type, quality, x, y, res, &lpd, L_FIRST_IMAGE);
+  *            convertToPdf(...  type, quality, x, y, res, &lpd, L_NEXT_IMAGE);
+  *            ...
+  *            convertToPdf(...  type, quality, x, y, res, &lpd, L_LAST_IMAGE);
+  *          This will write the result to the value of %fileout specified
+  *          in the first call; succeeding values of %fileout are ignored.
+  *          On the last call: the pdf data bytes are computed and written
+  *          to %fileout, lpd is destroyed internally, and the returned
+  *          value of lpd is null.  So the client has nothing to clean up.
+  *      (3) (a) Set %res == 0 to respect the resolution embedded in the
+  *              image file.  If no resolution is embedded, it will be set
+  *              to the default value.
+  *          (b) Set %res to some other value to override the file resolution.
+  *      (4) (a) If the input %res and the resolution of the output device
+  *              are equal, the image will be "displayed" at the same size
+  *              as the original.
+  *          (b) If the input %res is 72, the output device will render
+  *              the image at 1 pt/pixel.
+  *          (c) Some possible choices for the default input pix resolution are:
+  *                 72 ppi     Render pix on any output device at one pt/pixel
+  *                 96 ppi     Windows default for generated display images
+  *                300 ppi     Typical default for scanned images.
+  *              We choose 300, which is sensible for rendering page images.
+  *              However,  images come from a variety of sources, and
+  *              some are explicitly created for viewing on a display.
+  * </pre>
+  */
+diff --git a/src/pdfio2.c b/src/pdfio2.c
+index 004de06..c2b156f 100644
+--- a/src/pdfio2.c
++++ b/src/pdfio2.c
+@@ -205,109 +205,112 @@ L_COMP_DATA  *cid = NULL;
+ L_PDF_DATA   *lpd = NULL;
+ 
+     if (!pdata)
+         return ERROR_INT("&data not defined", __func__, 1);
+     *pdata = NULL;
+     if (!pnbytes)
+         return ERROR_INT("&nbytes not defined", __func__, 1);
+     *pnbytes = 0;
+     if (!pix)
+         return ERROR_INT("pix not defined", __func__, 1);
+     if (type != L_JPEG_ENCODE && type != L_G4_ENCODE &&
+         type != L_FLATE_ENCODE && type != L_JP2K_ENCODE) {
+         selectDefaultPdfEncoding(pix, &type);
+     }
++    if (quality < 0 || quality > 100)
++        return ERROR_INT("invalid quality", __func__, 1);
++
+     if (plpd) {  /* part of multi-page invocation */
+         if (position == L_FIRST_IMAGE)
+             *plpd = NULL;
+     }
+ 
+         /* Generate the compressed image data.  It must NOT
+          * be ascii85 encoded. */
+     pixGenerateCIData(pix, type, quality, 0, &cid);
+     if (!cid)
+         return ERROR_INT("cid not made", __func__, 1);
+ 
+         /* Get media box in pts.  Guess the input image resolution
+          * based on the input parameter %res, the resolution data in
+          * the pix, and the size of the image. */
+     pixres = cid->res;
+     w = cid->w;
+     h = cid->h;
+     if (res <= 0.0)
+         res = (pixres > 0) ? pixres : DefaultInputRes;
+     xpt = x * 72. / res;
+     ypt = y * 72. / res;
+     wpt = w * 72. / res;
+     hpt = h * 72. / res;
+ 
+         /* Set up lpd */
+     if (!plpd) {  /* single image */
+         if ((lpd = pdfdataCreate(title)) == NULL)
+             return ERROR_INT("lpd not made", __func__, 1);
+     } else if (position == L_FIRST_IMAGE) {  /* first of multiple images */
+         if ((lpd = pdfdataCreate(title)) == NULL)
+             return ERROR_INT("lpd not made", __func__, 1);
+         *plpd = lpd;
+     } else {  /* not the first of multiple images */
+         lpd = *plpd;
+     }
+ 
+         /* Add the data to the lpd */
+     ptraAdd(lpd->cida, cid);
+     lpd->n++;
+     ptaAddPt(lpd->xy, xpt, ypt);
+     ptaAddPt(lpd->wh, wpt, hpt);
+ 
+         /* If a single image or the last of multiple images,
+          * generate the pdf and destroy the lpd */
+     if (!plpd || (position == L_LAST_IMAGE)) {
+         ret = l_generatePdf(pdata, pnbytes, lpd);
+         pdfdataDestroy(&lpd);
+         if (plpd) *plpd = NULL;
+         if (ret)
+             return ERROR_INT("pdf output not made", __func__, 1);
+     }
+ 
+     return 0;
+ }
+ 
+ 
+ /*---------------------------------------------------------------------*
+  *      Intermediate function for generating multipage pdf output      *
+  *---------------------------------------------------------------------*/
+ /*!
+  * \brief   ptraConcatenatePdfToData()
+  *
+  * \param[in]    pa_data    ptra array of pdf strings, each for a
+  *                          single-page pdf file
+  * \param[in]    sa         [optional] string array of pathnames for
+  *                          input pdf files; can be null
+  * \param[out]   pdata      concatenated pdf data in memory
+  * \param[out]   pnbytes    number of bytes in pdf data
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) This only works with leptonica-formatted single-page pdf files.
+  *          pdf files generated by other programs will have unpredictable
+  *          (and usually bad) results.  The requirements for each pdf file:
+  *            (a) The Catalog and Info objects are the first two.
+  *            (b) Object 3 is Pages
+  *            (c) Object 4 is Page
+  *            (d) The remaining objects are Contents, XObjects, and ColorSpace
+  *      (2) We remove trailers from each page, and append the full trailer
+  *          for all pages at the end.
+  *      (3) For all but the first file, remove the ID and the first 3
+  *          objects (catalog, info, pages), so that each subsequent
+  *          file has only objects of these classes:
+  *              Page, Contents, XObject, ColorSpace (Indexed RGB).
+  *          For those objects, we substitute these refs to objects
+  *          in the local file:
+  *              Page:  Parent(object 3), Contents, XObject(typically multiple)
+  *              XObject:  [ColorSpace if indexed]
+  *          The Pages object on the first page (object 3) has a Kids array
+  *          of references to all the Page objects, with a Count equal
+  *          to the number of pages.  Each Page object refers back to
+  *          this parent.
+  * </pre>
+  */
+@@ -536,77 +539,76 @@ L_COMP_DATA  *cid;
+ PIX          *pixt;
+ 
+     if (!pcid)
+         return ERROR_INT("&cid not defined", __func__, 1);
+     *pcid = cid = NULL;
+     if (!fname && !pix)
+         return ERROR_INT("neither fname nor pix are defined", __func__, 1);
+ 
+         /* If a compressed file is given that is not 'stdin', see if we
+          * can generate the pdf output without transcoding. */
+     if (fname && strcmp(fname, "-") != 0 && strcmp(fname, "stdin") != 0) {
+         findFileFormat(fname, &format);
+         if (format == IFF_UNKNOWN)
+             L_WARNING("file %s format is unknown\n", __func__, fname);
+         if (format == IFF_PS || format == IFF_LPDF) {
+             L_ERROR("file %s is unsupported format %d\n",
+                   __func__, fname, format);
+             return 1;
+         }
+         if (format == IFF_JFIF_JPEG) {
+             cid = l_generateJpegData(fname, 0);
+         } else if (format == IFF_JP2) {
+             cid = l_generateJp2kData(fname);
+         } else if (format == IFF_PNG) {
+             cid = l_generateFlateDataPdf(fname, pix);
+         }
+-
++        if (!cid)
++            return ERROR_INT("cid not made from file", __func__, 1);
+     }
+ 
+         /* Otherwise, use the pix to generate the pdf output */
+     if  (!cid) {
+         if (!pix)
+             pixt = pixRead(fname);
+         else
+             pixt = pixClone(pix);
+         if (!pixt)
+             return ERROR_INT("pixt not made", __func__, 1);
+         if (selectDefaultPdfEncoding(pixt, &type)) {
+             pixDestroy(&pixt);
+             return 1;
+         }
+         pixGenerateCIData(pixt, type, quality, 0, &cid);
+         pixDestroy(&pixt);
+-    }
+-    if (!cid) {
+-        L_ERROR("totally kerflummoxed\n", __func__);
+-        return 1;
++        if (!cid)
++            return ERROR_INT("cid not made from pix", __func__, 1);
+     }
+     *pcid = cid;
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   l_generateCIData()
+  *
+  * \param[in]    fname
+  * \param[in]    type       L_G4_ENCODE, L_JPEG_ENCODE, L_FLATE_ENCODE,
+  *                          L_JP2K_ENCODE
+  * \param[in]    quality    for jpeg if transcoded: 1-100; 0 for default (75)
+  *                          for jp2k if transcoded: 27-45; 0 for default (34)
+  * \param[in]    ascii85    0 for binary; 1 for ascii85-encoded
+  * \param[out]   pcid       compressed data
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) This can be used for both PostScript and pdf.
+  *      (1) Set ascii85:
+  *           ~ 0 for binary data (PDF only)
+  *           ~ 1 for ascii85 (5 for 4) encoded binary data (PostScript only)
+  *      (2) This attempts to compress according to the requested type.
+  *          If this can't be done, it falls back to ordinary flate encoding.
+  *      (3) This differs from l_generateCIDataForPdf(), which determines
+  *          the file format and only works for pdf.
+  * </pre>
+  */
+@@ -1105,79 +1107,80 @@ L_COMP_DATA  *cid;
+ FILE         *fp;
+ 
+     if (!fname)
+         return (L_COMP_DATA *)ERROR_PTR("fname not defined", __func__, NULL);
+ 
+         /* Make sure this is a single page tiff file */
+     if ((fp = fopenReadStream(fname)) == NULL)
+         return (L_COMP_DATA *)ERROR_PTR("stream not opened", __func__, NULL);
+     tiffGetCount(fp, &npages);
+     fclose(fp);
+     if (npages != 1) {
+         L_ERROR(" %d page tiff; only works with 1 page\n", __func__, npages);
+         return NULL;
+     }
+ 
+         /* Read the resolution */
+     if ((fp = fopenReadStream(fname)) == NULL)
+         return (L_COMP_DATA *)ERROR_PTR("stream not opened", __func__, NULL);
+     getTiffResolution(fp, &xres, &yres);
+     fclose(fp);
+ 
+         /* The returned ccitt g4 data in memory is the block of
+          * bytes in the tiff file, starting after 8 bytes and
+          * ending before the directory. */
+     if (extractG4DataFromFile(fname, &datacomp, &nbytescomp,
+                               &w, &h, &minisblack)) {
+         return (L_COMP_DATA *)ERROR_PTR("datacomp not extracted",
+                                         __func__, NULL);
+     }
+ 
+         /* Optionally, encode the compressed data */
+     if (ascii85flag == 1) {
+         data85 = encodeAscii85(datacomp, nbytescomp, &nbytes85);
+         LEPT_FREE(datacomp);
+         if (!data85)
+             return (L_COMP_DATA *)ERROR_PTR("data85 not made", __func__, NULL);
+         else
+             data85[nbytes85 - 1] = '\0';  /* remove the newline */
+     }
+ 
+     cid = (L_COMP_DATA *)LEPT_CALLOC(1, sizeof(L_COMP_DATA));
+     if (ascii85flag == 0) {
+         cid->datacomp = datacomp;
+     } else {  /* ascii85 */
+         cid->data85 = data85;
+         cid->nbytes85 = nbytes85;
+     }
+     cid->type = L_G4_ENCODE;
+     cid->nbytescomp = nbytescomp;
+     cid->w = w;
+     cid->h = h;
+     cid->bps = 1;
+     cid->spp = 1;
+     cid->minisblack = minisblack;
+     cid->res = xres;
+     return cid;
+ }
+ 
+ 
+ /*!
+  * \brief   pixGenerateCIData()
+  *
+  * \param[in]    pixs       8 or 32 bpp, no colormap
+  * \param[in]    type       L_G4_ENCODE, L_JPEG_ENCODE, L_FLATE_ENCODE or
+  *                          L_JP2K_ENCODE
+  * \param[in]    quality    for jpeg if transcoded: 1-100; 0 for default (75)
+  *                          for jp2k if transcoded: 27-45; 0 for default (34)
+  * \param[in]    ascii85    0 for binary; 1 for ascii85-encoded
+  * \param[out]   pcid       compressed data
+  * \return  0 if OK, 1 on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) Set ascii85:
+  *           ~ 0 for binary data (PDF only)
+  *           ~ 1 for ascii85 (5 for 4) encoded binary data (PostScript only)
++ *      (2) Do not accept images with an asperity ratio greater than 10.
+  * </pre>
+  */
+ l_ok
+@@ -1185,94 +1188,100 @@ pixGenerateCIData(PIX           *pixs,
+                   l_int32        type,
+                   l_int32        quality,
+                   l_int32        ascii85,
+                   L_COMP_DATA  **pcid)
+ {
+-l_int32   d;
++l_int32   w, h, d, maxAsp;
+ PIXCMAP  *cmap;
+ 
+     if (!pcid)
+         return ERROR_INT("&cid not defined", __func__, 1);
+     *pcid = NULL;
+     if (!pixs)
+         return ERROR_INT("pixs not defined", __func__, 1);
+     if (type != L_G4_ENCODE && type != L_JPEG_ENCODE &&
+         type != L_FLATE_ENCODE && type != L_JP2K_ENCODE) {
+         selectDefaultPdfEncoding(pixs, &type);
+     }
+     if (ascii85 != 0 && ascii85 != 1)
+         return ERROR_INT("invalid ascii85", __func__, 1);
++    pixGetDimensions(pixs, &w, &h, NULL);
++    if (w == 0 || h == 0)
++        return ERROR_INT("invalid w or h", __func__, 1);
++    maxAsp = L_MAX(w / h, h / w);
++    if (maxAsp > 10)
++        return ERROR_INT("max asperity > 10", __func__, 1);
+ 
+         /* Conditionally modify the encoding type if libz is
+          * available and the requested library is missing. */
+ #if defined(HAVE_LIBZ)
+ # if !defined(HAVE_LIBJPEG)
+     if (type == L_JPEG_ENCODE) {
+         L_WARNING("no libjpeg; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     }
+ # endif /* !defined(HAVE_LIBJPEG) */
+ # if !defined(HAVE_LIBJP2K)
+     if (type == L_JP2K_ENCODE) {
+         L_WARNING("no libjp2k; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     }
+ # endif /* !defined(HAVE_LIBJP2K) */
+ # if !defined(HAVE_LIBTIFF)
+     if (type == L_G4_ENCODE) {
+         L_WARNING("no libtiff; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     }
+ # endif /* !defined(HAVE_LIBTIFF) */
+ #endif /* defined(HAVE_LIBZ) */
+ 
+         /* Sanity check on requested encoding */
+     d = pixGetDepth(pixs);
+     cmap = pixGetColormap(pixs);
+     if (cmap && type != L_FLATE_ENCODE) {
+         L_WARNING("pixs has cmap; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     } else if (d < 8 && (type == L_JPEG_ENCODE || type == L_JP2K_ENCODE)) {
+         L_WARNING("pixs has < 8 bpp; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     } else if (d > 1 && type == L_G4_ENCODE) {
+         L_WARNING("pixs has > 1 bpp; using flate encoding\n", __func__);
+         type = L_FLATE_ENCODE;
+     }
+ 
+     if (type == L_JPEG_ENCODE) {
+         if ((*pcid = pixGenerateJpegData(pixs, ascii85, quality)) == NULL)
+             return ERROR_INT("jpeg data not made", __func__, 1);
+     } else if (type == L_JP2K_ENCODE) {
+         if ((*pcid = pixGenerateJp2kData(pixs, quality)) == NULL)
+             return ERROR_INT("jp2k data not made", __func__, 1);
+     } else if (type == L_G4_ENCODE) {
+         if ((*pcid = pixGenerateG4Data(pixs, ascii85)) == NULL)
+             return ERROR_INT("g4 data not made", __func__, 1);
+     } else {  /* type == L_FLATE_ENCODE */
+         if ((*pcid = pixGenerateFlateData(pixs, ascii85)) == NULL)
+             return ERROR_INT("flate data not made", __func__, 1);
+     }
+     return 0;
+ }
+ 
+ 
+ /*!
+  * \brief   l_generateFlateData()
+  *
+  * \param[in]    fname
+  * \param[in]    ascii85flag    0 for gzipped; 1 for ascii85-encoded gzipped
+  * \return  cid flate compressed image data, or NULL on error
+  *
+  * <pre>
+  * Notes:
+  *      (1) The input image is converted to one of these 4 types:
+  *           ~ 1 bpp
+  *           ~ 8 bpp, no colormap
+  *           ~ 8 bpp, colormap
+  *           ~ 32 bpp rgb
+  *      (2) Set ascii85flag:
+  *           ~ 0 for binary data (PDF only)
+  *           ~ 1 for ascii85 (5 for 4) encoded binary data (PostScript only)
+  *      (3) Always transcodes (i.e., first decodes the png file)
+  * </pre>
+  */

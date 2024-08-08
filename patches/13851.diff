@@ -1,0 +1,354 @@
+commit c3b517dac2bbd3007c5ac8fc61efe87661dda5c0
+Author: Jun Li <junli1026@gmail.com>
+Date:   Thu Mar 21 16:58:41 2019 -0700
+
+    avformat/rtsp: Add https tunneling support
+    
+    Add https based tunneling for RTSP/RTP. Tested on Axis and Bosch cameras.
+    Https is widely used for security consideration.
+
+diff --git a/libavformat/rtsp.c b/libavformat/rtsp.c
+index ae8811234a..4661654967 100644
+--- a/libavformat/rtsp.c
++++ b/libavformat/rtsp.c
+@@ -82,28 +82,29 @@
+ const AVOption ff_rtsp_options[] = {
+     { "initial_pause",  "do not start playing the stream immediately", OFFSET(initial_pause), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
+     FF_RTP_FLAG_OPTS(RTSPState, rtp_muxer_flags),
+     { "rtsp_transport", "set RTSP transport protocols", OFFSET(lower_transport_mask), AV_OPT_TYPE_FLAGS, {.i64 = 0}, INT_MIN, INT_MAX, DEC|ENC, "rtsp_transport" }, \
+     { "udp", "UDP", 0, AV_OPT_TYPE_CONST, {.i64 = 1 << RTSP_LOWER_TRANSPORT_UDP}, 0, 0, DEC|ENC, "rtsp_transport" }, \
+     { "tcp", "TCP", 0, AV_OPT_TYPE_CONST, {.i64 = 1 << RTSP_LOWER_TRANSPORT_TCP}, 0, 0, DEC|ENC, "rtsp_transport" }, \
+     { "udp_multicast", "UDP multicast", 0, AV_OPT_TYPE_CONST, {.i64 = 1 << RTSP_LOWER_TRANSPORT_UDP_MULTICAST}, 0, 0, DEC, "rtsp_transport" },
+     { "http", "HTTP tunneling", 0, AV_OPT_TYPE_CONST, {.i64 = (1 << RTSP_LOWER_TRANSPORT_HTTP)}, 0, 0, DEC, "rtsp_transport" },
++    { "https", "HTTPS tunneling", 0, AV_OPT_TYPE_CONST, {.i64 = (1 << RTSP_LOWER_TRANSPORT_HTTPS )}, 0, 0, DEC, "rtsp_transport" },
+     RTSP_FLAG_OPTS("rtsp_flags", "set RTSP flags"),
+     { "listen", "wait for incoming connections", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_LISTEN}, 0, 0, DEC, "rtsp_flags" },
+     { "prefer_tcp", "try RTP via TCP first, if available", 0, AV_OPT_TYPE_CONST, {.i64 = RTSP_FLAG_PREFER_TCP}, 0, 0, DEC|ENC, "rtsp_flags" },
+     RTSP_MEDIATYPE_OPTS("allowed_media_types", "set media types to accept from the server"),
+     { "min_port", "set minimum local UDP port", OFFSET(rtp_port_min), AV_OPT_TYPE_INT, {.i64 = RTSP_RTP_PORT_MIN}, 0, 65535, DEC|ENC },
+     { "max_port", "set maximum local UDP port", OFFSET(rtp_port_max), AV_OPT_TYPE_INT, {.i64 = RTSP_RTP_PORT_MAX}, 0, 65535, DEC|ENC },
+     { "listen_timeout", "set maximum timeout (in seconds) to wait for incoming connections (-1 is infinite, imply flag listen)", OFFSET(initial_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC },
+ #if FF_API_OLD_RTSP_OPTIONS
+     { "timeout", "set maximum timeout (in seconds) to wait for incoming connections (-1 is infinite, imply flag listen) (deprecated, use listen_timeout)", OFFSET(initial_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC },
+     { "stimeout", "set timeout (in microseconds) of socket TCP I/O operations", OFFSET(stimeout), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
+ #else
+     { "timeout", "set timeout (in microseconds) of socket TCP I/O operations", OFFSET(stimeout), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
+ #endif
+     COMMON_OPTS(),
+     { "user_agent", "override User-Agent header", OFFSET(user_agent), AV_OPT_TYPE_STRING, {.str = LIBAVFORMAT_IDENT}, 0, 0, DEC },
+ #if FF_API_OLD_RTSP_OPTIONS
+     { "user-agent", "override User-Agent header (deprecated, use user_agent)", OFFSET(user_agent), AV_OPT_TYPE_STRING, {.str = LIBAVFORMAT_IDENT}, 0, 0, DEC },
+ #endif
+     { NULL },
+ };
+@@ -1662,34 +1663,37 @@ void ff_rtsp_close_connections(AVFormatContext *s)
+ int ff_rtsp_connect(AVFormatContext *s)
+ {
+     RTSPState *rt = s->priv_data;
+     char proto[128], host[1024], path[1024];
+     char tcpname[1024], cmd[2048], auth[128];
+     const char *lower_rtsp_proto = "tcp";
+     int port, err, tcp_fd;
+     RTSPMessageHeader reply1, *reply = &reply1;
+     int lower_transport_mask = 0;
+     int default_port = RTSP_DEFAULT_PORT;
++    int https_tunnel = 0;
+     char real_challenge[64] = "";
+     struct sockaddr_storage peer;
+     socklen_t peer_len = sizeof(peer);
+ 
+     if (rt->rtp_port_max < rt->rtp_port_min) {
+         av_log(s, AV_LOG_ERROR, "Invalid UDP port range, max port %d less "
+                                 "than min port %d\n", rt->rtp_port_max,
+                                                       rt->rtp_port_min);
+         return AVERROR(EINVAL);
+     }
+ 
+     if (!ff_network_init())
+         return AVERROR(EIO);
+ 
+     if (s->max_delay < 0) /* Not set by the caller */
+         s->max_delay = s->iformat ? DEFAULT_REORDERING_DELAY : 0;
+ 
+     rt->control_transport = RTSP_MODE_PLAIN;
+-    if (rt->lower_transport_mask & (1 << RTSP_LOWER_TRANSPORT_HTTP)) {
++    if (rt->lower_transport_mask & ((1 << RTSP_LOWER_TRANSPORT_HTTP) |
++                                    (1 << RTSP_LOWER_TRANSPORT_HTTPS))) {
++        https_tunnel = !!(rt->lower_transport_mask & (1 << RTSP_LOWER_TRANSPORT_HTTPS));
+         rt->lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
+         rt->control_transport = RTSP_MODE_TUNNEL;
+     }
+     /* Only pass through valid flags from here */
+     rt->lower_transport_mask &= (1 << RTSP_LOWER_TRANSPORT_NB) - 1;
+@@ -1697,242 +1701,242 @@ int ff_rtsp_connect(AVFormatContext *s)
+ redirect:
+     memset(&reply1, 0, sizeof(reply1));
+     /* extract hostname and port */
+     av_url_split(proto, sizeof(proto), auth, sizeof(auth),
+                  host, sizeof(host), &port, path, sizeof(path), s->url);
+ 
+     if (!strcmp(proto, "rtsps")) {
+         lower_rtsp_proto         = "tls";
+         default_port             = RTSPS_DEFAULT_PORT;
+         rt->lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
+     }
+ 
+     if (*auth) {
+         av_strlcpy(rt->auth, auth, sizeof(rt->auth));
+     }
+     if (port < 0)
+         port = default_port;
+ 
+     lower_transport_mask = rt->lower_transport_mask;
+ 
+     if (!lower_transport_mask)
+         lower_transport_mask = (1 << RTSP_LOWER_TRANSPORT_NB) - 1;
+ 
+     if (s->oformat) {
+         /* Only UDP or TCP - UDP multicast isn't supported. */
+         lower_transport_mask &= (1 << RTSP_LOWER_TRANSPORT_UDP) |
+                                 (1 << RTSP_LOWER_TRANSPORT_TCP);
+         if (!lower_transport_mask || rt->control_transport == RTSP_MODE_TUNNEL) {
+             av_log(s, AV_LOG_ERROR, "Unsupported lower transport method, "
+                                     "only UDP and TCP are supported for output.\n");
+             err = AVERROR(EINVAL);
+             goto fail;
+         }
+     }
+ 
+     /* Construct the URI used in request; this is similar to s->url,
+      * but with authentication credentials removed and RTSP specific options
+      * stripped out. */
+     ff_url_join(rt->control_uri, sizeof(rt->control_uri), proto, NULL,
+                 host, port, "%s", path);
+ 
+     if (rt->control_transport == RTSP_MODE_TUNNEL) {
+         /* set up initial handshake for tunneling */
+         char httpname[1024];
+         char sessioncookie[17];
+         char headers[1024];
+ 
+-        ff_url_join(httpname, sizeof(httpname), "http", auth, host, port, "%s", path);
++        ff_url_join(httpname, sizeof(httpname), https_tunnel ? "https" : "http", auth, host, port, "%s", path);
+         snprintf(sessioncookie, sizeof(sessioncookie), "%08x%08x",
+                  av_get_random_seed(), av_get_random_seed());
+ 
+         /* GET requests */
+         if (ffurl_alloc(&rt->rtsp_hd, httpname, AVIO_FLAG_READ,
+                         &s->interrupt_callback) < 0) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+ 
+         /* generate GET headers */
+         snprintf(headers, sizeof(headers),
+                  "x-sessioncookie: %s\r\n"
+                  "Accept: application/x-rtsp-tunnelled\r\n"
+                  "Pragma: no-cache\r\n"
+                  "Cache-Control: no-cache\r\n",
+                  sessioncookie);
+         av_opt_set(rt->rtsp_hd->priv_data, "headers", headers, 0);
+ 
+         if (!rt->rtsp_hd->protocol_whitelist && s->protocol_whitelist) {
+             rt->rtsp_hd->protocol_whitelist = av_strdup(s->protocol_whitelist);
+             if (!rt->rtsp_hd->protocol_whitelist) {
+                 err = AVERROR(ENOMEM);
+                 goto fail;
+             }
+         }
+ 
+         /* complete the connection */
+         if (ffurl_connect(rt->rtsp_hd, NULL)) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+ 
+         /* POST requests */
+         if (ffurl_alloc(&rt->rtsp_hd_out, httpname, AVIO_FLAG_WRITE,
+                         &s->interrupt_callback) < 0 ) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+ 
+         /* generate POST headers */
+         snprintf(headers, sizeof(headers),
+                  "x-sessioncookie: %s\r\n"
+                  "Content-Type: application/x-rtsp-tunnelled\r\n"
+                  "Pragma: no-cache\r\n"
+                  "Cache-Control: no-cache\r\n"
+                  "Content-Length: 32767\r\n"
+                  "Expires: Sun, 9 Jan 1972 00:00:00 GMT\r\n",
+                  sessioncookie);
+         av_opt_set(rt->rtsp_hd_out->priv_data, "headers", headers, 0);
+         av_opt_set(rt->rtsp_hd_out->priv_data, "chunked_post", "0", 0);
+ 
+         /* Initialize the authentication state for the POST session. The HTTP
+          * protocol implementation doesn't properly handle multi-pass
+          * authentication for POST requests, since it would require one of
+          * the following:
+          * - implementing Expect: 100-continue, which many HTTP servers
+          *   don't support anyway, even less the RTSP servers that do HTTP
+          *   tunneling
+          * - sending the whole POST data until getting a 401 reply specifying
+          *   what authentication method to use, then resending all that data
+          * - waiting for potential 401 replies directly after sending the
+          *   POST header (waiting for some unspecified time)
+          * Therefore, we copy the full auth state, which works for both basic
+          * and digest. (For digest, we would have to synchronize the nonce
+          * count variable between the two sessions, if we'd do more requests
+          * with the original session, though.)
+          */
+         ff_http_init_auth_state(rt->rtsp_hd_out, rt->rtsp_hd);
+ 
+         /* complete the connection */
+         if (ffurl_connect(rt->rtsp_hd_out, NULL)) {
+             err = AVERROR(EIO);
+             goto fail;
+         }
+     } else {
+         int ret;
+         /* open the tcp connection */
+         ff_url_join(tcpname, sizeof(tcpname), lower_rtsp_proto, NULL,
+                     host, port,
+                     "?timeout=%d", rt->stimeout);
+         if ((ret = ffurl_open_whitelist(&rt->rtsp_hd, tcpname, AVIO_FLAG_READ_WRITE,
+                        &s->interrupt_callback, NULL, s->protocol_whitelist, s->protocol_blacklist, NULL)) < 0) {
+             err = ret;
+             goto fail;
+         }
+         rt->rtsp_hd_out = rt->rtsp_hd;
+     }
+     rt->seq = 0;
+ 
+     tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
+     if (tcp_fd < 0) {
+         err = tcp_fd;
+         goto fail;
+     }
+     if (!getpeername(tcp_fd, (struct sockaddr*) &peer, &peer_len)) {
+         getnameinfo((struct sockaddr*) &peer, peer_len, host, sizeof(host),
+                     NULL, 0, NI_NUMERICHOST);
+     }
+ 
+     /* request options supported by the server; this also detects server
+      * type */
+     for (rt->server_type = RTSP_SERVER_RTP;;) {
+         cmd[0] = 0;
+         if (rt->server_type == RTSP_SERVER_REAL)
+             av_strlcat(cmd,
+                        /*
+                         * The following entries are required for proper
+                         * streaming from a Realmedia server. They are
+                         * interdependent in some way although we currently
+                         * don't quite understand how. Values were copied
+                         * from mplayer SVN r23589.
+                         *   ClientChallenge is a 16-byte ID in hex
+                         *   CompanyID is a 16-byte ID in base64
+                         */
+                        "ClientChallenge: 9e26d33f2984236010ef6253fb1887f7\r\n"
+                        "PlayerStarttime: [28/03/2003:22:50:23 00:00]\r\n"
+                        "CompanyID: KnKV4M4I/B2FjJ1TToLycw==\r\n"
+                        "GUID: 00000000-0000-0000-0000-000000000000\r\n",
+                        sizeof(cmd));
+         ff_rtsp_send_cmd(s, "OPTIONS", rt->control_uri, cmd, reply, NULL);
+         if (reply->status_code != RTSP_STATUS_OK) {
+             err = ff_rtsp_averror(reply->status_code, AVERROR_INVALIDDATA);
+             goto fail;
+         }
+ 
+         /* detect server type if not standard-compliant RTP */
+         if (rt->server_type != RTSP_SERVER_REAL && reply->real_challenge[0]) {
+             rt->server_type = RTSP_SERVER_REAL;
+             continue;
+         } else if (!av_strncasecmp(reply->server, "WMServer/", 9)) {
+             rt->server_type = RTSP_SERVER_WMS;
+         } else if (rt->server_type == RTSP_SERVER_REAL)
+             strcpy(real_challenge, reply->real_challenge);
+         break;
+     }
+ 
+     if (CONFIG_RTSP_DEMUXER && s->iformat)
+         err = ff_rtsp_setup_input_streams(s, reply);
+     else if (CONFIG_RTSP_MUXER)
+         err = ff_rtsp_setup_output_streams(s, host);
+     else
+         av_assert0(0);
+     if (err)
+         goto fail;
+ 
+     do {
+         int lower_transport = ff_log2_tab[lower_transport_mask &
+                                   ~(lower_transport_mask - 1)];
+ 
+         if ((lower_transport_mask & (1 << RTSP_LOWER_TRANSPORT_TCP))
+                 && (rt->rtsp_flags & RTSP_FLAG_PREFER_TCP))
+             lower_transport = RTSP_LOWER_TRANSPORT_TCP;
+ 
+         err = ff_rtsp_make_setup_request(s, host, port, lower_transport,
+                                  rt->server_type == RTSP_SERVER_REAL ?
+                                      real_challenge : NULL);
+         if (err < 0)
+             goto fail;
+         lower_transport_mask &= ~(1 << lower_transport);
+         if (lower_transport_mask == 0 && err == 1) {
+             err = AVERROR(EPROTONOSUPPORT);
+             goto fail;
+         }
+     } while (err);
+ 
+     rt->lower_transport_mask = lower_transport_mask;
+     av_strlcpy(rt->real_challenge, real_challenge, sizeof(rt->real_challenge));
+     rt->state = RTSP_STATE_IDLE;
+     rt->seek_timestamp = 0; /* default is to start stream at position zero */
+     return 0;
+  fail:
+     ff_rtsp_close_streams(s);
+     ff_rtsp_close_connections(s);
+     if (reply->status_code >=300 && reply->status_code < 400 && s->iformat) {
+         char *new_url = av_strdup(reply->location);
+         if (!new_url) {
+             err = AVERROR(ENOMEM);
+             goto fail2;
+         }
+         ff_format_set_url(s, new_url);
+         rt->session_id[0] = '\0';
+         av_log(s, AV_LOG_INFO, "Status %d: Redirecting to %s\n",
+                reply->status_code,
+                s->url);
+         goto redirect;
+     }
+  fail2:
+     ff_network_close();
+     return err;
+ }
+ #endif /* CONFIG_RTSP_DEMUXER || CONFIG_RTSP_MUXER */
+ 
+ #if CONFIG_RTPDEC
+diff --git a/libavformat/rtsp.h b/libavformat/rtsp.h
+index 9a7f366b39..b49278fc20 100644
+--- a/libavformat/rtsp.h
++++ b/libavformat/rtsp.h
+@@ -34,22 +34,23 @@
+ /**
+  * Network layer over which RTP/etc packet data will be transported.
+  */
+ enum RTSPLowerTransport {
+     RTSP_LOWER_TRANSPORT_UDP = 0,           /**< UDP/unicast */
+     RTSP_LOWER_TRANSPORT_TCP = 1,           /**< TCP; interleaved in RTSP */
+     RTSP_LOWER_TRANSPORT_UDP_MULTICAST = 2, /**< UDP/multicast */
+     RTSP_LOWER_TRANSPORT_NB,
+     RTSP_LOWER_TRANSPORT_HTTP = 8,          /**< HTTP tunneled - not a proper
+                                                  transport mode as such,
+                                                  only for use via AVOptions */
++    RTSP_LOWER_TRANSPORT_HTTPS,             /**< HTTPS tunneled */
+     RTSP_LOWER_TRANSPORT_CUSTOM = 16,       /**< Custom IO - not a public
+                                                  option for lower_transport_mask,
+                                                  but set in the SDP demuxer based
+                                                  on a flag. */
+ };
+ 
+ /**
+  * Packet profile of the data that we will be receiving. Real servers
+  * commonly send RDT (although they can sometimes send RTP as well),
+  * whereas most others will send RTP.
+  */

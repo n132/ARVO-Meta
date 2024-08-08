@@ -1,0 +1,144 @@
+commit 8470058934e89d1876b8e034d1ea818bde62b994
+Author: James Carter <jwcart2@gmail.com>
+Date:   Mon Jul 12 09:50:38 2021 -0400
+
+    libsepol/cil: Fix handling category sets in an expression
+    
+    There are two problems that need to be addressed when resolving an
+    expression with category sets.
+    
+    1. Only expand anonymous category sets in an expression.
+    
+    Commit 982ec302b67f3c7f8df667dadb67352b1e4a6d18 (libsepol/cil:
+    Account for anonymous category sets in an expression) attempted to
+    properly handle anonymous category sets when resolving category
+    expressions. Unfortunately, it did not check whether a category set
+    was actually an anonymous category set and expanded all category
+    sets in an expression. If a category set refers to itself in the
+    expression, then everything from the name of the category set to the
+    end of the expression is ignored.
+    
+    For example, the rule "(categoryset cs (c0 cs c1 c2))", would be
+    equivalent to the rule "(categoryset cs (c0))" as everything from
+    "cs" to the end would be dropped. The secilc-fuzzer found that the
+    rule "(categoryset cat (not cat))" would cause a segfault since
+    "(not)" is not a valid expression and it is assumed to be valid
+    during later evaluation because syntax checking has already been
+    done.
+    
+    Instead, check whether or not the category set is anonymous before
+    expanding it when resolving an expression.
+    
+    2. Category sets cannot be used in a category range
+    
+    A category range can be used to specify a large number of categories.
+    The range "(range c0 c1023)" refers to 1024 categories. Only categories
+    and category aliases can be used in a range. Determining if an
+    identifier is a category, an alias, or a set can only be done after
+    resolving the identifer.
+    
+    Keep track of the current operator as an expression is being resolved
+    and if the expression involves categories and a category set is
+    encountered, then return an error if the expression is a category
+    range.
+    
+    Signed-off-by: James Carter <jwcart2@gmail.com>
+
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 145d4e74..18007324 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -3224,72 +3224,86 @@ exit:
+ int cil_resolve_expr(enum cil_flavor expr_type, struct cil_list *str_expr, struct cil_list **datum_expr, struct cil_tree_node *parent, void *extra_args)
+ {
+ 	int rc = SEPOL_ERR;
+ 	struct cil_list_item *curr;
+ 	struct cil_symtab_datum *res_datum = NULL;
+ 	enum cil_sym_index sym_index =  CIL_SYM_UNKNOWN;
+ 	struct cil_list *datum_sub_expr;
++	enum cil_flavor op = CIL_NONE;
+ 
+ 	switch (str_expr->flavor) {
+ 	case CIL_BOOL:
+ 		sym_index = CIL_SYM_BOOLS;
+ 		break;
+ 	case CIL_TUNABLE:
+ 		sym_index = CIL_SYM_TUNABLES;
+ 		break;
+ 	case CIL_TYPE:
+ 		sym_index = CIL_SYM_TYPES;
+ 		break;
+ 	case CIL_ROLE:
+ 		sym_index = CIL_SYM_ROLES;
+ 		break;
+ 	case CIL_USER:
+ 		sym_index = CIL_SYM_USERS;
+ 		break;
+ 	case CIL_CAT:
+ 		sym_index = CIL_SYM_CATS;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 
+ 	cil_list_init(datum_expr, str_expr->flavor);
+ 
+ 	cil_list_for_each(curr, str_expr) {
+ 		switch (curr->flavor) {
+ 		case CIL_STRING:
+ 			rc = cil_resolve_name(parent, curr->data, sym_index, extra_args, &res_datum);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 			if (sym_index == CIL_SYM_CATS && NODE(res_datum)->flavor == CIL_CATSET) {
+ 				struct cil_catset *catset = (struct cil_catset *)res_datum;
+-				if (!catset->cats->datum_expr) {
+-					rc = cil_resolve_expr(expr_type, catset->cats->str_expr, &catset->cats->datum_expr, parent, extra_args);
+-					if (rc != SEPOL_OK) {
+-						goto exit;
++				if (op == CIL_RANGE) {
++					cil_tree_log(parent, CIL_ERR, "Category set not allowed in category range");
++					rc = SEPOL_ERR;
++					goto exit;
++				}
++				if (!res_datum->name) {
++					/* Anonymous category sets need to be resolved when encountered */
++					if (!catset->cats->datum_expr) {
++						rc = cil_resolve_expr(expr_type, catset->cats->str_expr, &catset->cats->datum_expr, parent, extra_args);
++						if (rc != SEPOL_OK) {
++							goto exit;
++						}
+ 					}
++					cil_copy_list(catset->cats->datum_expr, &datum_sub_expr);
++					cil_list_append(*datum_expr, CIL_LIST, datum_sub_expr);
++				} else {
++					cil_list_append(*datum_expr, CIL_DATUM, res_datum);
+ 				}
+-				cil_copy_list(catset->cats->datum_expr, &datum_sub_expr);
+-				cil_list_append(*datum_expr, CIL_LIST, datum_sub_expr);
+ 			} else {
+ 				if (sym_index == CIL_SYM_TYPES && (expr_type == CIL_CONSTRAIN || expr_type == CIL_VALIDATETRANS)) {
+ 					cil_type_used(res_datum, CIL_ATTR_CONSTRAINT);
+ 				}
+ 				cil_list_append(*datum_expr, CIL_DATUM, res_datum);
+ 			}
+ 			break;
+ 		case CIL_LIST: {
+ 			rc = cil_resolve_expr(expr_type, curr->data, &datum_sub_expr, parent, extra_args);
+ 			if (rc != SEPOL_OK) {
+ 				goto exit;
+ 			}
+ 			cil_list_append(*datum_expr, CIL_LIST, datum_sub_expr);
+ 			break;
+ 		}
+ 		default:
++			if (curr->flavor == CIL_OP) {
++				op = (enum cil_flavor)(uintptr_t)curr->data;
++			}
+ 			cil_list_append(*datum_expr, curr->flavor, curr->data);
+ 			break;
+-		}				
++		}
+ 	}
+ 	return SEPOL_OK;
+ 

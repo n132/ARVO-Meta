@@ -1,0 +1,163 @@
+commit 054f460d6e9e98deba186eee6bd956756dfc89e0
+Author: Julius Pfrommer <julius.pfrommer@web.de>
+Date:   Sat Jun 22 15:30:15 2019 +0200
+
+    View: Handle an edge-case where malloc fails during Browse
+
+diff --git a/src/server/ua_services_view.c b/src/server/ua_services_view.c
+index c7e90f6ed..8aca3c125 100644
+--- a/src/server/ua_services_view.c
++++ b/src/server/ua_services_view.c
+@@ -93,30 +93,31 @@ void RefTree_clear(RefTree *rt) {
+ static UA_StatusCode
+ RefTree_double(RefTree *rt) {
+     size_t capacity = rt->capacity * 2;
++    UA_assert(capacity > 0);
+     size_t space = (sizeof(UA_NodeId) + sizeof(RefEntry)) * capacity;
+-    UA_NodeId *newTargets = (UA_NodeId*)realloc(rt->targets, space);
++    UA_NodeId *newTargets = (UA_NodeId*)UA_realloc(rt->targets, space);
+     if(!newTargets)
+         return UA_STATUSCODE_BADOUTOFMEMORY;
+ 
+     /* Repair the pointers for the realloced array+tree  */
+     uintptr_t arraydiff = (uintptr_t)newTargets - (uintptr_t)rt->targets;
+     RefEntry *reArray = (RefEntry*)
+         ((uintptr_t)newTargets + (capacity * sizeof(UA_NodeId)));
+     uintptr_t entrydiff = (uintptr_t)reArray -
+         ((uintptr_t)rt->targets + (rt->capacity * sizeof(UA_NodeId)));
+     RefEntry *oldReArray = (RefEntry*)
+         ((uintptr_t)newTargets + (rt->capacity * sizeof(UA_NodeId)));
+     memmove(reArray, oldReArray, rt->size * sizeof(RefEntry));
+     for(size_t i = 0; i < rt->size; i++) {
+         if(reArray[i].zipfields.zip_left)
+             *(uintptr_t*)&reArray[i].zipfields.zip_left += entrydiff;
+         if(reArray[i].zipfields.zip_right)
+             *(uintptr_t*)&reArray[i].zipfields.zip_right += entrydiff;
+         *(uintptr_t*)&reArray[i].target += arraydiff;
+     }
+ 
+     rt->head.zip_root = (RefEntry*)((uintptr_t)rt->head.zip_root + entrydiff);
+     rt->capacity = capacity;
+     rt->targets = newTargets;
+     return UA_STATUSCODE_GOOD;
+ }
+@@ -452,114 +453,118 @@ void
+ Operation_Browse(UA_Server *server, UA_Session *session, const struct BrowseOpts *bo,
+                  const UA_BrowseDescription *descr, UA_BrowseResult *result) {
+     /* How many references can we return at most? */
+     UA_UInt32 maxRefs = bo->maxReferences;
+     if(maxRefs == 0) {
+         if(server->config.maxReferencesPerNode != 0) {
+             maxRefs = server->config.maxReferencesPerNode;
+         } else {
+             maxRefs = UA_INT32_MAX;
+         }
+     } else {
+         if(server->config.maxReferencesPerNode != 0 &&
+            maxRefs > server->config.maxReferencesPerNode) {
+             maxRefs = server->config.maxReferencesPerNode;
+         }
+     }
+ 
+     /* Create the results array */
+     RefResult rr;
+     result->statusCode = RefResult_init(&rr, maxRefs);
+     if(result->statusCode != UA_STATUSCODE_GOOD)
+         return;
+ 
+     ContinuationPoint cp;
+-    ContinuationPoint_init(&cp, maxRefs, bo->recursive);
++    result->statusCode = ContinuationPoint_init(&cp, maxRefs, bo->recursive);
++    if(result->statusCode != UA_STATUSCODE_GOOD) {
++        RefResult_clear(&rr);
++        return;
++    }
+     cp.bd = *descr; /* Deep-copy only when the cp is persisted in the session */
+ 
+     /* Add the initial node to the RefTree */
+     result->statusCode = RefTree_add(&cp.rt, &descr->nodeId);
+     if(result->statusCode != UA_STATUSCODE_GOOD) {
+         RefTree_clear(&cp.rt);
+         RefResult_clear(&rr);
+         return;
+     }
+     
+     /* Recurse to get all references */
+     UA_Boolean maxed = false;
+     result->statusCode = browseWithCp(server, session, &cp, &rr, &maxed);
+     if(result->statusCode != UA_STATUSCODE_GOOD) {
+         RefTree_clear(&cp.rt);
+         RefResult_clear(&rr);
+         return;
+     }
+ 
+     /* No results */
+     if(rr.size == 0) {
+         result->references = (UA_ReferenceDescription*)UA_EMPTY_ARRAY_SENTINEL;
+         RefTree_clear(&cp.rt);
+         UA_free(rr.descr);
+         return;
+     }
+ 
+     /* Move results to the output */
+     result->references = rr.descr;
+     result->referencesSize = rr.size;
+ 
+     /* Nothing left for BrowseNext */
+     if(!maxed) {
+         RefTree_clear(&cp.rt);
+         return;
+     }
+ 
+     /* Create a new continuation point. */
+     ContinuationPoint *newCp = (ContinuationPoint*)UA_malloc(sizeof(ContinuationPoint));
+     UA_StatusCode retval = UA_STATUSCODE_GOOD;
+     UA_ByteString tmp;
+     if(!newCp) {
+         retval = UA_STATUSCODE_BADOUTOFMEMORY;
+         goto cleanup;
+     }
+     *newCp = cp;
+ 
+     /* Make a deep copy of the BrowseDescription */
+     retval = UA_BrowseDescription_copy(descr, &newCp->bd);
+     if(retval != UA_STATUSCODE_GOOD)
+         goto cleanup;
+ 
+     /* Return the cp identifier */
+     tmp.length = sizeof(UA_Guid);
+     tmp.data = (UA_Byte*)&newCp->identifier;
+     retval = UA_ByteString_copy(&tmp, &result->continuationPoint);
+     if(retval != UA_STATUSCODE_GOOD)
+         goto cleanup;
+ 
+     /* Remove the oldest continuation point if required */
+     if(session->availableContinuationPoints <= 0) {
+         struct ContinuationPoint **prev = &session->continuationPoints;
+         struct ContinuationPoint *cp2 = session->continuationPoints;
+         while(cp2 && cp2->next) {
+             prev = &cp2->next;
+             cp2 = cp2->next;
+         }
+         if(cp2) {
+             *prev = NULL;
+             ContinuationPoint_clear(cp2);
+             UA_free(cp2);
+             ++session->availableContinuationPoints;
+         }
+     }
+ 
+     /* Attach the cp to the session */
+     newCp->next = session->continuationPoints;
+     session->continuationPoints = newCp;
+     --session->availableContinuationPoints;
+     return;
+ 
+  cleanup:
+     UA_BrowseResult_deleteMembers(result); /* Holds the content that was in rr before */
+     if(newCp) {
+         ContinuationPoint_clear(newCp);
+         UA_free(newCp);
+     }
+     result->statusCode = retval;
+ }

@@ -1,0 +1,1230 @@
+commit 54dd0411dd9670cc9ff0daf54d19ad277524a7b9
+Author: Kimball Thurston <kdt3rd@gmail.com>
+Date:   Mon Jul 24 09:55:27 2023 +1200
+
+    Fix handling for corrupt number of DC components (#1484)
+    
+    When the number of DC components has been incorrectly stored in the dwa
+    subheader, this causes a cascade of errors, resulting in out of bounds
+    access. Instead, track how many we've read and detect when we're out as
+    soon as possible
+    
+    Fixes OSS-Fuzz #59457
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+diff --git a/src/lib/OpenEXRCore/internal_dwa_compressor.h b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+index 497651dc..03ad6066 100644
+--- a/src/lib/OpenEXRCore/internal_dwa_compressor.h
++++ b/src/lib/OpenEXRCore/internal_dwa_compressor.h
+@@ -701,551 +701,555 @@ exr_result_t
+ DwaCompressor_uncompress (
+     DwaCompressor* me,
+     const uint8_t* inPtr,
+     uint64_t       iSize,
+     void*          uncompressed_data,
+     uint64_t       uncompressed_size)
+ {
+     uint64_t     headerSize = NUM_SIZES_SINGLE * sizeof (uint64_t);
+     exr_result_t rv         = EXR_ERR_SUCCESS;
+     uint64_t     counters[NUM_SIZES_SINGLE];
+     uint64_t     version;
+     uint64_t     unknownUncompressedSize;
+     uint64_t     unknownCompressedSize;
+     uint64_t     acCompressedSize;
+     uint64_t     dcCompressedSize;
+     uint64_t     rleCompressedSize;
+     uint64_t     rleUncompressedSize;
+     uint64_t     rleRawSize;
+ 
+     uint64_t totalAcUncompressedCount;
+     uint64_t totalDcUncompressedCount;
+ 
+     uint64_t acCompression;
+ 
+     size_t         outBufferSize;
+     uint64_t       compressedSize;
+     const uint8_t* dataPtr;
+     uint64_t       dataLeft;
+     uint8_t*       outBufferEnd;
+     uint8_t*       packedAcBufferEnd;
+     uint8_t*       packedDcBufferEnd;
+     const uint8_t* dataPtrEnd;
+     const uint8_t* compressedUnknownBuf;
+     const uint8_t* compressedAcBuf;
+     const uint8_t* compressedDcBuf;
+     const uint8_t* compressedRleBuf;
+ 
+     if (iSize < headerSize) return EXR_ERR_CORRUPT_CHUNK;
+ 
+     //
+     // Flip the counters from XDR to NATIVE
+     //
+ 
+     memset (uncompressed_data, 0, uncompressed_size);
+ 
+     memcpy (counters, inPtr, headerSize);
+     priv_to_native64 (counters, NUM_SIZES_SINGLE);
+ 
+     //
+     // Unwind all the counter info
+     //
+     version                 = counters[VERSION];
+     unknownUncompressedSize = counters[UNKNOWN_UNCOMPRESSED_SIZE];
+     unknownCompressedSize   = counters[UNKNOWN_COMPRESSED_SIZE];
+     acCompressedSize        = counters[AC_COMPRESSED_SIZE];
+     dcCompressedSize        = counters[DC_COMPRESSED_SIZE];
+     rleCompressedSize       = counters[RLE_COMPRESSED_SIZE];
+     rleUncompressedSize     = counters[RLE_UNCOMPRESSED_SIZE];
+     rleRawSize              = counters[RLE_RAW_SIZE];
+ 
+     totalAcUncompressedCount = counters[AC_UNCOMPRESSED_COUNT];
+     totalDcUncompressedCount = counters[DC_UNCOMPRESSED_COUNT];
+ 
+     acCompression = counters[AC_COMPRESSION];
+ 
+     compressedSize = unknownCompressedSize + acCompressedSize +
+                      dcCompressedSize + rleCompressedSize;
+ 
+     dataPtrEnd = inPtr + iSize;
+     dataPtr  = inPtr + headerSize;
+     dataLeft = iSize - headerSize;
+ 
+     /* Both the sum and individual sizes are checked in case of overflow. */
+     if (iSize < (headerSize + compressedSize) ||
+         iSize < unknownCompressedSize || iSize < acCompressedSize ||
+         iSize < dcCompressedSize || iSize < rleCompressedSize)
+     {
+         return EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     if ((int64_t) unknownUncompressedSize < 0 ||
+         (int64_t) unknownCompressedSize < 0 || (int64_t) acCompressedSize < 0 ||
+         (int64_t) dcCompressedSize < 0 || (int64_t) rleCompressedSize < 0 ||
+         (int64_t) rleUncompressedSize < 0 || (int64_t) rleRawSize < 0 ||
+         (int64_t) totalAcUncompressedCount < 0 ||
+         (int64_t) totalDcUncompressedCount < 0)
+     {
+         return EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     if (version < 2)
+     {
+         me->_channelRules = sLegacyChannelRules;
+         me->_channelRuleCount =
+             sizeof (sLegacyChannelRules) / sizeof (Classifier);
+     }
+     else
+     {
+         uint64_t ruleSize;
+         rv =
+             DwaCompressor_readChannelRules (me, &dataPtr, &dataLeft, &ruleSize);
+ 
+         headerSize += ruleSize;
+     }
+ 
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     outBufferSize = 0;
+     rv            = DwaCompressor_initializeBuffers (me, &outBufferSize);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     //
+     // Allocate _outBuffer, if we haven't done so already
+     //
+ 
+     // the C++ classes used to have one buffer size for compress / uncompress
+     // but here we want to do zero-ish copy...
+     outBufferEnd  = me->_decode->unpacked_buffer;
+     outBufferSize = me->_decode->unpacked_alloc_size;
+ 
+     //
+     // Find the start of the RLE packed AC components and
+     // the DC components for each channel. This will be handy
+     // if you want to decode the channels in parallel later on.
+     //
+ 
+     packedAcBufferEnd = NULL;
+ 
+     if (me->_packedAcBuffer) packedAcBufferEnd = me->_packedAcBuffer;
+ 
+     packedDcBufferEnd = NULL;
+ 
+     if (me->_packedDcBuffer) packedDcBufferEnd = me->_packedDcBuffer;
+ 
+     //
+     // UNKNOWN data is packed first, followed by the
+     // Huffman-compressed AC, then the DC values,
+     // and then the zlib compressed RLE data.
+     //
+ 
+     compressedUnknownBuf = dataPtr;
+ 
+     compressedAcBuf =
+         compressedUnknownBuf + (ptrdiff_t) (unknownCompressedSize);
+     compressedDcBuf  = compressedAcBuf + (ptrdiff_t) (acCompressedSize);
+     compressedRleBuf = compressedDcBuf + (ptrdiff_t) (dcCompressedSize);
+ 
+     if (compressedUnknownBuf > dataPtrEnd ||
+         dataPtr > compressedAcBuf ||
+         compressedAcBuf > dataPtrEnd ||
+         dataPtr > compressedDcBuf ||
+         compressedDcBuf > dataPtrEnd ||
+         dataPtr > compressedRleBuf ||
+         compressedRleBuf > dataPtrEnd ||
+         (compressedRleBuf + rleCompressedSize) > dataPtrEnd)
+     {
+         return EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     //
+     // Sanity check that the version is something we expect. Right now,
+     // we can decode version 0, 1, and 2. v1 adds 'end of block' symbols
+     // to the AC RLE. v2 adds channel classification rules at the
+     // start of the data block.
+     //
+ 
+     if (version > 2) { return EXR_ERR_BAD_CHUNK_LEADER; }
+ 
+     rv = DwaCompressor_setupChannelData (me);
+ 
+     //
+     // Uncompress the UNKNOWN data into _planarUncBuffer[UNKNOWN]
+     //
+ 
+     if (unknownCompressedSize > 0)
+     {
+         if (unknownUncompressedSize > me->_planarUncBufferSize[UNKNOWN])
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (EXR_ERR_SUCCESS != exr_uncompress_buffer (
+                                    me->_decode->context,
+                                    compressedUnknownBuf,
+                                    unknownCompressedSize,
+                                    me->_planarUncBuffer[UNKNOWN],
+                                    unknownUncompressedSize,
+                                    NULL))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+     }
+ 
+     //
+     // Uncompress the AC data into _packedAcBuffer
+     //
+ 
+     if (acCompressedSize > 0)
+     {
+         if (!me->_packedAcBuffer ||
+             totalAcUncompressedCount * sizeof (uint16_t) >
+                 me->_packedAcBufferSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         //
+         // Don't trust the user to get it right, look in the file.
+         //
+ 
+         switch (acCompression)
+         {
+             case STATIC_HUFFMAN:
+                 rv = internal_huf_decompress (
+                     me->_decode,
+                     compressedAcBuf,
+                     acCompressedSize,
+                     (uint16_t*) me->_packedAcBuffer,
+                     totalAcUncompressedCount,
+                     me->_decode->scratch_buffer_1,
+                     me->_decode->scratch_alloc_size_1);
+                 if (rv != EXR_ERR_SUCCESS) { return rv; }
+                 break;
+ 
+             case DEFLATE: {
+                 size_t destLen;
+ 
+                 rv = exr_uncompress_buffer (
+                     me->_decode->context,
+                     compressedAcBuf,
+                     acCompressedSize,
+                     me->_packedAcBuffer,
+                     totalAcUncompressedCount * sizeof (uint16_t),
+                     &destLen);
+                 if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+                 if (totalAcUncompressedCount * sizeof (uint16_t) != destLen)
+                 {
+                     return EXR_ERR_CORRUPT_CHUNK;
+                 }
+             }
+             break;
+ 
+             default: return EXR_ERR_CORRUPT_CHUNK; break;
+         }
+     }
+ 
+     //
+     // Uncompress the DC data into _packedDcBuffer
+     //
+ 
+     if (dcCompressedSize > 0)
+     {
+         size_t destLen;
+         size_t uncompBytes = totalDcUncompressedCount * sizeof (uint16_t);
+         if (uncompBytes > me->_packedDcBufferSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         rv = internal_decode_alloc_buffer (
+             me->_decode,
+             EXR_TRANSCODE_BUFFER_SCRATCH1,
+             &(me->_decode->scratch_buffer_1),
+             &(me->_decode->scratch_alloc_size_1),
+             uncompBytes);
+ 
+         if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+         rv = exr_uncompress_buffer (
+             me->_decode->context,
+             compressedDcBuf,
+             dcCompressedSize,
+             me->_decode->scratch_buffer_1,
+             uncompBytes,
+             &destLen);
+         if (rv != EXR_ERR_SUCCESS || (uncompBytes != destLen))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         internal_zip_reconstruct_bytes (
+             me->_packedDcBuffer, me->_decode->scratch_buffer_1, uncompBytes);
+     }
+     else
+     {
+         // if the compressed size is 0, then the uncompressed size must also be zero
+         if (totalDcUncompressedCount != 0) { return EXR_ERR_CORRUPT_CHUNK; }
+     }
+ 
+     //
+     // Uncompress the RLE data into _rleBuffer, then unRLE the results
+     // into _planarUncBuffer[RLE]
+     //
+ 
+     if (rleRawSize > 0)
+     {
+         size_t dstLen;
+ 
+         if (rleUncompressedSize > me->_rleBufferSize ||
+             rleRawSize > me->_planarUncBufferSize[RLE])
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (EXR_ERR_SUCCESS != exr_uncompress_buffer (
+                                    me->_decode->context,
+                                    compressedRleBuf,
+                                    rleCompressedSize,
+                                    me->_rleBuffer,
+                                    rleUncompressedSize,
+                                    &dstLen))
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         if (dstLen != rleUncompressedSize) { return EXR_ERR_CORRUPT_CHUNK; }
+ 
+         if (internal_rle_decompress (
+                 me->_planarUncBuffer[RLE],
+                 rleRawSize,
+                 (const uint8_t*) me->_rleBuffer,
+                 rleUncompressedSize) != rleRawSize)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+     }
+ 
+     //
+     // Determine the start of each row in the output buffer
+     //
+     for (int c = 0; c < me->_numChannels; ++c)
+     {
+         me->_channelData[c].processed = 0;
+     }
+ 
+     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+     {
+         for (int c = 0; c < me->_numChannels; ++c)
+         {
+             ChannelData*               cd   = &(me->_channelData[c]);
+             exr_coding_channel_info_t* chan = cd->chan;
+ 
+             if ((y % chan->y_samples) != 0) continue;
+ 
+             rv = DctCoderChannelData_push_row (
+                 me->alloc_fn, me->free_fn, &(cd->_dctData), outBufferEnd);
+             if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+             outBufferEnd += chan->width * chan->bytes_per_element;
+         }
+     }
+ 
+     //
+     // Setup to decode each block of 3 channels that need to
+     // be handled together
+     //
+ 
+     for (int csc = 0; csc < me->_numCscChannelSets; ++csc)
+     {
+         LossyDctDecoder decoder;
+         CscChannelSet*  cset = &(me->_cscChannelSets[csc]);
+ 
+         int rChan = cset->idx[0];
+         int gChan = cset->idx[1];
+         int bChan = cset->idx[2];
+ 
+         if (me->_channelData[rChan].compression != LOSSY_DCT ||
+             me->_channelData[gChan].compression != LOSSY_DCT ||
+             me->_channelData[bChan].compression != LOSSY_DCT)
+         {
+             return EXR_ERR_CORRUPT_CHUNK;
+         }
+ 
+         rv = LossyDctDecoderCsc_construct (
+             &decoder,
+             &(me->_channelData[rChan]._dctData),
+             &(me->_channelData[gChan]._dctData),
+             &(me->_channelData[bChan]._dctData),
+             packedAcBufferEnd,
+             packedAcBufferEnd + totalAcUncompressedCount * sizeof (uint16_t),
+             packedDcBufferEnd,
++            totalDcUncompressedCount,
+             dwaCompressorToLinear,
+             me->_channelData[rChan].chan->width,
+             me->_channelData[rChan].chan->height);
+ 
+         if (rv == EXR_ERR_SUCCESS)
+             rv = LossyDctDecoder_execute (me->alloc_fn, me->free_fn, &decoder);
+ 
+         packedAcBufferEnd += decoder._packedAcCount * sizeof (uint16_t);
+ 
+         packedDcBufferEnd += decoder._packedDcCount * sizeof (uint16_t);
++        totalDcUncompressedCount -= decoder._packedDcCount;
+ 
+         me->_channelData[rChan].processed = 1;
+         me->_channelData[gChan].processed = 1;
+         me->_channelData[bChan].processed = 1;
+ 
+         if (rv != EXR_ERR_SUCCESS) { return rv; }
+     }
+ 
+     //
+     // Setup to handle the remaining channels by themselves
+     //
+ 
+     for (int c = 0; c < me->_numChannels; ++c)
+     {
+         ChannelData*               cd        = &(me->_channelData[c]);
+         exr_coding_channel_info_t* chan      = cd->chan;
+         DctCoderChannelData*       dcddata   = &(cd->_dctData);
+         int                        pixelSize = chan->bytes_per_element;
+ 
+         if (cd->processed) continue;
+ 
+         switch (cd->compression)
+         {
+             case LOSSY_DCT:
+ 
+                 //
+                 // Setup a single-channel lossy DCT decoder pointing
+                 // at the output buffer
+                 //
+ 
+                 {
+                     const uint16_t* linearLut = NULL;
+                     LossyDctDecoder decoder;
+ 
+                     if (!chan->p_linear) linearLut = dwaCompressorToLinear;
+ 
+                     rv = LossyDctDecoder_construct (
+                         &decoder,
+                         dcddata,
+                         packedAcBufferEnd,
+                         packedAcBufferEnd +
+                             totalAcUncompressedCount * sizeof (uint16_t),
+                         packedDcBufferEnd,
++                        totalDcUncompressedCount,
+                         linearLut,
+                         chan->width,
+                         chan->height);
+ 
+                     if (rv == EXR_ERR_SUCCESS)
+                         rv = LossyDctDecoder_execute (
+                             me->alloc_fn, me->free_fn, &decoder);
+ 
+                     packedAcBufferEnd +=
+                         (size_t) decoder._packedAcCount * sizeof (uint16_t);
+ 
+                     packedDcBufferEnd +=
+                         (size_t) decoder._packedDcCount * sizeof (uint16_t);
+ 
++                    totalDcUncompressedCount -= decoder._packedDcCount;
+                     if (rv != EXR_ERR_SUCCESS) { return rv; }
+                 }
+ 
+                 break;
+ 
+             case RLE:
+ 
+                 //
+                 // For the RLE case, the data has been un-RLE'd into
+                 // planarUncRleEnd[], but is still split out by bytes.
+                 // We need to rearrange the bytes back into the correct
+                 // order in the output buffer;
+                 //
+ 
+                 {
+                     int row = 0;
+ 
+                     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+                     {
+                         uint8_t* dst;
+                         if ((y % chan->y_samples) != 0) continue;
+ 
+                         dst = dcddata->_rows[row];
+ 
+                         if (pixelSize == 2)
+                         {
+                             interleaveByte2 (
+                                 dst,
+                                 cd->planarUncRleEnd[0],
+                                 cd->planarUncRleEnd[1],
+                                 chan->width);
+ 
+                             cd->planarUncRleEnd[0] += chan->width;
+                             cd->planarUncRleEnd[1] += chan->width;
+                         }
+                         else
+                         {
+                             for (int x = 0; x < chan->width; ++x)
+                             {
+                                 for (int byte = 0; byte < pixelSize; ++byte)
+                                 {
+                                     *dst++ = *cd->planarUncRleEnd[byte]++;
+                                 }
+                             }
+                         }
+ 
+                         row++;
+                     }
+                 }
+ 
+                 break;
+ 
+             case UNKNOWN:
+ 
+                 //
+                 // In the UNKNOWN case, data is already in planarUncBufferEnd
+                 // and just needs to copied over to the output buffer
+                 //
+ 
+                 {
+                     int    row = 0;
+                     size_t dstScanlineSize =
+                         (size_t) chan->width * (size_t) pixelSize;
+ 
+                     for (int y = me->_min[1]; y <= me->_max[1]; ++y)
+                     {
+                         if ((y % chan->y_samples) != 0) continue;
+ 
+                         //
+                         // sanity check for buffer data lying within range
+                         //
+                         if ((cd->planarUncBufferEnd +
+                              (size_t) (dstScanlineSize)) >
+                             (me->_planarUncBuffer[UNKNOWN] +
+                              me->_planarUncBufferSize[UNKNOWN]))
+                         {
+                             return EXR_ERR_CORRUPT_CHUNK;
+                         }
+ 
+                         memcpy (
+                             dcddata->_rows[row],
+                             cd->planarUncBufferEnd,
+                             dstScanlineSize);
+ 
+                         cd->planarUncBufferEnd += dstScanlineSize;
+                         row++;
+                     }
+                 }
+ 
+                 break;
+ 
+             case NUM_COMPRESSOR_SCHEMES:
+             default: return EXR_ERR_CORRUPT_CHUNK; break;
+         }
+ 
+         cd->processed = 1;
+     }
+ 
+     return rv;
+ }
+ 
+ /**************************************/
+diff --git a/src/lib/OpenEXRCore/internal_dwa_decoder.h b/src/lib/OpenEXRCore/internal_dwa_decoder.h
+index 1656a64e..bcdebd98 100644
+--- a/src/lib/OpenEXRCore/internal_dwa_decoder.h
++++ b/src/lib/OpenEXRCore/internal_dwa_decoder.h
+@@ -14,40 +14,42 @@
+ typedef struct _LossyDctDecoder
+ {
+     //
+     // if NATIVE and XDR are really the same values, we can
+     // skip some processing and speed things along
+     //
+ 
+     //
+     // Counts of how many items have been packed into the
+     // AC and DC buffers
+     //
+ 
+     uint64_t _packedAcCount;
+     uint64_t _packedDcCount;
+ 
+     //
+     // AC and DC buffers to pack
+     //
+ 
+     uint8_t* _packedAc;
+     uint8_t* _packedAcEnd;
+     uint8_t* _packedDc;
+ 
++    uint64_t _remDcCount;
++
+     //
+     // half -> half LUT to transform from nonlinear to linear
+     //
+ 
+     const uint16_t* _toLinear;
+ 
+     //
+     // image dimensions
+     //
+ 
+     int _width;
+     int _height;
+ 
+     DctCoderChannelData* _channel_decode_data[3];
+     int                  _channel_decode_data_count;
+     uint8_t              _pad[4];
+ } LossyDctDecoder;
+@@ -55,8 +57,9 @@ typedef struct _LossyDctDecoder
+ static exr_result_t LossyDctDecoder_base_construct (
+     LossyDctDecoder* d,
+     uint8_t*         packedAc,
+     uint8_t*         packedAcEnd,
+     uint8_t*         packedDc,
++    uint64_t         remDcCount,
+     const uint16_t*  toLinear,
+     int              width,
+     int              height);
+@@ -64,9 +67,10 @@ static exr_result_t LossyDctDecoder_base_construct (
+ static exr_result_t LossyDctDecoder_construct (
+     LossyDctDecoder*     d,
+     DctCoderChannelData* rowPtrs,
+     uint8_t*             packedAc,
+     uint8_t*             packedAcEnd,
+     uint8_t*             packedDc,
++    uint64_t             remDcCount,
+     const uint16_t*      toLinear,
+     int                  width,
+     int                  height);
+@@ -74,11 +78,12 @@ static exr_result_t LossyDctDecoder_construct (
+ static exr_result_t LossyDctDecoderCsc_construct (
+     LossyDctDecoder*     d,
+     DctCoderChannelData* rowPtrsR,
+     DctCoderChannelData* rowPtrsG,
+     DctCoderChannelData* rowPtrsB,
+     uint8_t*             packedAc,
+     uint8_t*             packedAcEnd,
+     uint8_t*             packedDc,
++    uint64_t             remDcCount,
+     const uint16_t*      toLinear,
+     int                  width,
+     int                  height);
+@@ -112,37 +117,38 @@ exr_result_t
+ LossyDctDecoder_construct (
+     LossyDctDecoder*     d,
+     DctCoderChannelData* rowPtrs,
+     uint8_t*             packedAc,
+     uint8_t*             packedAcEnd,
+     uint8_t*             packedDc,
++    uint64_t             remDcCount,
+     const uint16_t*      toLinear,
+     int                  width,
+     int                  height)
+ {
+     exr_result_t rv;
+     //
+     // toLinear is a half-float LUT to convert the encoded values
+     // back to linear light. If you want to skip this step, pass
+     // in NULL here.
+     //
+ 
+     rv = LossyDctDecoder_base_construct (
+-        d, packedAc, packedAcEnd, packedDc, toLinear, width, height);
++        d, packedAc, packedAcEnd, packedDc, remDcCount, toLinear, width, height);
+ 
+     d->_channel_decode_data[0]    = rowPtrs;
+     d->_channel_decode_data_count = 1;
+ 
+     return rv;
+ }
+ 
+ /**************************************/
+ 
+ //
+ // Used to decode 3 channels of LOSSY_DCT data that
+ // are grouped together and color space converted.
+ //
+ //
+ // toLinear is a half-float LUT to convert the encoded values
+ // back to linear light. If you want to skip this step, pass
+ // in NULL here.
+ //
+@@ -150,26 +156,27 @@ exr_result_t
+ LossyDctDecoderCsc_construct (
+     LossyDctDecoder*     d,
+     DctCoderChannelData* rowPtrsR,
+     DctCoderChannelData* rowPtrsG,
+     DctCoderChannelData* rowPtrsB,
+     uint8_t*             packedAc,
+     uint8_t*             packedAcEnd,
+     uint8_t*             packedDc,
++    uint64_t             remDcCount,
+     const uint16_t*      toLinear,
+     int                  width,
+     int                  height)
+ {
+     exr_result_t rv;
+     rv = LossyDctDecoder_base_construct (
+-        d, packedAc, packedAcEnd, packedDc, toLinear, width, height);
++        d, packedAc, packedAcEnd, packedDc, remDcCount, toLinear, width, height);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     d->_channel_decode_data[0]    = rowPtrsR;
+     d->_channel_decode_data[1]    = rowPtrsG;
+     d->_channel_decode_data[2]    = rowPtrsB;
+     d->_channel_decode_data_count = 3;
+ 
+     return rv;
+ }
+ 
+ /**************************************/
+@@ -178,30 +185,32 @@ exr_result_t
+ LossyDctDecoder_base_construct (
+     LossyDctDecoder* d,
+     uint8_t*         packedAc,
+     uint8_t*         packedAcEnd,
+     uint8_t*         packedDc,
++    uint64_t         remDcCount,
+     const uint16_t*  toLinear,
+     int              width,
+     int              height)
+ {
+     d->_packedAcCount = 0;
+     d->_packedDcCount = 0;
+     d->_packedAc      = packedAc;
+     d->_packedAcEnd   = packedAcEnd;
+     d->_packedDc      = packedDc;
++    d->_remDcCount    = remDcCount;
+     d->_toLinear      = toLinear;
+     d->_width         = width;
+     d->_height        = height;
+     if (d->_toLinear == NULL) d->_toLinear = dwaCompressorNoOp;
+ 
+     //d->_isNativeXdr = GLOBAL_SYSTEM_LITTLE_ENDIAN;
+ 
+     d->_channel_decode_data[0]    = NULL;
+     d->_channel_decode_data[1]    = NULL;
+     d->_channel_decode_data[2]    = NULL;
+     d->_channel_decode_data_count = 0;
+ 
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+@@ -210,463 +219,468 @@ exr_result_t
+ LossyDctDecoder_execute (
+     void* (*alloc_fn) (size_t), void (*free_fn) (void*), LossyDctDecoder* d)
+ {
+     exr_result_t         rv;
+     int                  numComp = d->_channel_decode_data_count;
+     DctCoderChannelData* chanData[3];
+     int                  lastNonZero = 0;
+-    int                  numBlocksX  = (int) (ceilf ((float) d->_width / 8.0f));
+-    int                  numBlocksY = (int) (ceilf ((float) d->_height / 8.0f));
++    int                  numBlocksX  = (d->_width + 7) / 8;
++    int                  numBlocksY = (d->_height + 7) / 8;
+     int                  leftoverX  = d->_width - (numBlocksX - 1) * 8;
+     int                  leftoverY  = d->_height - (numBlocksY - 1) * 8;
+ 
+-    int numFullBlocksX = (int) (floorf ((float) d->_width / 8.0f));
++    int numFullBlocksX = d->_width / 8;
+ 
+     uint16_t* currAcComp = (uint16_t*) (d->_packedAc);
+     uint16_t* acCompEnd  = (uint16_t*) (d->_packedAcEnd);
+     uint16_t* currDcComp[3];
+     uint8_t*  rowBlockHandle;
+     uint16_t* rowBlock[3];
+ 
++    if (d->_remDcCount < ((uint64_t)numComp * (uint64_t)numBlocksX * (uint64_t)numBlocksY))
++    {
++        return EXR_ERR_CORRUPT_CHUNK;
++    }
++
+     for (int chan = 0; chan < numComp; ++chan)
+     {
+         chanData[chan] = d->_channel_decode_data[chan];
+     }
+ 
+     //
+     // Allocate a temp aligned buffer to hold a rows worth of full
+     // 8x8 half-float blocks
+     //
+ 
+     rowBlockHandle = alloc_fn (
+         (size_t) numComp * (size_t) numBlocksX * 64 * sizeof (uint16_t) +
+         _SSE_ALIGNMENT);
+     if (!rowBlockHandle) return EXR_ERR_OUT_OF_MEMORY;
+ 
+     rowBlock[0] = (uint16_t*) rowBlockHandle;
+ 
+     for (int i = 0; i < _SSE_ALIGNMENT; ++i)
+     {
+         if (((uintptr_t) (rowBlockHandle + i) & _SSE_ALIGNMENT_MASK) == 0)
+             rowBlock[0] = (uint16_t*) (rowBlockHandle + i);
+     }
+ 
+     for (int comp = 1; comp < numComp; ++comp)
+         rowBlock[comp] = rowBlock[comp - 1] + numBlocksX * 64;
+ 
+     //
+     // Pack DC components together by common plane, so we can get
+     // a little more out of differencing them. We'll always have
+     // one component per block, so we can computed offsets.
+     //
+ 
+     currDcComp[0] = (uint16_t*) d->_packedDc;
+     for (int comp = 1; comp < numComp; ++comp)
+         currDcComp[comp] = currDcComp[comp - 1] + numBlocksX * numBlocksY;
+ 
+     for (int blocky = 0; blocky < numBlocksY; ++blocky)
+     {
+         int maxY = 8, maxX = 8;
+         if (blocky == numBlocksY - 1) maxY = leftoverY;
+ 
+         for (int blockx = 0; blockx < numBlocksX; ++blockx)
+         {
+             uint8_t blockIsConstant = DWA_CLASSIFIER_TRUE;
+ 
+             if (blockx == numBlocksX - 1) maxX = leftoverX;
+ 
+             //
+             // If we can detect that the block is constant values
+             // (all components only have DC values, and all AC is 0),
+             // we can do everything only on 1 value, instead of all
+             // 64.
+             //
+             // This won't really help for regular images, but it is
+             // meant more for layers with large swaths of black
+             //
+             for (int comp = 0; comp < numComp; ++comp)
+             {
+                 uint16_t* halfZigData = chanData[comp]->_halfZigData;
+                 float*    dctData     = chanData[comp]->_dctData;
+                 //
+                 // DC component is stored separately
+                 //
+ 
+ #ifdef IMF_HAVE_SSE2
+                 {
+                     __m128i* dst = (__m128i*) halfZigData;
+ 
+                     dst[7] = _mm_setzero_si128 ();
+                     dst[6] = _mm_setzero_si128 ();
+                     dst[5] = _mm_setzero_si128 ();
+                     dst[4] = _mm_setzero_si128 ();
+                     dst[3] = _mm_setzero_si128 ();
+                     dst[2] = _mm_setzero_si128 ();
+                     dst[1] = _mm_setzero_si128 ();
+                     dst[0] = _mm_insert_epi16 (
+                         _mm_setzero_si128 (), *currDcComp[comp]++, 0);
+                 }
+ #else /* IMF_HAVE_SSE2 */
+ 
+                 memset (halfZigData, 0, 64 * 2);
+                 halfZigData[0] = *currDcComp[comp]++;
+ 
+ #endif /* IMF_HAVE_SSE2 */
+ 
+                 d->_packedDcCount++;
+ 
+                 //
+                 // UnRLE the AC. This will modify currAcComp
+                 //
+ 
+                 rv = LossyDctDecoder_unRleAc (
+                     d, &lastNonZero, &currAcComp, acCompEnd, halfZigData);
+                 if (rv != EXR_ERR_SUCCESS)
+                 {
+                     free_fn (rowBlockHandle);
+                     return rv;
+                 }
+ 
+                 //
+                 // Convert from XDR to NATIVE
+                 //
+ 
+                 priv_to_native16 (halfZigData, 64);
+ 
+                 if (lastNonZero == 0)
+                 {
+                     //
+                     // DC only case - AC components are all 0
+                     //
+                     dctData[0] = half_to_float (halfZigData[0]);
+ 
+                     dctInverse8x8DcOnly (dctData);
+                 }
+                 else
+                 {
+                     //
+                     // We have some AC components that are non-zero.
+                     // Can't use the 'constant block' optimization
+                     //
+ 
+                     blockIsConstant = DWA_CLASSIFIER_FALSE;
+ 
+                     //
+                     // Un-Zig zag
+                     //
+ 
+                     (*fromHalfZigZag) (halfZigData, dctData);
+ 
+                     //
+                     // Zig-Zag indices in normal layout are as follows:
+                     //
+                     // 0   1   5   6   14  15  27  28
+                     // 2   4   7   13  16  26  29  42
+                     // 3   8   12  17  25  30  41  43
+                     // 9   11  18  24  31  40  44  53
+                     // 10  19  23  32  39  45  52  54
+                     // 20  22  33  38  46  51  55  60
+                     // 21  34  37  47  50  56  59  61
+                     // 35  36  48  49  57  58  62  63
+                     //
+                     // If lastNonZero is less than the first item on
+                     // each row, we know that the whole row is zero and
+                     // can be skipped in the row-oriented part of the
+                     // iDCT.
+                     //
+                     // The unrolled logic here is:
+                     //
+                     //    if lastNonZero < rowStartIdx[i],
+                     //    zeroedRows = rowsEmpty[i]
+                     //
+                     // where:
+                     //
+                     //    const int rowStartIdx[] = {2, 3, 9, 10, 20, 21, 35};
+                     //    const int rowsEmpty[]   = {7, 6, 5,  4,  3,  2,  1};
+                     //
+ 
+                     if (lastNonZero < 2)
+                         dctInverse8x8_7 (dctData);
+                     else if (lastNonZero < 3)
+                         dctInverse8x8_6 (dctData);
+                     else if (lastNonZero < 9)
+                         dctInverse8x8_5 (dctData);
+                     else if (lastNonZero < 10)
+                         dctInverse8x8_4 (dctData);
+                     else if (lastNonZero < 20)
+                         dctInverse8x8_3 (dctData);
+                     else if (lastNonZero < 21)
+                         dctInverse8x8_2 (dctData);
+                     else if (lastNonZero < 35)
+                         dctInverse8x8_1 (dctData);
+                     else
+                         dctInverse8x8_0 (dctData);
+                 }
+             }
+ 
+             //
+             // Perform the CSC
+             //
+ 
+             if (numComp == 3)
+             {
+                 if (!blockIsConstant)
+                 {
+                     csc709Inverse64 (
+                         chanData[0]->_dctData,
+                         chanData[1]->_dctData,
+                         chanData[2]->_dctData);
+                 }
+                 else
+                 {
+                     csc709Inverse (
+                         chanData[0]->_dctData,
+                         chanData[1]->_dctData,
+                         chanData[2]->_dctData);
+                 }
+             }
+ 
+             //
+             // Float -> Half conversion.
+             //
+             // If the block has a constant value, just convert the first pixel.
+             //
+ 
+             for (int comp = 0; comp < numComp; ++comp)
+             {
+                 if (!blockIsConstant)
+                 {
+                     (*convertFloatToHalf64) (
+                         &rowBlock[comp][blockx * 64], chanData[comp]->_dctData);
+                 }
+                 else
+                 {
+ #ifdef IMF_HAVE_SSE2
+ 
+                     __m128i* dst = (__m128i*) &rowBlock[comp][blockx * 64];
+ 
+                     dst[0] = _mm_set1_epi16 (
+                         (short) float_to_half (chanData[comp]->_dctData[0]));
+ 
+                     dst[1] = dst[0];
+                     dst[2] = dst[0];
+                     dst[3] = dst[0];
+                     dst[4] = dst[0];
+                     dst[5] = dst[0];
+                     dst[6] = dst[0];
+                     dst[7] = dst[0];
+ 
+ #else /* IMF_HAVE_SSE2 */
+ 
+                     uint16_t* dst = &rowBlock[comp][blockx * 64];
+ 
+                     dst[0] = float_to_half (chanData[comp]->_dctData[0]);
+ 
+                     for (int i = 1; i < 64; ++i)
+                     {
+                         dst[i] = dst[0];
+                     }
+ 
+ #endif            /* IMF_HAVE_SSE2 */
+                 } // blockIsConstant
+             }     // comp
+         }         // blockx
+ 
+         //
+         // At this point, we have half-float nonlinear value blocked
+         // in rowBlock[][]. We need to unblock the data, transfer
+         // back to linear, and write the results in the _rowPtrs[].
+         //
+         // There is a fast-path for aligned rows, which helps
+         // things a little. Since this fast path is only valid
+         // for full 8-element wide blocks, the partial x blocks
+         // are broken into a separate loop below.
+         //
+         // At the moment, the fast path requires:
+         //   * sse support
+         //   * aligned row pointers
+         //   * full 8-element wide blocks
+         //
+ 
+         for (int comp = 0; comp < numComp; ++comp)
+         {
+             //
+             // Test if we can use the fast path
+             //
+ 
+ #ifdef IMF_HAVE_SSE2
+ 
+             uint8_t fastPath = DWA_CLASSIFIER_TRUE;
+ 
+             for (int y = 8 * blocky; y < 8 * blocky + maxY; ++y)
+             {
+                 if ((uintptr_t) (chanData[comp]->_rows[y]) &
+                     _SSE_ALIGNMENT_MASK)
+                     fastPath = DWA_CLASSIFIER_FALSE;
+             }
+ 
+             if (fastPath)
+             {
+                 //
+                 // Handle all the full X blocks, in a fast path with sse2 and
+                 // aligned row pointers
+                 //
+ 
+                 for (int y = 8 * blocky; y < 8 * blocky + maxY; ++y)
+                 {
+                     __m128i* dst = (__m128i*) chanData[comp]->_rows[y];
+                     __m128i* src = (__m128i*) &rowBlock[comp][(y & 0x7) * 8];
+ 
+                     for (int blockx = 0; blockx < numFullBlocksX; ++blockx)
+                     {
+                         uint16_t i0, i1, i2, i3, i4, i5, i6, i7;
+                         //
+                         // These may need some twiddling.
+                         // Run with multiples of 8
+                         //
+ 
+                         _mm_prefetch ((char*) (src + 16), _MM_HINT_NTA);
+ 
+                         i0 = (uint16_t) _mm_extract_epi16 (*src, 0);
+                         i1 = (uint16_t) _mm_extract_epi16 (*src, 1);
+                         i2 = (uint16_t) _mm_extract_epi16 (*src, 2);
+                         i3 = (uint16_t) _mm_extract_epi16 (*src, 3);
+ 
+                         i4 = (uint16_t) _mm_extract_epi16 (*src, 4);
+                         i5 = (uint16_t) _mm_extract_epi16 (*src, 5);
+                         i6 = (uint16_t) _mm_extract_epi16 (*src, 6);
+                         i7 = (uint16_t) _mm_extract_epi16 (*src, 7);
+ 
+                         i0 = d->_toLinear[i0];
+                         i1 = d->_toLinear[i1];
+                         i2 = d->_toLinear[i2];
+                         i3 = d->_toLinear[i3];
+ 
+                         i4 = d->_toLinear[i4];
+                         i5 = d->_toLinear[i5];
+                         i6 = d->_toLinear[i6];
+                         i7 = d->_toLinear[i7];
+ 
+                         *dst = _mm_insert_epi16 (_mm_setzero_si128 (), i0, 0);
+                         *dst = _mm_insert_epi16 (*dst, i1, 1);
+                         *dst = _mm_insert_epi16 (*dst, i2, 2);
+                         *dst = _mm_insert_epi16 (*dst, i3, 3);
+ 
+                         *dst = _mm_insert_epi16 (*dst, i4, 4);
+                         *dst = _mm_insert_epi16 (*dst, i5, 5);
+                         *dst = _mm_insert_epi16 (*dst, i6, 6);
+                         *dst = _mm_insert_epi16 (*dst, i7, 7);
+ 
+                         src += 8;
+                         dst++;
+                     }
+                 }
+             }
+             else
+             {
+ 
+ #endif /* IMF_HAVE_SSE2 */
+ 
+                 //
+                 // Basic scalar kinda slow path for handling the full X blocks
+                 //
+ 
+                 for (int y = 8 * blocky; y < 8 * blocky + maxY; ++y)
+                 {
+                     uint16_t* dst = (uint16_t*) chanData[comp]->_rows[y];
+ 
+                     for (int blockx = 0; blockx < numFullBlocksX; ++blockx)
+                     {
+                         uint16_t* src =
+                             &rowBlock[comp][blockx * 64 + ((y & 0x7) * 8)];
+ 
+                         dst[0] = d->_toLinear[src[0]];
+                         dst[1] = d->_toLinear[src[1]];
+                         dst[2] = d->_toLinear[src[2]];
+                         dst[3] = d->_toLinear[src[3]];
+ 
+                         dst[4] = d->_toLinear[src[4]];
+                         dst[5] = d->_toLinear[src[5]];
+                         dst[6] = d->_toLinear[src[6]];
+                         dst[7] = d->_toLinear[src[7]];
+ 
+                         dst += 8;
+                     }
+                 }
+ 
+ #ifdef IMF_HAVE_SSE2
+             }
+ 
+ #endif /* IMF_HAVE_SSE2 */
+ 
+             //
+             // If we have partial X blocks, deal with all those now
+             // Since this should be minimal work, there currently
+             // is only one path that should work for everyone.
+             //
+ 
+             if (numFullBlocksX != numBlocksX)
+             {
+                 for (int y = 8 * blocky; y < 8 * blocky + maxY; ++y)
+                 {
+                     uint16_t* src = (uint16_t*) &rowBlock[comp]
+                                                          [numFullBlocksX * 64 +
+                                                           ((y & 0x7) * 8)];
+ 
+                     uint16_t* dst = (uint16_t*) chanData[comp]->_rows[y];
+ 
+                     dst += 8 * numFullBlocksX;
+ 
+                     for (int x = 0; x < maxX; ++x)
+                     {
+                         *dst++ = d->_toLinear[*src++];
+                     }
+                 }
+             }
+         } // comp
+     }     // blocky
+ 
+     //
+     // Walk over all the channels that are of type FLOAT.
+     // Convert from HALF XDR back to FLOAT XDR.
+     //
+ 
+     for (int chan = 0; chan < numComp; ++chan)
+     {
+         if (chanData[chan]->_type != EXR_PIXEL_FLOAT) continue;
+ 
+         /* process in place in reverse to avoid temporary buffer */
+         for (int y = 0; y < d->_height; ++y)
+         {
+             float*    floatXdrPtr = (float*) chanData[chan]->_rows[y];
+             uint16_t* halfXdr     = (uint16_t*) floatXdrPtr;
+ 
+             for (int x = d->_width - 1; x >= 0; --x)
+             {
+                 floatXdrPtr[x] = one_from_native_float (
+                     half_to_float (one_to_native16 (halfXdr[x])));
+             }
+         }
+     }
+ 
+     free_fn (rowBlockHandle);
+ 
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+ 
+ //
+ // Un-RLE the packed AC components into
+ // a half buffer. The half block should
+ // be the full 8x8 block (in zig-zag order
+ // still), not the first AC component.
+ //
+ // currAcComp is advanced as bytes are decoded.
+ //
+ // This returns the index of the last non-zero
+ // value in the buffer - with the index into zig zag
+ // order data. If we return 0, we have DC only data.
+ //
+ // This is assuminging that halfZigBlock is zero'ed
+ // prior to calling
+ //

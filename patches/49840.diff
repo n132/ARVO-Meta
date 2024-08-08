@@ -1,0 +1,2130 @@
+commit fa4b613f2e2510bd036f2eeed2fece97cd18b079
+Merge: 410ecbd3 98ce79a5
+Author: Martin Matuška <martin@matuska.org>
+Date:   Wed Nov 2 09:55:23 2022 +0100
+
+    Merge pull request #1790 from jvoisin/extend_nocrcerr
+    
+    Extend the usage of the DONT_FAIL_ON_CRC_ERROR macro
+
+diff --git a/libarchive/archive_read_support_filter_lz4.c b/libarchive/archive_read_support_filter_lz4.c
+index ae0b0800..1e99542d 100644
+--- a/libarchive/archive_read_support_filter_lz4.c
++++ b/libarchive/archive_read_support_filter_lz4.c
+@@ -374,92 +374,94 @@ static int
+ lz4_filter_read_descriptor(struct archive_read_filter *self)
+ {
+ 	struct private_data *state = (struct private_data *)self->data;
+ 	const char *read_buf;
+ 	ssize_t bytes_remaining;
+ 	ssize_t descriptor_bytes;
+ 	unsigned char flag, bd;
+ 	unsigned int chsum, chsum_verifier;
+ 
+ 	/* Make sure we have 2 bytes for flags. */
+ 	read_buf = __archive_read_filter_ahead(self->upstream, 2,
+ 	    &bytes_remaining);
+ 	if (read_buf == NULL) {
+ 		archive_set_error(&self->archive->archive,
+ 		    ARCHIVE_ERRNO_MISC,
+ 		    "truncated lz4 input");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	/*
+ 	   Parse flags.
+ 	 */
+ 	flag = (unsigned char)read_buf[0];
+ 	/* Verify version number. */
+ 	if ((flag & 0xc0) != 1<<6)
+ 		goto malformed_error;
+ 	/* A reserved bit must be zero. */
+ 	if (flag & 0x02)
+ 		goto malformed_error;
+ 	state->flags.block_independence = (flag & 0x20) != 0;
+ 	state->flags.block_checksum = (flag & 0x10)?4:0;
+ 	state->flags.stream_size = (flag & 0x08) != 0;
+ 	state->flags.stream_checksum = (flag & 0x04) != 0;
+ 	state->flags.preset_dictionary = (flag & 0x01) != 0;
+ 
+ 	/* BD */
+ 	bd = (unsigned char)read_buf[1];
+ 	/* Reserved bits must be zero. */
+ 	if (bd & 0x8f)
+ 		goto malformed_error;
+ 	/* Get a maximum block size. */
+ 	switch (read_buf[1] >> 4) {
+ 	case 4: /* 64 KB */
+ 		state->flags.block_maximum_size = 64 * 1024;
+ 		break;
+ 	case 5: /* 256 KB */
+ 		state->flags.block_maximum_size = 256 * 1024;
+ 		break;
+ 	case 6: /* 1 MB */
+ 		state->flags.block_maximum_size = 1024 * 1024;
+ 		break;
+ 	case 7: /* 4 MB */
+ 		state->flags.block_maximum_size = 4 * 1024 * 1024;
+ 		break;
+ 	default:
+ 		goto malformed_error;
+ 	}
+ 
+ 	/* Read the whole descriptor in a stream block. */
+ 	descriptor_bytes = 3;
+ 	if (state->flags.stream_size)
+ 		descriptor_bytes += 8;
+ 	if (state->flags.preset_dictionary)
+ 		descriptor_bytes += 4;
+ 	if (bytes_remaining < descriptor_bytes) {
+ 		read_buf = __archive_read_filter_ahead(self->upstream,
+ 		    descriptor_bytes, &bytes_remaining);
+ 		if (read_buf == NULL) {
+ 			archive_set_error(&self->archive->archive,
+ 			    ARCHIVE_ERRNO_MISC,
+ 			    "truncated lz4 input");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 	}
+ 	/* Check if a descriptor is corrupted */
+ 	chsum = __archive_xxhash.XXH32(read_buf, (int)descriptor_bytes -1, 0);
+ 	chsum = (chsum >> 8) & 0xff;
+ 	chsum_verifier = read_buf[descriptor_bytes-1] & 0xff;
+ 	if (chsum != chsum_verifier)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		goto malformed_error;
++#endif
+ 
+ 	__archive_read_filter_consume(self->upstream, descriptor_bytes);
+ 
+ 	/* Make sure we have a large enough buffer for uncompressed data. */
+ 	if (lz4_allocate_out_block(self) != ARCHIVE_OK)
+ 		return (ARCHIVE_FATAL);
+ 	if (state->flags.stream_checksum)
+ 		state->xxh32_state = __archive_xxhash.XXH32_init(0);
+ 
+ 	state->decoded_size = 0;
+ 	/* Success */
+ 	return (ARCHIVE_OK);
+@@ -473,130 +475,132 @@ static ssize_t
+ lz4_filter_read_data_block(struct archive_read_filter *self, const void **p)
+ {
+ 	struct private_data *state = (struct private_data *)self->data;
+ 	ssize_t compressed_size;
+ 	const char *read_buf;
+ 	ssize_t bytes_remaining;
+ 	int checksum_size;
+ 	ssize_t uncompressed_size;
+ 	size_t prefix64k;
+ 
+ 	*p = NULL;
+ 
+ 	/* Make sure we have 4 bytes for a block size. */
+ 	read_buf = __archive_read_filter_ahead(self->upstream, 4,
+ 	    &bytes_remaining);
+ 	if (read_buf == NULL)
+ 		goto truncated_error;
+ 	compressed_size = archive_le32dec(read_buf);
+ 	if ((compressed_size & 0x7fffffff) > state->flags.block_maximum_size)
+ 		goto malformed_error;
+ 	/* A compressed size == 0 means the end of stream blocks. */
+ 	if (compressed_size == 0) {
+ 		__archive_read_filter_consume(self->upstream, 4);
+ 		return 0;
+ 	}
+ 
+ 	checksum_size = state->flags.block_checksum;
+ 	/* Check if the block is uncompressed. */
+ 	if (compressed_size & 0x80000000U) {
+ 		compressed_size &= 0x7fffffff;
+ 		uncompressed_size = compressed_size;
+ 	} else
+ 		uncompressed_size = 0;/* Unknown yet. */
+ 
+ 	/*
+ 	  Unfortunately, lz4 decompression API requires a whole block
+ 	  for its decompression speed, so we read a whole block and allocate
+ 	  a huge buffer used for decoded data.
+ 	*/
+ 	read_buf = __archive_read_filter_ahead(self->upstream,
+ 	    4 + compressed_size + checksum_size, &bytes_remaining);
+ 	if (read_buf == NULL)
+ 		goto truncated_error;
+ 
+ 	/* Optional processing, checking a block sum. */
+ 	if (checksum_size) {
+ 		unsigned int chsum = __archive_xxhash.XXH32(
+ 			read_buf + 4, (int)compressed_size, 0);
+ 		unsigned int chsum_block =
+ 		    archive_le32dec(read_buf + 4 + compressed_size);
+ 		if (chsum != chsum_block)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			goto malformed_error;
++#endif
+ 	}
+ 
+ 
+ 	/* If the block is uncompressed, there is nothing to do. */
+ 	if (uncompressed_size) {
+ 		/* Prepare a prefix 64k block for next block. */
+ 		if (!state->flags.block_independence) {
+ 			prefix64k = 64 * 1024;
+ 			if (uncompressed_size < (ssize_t)prefix64k) {
+ 				memcpy(state->out_block
+ 					+ prefix64k - uncompressed_size,
+ 				    read_buf + 4,
+ 				    uncompressed_size);
+ 				memset(state->out_block, 0,
+ 				    prefix64k - uncompressed_size);
+ 			} else {
+ 				memcpy(state->out_block,
+ 				    read_buf + 4
+ 					+ uncompressed_size - prefix64k,
+ 				    prefix64k);
+ 			}
+ 			state->decoded_size = 0;
+ 		}
+ 		state->unconsumed = 4 + uncompressed_size + checksum_size;
+ 		*p = read_buf + 4;
+ 		return uncompressed_size;
+ 	}
+ 
+ 	/*
+ 	   Decompress a block data.
+ 	 */
+ 	if (state->flags.block_independence) {
+ 		prefix64k = 0;
+ 		uncompressed_size = LZ4_decompress_safe(read_buf + 4,
+ 		    state->out_block, (int)compressed_size,
+ 		    state->flags.block_maximum_size);
+ 	} else {
+ 		prefix64k = 64 * 1024;
+ 		if (state->decoded_size) {
+ 			if (state->decoded_size < prefix64k) {
+ 				memmove(state->out_block
+ 					+ prefix64k - state->decoded_size,
+ 				    state->out_block + prefix64k,
+ 				    state->decoded_size);
+ 				memset(state->out_block, 0,
+ 				    prefix64k - state->decoded_size);
+ 			} else {
+ 				memmove(state->out_block,
+ 				    state->out_block + state->decoded_size,
+ 				    prefix64k);
+ 			}
+ 		}
+ #if LZ4_VERSION_MAJOR >= 1 && LZ4_VERSION_MINOR >= 7
+ 		uncompressed_size = LZ4_decompress_safe_usingDict(
+ 		    read_buf + 4,
+ 		    state->out_block + prefix64k, (int)compressed_size,
+ 		    state->flags.block_maximum_size,
+ 		    state->out_block,
+ 		    prefix64k);
+ #else
+ 		uncompressed_size = LZ4_decompress_safe_withPrefix64k(
+ 		    read_buf + 4,
+ 		    state->out_block + prefix64k, (int)compressed_size,
+ 		    state->flags.block_maximum_size);
+ #endif
+ 	}
+ 
+ 	/* Check if an error occurred in the decompression process. */
+ 	if (uncompressed_size < 0) {
+ 		archive_set_error(&(self->archive->archive),
+ 		    ARCHIVE_ERRNO_MISC, "lz4 decompression failed");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	state->unconsumed = 4 + compressed_size + checksum_size;
+ 	*p = state->out_block + prefix64k;
+ 	state->decoded_size = uncompressed_size;
+ 	return uncompressed_size;
+@@ -615,51 +619,53 @@ static ssize_t
+ lz4_filter_read_default_stream(struct archive_read_filter *self, const void **p)
+ {
+ 	struct private_data *state = (struct private_data *)self->data;
+ 	const char *read_buf;
+ 	ssize_t bytes_remaining;
+ 	ssize_t ret;
+ 
+ 	if (state->stage == SELECT_STREAM) {
+ 		state->stage = READ_DEFAULT_STREAM;
+ 		/* First, read a descriptor. */
+ 		if((ret = lz4_filter_read_descriptor(self)) != ARCHIVE_OK)
+ 			return (ret);
+ 		state->stage = READ_DEFAULT_BLOCK;
+ 	}
+ 	/* Decompress a block. */
+ 	ret = lz4_filter_read_data_block(self, p);
+ 
+ 	/* If the end of block is detected, change the filter status
+ 	   to read next stream. */
+ 	if (ret == 0 && *p == NULL)
+ 		state->stage = SELECT_STREAM;
+ 
+ 	/* Optional processing, checking a stream sum. */
+ 	if (state->flags.stream_checksum) {
+ 		if (state->stage == SELECT_STREAM) {
+ 			unsigned int checksum;
+ 			unsigned int checksum_stream;
+ 			read_buf = __archive_read_filter_ahead(self->upstream,
+ 			    4, &bytes_remaining);
+ 			if (read_buf == NULL) {
+ 				archive_set_error(&self->archive->archive,
+ 				    ARCHIVE_ERRNO_MISC, "truncated lz4 input");
+ 				return (ARCHIVE_FATAL);
+ 			}
+ 			checksum = archive_le32dec(read_buf);
+ 			__archive_read_filter_consume(self->upstream, 4);
+ 			checksum_stream = __archive_xxhash.XXH32_digest(
+ 			    state->xxh32_state);
+ 			state->xxh32_state = NULL;
+ 			if (checksum != checksum_stream) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 				archive_set_error(&self->archive->archive,
+ 				    ARCHIVE_ERRNO_MISC,
+ 				    "lz4 stream checksum error");
+ 				return (ARCHIVE_FATAL);
++#endif
+ 			}
+ 		} else if (ret > 0)
+ 			__archive_xxhash.XXH32_update(state->xxh32_state,
+ 			    *p, (int)ret);
+ 	}
+ 	return (ret);
+ }
+diff --git a/libarchive/archive_read_support_filter_lzop.c b/libarchive/archive_read_support_filter_lzop.c
+index afd2d4d0..4ebdd3bf 100644
+--- a/libarchive/archive_read_support_filter_lzop.c
++++ b/libarchive/archive_read_support_filter_lzop.c
+@@ -204,95 +204,97 @@ static int
+ consume_header(struct archive_read_filter *self)
+ {
+ 	struct read_lzop *state = (struct read_lzop *)self->data;
+ 	const unsigned char *p, *_p;
+ 	unsigned checksum, flags, len, method, version;
+ 
+ 	/*
+ 	 * Check LZOP magic code.
+ 	 */
+ 	p = __archive_read_filter_ahead(self->upstream,
+ 		LZOP_HEADER_MAGIC_LEN, NULL);
+ 	if (p == NULL)
+ 		return (ARCHIVE_EOF);
+ 
+ 	if (memcmp(p, LZOP_HEADER_MAGIC, LZOP_HEADER_MAGIC_LEN))
+ 		return (ARCHIVE_EOF);
+ 	__archive_read_filter_consume(self->upstream,
+ 	    LZOP_HEADER_MAGIC_LEN);
+ 
+ 	p = __archive_read_filter_ahead(self->upstream, 29, NULL);
+ 	if (p == NULL)
+ 		goto truncated;
+ 	_p = p;
+ 	version = archive_be16dec(p);
+ 	p += 4;/* version(2 bytes) + library version(2 bytes) */
+ 
+ 	if (version >= 0x940) {
+ 		unsigned reqversion = archive_be16dec(p); p += 2;
+ 		if (reqversion < 0x900) {
+ 			archive_set_error(&self->archive->archive,
+ 			    ARCHIVE_ERRNO_MISC, "Invalid required version");
+ 			return (ARCHIVE_FAILED);
+ 		}
+ 	}
+ 
+ 	method = *p++;
+ 	if (method < 1 || method > 3) {
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Unsupported method");
+ 		return (ARCHIVE_FAILED);
+ 	}
+ 
+ 	if (version >= 0x940) {
+ 		unsigned level = *p++;
+ #if 0
+ 		unsigned default_level[] = {0, 3, 1, 9};
+ #endif
+ 		if (level == 0)
+ 			/* Method is 1..3 here due to check above. */
+ #if 0	/* Avoid an error Clang Static Analyzer claims
+ 	  "Value stored to 'level' is never read". */
+ 			level = default_level[method];
+ #else
+ 			;/* NOP */
+ #endif
+ 		else if (level > 9) {
+ 			archive_set_error(&self->archive->archive,
+ 			    ARCHIVE_ERRNO_MISC, "Invalid level");
+ 			return (ARCHIVE_FAILED);
+ 		}
+ 	}
+ 
+ 	flags = archive_be32dec(p); p += 4;
+ 
+ 	if (flags & FILTER)
+ 		p += 4; /* Skip filter */
+ 	p += 4; /* Skip mode */
+ 	if (version >= 0x940)
+ 		p += 8; /* Skip mtime */
+ 	else
+ 		p += 4; /* Skip mtime */
+ 	len = *p++; /* Read filename length */
+ 	len += p - _p;
+ 	/* Make sure we have all bytes we need to calculate checksum. */
+ 	p = __archive_read_filter_ahead(self->upstream, len + 4, NULL);
+ 	if (p == NULL)
+ 		goto truncated;
+ 	if (flags & CRC32_HEADER)
+ 		checksum = crc32(crc32(0, NULL, 0), p, len);
+ 	else
+ 		checksum = adler32(adler32(0, NULL, 0), p, len);
+ 	if (archive_be32dec(p + len) != checksum)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		goto corrupted;
++#endif
+ 	__archive_read_filter_consume(self->upstream, len + 4);
+ 	if (flags & EXTRA_FIELD) {
+ 		/* Skip extra field */
+ 		p = __archive_read_filter_ahead(self->upstream, 4, NULL);
+ 		if (p == NULL)
+ 			goto truncated;
+ 		len = archive_be32dec(p);
+ 		__archive_read_filter_consume(self->upstream, len + 4 + 4);
+ 	}
+ 	state->flags = flags;
+ 	state->in_stream = 1;
+ 	return (ARCHIVE_OK);
+diff --git a/libarchive/archive_read_support_filter_xz.c b/libarchive/archive_read_support_filter_xz.c
+index 32ae0be9..e313d39c 100644
+--- a/libarchive/archive_read_support_filter_xz.c
++++ b/libarchive/archive_read_support_filter_xz.c
+@@ -591,60 +591,62 @@ static int
+ lzip_tail(struct archive_read_filter *self)
+ {
+ 	struct private_data *state;
+ 	const unsigned char *f;
+ 	ssize_t avail_in;
+ 	int tail;
+ 
+ 	state = (struct private_data *)self->data;
+ 	if (state->lzip_ver == 0)
+ 		tail = 12;
+ 	else
+ 		tail = 20;
+ 	f = __archive_read_filter_ahead(self->upstream, tail, &avail_in);
+ 	if (f == NULL && avail_in < 0)
+ 		return (ARCHIVE_FATAL);
+ 	if (f == NULL || avail_in < tail) {
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Lzip: Remaining data is less bytes");
+ 		return (ARCHIVE_FAILED);
+ 	}
+ 
+ 	/* Check the crc32 value of the uncompressed data of the current
+ 	 * member */
+ 	if (state->crc32 != archive_le32dec(f)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Lzip: CRC32 error");
+ 		return (ARCHIVE_FAILED);
++#endif
+ 	}
+ 
+ 	/* Check the uncompressed size of the current member */
+ 	if ((uint64_t)state->member_out != archive_le64dec(f + 4)) {
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Lzip: Uncompressed size error");
+ 		return (ARCHIVE_FAILED);
+ 	}
+ 
+ 	/* Check the total size of the current member */
+ 	if (state->lzip_ver == 1 &&
+ 	    (uint64_t)state->member_in + tail != archive_le64dec(f + 12)) {
+ 		archive_set_error(&self->archive->archive, ARCHIVE_ERRNO_MISC,
+ 		    "Lzip: Member size error");
+ 		return (ARCHIVE_FAILED);
+ 	}
+ 	__archive_read_filter_consume(self->upstream, tail);
+ 
+ 	/* If current lzip data consists of multi member, try decompressing
+ 	 * a next member. */
+ 	if (lzip_has_member(self->upstream) != 0) {
+ 		state->in_stream = 0;
+ 		state->crc32 = 0;
+ 		state->member_out = 0;
+ 		state->member_in = 0;
+ 		state->eof = 0;
+ 	}
+ 	return (ARCHIVE_OK);
+ }
+ 
+ /*
+  * Return the next block of decompressed data.
+  */
+diff --git a/libarchive/archive_read_support_format_7zip.c b/libarchive/archive_read_support_format_7zip.c
+index 9142051e..0ba4bee3 100644
+--- a/libarchive/archive_read_support_format_7zip.c
++++ b/libarchive/archive_read_support_format_7zip.c
+@@ -2829,155 +2829,161 @@ static int
+ slurp_central_directory(struct archive_read *a, struct _7zip *zip,
+     struct _7z_header_info *header)
+ {
+ 	const unsigned char *p;
+ 	uint64_t next_header_offset;
+ 	uint64_t next_header_size;
+ 	uint32_t next_header_crc;
+ 	ssize_t bytes_avail;
+ 	int check_header_crc, r;
+ 
+ 	if ((p = __archive_read_ahead(a, 32, &bytes_avail)) == NULL)
+ 		return (ARCHIVE_FATAL);
+ 
+ 	if ((p[0] == 'M' && p[1] == 'Z') || memcmp(p, "\x7F\x45LF", 4) == 0) {
+ 		/* This is an executable ? Must be self-extracting... */
+ 		r = skip_sfx(a, bytes_avail);
+ 		if (r < ARCHIVE_WARN)
+ 			return (r);
+ 		if ((p = __archive_read_ahead(a, 32, &bytes_avail)) == NULL)
+ 			return (ARCHIVE_FATAL);
+ 	}
+ 	zip->seek_base += 32;
+ 
+ 	if (memcmp(p, _7ZIP_SIGNATURE, 6) != 0) {
+ 		archive_set_error(&a->archive, -1, "Not 7-Zip archive file");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	/* CRC check. */
+ 	if (crc32(0, (const unsigned char *)p + 12, 20)
+ 	    != archive_le32dec(p + 8)) {
++#ifdef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, -1, "Header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 
+ 	next_header_offset = archive_le64dec(p + 12);
+ 	next_header_size = archive_le64dec(p + 20);
+ 	next_header_crc = archive_le32dec(p + 28);
+ 
+ 	if (next_header_size == 0)
+ 		/* There is no entry in an archive file. */
+ 		return (ARCHIVE_EOF);
+ 
+ 	if (((int64_t)next_header_offset) < 0) {
+ 		archive_set_error(&a->archive, -1, "Malformed 7-Zip archive");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 	__archive_read_consume(a, 32);
+ 	if (next_header_offset != 0) {
+ 		if (bytes_avail >= (ssize_t)next_header_offset)
+ 			__archive_read_consume(a, next_header_offset);
+ 		else if (__archive_read_seek(a,
+ 		    next_header_offset + zip->seek_base, SEEK_SET) < 0)
+ 			return (ARCHIVE_FATAL);
+ 	}
+ 	zip->stream_offset = next_header_offset;
+ 	zip->header_offset = next_header_offset;
+ 	zip->header_bytes_remaining = next_header_size;
+ 	zip->header_crc32 = 0;
+ 	zip->header_is_encoded = 0;
+ 	zip->header_is_being_read = 1;
+ 	zip->has_encrypted_entries = 0;
+ 	check_header_crc = 1;
+ 
+ 	if ((p = header_bytes(a, 1)) == NULL) {
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Truncated 7-Zip file body");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 	/* Parse ArchiveProperties. */
+ 	switch (p[0]) {
+ 	case kEncodedHeader:
+ 		/*
+ 		 * The archive has an encoded header and we have to decode it
+ 		 * in order to parse the header correctly.
+ 		 */
+ 		r = decode_encoded_header_info(a, &(zip->si));
+ 
+ 		/* Check the EncodedHeader CRC.*/
+ 		if (r == 0 && zip->header_crc32 != next_header_crc) {
+ 			archive_set_error(&a->archive, -1,
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			    "Damaged 7-Zip archive");
+ 			r = -1;
++#endif
+ 		}
+ 		if (r == 0) {
+ 			if (zip->si.ci.folders[0].digest_defined)
+ 				next_header_crc = zip->si.ci.folders[0].digest;
+ 			else
+ 				check_header_crc = 0;
+ 			if (zip->pack_stream_bytes_unconsumed)
+ 				read_consume(a);
+ 			r = setup_decode_folder(a, zip->si.ci.folders, 1);
+ 			if (r == 0) {
+ 				zip->header_bytes_remaining =
+ 					zip->folder_outbytes_remaining;
+ 				r = seek_pack(a);
+ 			}
+ 		}
+ 		/* Clean up StreamsInfo. */
+ 		free_StreamsInfo(&(zip->si));
+ 		memset(&(zip->si), 0, sizeof(zip->si));
+ 		if (r < 0)
+ 			return (ARCHIVE_FATAL);
+ 		zip->header_is_encoded = 1;
+ 		zip->header_crc32 = 0;
+ 		/* FALL THROUGH */
+ 	case kHeader:
+ 		/*
+ 		 * Parse the header.
+ 		 */
+ 		errno = 0;
+ 		r = read_Header(a, header, zip->header_is_encoded);
+ 		if (r < 0) {
+ 			if (errno == ENOMEM)
+ 				archive_set_error(&a->archive, -1,
+ 				    "Couldn't allocate memory");
+ 			else
+ 				archive_set_error(&a->archive, -1,
+ 				    "Damaged 7-Zip archive");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 
+ 		/*
+ 		 *  Must be kEnd.
+ 		 */
+ 		if ((p = header_bytes(a, 1)) == NULL ||*p != kEnd) {
+ 			archive_set_error(&a->archive, -1,
+ 			    "Malformed 7-Zip archive");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 
+ 		/* Check the Header CRC.*/
+ 		if (check_header_crc && zip->header_crc32 != next_header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			archive_set_error(&a->archive, -1,
+ 			    "Malformed 7-Zip archive");
+ 			return (ARCHIVE_FATAL);
++#endif
+ 		}
+ 		break;
+ 	default:
+ 		archive_set_error(&a->archive, -1,
+ 		    "Unexpected Property ID = %X", p[0]);
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	/* Clean up variables be used for decoding the archive header */
+ 	zip->pack_stream_remaining = 0;
+ 	zip->pack_stream_index = 0;
+ 	zip->folder_outbytes_remaining = 0;
+ 	zip->uncompressed_buffer_bytes_remaining = 0;
+ 	zip->pack_stream_bytes_unconsumed = 0;
+ 	zip->header_is_being_read = 0;
+ 
+ 	return (ARCHIVE_OK);
+ }
+diff --git a/libarchive/archive_read_support_format_cab.c b/libarchive/archive_read_support_format_cab.c
+index 433b5600..ea256cda 100644
+--- a/libarchive/archive_read_support_format_cab.c
++++ b/libarchive/archive_read_support_format_cab.c
+@@ -1148,39 +1148,41 @@ static int
+ cab_checksum_finish(struct archive_read *a)
+ {
+ 	struct cab *cab = (struct cab *)(a->format->data);
+ 	struct cfdata *cfdata = cab->entry_cfdata;
+ 	int l;
+ 
+ 	/* Do not need to compute a sum. */
+ 	if (cfdata->sum == 0)
+ 		return (ARCHIVE_OK);
+ 
+ 	/*
+ 	 * Calculate the sum of remaining CFDATA.
+ 	 */
+ 	if (cfdata->sum_extra_avail) {
+ 		cfdata->sum_calculated =
+ 		    cab_checksum_cfdata(cfdata->sum_extra,
+ 		       cfdata->sum_extra_avail, cfdata->sum_calculated);
+ 		cfdata->sum_extra_avail = 0;
+ 	}
+ 
+ 	l = 4;
+ 	if (cab->cfheader.flags & RESERVE_PRESENT)
+ 		l += cab->cfheader.cfdata;
+ 	cfdata->sum_calculated = cab_checksum_cfdata(
+ 	    cfdata->memimage + CFDATA_cbData, l, cfdata->sum_calculated);
+ 	if (cfdata->sum_calculated != cfdata->sum) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Checksum error CFDATA[%d] %" PRIx32 ":%" PRIx32 " in %d bytes",
+ 		    cab->entry_cffolder->cfdata_index -1,
+ 		    cfdata->sum, cfdata->sum_calculated,
+ 		    cfdata->compressed_size);
+ 		return (ARCHIVE_FAILED);
++#endif
+ 	}
+ 	return (ARCHIVE_OK);
+ }
+ 
+ /*
+  * Read CFDATA if needed.
+  */
+diff --git a/libarchive/archive_read_support_format_lha.c b/libarchive/archive_read_support_format_lha.c
+index 6d0b6d2e..bcfd42e1 100644
+--- a/libarchive/archive_read_support_format_lha.c
++++ b/libarchive/archive_read_support_format_lha.c
+@@ -1000,78 +1000,80 @@ static int
+ lha_read_file_header_2(struct archive_read *a, struct lha *lha)
+ {
+ 	const unsigned char *p;
+ 	size_t extdsize;
+ 	int err, padding;
+ 	uint16_t header_crc;
+ 
+ 	if ((p = __archive_read_ahead(a, H2_FIXED_SIZE, NULL)) == NULL)
+ 		return (truncated_error(a));
+ 
+ 	lha->header_size =archive_le16dec(p + H2_HEADER_SIZE_OFFSET);
+ 	lha->compsize = archive_le32dec(p + H2_COMP_SIZE_OFFSET);
+ 	lha->origsize = archive_le32dec(p + H2_ORIG_SIZE_OFFSET);
+ 	lha->mtime = archive_le32dec(p + H2_TIME_OFFSET);
+ 	lha->crc = archive_le16dec(p + H2_CRC_OFFSET);
+ 	lha->setflag |= CRC_IS_SET;
+ 
+ 	if (lha->header_size < H2_FIXED_SIZE) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Invalid LHa header size");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	header_crc = lha_crc16(0, p, H2_FIXED_SIZE);
+ 	__archive_read_consume(a, H2_FIXED_SIZE);
+ 
+ 	/* Read extended headers */
+ 	err = lha_read_file_extended_header(a, lha, &header_crc, 2,
+ 		  lha->header_size - H2_FIXED_SIZE, &extdsize);
+ 	if (err < ARCHIVE_WARN)
+ 		return (err);
+ 
+ 	/* Calculate a padding size. The result will be normally 0 or 1. */
+ 	padding = (int)lha->header_size - (int)(H2_FIXED_SIZE + extdsize);
+ 	if (padding > 0) {
+ 		if ((p = __archive_read_ahead(a, padding, NULL)) == NULL)
+ 			return (truncated_error(a));
+ 		header_crc = lha_crc16(header_crc, p, padding);
+ 		__archive_read_consume(a, padding);
+ 	}
+ 
+ 	if (header_crc != lha->header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "LHa header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 	return (err);
+ }
+ 
+ /*
+  * Header 3 format
+  *
+  * +0           +2               +7                  +11               +15
+  * +------------+----------------+-------------------+-----------------+
+  * | 0x04 fixed |compression type|compressed size(*2)|uncompressed size|
+  * +------------+----------------+-------------------+-----------------+
+  *  <-------------------------------(*1)-------------------------------*
+  *
+  * +15               +19          +20              +21        +23         +24
+  * +-----------------+------------+----------------+----------+-----------+
+  * |date/time(time_t)| 0x20 fixed |header level(=3)|file CRC16|  creator  |
+  * +-----------------+------------+----------------+----------+-----------+
+  * *--------------------------------(*1)----------------------------------*
+  *
+  * +24             +28              +32                 +32+(*3)
+  * +---------------+----------------+-------------------+-----------------+
+  * |header size(*1)|next header size|extended header(*3)| compressed data |
+  * +---------------+----------------+-------------------+-----------------+
+  * *------------------------(*1)-----------------------> <------(*2)----->
+  *
+  */
+ #define H3_FIELD_LEN_OFFSET	0
+ #define H3_COMP_SIZE_OFFSET	7
+ #define H3_ORIG_SIZE_OFFSET	11
+ #define H3_TIME_OFFSET		15
+ #define H3_CRC_OFFSET		21
+ #define H3_HEADER_SIZE_OFFSET	24
+ #define H3_FIXED_SIZE		28
+@@ -1079,37 +1081,39 @@ static int
+ lha_read_file_header_3(struct archive_read *a, struct lha *lha)
+ {
+ 	const unsigned char *p;
+ 	size_t extdsize;
+ 	int err;
+ 	uint16_t header_crc;
+ 
+ 	if ((p = __archive_read_ahead(a, H3_FIXED_SIZE, NULL)) == NULL)
+ 		return (truncated_error(a));
+ 
+ 	if (archive_le16dec(p + H3_FIELD_LEN_OFFSET) != 4)
+ 		goto invalid;
+ 	lha->header_size =archive_le32dec(p + H3_HEADER_SIZE_OFFSET);
+ 	lha->compsize = archive_le32dec(p + H3_COMP_SIZE_OFFSET);
+ 	lha->origsize = archive_le32dec(p + H3_ORIG_SIZE_OFFSET);
+ 	lha->mtime = archive_le32dec(p + H3_TIME_OFFSET);
+ 	lha->crc = archive_le16dec(p + H3_CRC_OFFSET);
+ 	lha->setflag |= CRC_IS_SET;
+ 
+ 	if (lha->header_size < H3_FIXED_SIZE + 4)
+ 		goto invalid;
+ 	header_crc = lha_crc16(0, p, H3_FIXED_SIZE);
+ 	__archive_read_consume(a, H3_FIXED_SIZE);
+ 
+ 	/* Read extended headers */
+ 	err = lha_read_file_extended_header(a, lha, &header_crc, 4,
+ 		  lha->header_size - H3_FIXED_SIZE, &extdsize);
+ 	if (err < ARCHIVE_WARN)
+ 		return (err);
+ 
+ 	if (header_crc != lha->header_crc) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "LHa header CRC error");
+ 		return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 	return (err);
+ invalid:
+diff --git a/libarchive/archive_read_support_format_rar.c b/libarchive/archive_read_support_format_rar.c
+index f9cbe2a8..793e8e98 100644
+--- a/libarchive/archive_read_support_format_rar.c
++++ b/libarchive/archive_read_support_format_rar.c
+@@ -907,181 +907,185 @@ static int
+ archive_read_format_rar_read_header(struct archive_read *a,
+                                     struct archive_entry *entry)
+ {
+   const void *h;
+   const char *p;
+   struct rar *rar;
+   size_t skip;
+   char head_type;
+   int ret;
+   unsigned flags;
+   unsigned long crc32_expected;
+ 
+   a->archive.archive_format = ARCHIVE_FORMAT_RAR;
+   if (a->archive.archive_format_name == NULL)
+     a->archive.archive_format_name = "RAR";
+ 
+   rar = (struct rar *)(a->format->data);
+ 
+   /*
+    * It should be sufficient to call archive_read_next_header() for
+    * a reader to determine if an entry is encrypted or not. If the
+    * encryption of an entry is only detectable when calling
+    * archive_read_data(), so be it. We'll do the same check there
+    * as well.
+    */
+   if (rar->has_encrypted_entries == ARCHIVE_READ_FORMAT_ENCRYPTION_DONT_KNOW) {
+ 	  rar->has_encrypted_entries = 0;
+   }
+ 
+   /* RAR files can be generated without EOF headers, so return ARCHIVE_EOF if
+   * this fails.
+   */
+   if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_EOF);
+ 
+   p = h;
+   if (rar->found_first_header == 0 &&
+      ((p[0] == 'M' && p[1] == 'Z') || memcmp(p, "\x7F\x45LF", 4) == 0)) {
+     /* This is an executable ? Must be self-extracting... */
+     ret = skip_sfx(a);
+     if (ret < ARCHIVE_WARN)
+       return (ret);
+   }
+   rar->found_first_header = 1;
+ 
+   while (1)
+   {
+     unsigned long crc32_val;
+ 
+     if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
+       return (ARCHIVE_FATAL);
+     p = h;
+ 
+     head_type = p[2];
+     switch(head_type)
+     {
+     case MARK_HEAD:
+       if (memcmp(p, RAR_SIGNATURE, 7) != 0) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Invalid marker header");
+         return (ARCHIVE_FATAL);
+       }
+       __archive_read_consume(a, 7);
+       break;
+ 
+     case MAIN_HEAD:
+       rar->main_flags = archive_le16dec(p + 3);
+       skip = archive_le16dec(p + 5);
+       if (skip < 7 + sizeof(rar->reserved1) + sizeof(rar->reserved2)) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Invalid header size");
+         return (ARCHIVE_FATAL);
+       }
+       if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
+         return (ARCHIVE_FATAL);
+       p = h;
+       memcpy(rar->reserved1, p + 7, sizeof(rar->reserved1));
+       memcpy(rar->reserved2, p + 7 + sizeof(rar->reserved1),
+              sizeof(rar->reserved2));
+       if (rar->main_flags & MHD_ENCRYPTVER) {
+         if (skip < 7 + sizeof(rar->reserved1) + sizeof(rar->reserved2)+1) {
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+             "Invalid header size");
+           return (ARCHIVE_FATAL);
+         }
+         rar->encryptver = *(p + 7 + sizeof(rar->reserved1) +
+                             sizeof(rar->reserved2));
+       }
+ 
+       /* Main header is password encrypted, so we cannot read any
+          file names or any other info about files from the header. */
+       if (rar->main_flags & MHD_PASSWORD)
+       {
+         archive_entry_set_is_metadata_encrypted(entry, 1);
+         archive_entry_set_is_data_encrypted(entry, 1);
+         rar->has_encrypted_entries = 1;
+          archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                           "RAR encryption support unavailable.");
+         return (ARCHIVE_FATAL);
+       }
+ 
+       crc32_val = crc32(0, (const unsigned char *)p + 2, (unsigned)skip - 2);
+       if ((crc32_val & 0xffff) != archive_le16dec(p)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Header CRC error");
+         return (ARCHIVE_FATAL);
++#endif
+       }
+       __archive_read_consume(a, skip);
+       break;
+ 
+     case FILE_HEAD:
+       return read_header(a, entry, head_type);
+ 
+     case COMM_HEAD:
+     case AV_HEAD:
+     case SUB_HEAD:
+     case PROTECT_HEAD:
+     case SIGN_HEAD:
+     case ENDARC_HEAD:
+       flags = archive_le16dec(p + 3);
+       skip = archive_le16dec(p + 5);
+       if (skip < 7) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Invalid header size too small");
+         return (ARCHIVE_FATAL);
+       }
+       if (flags & HD_ADD_SIZE_PRESENT)
+       {
+         if (skip < 7 + 4) {
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+             "Invalid header size too small");
+           return (ARCHIVE_FATAL);
+         }
+         if ((h = __archive_read_ahead(a, skip, NULL)) == NULL)
+           return (ARCHIVE_FATAL);
+         p = h;
+         skip += archive_le32dec(p + 7);
+       }
+ 
+       /* Skip over the 2-byte CRC at the beginning of the header. */
+       crc32_expected = archive_le16dec(p);
+       __archive_read_consume(a, 2);
+       skip -= 2;
+ 
+       /* Skim the entire header and compute the CRC. */
+       crc32_val = 0;
+       while (skip > 0) {
+ 	      size_t to_read = skip;
+ 	      if (to_read > 32 * 1024)
+ 		      to_read = 32 * 1024;
+ 	      if ((h = __archive_read_ahead(a, to_read, NULL)) == NULL) {
+ 		      archive_set_error(&a->archive,  ARCHIVE_ERRNO_FILE_FORMAT,
+ 			  "Bad RAR file");
+ 		      return (ARCHIVE_FATAL);
+ 	      }
+ 	      p = h;
+ 	      crc32_val = crc32(crc32_val, (const unsigned char *)p, to_read);
+ 	      __archive_read_consume(a, to_read);
+ 	      skip -= to_read;
+       }
+       if ((crc32_val & 0xffff) != crc32_expected) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 	      archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		  "Header CRC error");
+ 	      return (ARCHIVE_FATAL);
++#endif
+       }
+       if (head_type == ENDARC_HEAD)
+ 	      return (ARCHIVE_EOF);
+       break;
+ 
+     case NEWSUB_HEAD:
+       if ((ret = read_header(a, entry, head_type)) < ARCHIVE_WARN)
+         return ret;
+       break;
+ 
+     default:
+       archive_set_error(&a->archive,  ARCHIVE_ERRNO_FILE_FORMAT,
+                         "Bad RAR file");
+       return (ARCHIVE_FATAL);
+     }
+   }
+ }
+@@ -1354,450 +1358,452 @@ static int
+ read_header(struct archive_read *a, struct archive_entry *entry,
+             char head_type)
+ {
+   const void *h;
+   const char *p, *endp;
+   struct rar *rar;
+   struct rar_header rar_header;
+   struct rar_file_header file_header;
+   int64_t header_size;
+   unsigned filename_size, end;
+   char *filename;
+   char *strp;
+   char packed_size[8];
+   char unp_size[8];
+   int ttime;
+   struct archive_string_conv *sconv, *fn_sconv;
+   unsigned long crc32_val;
+   int ret = (ARCHIVE_OK), ret2;
+ 
+   rar = (struct rar *)(a->format->data);
+ 
+   /* Setup a string conversion object for non-rar-unicode filenames. */
+   sconv = rar->opt_sconv;
+   if (sconv == NULL) {
+     if (!rar->init_default_conversion) {
+       rar->sconv_default =
+           archive_string_default_conversion_for_read(
+             &(a->archive));
+       rar->init_default_conversion = 1;
+     }
+     sconv = rar->sconv_default;
+   }
+ 
+ 
+   if ((h = __archive_read_ahead(a, 7, NULL)) == NULL)
+     return (ARCHIVE_FATAL);
+   p = h;
+   memcpy(&rar_header, p, sizeof(rar_header));
+   rar->file_flags = archive_le16dec(rar_header.flags);
+   header_size = archive_le16dec(rar_header.size);
+   if (header_size < (int64_t)sizeof(file_header) + 7) {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+       "Invalid header size");
+     return (ARCHIVE_FATAL);
+   }
+   crc32_val = crc32(0, (const unsigned char *)p + 2, 7 - 2);
+   __archive_read_consume(a, 7);
+ 
+   if (!(rar->file_flags & FHD_SOLID))
+   {
+     rar->compression_method = 0;
+     rar->packed_size = 0;
+     rar->unp_size = 0;
+     rar->mtime = 0;
+     rar->ctime = 0;
+     rar->atime = 0;
+     rar->arctime = 0;
+     rar->mode = 0;
+     memset(&rar->salt, 0, sizeof(rar->salt));
+     rar->atime = 0;
+     rar->ansec = 0;
+     rar->ctime = 0;
+     rar->cnsec = 0;
+     rar->mtime = 0;
+     rar->mnsec = 0;
+     rar->arctime = 0;
+     rar->arcnsec = 0;
+   }
+   else
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "RAR solid archive support unavailable.");
+     return (ARCHIVE_FATAL);
+   }
+ 
+   if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
+     return (ARCHIVE_FATAL);
+ 
+   /* File Header CRC check. */
+   crc32_val = crc32(crc32_val, h, (unsigned)(header_size - 7));
+   if ((crc32_val & 0xffff) != archive_le16dec(rar_header.crc)) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+       "Header CRC error");
+     return (ARCHIVE_FATAL);
++#endif
+   }
+   /* If no CRC error, Go on parsing File Header. */
+   p = h;
+   endp = p + header_size - 7;
+   memcpy(&file_header, p, sizeof(file_header));
+   p += sizeof(file_header);
+ 
+   rar->compression_method = file_header.method;
+ 
+   ttime = archive_le32dec(file_header.file_time);
+   rar->mtime = get_time(ttime);
+ 
+   rar->file_crc = archive_le32dec(file_header.file_crc);
+ 
+   if (rar->file_flags & FHD_PASSWORD)
+   {
+ 	archive_entry_set_is_data_encrypted(entry, 1);
+ 	rar->has_encrypted_entries = 1;
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "RAR encryption support unavailable.");
+     /* Since it is only the data part itself that is encrypted we can at least
+        extract information about the currently processed entry and don't need
+        to return ARCHIVE_FATAL here. */
+     /*return (ARCHIVE_FATAL);*/
+   }
+ 
+   if (rar->file_flags & FHD_LARGE)
+   {
+     memcpy(packed_size, file_header.pack_size, 4);
+     memcpy(packed_size + 4, p, 4); /* High pack size */
+     p += 4;
+     memcpy(unp_size, file_header.unp_size, 4);
+     memcpy(unp_size + 4, p, 4); /* High unpack size */
+     p += 4;
+     rar->packed_size = archive_le64dec(&packed_size);
+     rar->unp_size = archive_le64dec(&unp_size);
+   }
+   else
+   {
+     rar->packed_size = archive_le32dec(file_header.pack_size);
+     rar->unp_size = archive_le32dec(file_header.unp_size);
+   }
+ 
+   if (rar->packed_size < 0 || rar->unp_size < 0)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Invalid sizes specified.");
+     return (ARCHIVE_FATAL);
+   }
+ 
+   rar->bytes_remaining = rar->packed_size;
+ 
+   /* TODO: RARv3 subblocks contain comments. For now the complete block is
+    * consumed at the end.
+    */
+   if (head_type == NEWSUB_HEAD) {
+     size_t distance = p - (const char *)h;
+     header_size += rar->packed_size;
+     /* Make sure we have the extended data. */
+     if ((h = __archive_read_ahead(a, (size_t)header_size - 7, NULL)) == NULL)
+         return (ARCHIVE_FATAL);
+     p = h;
+     endp = p + header_size - 7;
+     p += distance;
+   }
+ 
+   filename_size = archive_le16dec(file_header.name_size);
+   if (p + filename_size > endp) {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+       "Invalid filename size");
+     return (ARCHIVE_FATAL);
+   }
+   if (rar->filename_allocated < filename_size * 2 + 2) {
+     char *newptr;
+     size_t newsize = filename_size * 2 + 2;
+     newptr = realloc(rar->filename, newsize);
+     if (newptr == NULL) {
+       archive_set_error(&a->archive, ENOMEM,
+                         "Couldn't allocate memory.");
+       return (ARCHIVE_FATAL);
+     }
+     rar->filename = newptr;
+     rar->filename_allocated = newsize;
+   }
+   filename = rar->filename;
+   memcpy(filename, p, filename_size);
+   filename[filename_size] = '\0';
+   if (rar->file_flags & FHD_UNICODE)
+   {
+     if (filename_size != strlen(filename))
+     {
+       unsigned char highbyte, flagbits, flagbyte;
+       unsigned fn_end, offset;
+ 
+       end = filename_size;
+       fn_end = filename_size * 2;
+       filename_size = 0;
+       offset = (unsigned)strlen(filename) + 1;
+       highbyte = *(p + offset++);
+       flagbits = 0;
+       flagbyte = 0;
+       while (offset < end && filename_size < fn_end)
+       {
+         if (!flagbits)
+         {
+           flagbyte = *(p + offset++);
+           flagbits = 8;
+         }
+ 
+         flagbits -= 2;
+         switch((flagbyte >> flagbits) & 3)
+         {
+           case 0:
+             filename[filename_size++] = '\0';
+             filename[filename_size++] = *(p + offset++);
+             break;
+           case 1:
+             filename[filename_size++] = highbyte;
+             filename[filename_size++] = *(p + offset++);
+             break;
+           case 2:
+             filename[filename_size++] = *(p + offset + 1);
+             filename[filename_size++] = *(p + offset);
+             offset += 2;
+             break;
+           case 3:
+           {
+             char extra, high;
+             uint8_t length = *(p + offset++);
+ 
+             if (length & 0x80) {
+               extra = *(p + offset++);
+               high = (char)highbyte;
+             } else
+               extra = high = 0;
+             length = (length & 0x7f) + 2;
+             while (length && filename_size < fn_end) {
+               unsigned cp = filename_size >> 1;
+               filename[filename_size++] = high;
+               filename[filename_size++] = p[cp] + extra;
+               length--;
+             }
+           }
+           break;
+         }
+       }
+       if (filename_size > fn_end) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+           "Invalid filename");
+         return (ARCHIVE_FATAL);
+       }
+       filename[filename_size++] = '\0';
+       /*
+        * Do not increment filename_size here as the computations below
+        * add the space for the terminating NUL explicitly.
+        */
+       filename[filename_size] = '\0';
+ 
+       /* Decoded unicode form is UTF-16BE, so we have to update a string
+        * conversion object for it. */
+       if (rar->sconv_utf16be == NULL) {
+         rar->sconv_utf16be = archive_string_conversion_from_charset(
+            &a->archive, "UTF-16BE", 1);
+         if (rar->sconv_utf16be == NULL)
+           return (ARCHIVE_FATAL);
+       }
+       fn_sconv = rar->sconv_utf16be;
+ 
+       strp = filename;
+       while (memcmp(strp, "\x00\x00", 2))
+       {
+         if (!memcmp(strp, "\x00\\", 2))
+           *(strp + 1) = '/';
+         strp += 2;
+       }
+       p += offset;
+     } else {
+       /*
+        * If FHD_UNICODE is set but no unicode data, this file name form
+        * is UTF-8, so we have to update a string conversion object for
+        * it accordingly.
+        */
+       if (rar->sconv_utf8 == NULL) {
+         rar->sconv_utf8 = archive_string_conversion_from_charset(
+            &a->archive, "UTF-8", 1);
+         if (rar->sconv_utf8 == NULL)
+           return (ARCHIVE_FATAL);
+       }
+       fn_sconv = rar->sconv_utf8;
+       while ((strp = strchr(filename, '\\')) != NULL)
+         *strp = '/';
+       p += filename_size;
+     }
+   }
+   else
+   {
+     fn_sconv = sconv;
+     while ((strp = strchr(filename, '\\')) != NULL)
+       *strp = '/';
+     p += filename_size;
+   }
+ 
+   /* Split file in multivolume RAR. No more need to process header. */
+   if (rar->filename_save &&
+     filename_size == rar->filename_save_size &&
+     !memcmp(rar->filename, rar->filename_save, filename_size + 1))
+   {
+     __archive_read_consume(a, header_size - 7);
+     rar->cursor++;
+     if (rar->cursor >= rar->nodes)
+     {
+       rar->nodes++;
+       if ((rar->dbo =
+         realloc(rar->dbo, sizeof(*rar->dbo) * rar->nodes)) == NULL)
+       {
+         archive_set_error(&a->archive, ENOMEM, "Couldn't allocate memory.");
+         return (ARCHIVE_FATAL);
+       }
+       rar->dbo[rar->cursor].header_size = header_size;
+       rar->dbo[rar->cursor].start_offset = -1;
+       rar->dbo[rar->cursor].end_offset = -1;
+     }
+     if (rar->dbo[rar->cursor].start_offset < 0)
+     {
+       rar->dbo[rar->cursor].start_offset = a->filter->position;
+       rar->dbo[rar->cursor].end_offset = rar->dbo[rar->cursor].start_offset +
+         rar->packed_size;
+     }
+     return ret;
+   }
+   else if (rar->filename_must_match)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+       "Mismatch of file parts split across multi-volume archive");
+     return (ARCHIVE_FATAL);
+   }
+ 
+   rar->filename_save = (char*)realloc(rar->filename_save,
+                                       filename_size + 1);
+   memcpy(rar->filename_save, rar->filename, filename_size + 1);
+   rar->filename_save_size = filename_size;
+ 
+   /* Set info for seeking */
+   free(rar->dbo);
+   if ((rar->dbo = calloc(1, sizeof(*rar->dbo))) == NULL)
+   {
+     archive_set_error(&a->archive, ENOMEM, "Couldn't allocate memory.");
+     return (ARCHIVE_FATAL);
+   }
+   rar->dbo[0].header_size = header_size;
+   rar->dbo[0].start_offset = -1;
+   rar->dbo[0].end_offset = -1;
+   rar->cursor = 0;
+   rar->nodes = 1;
+ 
+   if (rar->file_flags & FHD_SALT)
+   {
+     if (p + 8 > endp) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+         "Invalid header size");
+       return (ARCHIVE_FATAL);
+     }
+     memcpy(rar->salt, p, 8);
+     p += 8;
+   }
+ 
+   if (rar->file_flags & FHD_EXTTIME) {
+     if (read_exttime(p, rar, endp) < 0) {
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+         "Invalid header size");
+       return (ARCHIVE_FATAL);
+     }
+   }
+ 
+   __archive_read_consume(a, header_size - 7);
+   rar->dbo[0].start_offset = a->filter->position;
+   rar->dbo[0].end_offset = rar->dbo[0].start_offset + rar->packed_size;
+ 
+   switch(file_header.host_os)
+   {
+   case OS_MSDOS:
+   case OS_OS2:
+   case OS_WIN32:
+     rar->mode = archive_le32dec(file_header.file_attr);
+     if (rar->mode & FILE_ATTRIBUTE_DIRECTORY)
+       rar->mode = AE_IFDIR | S_IXUSR | S_IXGRP | S_IXOTH;
+     else
+       rar->mode = AE_IFREG;
+     rar->mode |= S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+     break;
+ 
+   case OS_UNIX:
+   case OS_MAC_OS:
+   case OS_BEOS:
+     rar->mode = archive_le32dec(file_header.file_attr);
+     break;
+ 
+   default:
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Unknown file attributes from RAR file's host OS");
+     return (ARCHIVE_FATAL);
+   }
+ 
+   rar->bytes_uncopied = rar->bytes_unconsumed = 0;
+   rar->lzss.position = rar->offset = 0;
+   rar->offset_seek = 0;
+   rar->dictionary_size = 0;
+   rar->offset_outgoing = 0;
+   rar->br.cache_avail = 0;
+   rar->br.avail_in = 0;
+   rar->crc_calculated = 0;
+   rar->entry_eof = 0;
+   rar->valid = 1;
+   rar->is_ppmd_block = 0;
+   rar->start_new_table = 1;
+   free(rar->unp_buffer);
+   rar->unp_buffer = NULL;
+   rar->unp_offset = 0;
+   rar->unp_buffer_size = UNP_BUFFER_SIZE;
+   memset(rar->lengthtable, 0, sizeof(rar->lengthtable));
+   __archive_ppmd7_functions.Ppmd7_Free(&rar->ppmd7_context);
+   rar->ppmd_valid = rar->ppmd_eod = 0;
+   rar->filters.filterstart = INT64_MAX;
+ 
+   /* Don't set any archive entries for non-file header types */
+   if (head_type == NEWSUB_HEAD)
+     return ret;
+ 
+   archive_entry_set_mtime(entry, rar->mtime, rar->mnsec);
+   archive_entry_set_ctime(entry, rar->ctime, rar->cnsec);
+   archive_entry_set_atime(entry, rar->atime, rar->ansec);
+   archive_entry_set_size(entry, rar->unp_size);
+   archive_entry_set_mode(entry, rar->mode);
+ 
+   if (archive_entry_copy_pathname_l(entry, filename, filename_size, fn_sconv))
+   {
+     if (errno == ENOMEM)
+     {
+       archive_set_error(&a->archive, ENOMEM,
+                         "Can't allocate memory for Pathname");
+       return (ARCHIVE_FATAL);
+     }
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Pathname cannot be converted from %s to current locale.",
+                       archive_string_conversion_charset_name(fn_sconv));
+     ret = (ARCHIVE_WARN);
+   }
+ 
+   if (((rar->mode) & AE_IFMT) == AE_IFLNK)
+   {
+     /* Make sure a symbolic-link file does not have its body. */
+     rar->bytes_remaining = 0;
+     archive_entry_set_size(entry, 0);
+ 
+     /* Read a symbolic-link name. */
+     if ((ret2 = read_symlink_stored(a, entry, sconv)) < (ARCHIVE_WARN))
+       return ret2;
+     if (ret > ret2)
+       ret = ret2;
+   }
+ 
+   if (rar->bytes_remaining == 0)
+     rar->entry_eof = 1;
+ 
+   return ret;
+ }
+@@ -1941,41 +1947,43 @@ static int
+ read_data_stored(struct archive_read *a, const void **buff, size_t *size,
+                  int64_t *offset)
+ {
+   struct rar *rar;
+   ssize_t bytes_avail;
+ 
+   rar = (struct rar *)(a->format->data);
+   if (rar->bytes_remaining == 0 &&
+     !(rar->main_flags & MHD_VOLUME && rar->file_flags & FHD_SPLIT_AFTER))
+   {
+     *buff = NULL;
+     *size = 0;
+     *offset = rar->offset;
+     if (rar->file_crc != rar->crc_calculated) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+       archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                         "File CRC error");
+       return (ARCHIVE_FATAL);
++#endif
+     }
+     rar->entry_eof = 1;
+     return (ARCHIVE_EOF);
+   }
+ 
+   *buff = rar_read_ahead(a, 1, &bytes_avail);
+   if (bytes_avail <= 0)
+   {
+     archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                       "Truncated RAR file data");
+     return (ARCHIVE_FATAL);
+   }
+ 
+   *size = bytes_avail;
+   *offset = rar->offset;
+   rar->offset += bytes_avail;
+   rar->offset_seek += bytes_avail;
+   rar->bytes_remaining -= bytes_avail;
+   rar->bytes_unconsumed = bytes_avail;
+   /* Calculate File CRC. */
+   rar->crc_calculated = crc32(rar->crc_calculated, *buff,
+     (unsigned)bytes_avail);
+   return (ARCHIVE_OK);
+ }
+@@ -1984,233 +1992,235 @@ static int
+ read_data_compressed(struct archive_read *a, const void **buff, size_t *size,
+                      int64_t *offset, size_t looper)
+ {
+   if (looper++ > MAX_COMPRESS_DEPTH)
+     return (ARCHIVE_FATAL);
+ 
+   struct rar *rar;
+   int64_t start, end;
+   size_t bs;
+   int ret = (ARCHIVE_OK), sym, code, lzss_offset, length, i;
+ 
+   rar = (struct rar *)(a->format->data);
+ 
+   do {
+     if (!rar->valid)
+       return (ARCHIVE_FATAL);
+ 
+     if (rar->filters.bytes_ready > 0)
+     {
+       /* Flush unp_buffer first */
+       if (rar->unp_offset > 0)
+       {
+         *buff = rar->unp_buffer;
+         *size = rar->unp_offset;
+         rar->unp_offset = 0;
+         *offset = rar->offset_outgoing;
+         rar->offset_outgoing += *size;
+       }
+       else
+       {
+         *buff = rar->filters.bytes;
+         *size = rar->filters.bytes_ready;
+ 
+         rar->offset += *size;
+         *offset = rar->offset_outgoing;
+         rar->offset_outgoing += *size;
+ 
+         rar->filters.bytes_ready -= *size;
+         rar->filters.bytes += *size;
+       }
+       goto ending_block;
+     }
+ 
+     if (rar->ppmd_eod ||
+        (rar->dictionary_size && rar->offset >= rar->unp_size))
+     {
+       if (rar->unp_offset > 0) {
+         /*
+          * We have unprocessed extracted data. write it out.
+          */
+         *buff = rar->unp_buffer;
+         *size = rar->unp_offset;
+         *offset = rar->offset_outgoing;
+         rar->offset_outgoing += *size;
+         /* Calculate File CRC. */
+         rar->crc_calculated = crc32(rar->crc_calculated, *buff,
+           (unsigned)*size);
+         rar->unp_offset = 0;
+         return (ARCHIVE_OK);
+       }
+       *buff = NULL;
+       *size = 0;
+       *offset = rar->offset;
+       if (rar->file_crc != rar->crc_calculated) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                           "File CRC error");
+         return (ARCHIVE_FATAL);
++#endif
+       }
+       rar->entry_eof = 1;
+       return (ARCHIVE_EOF);
+     }
+ 
+     if (!rar->is_ppmd_block && rar->dictionary_size && rar->bytes_uncopied > 0)
+     {
+       if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
+         bs = rar->unp_buffer_size - rar->unp_offset;
+       else
+         bs = (size_t)rar->bytes_uncopied;
+       ret = copy_from_lzss_window_to_unp(a, buff, rar->offset, (int)bs);
+       if (ret != ARCHIVE_OK)
+         return (ret);
+       rar->offset += bs;
+       rar->bytes_uncopied -= bs;
+       if (*buff != NULL) {
+         rar->unp_offset = 0;
+         *size = rar->unp_buffer_size;
+         *offset = rar->offset_outgoing;
+         rar->offset_outgoing += *size;
+         /* Calculate File CRC. */
+         rar->crc_calculated = crc32(rar->crc_calculated, *buff,
+           (unsigned)*size);
+         return (ret);
+       }
+       continue;
+     }
+ 
+     if (rar->filters.lastend == rar->filters.filterstart)
+     {
+       if (!run_filters(a))
+         return (ARCHIVE_FATAL);
+       continue;
+     }
+ 
+     if (!rar->br.next_in &&
+       (ret = rar_br_preparation(a, &(rar->br))) < ARCHIVE_WARN)
+       return (ret);
+     if (rar->start_new_table && ((ret = parse_codes(a)) < (ARCHIVE_WARN)))
+       return (ret);
+ 
+     if (rar->is_ppmd_block)
+     {
+       if ((sym = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+         &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+       {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                           "Invalid symbol");
+         return (ARCHIVE_FATAL);
+       }
+       if(sym != rar->ppmd_escape)
+       {
+         lzss_emit_literal(rar, sym);
+         rar->bytes_uncopied++;
+       }
+       else
+       {
+         if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+           &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+         {
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                             "Invalid symbol");
+           return (ARCHIVE_FATAL);
+         }
+ 
+         switch(code)
+         {
+           case 0:
+             rar->start_new_table = 1;
+             return read_data_compressed(a, buff, size, offset, looper);
+ 
+           case 2:
+             rar->ppmd_eod = 1;/* End Of ppmd Data. */
+             continue;
+ 
+           case 3:
+             archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+                               "Parsing filters is unsupported.");
+             return (ARCHIVE_FAILED);
+ 
+           case 4:
+             lzss_offset = 0;
+             for (i = 2; i >= 0; i--)
+             {
+               if ((code = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+                 &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+               {
+                 archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                                   "Invalid symbol");
+                 return (ARCHIVE_FATAL);
+               }
+               lzss_offset |= code << (i * 8);
+             }
+             if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+               &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+             {
+               archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                                 "Invalid symbol");
+               return (ARCHIVE_FATAL);
+             }
+             lzss_emit_match(rar, lzss_offset + 2, length + 32);
+             rar->bytes_uncopied += length + 32;
+             break;
+ 
+           case 5:
+             if ((length = __archive_ppmd7_functions.Ppmd7_DecodeSymbol(
+               &rar->ppmd7_context, &rar->range_dec.p)) < 0)
+             {
+               archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                                 "Invalid symbol");
+               return (ARCHIVE_FATAL);
+             }
+             lzss_emit_match(rar, 1, length + 4);
+             rar->bytes_uncopied += length + 4;
+             break;
+ 
+          default:
+            lzss_emit_literal(rar, sym);
+            rar->bytes_uncopied++;
+         }
+       }
+     }
+     else
+     {
+       start = rar->offset;
+       end = start + rar->dictionary_size;
+       if (rar->filters.filterstart < end) {
+         end = rar->filters.filterstart;
+       }
+ 
+       ret = expand(a, &end);
+       if (ret != ARCHIVE_OK)
+ 	      return (ret);
+ 
+       rar->bytes_uncopied = end - start;
+       rar->filters.lastend = end;
+       if (rar->filters.lastend != rar->filters.filterstart && rar->bytes_uncopied == 0) {
+           /* Broken RAR files cause this case.
+           * NOTE: If this case were possible on a normal RAR file
+           * we would find out where it was actually bad and
+           * what we would do to solve it. */
+           archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                             "Internal error extracting RAR file");
+           return (ARCHIVE_FATAL);
+       }
+     }
+     if (rar->bytes_uncopied > (rar->unp_buffer_size - rar->unp_offset))
+       bs = rar->unp_buffer_size - rar->unp_offset;
+     else
+       bs = (size_t)rar->bytes_uncopied;
+     ret = copy_from_lzss_window_to_unp(a, buff, rar->offset, (int)bs);
+     if (ret != ARCHIVE_OK)
+       return (ret);
+     rar->offset += bs;
+     rar->bytes_uncopied -= bs;
+     /*
+      * If *buff is NULL, it means unp_buffer is not full.
+      * So we have to continue extracting a RAR file.
+      */
+   } while (*buff == NULL);
+ 
+   rar->unp_offset = 0;
+   *size = rar->unp_buffer_size;
+   *offset = rar->offset_outgoing;
+   rar->offset_outgoing += *size;
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index cc966a51..38979cbe 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -2773,62 +2773,64 @@ static int parse_tables(struct archive_read* a, struct rar5* rar,
+ /* Parses the block header, verifies its CRC byte, and saves the header
+  * fields inside the `hdr` pointer. */
+ static int parse_block_header(struct archive_read* a, const uint8_t* p,
+     ssize_t* block_size, struct compressed_block_header* hdr)
+ {
+ 	uint8_t calculated_cksum;
+ 	memcpy(hdr, p, sizeof(struct compressed_block_header));
+ 
+ 	if(bf_byte_count(hdr) > 2) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Unsupported block header size (was %d, max is 2)",
+ 		    bf_byte_count(hdr));
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	/* This should probably use bit reader interface in order to be more
+ 	 * future-proof. */
+ 	*block_size = 0;
+ 	switch(bf_byte_count(hdr)) {
+ 		/* 1-byte block size */
+ 		case 0:
+ 			*block_size = *(const uint8_t*) &p[2];
+ 			break;
+ 
+ 		/* 2-byte block size */
+ 		case 1:
+ 			*block_size = archive_le16dec(&p[2]);
+ 			break;
+ 
+ 		/* 3-byte block size */
+ 		case 2:
+ 			*block_size = archive_le32dec(&p[2]);
+ 			*block_size &= 0x00FFFFFF;
+ 			break;
+ 
+ 		/* Other block sizes are not supported. This case is not
+ 		 * reached, because we have an 'if' guard before the switch
+ 		 * that makes sure of it. */
+ 		default:
+ 			return ARCHIVE_FATAL;
+ 	}
+ 
+ 	/* Verify the block header checksum. 0x5A is a magic value and is
+ 	 * always * constant. */
+ 	calculated_cksum = 0x5A
+ 	    ^ (uint8_t) hdr->block_flags_u8
+ 	    ^ (uint8_t) *block_size
+ 	    ^ (uint8_t) (*block_size >> 8)
+ 	    ^ (uint8_t) (*block_size >> 16);
+ 
+ 	if(calculated_cksum != hdr->block_cksum) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Block checksum error: got 0x%x, expected 0x%x",
+ 		    hdr->block_cksum, calculated_cksum);
+ 
+ 		return ARCHIVE_FATAL;
++#endif
+ 	}
+ 
+ 	return ARCHIVE_OK;
+ }
+ 
+ /* Convenience function used during filter processing. */
+diff --git a/libarchive/archive_read_support_format_xar.c b/libarchive/archive_read_support_format_xar.c
+index 503ff58b..ec5b06ed 100644
+--- a/libarchive/archive_read_support_format_xar.c
++++ b/libarchive/archive_read_support_format_xar.c
+@@ -531,132 +531,134 @@ static int
+ read_toc(struct archive_read *a)
+ {
+ 	struct xar *xar;
+ 	struct xar_file *file;
+ 	const unsigned char *b;
+ 	uint64_t toc_compressed_size;
+ 	uint64_t toc_uncompressed_size;
+ 	uint32_t toc_chksum_alg;
+ 	ssize_t bytes;
+ 	int r;
+ 
+ 	xar = (struct xar *)(a->format->data);
+ 
+ 	/*
+ 	 * Read xar header.
+ 	 */
+ 	b = __archive_read_ahead(a, HEADER_SIZE, &bytes);
+ 	if (bytes < 0)
+ 		return ((int)bytes);
+ 	if (bytes < HEADER_SIZE) {
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Truncated archive header");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	if (archive_be32dec(b) != HEADER_MAGIC) {
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Invalid header magic");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 	if (archive_be16dec(b+6) != HEADER_VERSION) {
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Unsupported header version(%d)",
+ 		    archive_be16dec(b+6));
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 	toc_compressed_size = archive_be64dec(b+8);
+ 	xar->toc_remaining = toc_compressed_size;
+ 	toc_uncompressed_size = archive_be64dec(b+16);
+ 	toc_chksum_alg = archive_be32dec(b+24);
+ 	__archive_read_consume(a, HEADER_SIZE);
+ 	xar->offset += HEADER_SIZE;
+ 	xar->toc_total = 0;
+ 
+ 	/*
+ 	 * Read TOC(Table of Contents).
+ 	 */
+ 	/* Initialize reading contents. */
+ 	r = move_reading_point(a, HEADER_SIZE);
+ 	if (r != ARCHIVE_OK)
+ 		return (r);
+ 	r = rd_contents_init(a, GZIP, toc_chksum_alg, CKSUM_NONE);
+ 	if (r != ARCHIVE_OK)
+ 		return (r);
+ 
+ #ifdef HAVE_LIBXML_XMLREADER_H
+ 	r = xml2_read_toc(a);
+ #elif defined(HAVE_BSDXML_H) || defined(HAVE_EXPAT_H)
+ 	r = expat_read_toc(a);
+ #endif
+ 	if (r != ARCHIVE_OK)
+ 		return (r);
+ 
+ 	/* Set 'The HEAP' base. */
+ 	xar->h_base = xar->offset;
+ 	if (xar->toc_total != toc_uncompressed_size) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_MISC,
+ 		    "TOC uncompressed size error");
+ 		return (ARCHIVE_FATAL);
+ 	}
+ 
+ 	/*
+ 	 * Checksum TOC
+ 	 */
+ 	if (toc_chksum_alg != CKSUM_NONE) {
+ 		r = move_reading_point(a, xar->toc_chksum_offset);
+ 		if (r != ARCHIVE_OK)
+ 			return (r);
+ 		b = __archive_read_ahead(a,
+ 			(size_t)xar->toc_chksum_size, &bytes);
+ 		if (bytes < 0)
+ 			return ((int)bytes);
+ 		if ((uint64_t)bytes < xar->toc_chksum_size) {
+ 			archive_set_error(&a->archive,
+ 			    ARCHIVE_ERRNO_FILE_FORMAT,
+ 			    "Truncated archive file");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 		r = checksum_final(a, b,
+ 			(size_t)xar->toc_chksum_size, NULL, 0);
+ 		__archive_read_consume(a, xar->toc_chksum_size);
+ 		xar->offset += xar->toc_chksum_size;
+ 		if (r != ARCHIVE_OK)
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			return (ARCHIVE_FATAL);
++#endif
+ 	}
+ 
+ 	/*
+ 	 * Connect hardlinked files.
+ 	 */
+ 	for (file = xar->hdlink_orgs; file != NULL; file = file->hdnext) {
+ 		struct hdlink **hdlink;
+ 
+ 		for (hdlink = &(xar->hdlink_list); *hdlink != NULL;
+ 		    hdlink = &((*hdlink)->next)) {
+ 			if ((*hdlink)->id == file->id) {
+ 				struct hdlink *hltmp;
+ 				struct xar_file *f2;
+ 				int nlink = (*hdlink)->cnt + 1;
+ 
+ 				file->nlink = nlink;
+ 				for (f2 = (*hdlink)->files; f2 != NULL;
+ 				    f2 = f2->hdnext) {
+ 					f2->nlink = nlink;
+ 					archive_string_copy(
+ 					    &(f2->hardlink), &(file->pathname));
+ 				}
+ 				/* Remove resolved files from hdlist_list. */
+ 				hltmp = *hdlink;
+ 				*hdlink = hltmp->next;
+ 				free(hltmp);
+ 				break;
+ 			}
+ 		}
+ 	}
+ 	a->archive.archive_format = ARCHIVE_FORMAT_XAR;
+ 	a->archive.archive_format_name = "xar";
+ 
+ 	return (ARCHIVE_OK);
+ }
+@@ -665,195 +667,197 @@ static int
+ xar_read_header(struct archive_read *a, struct archive_entry *entry)
+ {
+ 	struct xar *xar;
+ 	struct xar_file *file;
+ 	struct xattr *xattr;
+ 	int r;
+ 
+ 	xar = (struct xar *)(a->format->data);
+ 	r = ARCHIVE_OK;
+ 
+ 	if (xar->offset == 0) {
+ 		/* Create a character conversion object. */
+ 		if (xar->sconv == NULL) {
+ 			xar->sconv = archive_string_conversion_from_charset(
+ 			    &(a->archive), "UTF-8", 1);
+ 			if (xar->sconv == NULL)
+ 				return (ARCHIVE_FATAL);
+ 		}
+ 
+ 		/* Read TOC. */
+ 		r = read_toc(a);
+ 		if (r != ARCHIVE_OK)
+ 			return (r);
+ 	}
+ 
+ 	for (;;) {
+ 		file = xar->file = heap_get_entry(&(xar->file_queue));
+ 		if (file == NULL) {
+ 			xar->end_of_file = 1;
+ 			return (ARCHIVE_EOF);
+ 		}
+ 		if ((file->mode & AE_IFMT) != AE_IFDIR)
+ 			break;
+ 		if (file->has != (HAS_PATHNAME | HAS_TYPE))
+ 			break;
+ 		/*
+ 		 * If a file type is a directory and it does not have
+ 		 * any metadata, do not export.
+ 		 */
+ 		file_free(file);
+ 	}
+         if (file->has & HAS_ATIME) {
+           archive_entry_set_atime(entry, file->atime, 0);
+         }
+         if (file->has & HAS_CTIME) {
+           archive_entry_set_ctime(entry, file->ctime, 0);
+         }
+         if (file->has & HAS_MTIME) {
+           archive_entry_set_mtime(entry, file->mtime, 0);
+         }
+ 	archive_entry_set_gid(entry, file->gid);
+ 	if (file->gname.length > 0 &&
+ 	    archive_entry_copy_gname_l(entry, file->gname.s,
+ 		archive_strlen(&(file->gname)), xar->sconv) != 0) {
+ 		if (errno == ENOMEM) {
+ 			archive_set_error(&a->archive, ENOMEM,
+ 			    "Can't allocate memory for Gname");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Gname cannot be converted from %s to current locale.",
+ 		    archive_string_conversion_charset_name(xar->sconv));
+ 		r = ARCHIVE_WARN;
+ 	}
+ 	archive_entry_set_uid(entry, file->uid);
+ 	if (file->uname.length > 0 &&
+ 	    archive_entry_copy_uname_l(entry, file->uname.s,
+ 		archive_strlen(&(file->uname)), xar->sconv) != 0) {
+ 		if (errno == ENOMEM) {
+ 			archive_set_error(&a->archive, ENOMEM,
+ 			    "Can't allocate memory for Uname");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Uname cannot be converted from %s to current locale.",
+ 		    archive_string_conversion_charset_name(xar->sconv));
+ 		r = ARCHIVE_WARN;
+ 	}
+ 	archive_entry_set_mode(entry, file->mode);
+ 	if (archive_entry_copy_pathname_l(entry, file->pathname.s,
+ 	    archive_strlen(&(file->pathname)), xar->sconv) != 0) {
+ 		if (errno == ENOMEM) {
+ 			archive_set_error(&a->archive, ENOMEM,
+ 			    "Can't allocate memory for Pathname");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Pathname cannot be converted from %s to current locale.",
+ 		    archive_string_conversion_charset_name(xar->sconv));
+ 		r = ARCHIVE_WARN;
+ 	}
+ 
+ 
+ 	if (file->symlink.length > 0 &&
+ 	    archive_entry_copy_symlink_l(entry, file->symlink.s,
+ 		archive_strlen(&(file->symlink)), xar->sconv) != 0) {
+ 		if (errno == ENOMEM) {
+ 			archive_set_error(&a->archive, ENOMEM,
+ 			    "Can't allocate memory for Linkname");
+ 			return (ARCHIVE_FATAL);
+ 		}
+ 		archive_set_error(&a->archive,
+ 		    ARCHIVE_ERRNO_FILE_FORMAT,
+ 		    "Linkname cannot be converted from %s to current locale.",
+ 		    archive_string_conversion_charset_name(xar->sconv));
+ 		r = ARCHIVE_WARN;
+ 	}
+ 	/* Set proper nlink. */
+ 	if ((file->mode & AE_IFMT) == AE_IFDIR)
+ 		archive_entry_set_nlink(entry, file->subdirs + 2);
+ 	else
+ 		archive_entry_set_nlink(entry, file->nlink);
+ 	archive_entry_set_size(entry, file->size);
+ 	if (archive_strlen(&(file->hardlink)) > 0)
+ 		archive_entry_set_hardlink(entry, file->hardlink.s);
+ 	archive_entry_set_ino64(entry, file->ino64);
+ 	if (file->has & HAS_DEV)
+ 		archive_entry_set_dev(entry, file->dev);
+ 	if (file->has & HAS_DEVMAJOR)
+ 		archive_entry_set_devmajor(entry, file->devmajor);
+ 	if (file->has & HAS_DEVMINOR)
+ 		archive_entry_set_devminor(entry, file->devminor);
+ 	if (archive_strlen(&(file->fflags_text)) > 0)
+ 		archive_entry_copy_fflags_text(entry, file->fflags_text.s);
+ 
+ 	xar->entry_init = 1;
+ 	xar->entry_total = 0;
+ 	xar->entry_remaining = file->length;
+ 	xar->entry_size = file->size;
+ 	xar->entry_encoding = file->encoding;
+ 	xar->entry_a_sum = file->a_sum;
+ 	xar->entry_e_sum = file->e_sum;
+ 	/*
+ 	 * Read extended attributes.
+ 	 */
+ 	xattr = file->xattr_list;
+ 	while (xattr != NULL) {
+ 		const void *d;
+ 		size_t outbytes = 0;
+ 		size_t used = 0;
+ 
+ 		r = move_reading_point(a, xattr->offset);
+ 		if (r != ARCHIVE_OK)
+ 			break;
+ 		r = rd_contents_init(a, xattr->encoding,
+ 		    xattr->a_sum.alg, xattr->e_sum.alg);
+ 		if (r != ARCHIVE_OK)
+ 			break;
+ 		d = NULL;
+ 		r = rd_contents(a, &d, &outbytes, &used, xattr->length);
+ 		if (r != ARCHIVE_OK)
+ 			break;
+ 		if (outbytes != xattr->size) {
+ 			archive_set_error(&(a->archive), ARCHIVE_ERRNO_MISC,
+ 			    "Decompressed size error");
+ 			r = ARCHIVE_FATAL;
+ 			break;
+ 		}
+ 		r = checksum_final(a,
+ 		    xattr->a_sum.val, xattr->a_sum.len,
+ 		    xattr->e_sum.val, xattr->e_sum.len);
+ 		if (r != ARCHIVE_OK) {
++#ifndef DONT_FAIL_ON_CRC_ERROR
+ 			archive_set_error(&(a->archive), ARCHIVE_ERRNO_MISC,
+ 			    "Xattr checksum error");
+ 			r = ARCHIVE_WARN;
+ 			break;
++#endif
+ 		}
+ 		if (xattr->name.s == NULL) {
+ 			archive_set_error(&(a->archive), ARCHIVE_ERRNO_MISC,
+ 			    "Xattr name error");
+ 			r = ARCHIVE_WARN;
+ 			break;
+ 		}
+ 		archive_entry_xattr_add_entry(entry,
+ 		    xattr->name.s, d, outbytes);
+ 		xattr = xattr->next;
+ 	}
+ 	if (r != ARCHIVE_OK) {
+ 		file_free(file);
+ 		return (r);
+ 	}
+ 
+ 	if (xar->entry_remaining > 0)
+ 		/* Move reading point to the beginning of current
+ 		 * file contents. */
+ 		r = move_reading_point(a, file->offset);
+ 	else
+ 		r = ARCHIVE_OK;
+ 
+ 	file_free(file);
+ 	return (r);
+ }

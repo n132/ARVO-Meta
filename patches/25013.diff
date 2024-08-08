@@ -1,0 +1,161 @@
+commit 9825e3dd2eaea4e267054adebc8d972e1f01cc0d
+Author: Garret Rieger <grieger@google.com>
+Date:   Wed Aug 26 17:31:50 2020 -0700
+
+    [ENOMEM] fix access to unitialized memory.
+    If the serialize() call fails to write the object then we can't safely read varstore_prime fields. Fixes https://oss-fuzz.com/testcase-detail/5137462782066688.
+
+diff --git a/src/hb-ot-layout-common.hh b/src/hb-ot-layout-common.hh
+index 3140dd632..6ab950a32 100644
+--- a/src/hb-ot-layout-common.hh
++++ b/src/hb-ot-layout-common.hh
+@@ -2433,141 +2433,144 @@ struct VarData
+ struct VariationStore
+ {
+   float get_delta (unsigned int outer, unsigned int inner,
+ 		   const int *coords, unsigned int coord_count) const
+   {
+ #ifdef HB_NO_VAR
+     return 0.f;
+ #endif
+ 
+     if (unlikely (outer >= dataSets.len))
+       return 0.f;
+ 
+     return (this+dataSets[outer]).get_delta (inner,
+ 					     coords, coord_count,
+ 					     this+regions);
+   }
+ 
+   float get_delta (unsigned int index,
+ 		   const int *coords, unsigned int coord_count) const
+   {
+     unsigned int outer = index >> 16;
+     unsigned int inner = index & 0xFFFF;
+     return get_delta (outer, inner, coords, coord_count);
+   }
+ 
+   bool sanitize (hb_sanitize_context_t *c) const
+   {
+ #ifdef HB_NO_VAR
+     return true;
+ #endif
+ 
+     TRACE_SANITIZE (this);
+     return_trace (c->check_struct (this) &&
+ 		  format == 1 &&
+ 		  regions.sanitize (c, this) &&
+ 		  dataSets.sanitize (c, this));
+   }
+ 
+   bool serialize (hb_serialize_context_t *c,
+ 		  const VariationStore *src,
+ 		  const hb_array_t <hb_inc_bimap_t> &inner_maps)
+   {
+     TRACE_SERIALIZE (this);
+     unsigned int set_count = 0;
+     for (unsigned int i = 0; i < inner_maps.length; i++)
+       if (inner_maps[i].get_population () > 0) set_count++;
+ 
+     unsigned int size = min_size + HBUINT32::static_size * set_count;
+     if (unlikely (!c->allocate_size<HBUINT32> (size))) return_trace (false);
+     format = 1;
+ 
+     hb_inc_bimap_t region_map;
+     for (unsigned int i = 0; i < inner_maps.length; i++)
+       (src+src->dataSets[i]).collect_region_refs (region_map, inner_maps[i]);
+     region_map.sort ();
+ 
+     if (unlikely (!regions.serialize (c, this)
+ 		  .serialize (c, &(src+src->regions), region_map))) return_trace (false);
+ 
+     /* TODO: The following code could be simplified when
+      * OffsetListOf::subset () can take a custom param to be passed to VarData::serialize ()
+      */
+     dataSets.len = set_count;
+     unsigned int set_index = 0;
+     for (unsigned int i = 0; i < inner_maps.length; i++)
+     {
+       if (inner_maps[i].get_population () == 0) continue;
+       if (unlikely (!dataSets[set_index++].serialize (c, this)
+ 		      .serialize (c, &(src+src->dataSets[i]), inner_maps[i], region_map)))
+ 	return_trace (false);
+     }
+ 
+     return_trace (true);
+   }
+ 
+   bool subset (hb_subset_context_t *c) const
+   {
+     TRACE_SUBSET (this);
+ 
+     VariationStore *varstore_prime = c->serializer->start_embed<VariationStore> ();
+     if (unlikely (!varstore_prime)) return_trace (false);
+ 
+     const hb_set_t *variation_indices = c->plan->layout_variation_indices;
+     if (variation_indices->is_empty ()) return_trace (false);
+ 
+     hb_vector_t<hb_inc_bimap_t> inner_maps;
+     inner_maps.resize ((unsigned) dataSets.len);
+     for (unsigned i = 0; i < inner_maps.length; i++)
+       inner_maps[i].init ();
+ 
+     for (unsigned idx : c->plan->layout_variation_indices->iter ())
+     {
+       uint16_t major = idx >> 16;
+       uint16_t minor = idx & 0xFFFF;
+ 
+       if (major >= inner_maps.length)
+       {
+ 	for (unsigned i = 0; i < inner_maps.length; i++)
+ 	  inner_maps[i].fini ();
+ 	return_trace (false);
+       }
+       inner_maps[major].add (minor);
+     }
+     varstore_prime->serialize (c->serializer, this, inner_maps.as_array ());
+ 
+     for (unsigned i = 0; i < inner_maps.length; i++)
+       inner_maps[i].fini ();
+-    return_trace (bool (varstore_prime->dataSets));
++
++    return_trace (
++        !c->serializer->in_error()
++        && varstore_prime->dataSets);
+   }
+ 
+   unsigned int get_region_index_count (unsigned int ivs) const
+   { return (this+dataSets[ivs]).get_region_index_count (); }
+ 
+   void get_scalars (unsigned int ivs,
+ 		    const int *coords, unsigned int coord_count,
+ 		    float *scalars /*OUT*/,
+ 		    unsigned int num_scalars) const
+   {
+ #ifdef HB_NO_VAR
+     for (unsigned i = 0; i < num_scalars; i++)
+       scalars[i] = 0.f;
+     return;
+ #endif
+ 
+     (this+dataSets[ivs]).get_scalars (coords, coord_count, this+regions,
+ 				      &scalars[0], num_scalars);
+   }
+ 
+   unsigned int get_sub_table_count () const { return dataSets.len; }
+ 
+   protected:
+   HBUINT16				format;
+   LOffsetTo<VarRegionList>		regions;
+   LOffsetArrayOf<VarData>		dataSets;
+   public:
+   DEFINE_SIZE_ARRAY (8, dataSets);
+ };
+ 
+ /*
+  * Feature Variations
+  */
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5137462782066688 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5137462782066688
+new file mode 100644
+index 000000000..7b049bac2
+Binary files /dev/null and b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5137462782066688 differ

@@ -1,0 +1,268 @@
+commit 61aae4f319ac801ead90d789cbd7f7e3f2efd133
+Author: Nathan Moinvaziri <nathan@nathanm.com>
+Date:   Fri Jan 29 17:47:36 2021 -0800
+
+    Fixed ASAN unknown-read when reading stream if previous stream cbytes < 0.
+    https://oss-fuzz.com/testcase-detail/4727058852872192
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 695a7fc1..0b9f512c 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -986,254 +986,254 @@ int pipeline_d(blosc2_context* context, const int32_t bsize, uint8_t* dest,
+ /* Decompress & unshuffle a single block */
+ static int blosc_d(
+     struct thread_context* thread_context, int32_t bsize,
+     int32_t leftoverblock, const uint8_t* src, int32_t srcsize, int32_t src_offset,
+     int32_t nblock, uint8_t* dest, int32_t dest_offset, uint8_t* tmp, uint8_t* tmp2) {
+   blosc2_context* context = thread_context->parent_context;
+   uint8_t* filters = context->filters;
+   uint8_t *tmp3 = thread_context->tmp4;
+   int32_t compformat = (context->header_flags & (uint8_t)0xe0) >> 5u;
+   int dont_split = (context->header_flags & (uint8_t)0x10) >> 4u;
+   int memcpyed = context->header_flags & (uint8_t)BLOSC_MEMCPYED;
+   int32_t chunk_nbytes = *(int32_t*)(src + BLOSC2_CHUNK_NBYTES);
+   int32_t chunk_cbytes = *(int32_t*)(src + BLOSC2_CHUNK_CBYTES);
+   //uint8_t blosc_version_format = src[BLOSC2_CHUNK_VERSION];
+   int nstreams;
+   int32_t neblock;
+   int32_t nbytes;                /* number of decompressed bytes in split */
+   int32_t cbytes;                /* number of compressed bytes in split */
+   int32_t ctbytes = 0;           /* number of compressed bytes in block */
+   int32_t ntbytes = 0;           /* number of uncompressed bytes in block */
+   uint8_t* _dest;
+   int32_t typesize = context->typesize;
+   const char* compname;
+ 
+   if (context->block_maskout != NULL && context->block_maskout[nblock]) {
+     // Do not decompress, but act as if we successfully decompressed everything
+     return bsize;
+   }
+ 
+   // In some situations (lazychunks) the context can arrive uninitialized
+   // (but BITSHUFFLE needs it for accessing the format of the chunk)
+   if (context->src == NULL) {
+     context->src = src;
+   }
+ 
+   bool is_lazy = ((context->header_overhead == BLOSC_EXTENDED_HEADER_LENGTH) &&
+           (context->blosc2_flags & 0x08u));
+   if (is_lazy) {
+     // The chunk is on disk, so just lazily load the block
+     if (context->schunk == NULL) {
+       BLOSC_TRACE_ERROR("Lazy chunk needs an associated super-chunk.");
+       return -11;
+     }
+     if (context->schunk->frame == NULL) {
+       BLOSC_TRACE_ERROR("Lazy chunk needs an associated frame.");
+       return -12;
+     }
+     char* urlpath = context->schunk->frame->urlpath;
+     int32_t trailer_len = sizeof(int32_t) + sizeof(int64_t) + context->nblocks * sizeof(int32_t);
+     size_t trailer_offset = BLOSC_EXTENDED_HEADER_LENGTH + context->nblocks * sizeof(int32_t);
+     int32_t nchunk;
+     int64_t chunk_offset;
+     // The nchunk and the offset of the current chunk are in the trailer
+     nchunk = *(int32_t*)(src + trailer_offset);
+     chunk_offset = *(int64_t*)(src + trailer_offset + sizeof(int32_t));
+     // Get the csize of the nblock
+     int32_t *block_csizes = (int32_t *)(src + trailer_offset + sizeof(int32_t) + sizeof(int64_t));
+     int32_t block_csize = block_csizes[nblock];
+     // Read the lazy block on disk
+     FILE* fp = NULL;
+     if (context->schunk->frame->eframe) {
+       // The chunk is not in the frame
+       char* chunkpath = malloc(strlen(context->schunk->frame->urlpath) + 1 + 8 + strlen(".chunk") + 1);
+       sprintf(chunkpath, "%s/%08X.chunk", context->schunk->frame->urlpath, nchunk);
+       fp = fopen(chunkpath, "rb");
+       free(chunkpath);
+       // The offset of the block is src_offset
+       fseek(fp, src_offset, SEEK_SET);
+     }
+     else {
+       fp = fopen(urlpath, "rb");
+       // The offset of the block is src_offset
+       fseek(fp, chunk_offset + src_offset, SEEK_SET);
+     }
+     // We can make use of tmp3 because it will be used after src is not needed anymore
+     size_t rbytes = fread(tmp3, 1, block_csize, fp);
+     fclose(fp);
+     if ((int32_t)rbytes != block_csize) {
+       BLOSC_TRACE_ERROR("Cannot read the (lazy) block out of the fileframe.");
+       return -13;
+     }
+     src = tmp3;
+     src_offset = 0;
+     srcsize = block_csize;
+   }
+ 
+   // If the chunk is memcpyed, we just have to copy the block to dest and return
+   if (memcpyed) {
+     if (chunk_nbytes + context->header_overhead != chunk_cbytes) {
+       return -1;
+     }
+     int bsize_ = leftoverblock ? chunk_nbytes % context->blocksize : bsize;
+     if (chunk_cbytes < context->header_overhead + (nblock * context->blocksize) + bsize_) {
+       /* Not enough input to copy block */
+       return -1;
+     }
+     if (!is_lazy) {
+       src += context->header_overhead + nblock * context->blocksize;
+     }
+     memcpy(dest + dest_offset, src, bsize_);
+     return bsize_;
+   }
+ 
+   if (!is_lazy && (src_offset <= 0 || src_offset >= srcsize)) {
+     /* Invalid block src offset encountered */
+     return -1;
+   }
+ 
+   src += src_offset;
+   srcsize -= src_offset;
+ 
+   int last_filter_index = last_filter(filters, 'd');
+ 
+   if ((last_filter_index >= 0) &&
+           (next_filter(filters, BLOSC2_MAX_FILTERS, 'd') != BLOSC_DELTA)) {
+    // We are making use of some filter, so use a temp for destination
+    _dest = tmp;
+   } else {
+     // If no filters, or only DELTA in pipeline
+    _dest = dest + dest_offset;
+   }
+ 
+   /* The number of compressed data streams for this block */
+   if (!dont_split && !leftoverblock && !context->use_dict) {
+     // We don't want to split when in a training dict state
+     nstreams = (int32_t)typesize;
+   }
+   else {
+     nstreams = 1;
+   }
+ 
+   neblock = bsize / nstreams;
+   for (int j = 0; j < nstreams; j++) {
+     if (srcsize < (signed)sizeof(int32_t)) {
+       /* Not enough input to read compressed size */
+       return -1;
+     }
+     srcsize -= sizeof(int32_t);
+     cbytes = sw32_(src);      /* amount of compressed bytes */
+     if (cbytes > 0) {
+       if (srcsize < cbytes) {
+         /* Not enough input to read compressed bytes */
+         return -1;
+       }
+       srcsize -= cbytes;
+     }
+     src += sizeof(int32_t);
+     ctbytes += (signed)sizeof(int32_t);
+ 
+     /* Uncompress */
+     if (cbytes == 0) {
+       // A run of 0's
+       memset(_dest, 0, (unsigned int)neblock);
+       nbytes = neblock;
+     }
+     else if (cbytes < 0) {
+       // A negative number means some encoding depending on the token that comes next
+       uint8_t token;
+ 
+       if (srcsize < (signed)sizeof(uint8_t)) {
+         // Not enough input to read token */
+         return -1;
+       }
+       srcsize -= sizeof(uint8_t);
+ 
+       token = src[0];
+       src += 1;
+       ctbytes += 1;
+ 
+       if (token & 0x1) {
+         // A run of bytes that are different than 0
+         if (cbytes < -255) {
+           // Runs can only encode a byte
+           return -2;
+         }
+         uint8_t value = -cbytes;
+         memset(_dest, value, (unsigned int) neblock);
+-        nbytes = neblock;
+-        cbytes = 0;  // everything is encoded in the cbytes token
+       }
++      nbytes = neblock;
++      cbytes = 0;  // everything is encoded in the cbytes token
+     }
+     else if (cbytes == neblock) {
+       memcpy(_dest, src, (unsigned int)neblock);
+       nbytes = (int32_t)neblock;
+     }
+     else {
+       if (compformat == BLOSC_BLOSCLZ_FORMAT) {
+         nbytes = blosclz_decompress(src, cbytes, _dest, (int)neblock);
+       }
+   #if defined(HAVE_LZ4)
+       else if (compformat == BLOSC_LZ4_FORMAT) {
+         nbytes = lz4_wrap_decompress((char*)src, (size_t)cbytes,
+                                      (char*)_dest, (size_t)neblock);
+       }
+   #endif /*  HAVE_LZ4 */
+   #if defined(HAVE_LIZARD)
+       else if (compformat == BLOSC_LIZARD_FORMAT) {
+         nbytes = lizard_wrap_decompress((char*)src, (size_t)cbytes,
+                                         (char*)_dest, (size_t)neblock);
+       }
+   #endif /*  HAVE_LIZARD */
+   #if defined(HAVE_SNAPPY)
+       else if (compformat == BLOSC_SNAPPY_FORMAT) {
+         nbytes = snappy_wrap_decompress((char*)src, (size_t)cbytes,
+                                         (char*)_dest, (size_t)neblock);
+       }
+   #endif /*  HAVE_SNAPPY */
+   #if defined(HAVE_ZLIB)
+       else if (compformat == BLOSC_ZLIB_FORMAT) {
+         nbytes = zlib_wrap_decompress((char*)src, (size_t)cbytes,
+                                       (char*)_dest, (size_t)neblock);
+       }
+   #endif /*  HAVE_ZLIB */
+   #if defined(HAVE_ZSTD)
+       else if (compformat == BLOSC_ZSTD_FORMAT) {
+         nbytes = zstd_wrap_decompress(thread_context,
+                                       (char*)src, (size_t)cbytes,
+                                       (char*)_dest, (size_t)neblock);
+       }
+   #endif /*  HAVE_ZSTD */
+       else {
+         compname = clibcode_to_clibname(compformat);
+         BLOSC_TRACE_ERROR(
+                 "Blosc has not been compiled with decompression "
+                 "support for '%s' format.  "
+                 "Please recompile for adding this support.", compname);
+         return -5;    /* signals no decompression support */
+       }
+ 
+       /* Check that decompressed bytes number is correct */
+       if (nbytes != neblock) {
+         return -2;
+       }
+ 
+     }
+     src += cbytes;
+     ctbytes += cbytes;
+     _dest += nbytes;
+     ntbytes += nbytes;
+   } /* Closes j < nstreams */
+ 
+   if (last_filter_index >= 0) {
+     int errcode = pipeline_d(context, bsize, dest, dest_offset, tmp, tmp2, tmp3,
+                              last_filter_index);
+     if (errcode < 0)
+       return errcode;
+   }
+ 
+   /* Return the number of uncompressed bytes */
+   return (int)ntbytes;
+ }
+ 
+ 
+ /* Serial version for compression/decompression */

@@ -1,0 +1,385 @@
+commit 90fef7300c75ca6b8834da0dcb710e27d599324e
+Author: James Bonfield <jkb@sanger.ac.uk>
+Date:   Mon Jan 25 09:32:50 2021 +0000
+
+    More OSS-Fuzz detected fixes
+    
+    Credit to OSS-Fuzz
+    
+    - Clean up properly when XPACK output values are out of the accepted
+      range.
+    
+      Fixes oss-fuzz 29827
+    
+    - Add "cp_end" arg to varint_get* funcs in cram_varint_decode_init so
+      reading beyond the buffer can be spotted.
+    
+      Fixes oss-fuzz 29837
+    
+    - Set b->uncomp_size for FQZ decoder.  Already done in other codecs,
+      just accidentally missed here.  Without it, it invalidates the
+      boundary check in int32_get_blk.
+    
+      Fixes oss-fuzz 29855
+      Fixes oss-fuzz 29908
+    
+    - Fixed memory leak in XDELTA when recovering from malformed data stream.
+    
+      Fixes oss-fuzz 29858
+
+diff --git a/cram/cram_codecs.c b/cram/cram_codecs.c
+index 067319fc..63c6ea73 100644
+--- a/cram/cram_codecs.c
++++ b/cram/cram_codecs.c
+@@ -742,49 +742,49 @@ cram_block *cram_varint_get_block(cram_slice *slice, cram_codec *c) {
+ cram_codec *cram_varint_decode_init(cram_block_compression_hdr *hdr,
+                                     char *data, int size,
+                                     enum cram_encoding codec,
+                                     enum cram_external_type option,
+                                     int version, varint_vec *vv) {
+     cram_codec *c;
+-    char *cp = data;
++    char *cp = data, *cp_end = data+size;
+ 
+     if (!(c = malloc(sizeof(*c))))
+         return NULL;
+ 
+     c->codec  = codec;
+ 
+     // Function pointer choice is theoretically by codec type.
+     // Given we have some vars as int32 and some as int64 we
+     // use option too for sizing, although on disk format
+     // does not change.
+     switch(codec) {
+     case E_VARINT_UNSIGNED:
+         c->decode = (option == E_INT)
+             ? cram_varint_decode_int
+             : cram_varint_decode_long;
+         break;
+     case E_VARINT_SIGNED:
+         c->decode = (option == E_INT)
+             ? cram_varint_decode_sint
+             : cram_varint_decode_slong;
+         break;
+     default:
+         return NULL;
+     }
+ 
+     c->free   = cram_varint_decode_free;
+     c->size   = cram_varint_decode_size;
+     c->get_block = cram_varint_get_block;
+ 
+-    c->u.varint.content_id = vv->varint_get32 (&cp, NULL, NULL);
+-    c->u.varint.offset     = vv->varint_get64s(&cp, NULL, NULL);
++    c->u.varint.content_id = vv->varint_get32 (&cp, cp_end, NULL);
++    c->u.varint.offset     = vv->varint_get64s(&cp, cp_end, NULL);
+ 
+     if (cp - data != size) {
+         fprintf(stderr, "Malformed varint header stream\n");
+         free(c);
+         return NULL;
+     }
+ 
+     c->u.varint.type = option;
+ 
+     return c;
+ }
+@@ -1382,59 +1382,60 @@ cram_block *cram_xpack_get_block(cram_slice *slice, cram_codec *c) {
+ cram_codec *cram_xpack_decode_init(cram_block_compression_hdr *hdr,
+                                    char *data, int size,
+                                    enum cram_encoding codec,
+                                    enum cram_external_type option,
+                                    int version, varint_vec *vv) {
+     cram_codec *c;
+     char *cp = data;
+     char *endp = data+size;
+ 
+     if (!(c = malloc(sizeof(*c))))
+         return NULL;
+ 
+     c->codec  = E_XPACK;
+     if (option == E_LONG)
+         c->decode = cram_xpack_decode_long;
+     else if (option == E_INT)
+         c->decode = cram_xpack_decode_int;
+     else if (option == E_BYTE_ARRAY || option == E_BYTE)
+         c->decode = cram_xpack_decode_char;
+     else {
+         fprintf(stderr, "BYTE_ARRAYs not supported by this codec\n");
+         goto malformed;
+     }
+     c->free = cram_xpack_decode_free;
+     c->size = cram_xpack_decode_size;
+     c->get_block = cram_xpack_get_block;
+ 
+     c->u.xpack.nbits = vv->varint_get32(&cp, endp, NULL);
+     c->u.xpack.nval  = vv->varint_get32(&cp, endp, NULL);
+     if (c->u.xpack.nbits >= 8  || c->u.xpack.nbits < 0 ||
+         c->u.xpack.nval  > 256 || c->u.xpack.nval < 0)
+         goto malformed;
+     int i;
+     for (i = 0; i < c->u.xpack.nval; i++) {
+         uint32_t v = vv->varint_get32(&cp, endp, NULL);
+-        if (v >= 256) return NULL;
++        if (v >= 256)
++            goto malformed;
+         c->u.xpack.rmap[i] = v; // reverse map: e.g 0-3 to P,A,C,K
+     }
+ 
+     int encoding = vv->varint_get32(&cp, endp, NULL);
+     int sub_size = vv->varint_get32(&cp, endp, NULL);
+     if (sub_size < 0 || endp - cp < sub_size)
+         goto malformed;
+     c->u.xpack.sub_codec = cram_decoder_init(hdr, encoding, cp, sub_size,
+                                              option, version, vv);
+     if (c->u.xpack.sub_codec == NULL)
+         goto malformed;
+     cp += sub_size;
+ 
+     if (cp - data != size
+         || c->u.xpack.nbits < 0 || c->u.xpack.nbits > 8 * sizeof(int64_t)) {
+     malformed:
+         fprintf(stderr, "Malformed xpack header stream\n");
+         free(c);
+         return NULL;
+     }
+ 
+     return c;
+ }
+@@ -1708,50 +1709,50 @@ cram_block *cram_xdelta_get_block(cram_slice *slice, cram_codec *c) {
+ cram_codec *cram_xdelta_decode_init(cram_block_compression_hdr *hdr,
+                                     char *data, int size,
+                                     enum cram_encoding codec,
+                                     enum cram_external_type option,
+                                     int version, varint_vec *vv) {
+     cram_codec *c;
+     char *cp = data;
+     char *endp = data+size;
+ 
+-    if (!(c = malloc(sizeof(*c))))
++    if (!(c = calloc(1, sizeof(*c))))
+         return NULL;
+ 
+     c->codec  = E_XDELTA;
+     if (option == E_LONG)
+         c->decode = cram_xdelta_decode_long;
+     else if (option == E_INT)
+         c->decode = cram_xdelta_decode_int;
+     else if (option == E_BYTE_ARRAY || option == E_BYTE)
+         c->decode = cram_xdelta_decode_char;
+     else if (option == E_BYTE_ARRAY_BLOCK) {
+         option = E_BYTE_ARRAY;
+         c->decode = cram_xdelta_decode_block;
+     } else
+         return NULL;
+     c->free = cram_xdelta_decode_free;
+     c->size = cram_xdelta_decode_size;
+     c->get_block = cram_xdelta_get_block;
+ 
+     c->u.xdelta.word_size = vv->varint_get32(&cp, endp, NULL);
+     c->u.xdelta.last = 0;
+ 
+     int encoding = vv->varint_get32(&cp, endp, NULL);
+     int sub_size = vv->varint_get32(&cp, endp, NULL);
+     if (sub_size < 0 || endp - cp < sub_size)
+         goto malformed;
+     c->u.xdelta.sub_codec = cram_decoder_init(hdr, encoding, cp, sub_size,
+                                               option, version, vv);
+     if (c->u.xdelta.sub_codec == NULL)
+         goto malformed;
+     cp += sub_size;
+ 
+     if (cp - data != size) {
+     malformed:
+         fprintf(stderr, "Malformed xdelta header stream\n");
+-        free(c);
++        cram_xdelta_decode_free(c);
+         return NULL;
+     }
+ 
+     return c;
+ }
+diff --git a/cram/cram_io.c b/cram/cram_io.c
+index 30f109d6..8d257acc 100644
+--- a/cram/cram_io.c
++++ b/cram/cram_io.c
+@@ -1562,178 +1562,179 @@ void cram_free_block(cram_block *b) {
+ /*
+  * Uncompresses a CRAM block, if compressed.
+  */
+ int cram_uncompress_block(cram_block *b) {
+     char *uncomp;
+     size_t uncomp_size = 0;
+ 
+     if (b->crc32_checked == 0) {
+         uint32_t crc = crc32(b->crc_part, b->data ? b->data : (uc *)"", b->alloc);
+         b->crc32_checked = 1;
+         if (crc != b->crc32) {
+             hts_log_error("Block CRC32 failure");
+             return -1;
+         }
+     }
+ 
+     if (b->uncomp_size == 0) {
+         // blank block
+         b->method = RAW;
+         return 0;
+     }
+     assert(b->uncomp_size >= 0); // cram_read_block should ensure this
+ 
+     switch (b->method) {
+     case RAW:
+         return 0;
+ 
+     case GZIP:
+         uncomp_size = b->uncomp_size;
+         uncomp = zlib_mem_inflate((char *)b->data, b->comp_size, &uncomp_size);
+ 
+         if (!uncomp)
+             return -1;
+         if (uncomp_size != b->uncomp_size) {
+             free(uncomp);
+             return -1;
+         }
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = uncomp_size;
+         b->method = RAW;
+         break;
+ 
+ #ifdef HAVE_LIBBZ2
+     case BZIP2: {
+         unsigned int usize = b->uncomp_size;
+         if (!(uncomp = malloc(usize)))
+             return -1;
+         if (BZ_OK != BZ2_bzBuffToBuffDecompress(uncomp, &usize,
+                                                 (char *)b->data, b->comp_size,
+                                                 0, 0)) {
+             free(uncomp);
+             return -1;
+         }
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = usize;
+         b->method = RAW;
+         b->uncomp_size = usize; // Just in case it differs
+         break;
+     }
+ #else
+     case BZIP2:
+         hts_log_error("Bzip2 compression is not compiled into this version. Please rebuild and try again");
+         return -1;
+ #endif
+ 
+ #ifdef HAVE_LIBLZMA
+     case LZMA:
+         uncomp = lzma_mem_inflate((char *)b->data, b->comp_size, &uncomp_size);
+         if (!uncomp)
+             return -1;
+         if (uncomp_size != b->uncomp_size) {
+             free(uncomp);
+             return -1;
+         }
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = uncomp_size;
+         b->method = RAW;
+         break;
+ #else
+     case LZMA:
+         hts_log_error("Lzma compression is not compiled into this version. Please rebuild and try again");
+         return -1;
+         break;
+ #endif
+ 
+     case RANS: {
+         unsigned int usize = b->uncomp_size, usize2;
+         uncomp = (char *)rans_uncompress(b->data, b->comp_size, &usize2);
+         if (!uncomp)
+             return -1;
+         if (usize != usize2) {
+             free(uncomp);
+             return -1;
+         }
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = usize2;
+         b->method = RAW;
+         b->uncomp_size = usize2; // Just in case it differs
+         //fprintf(stderr, "Expanded %d to %d\n", b->comp_size, b->uncomp_size);
+         break;
+     }
+ 
+     case FQZ: {
+         uncomp_size = b->uncomp_size;
+         uncomp = fqz_decompress((char *)b->data, b->comp_size, &uncomp_size, NULL, 0);
+         if (!uncomp)
+             return -1;
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = uncomp_size;
+         b->method = RAW;
++        b->uncomp_size = uncomp_size;
+         break;
+     }
+ 
+     case RANS_PR0: {
+         unsigned int usize = b->uncomp_size, usize2;
+         uncomp = (char *)rans_uncompress_4x16(b->data, b->comp_size, &usize2);
+         if (!uncomp)
+             return -1;
+         if (usize != usize2) {
+             free(uncomp);
+             return -1;
+         }
+         b->orig_method = RANS_PR0 + (b->data[0]&1)
+             + 2*((b->data[0]&0x40)>0) + 4*((b->data[0]&0x80)>0);
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = usize2;
+         b->method = RAW;
+         b->uncomp_size = usize2; // Just incase it differs
+         //fprintf(stderr, "Expanded %d to %d\n", b->comp_size, b->uncomp_size);
+         break;
+     }
+ 
+     case ARITH_PR0: {
+         unsigned int usize = b->uncomp_size, usize2;
+         uncomp = (char *)arith_uncompress_to(b->data, b->comp_size, NULL, &usize2);
+         if (!uncomp)
+             return -1;
+         if (usize != usize2) {
+             free(uncomp);
+             return -1;
+         }
+         b->orig_method = ARITH_PR0 + (b->data[0]&1)
+             + 2*((b->data[0]&0x40)>0) + 4*((b->data[0]&0x80)>0);
+         free(b->data);
+         b->data = (unsigned char *)uncomp;
+         b->alloc = usize2;
+         b->method = RAW;
+         b->uncomp_size = usize2; // Just incase it differs
+         //fprintf(stderr, "Expanded %d to %d\n", b->comp_size, b->uncomp_size);
+         break;
+     }
+ 
+     case TOK3: {
+         uint32_t out_len;
+         uint8_t *cp = decode_names(b->data, b->comp_size, &out_len);
+         if (!cp)
+             return -1;
+         b->orig_method = TOK3;
+         b->method = RAW;
+         free(b->data);
+         b->data = cp;
+         b->alloc = out_len;
+         b->uncomp_size = out_len;
+         break;
+     }
+ 
+     default:
+         return -1;
+     }
+ 
+     return 0;
+ }

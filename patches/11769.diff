@@ -1,0 +1,289 @@
+commit 7a3805c348c3791f86743ab6e7d10dff23c5b98b
+Author: Leon Scroggins III <scroggo@google.com>
+Date:   Fri Dec 7 09:21:30 2018 -0500
+
+    SkWuffsCodec: Do not swizzle frame of width 0
+    
+    Bug: oss-fuzz:11769
+    
+    The test image has a frame with width 0 whose left edge matches
+    the right edge of the image. If we were to attempt to swizzle,
+    this would read memory we shouldn't read. Check for a zero width
+    first.
+    
+    Only compute scaledHeight once, and move it before the early return
+    to simplify the method.
+    
+    Fix a comparison in an assert. It is okay for dstSwizzleBytes to be
+    equal to dstAllocatedBytes, so long as it is not greater, which would
+    mean we would write beyond the edge of the allocation.
+    
+    Change-Id: If229ac926f01b74816d1a4ce714f114d20d2304e
+    Reviewed-on: https://skia-review.googlesource.com/c/175440
+    Commit-Queue: Leon Scroggins <scroggo@google.com>
+    Reviewed-by: Nigel Tao <nigeltao@google.com>
+
+diff --git a/src/codec/SkSwizzler.cpp b/src/codec/SkSwizzler.cpp
+index 8e9fec301b..e74b72d4e4 100644
+--- a/src/codec/SkSwizzler.cpp
++++ b/src/codec/SkSwizzler.cpp
+@@ -1189,43 +1189,43 @@ SkSwizzler::SkSwizzler(RowProc fastProc, RowProc proc, const SkPMColor* ctable,
+ int SkSwizzler::onSetSampleX(int sampleX) {
+     SkASSERT(sampleX > 0);
+ 
+     fSampleX = sampleX;
+     fDstOffsetBytes = (fDstOffset / sampleX) * fDstBPP;
+     fSwizzleWidth = get_scaled_dimension(fSrcWidth, sampleX);
+     fAllocatedWidth = get_scaled_dimension(fDstWidth, sampleX);
+ 
+     int frameSampleX = sampleX;
+     if (fSrcWidth < fDstWidth) {
+         // Although SkSampledCodec adjusted sampleX so that it will never be
+         // larger than the width of the image (or subset, if applicable), it
+         // doesn't account for the width of a subset frame (i.e. gif). As a
+         // result, get_start_coord(sampleX) could result in fSrcOffsetUnits
+         // being wider than fSrcWidth. Compute a sampling rate based on the
+         // frame width to ensure that fSrcOffsetUnits is sensible.
+         frameSampleX = fSrcWidth / fSwizzleWidth;
+     }
+     fSrcOffsetUnits = (get_start_coord(frameSampleX) + fSrcOffset) * fSrcBPP;
+ 
+     if (fDstOffsetBytes > 0) {
+         const size_t dstSwizzleBytes   = fSwizzleWidth   * fDstBPP;
+         const size_t dstAllocatedBytes = fAllocatedWidth * fDstBPP;
+         if (fDstOffsetBytes + dstSwizzleBytes > dstAllocatedBytes) {
+ #ifdef SK_BUILD_FOR_ANDROID_FRAMEWORK
+             SkAndroidFrameworkUtils::SafetyNetLog("118143775");
+ #endif
+-            SkASSERT(dstSwizzleBytes < dstAllocatedBytes);
++            SkASSERT(dstSwizzleBytes <= dstAllocatedBytes);
+             fDstOffsetBytes = dstAllocatedBytes - dstSwizzleBytes;
+         }
+     }
+ 
+     // The optimized swizzler functions do not support sampling.  Sampled swizzles
+     // are already fast because they skip pixels.  We haven't seen a situation
+     // where speeding up sampling has a significant impact on total decode time.
+     if (1 == fSampleX && fFastProc) {
+         fActualProc = fFastProc;
+     } else {
+         fActualProc = fSlowProc;
+     }
+ 
+     return fAllocatedWidth;
+ }
+diff --git a/src/codec/SkWuffsCodec.cpp b/src/codec/SkWuffsCodec.cpp
+index 59b53a5de7..fe859b75e5 100644
+--- a/src/codec/SkWuffsCodec.cpp
++++ b/src/codec/SkWuffsCodec.cpp
+@@ -418,141 +418,136 @@ static void blend(uint32_t* dst, const uint32_t* src, int width) {
+ SkCodec::Result SkWuffsCodec::onIncrementalDecode(int* rowsDecoded) {
+     if (!fIncrDecDst) {
+         return SkCodec::kInternalError;
+     }
+ 
+     // In Wuffs, a paletted image is always 1 byte per pixel.
+     static constexpr size_t src_bpp = 1;
+     wuffs_base__table_u8 pixels = fPixelBuffer.plane(0);
+-
++    int scaledHeight = dstInfo().height();
+     const bool independent = independent_frame(this, options().fFrameIndex);
+     wuffs_base__rect_ie_u32 r = fFrameConfig.bounds();
+     if (!fSwizzler) {
+         auto bounds = SkIRect::MakeLTRB(r.min_incl_x, r.min_incl_y, r.max_excl_x, r.max_excl_y);
+         fSwizzler = SkSwizzler::Make(this->getEncodedInfo(), fColorTable, dstInfo(),
+                                      this->options(), &bounds);
+         fSwizzler->setSampleX(fSpySampler.sampleX());
+         fSwizzler->setSampleY(fSpySampler.sampleY());
++        scaledHeight = get_scaled_dimension(dstInfo().height(), fSpySampler.sampleY());
+ 
+         // Zero-initialize wuffs' buffer covering the frame rect. This will later be used to
+         // determine how we write to the output, even if the image was incomplete. This ensures
+         // that we do not swizzle uninitialized memory.
+         for (uint32_t y = r.min_incl_y; y < r.max_excl_y; y++) {
+             uint8_t* s = pixels.ptr + (y * pixels.stride) + (r.min_incl_x * src_bpp);
+             sk_bzero(s, r.width() * src_bpp);
+         }
+ 
+         // If the frame rect does not fill the output, ensure that those pixels are not
+         // left uninitialized either.
+         if (independent && bounds != this->bounds()) {
+-            auto fillInfo = dstInfo().makeWH(fSwizzler->fillWidth(),
+-                                             get_scaled_dimension(this->dstInfo().height(),
+-                                                                  fSwizzler->sampleY()));
++            auto fillInfo = dstInfo().makeWH(fSwizzler->fillWidth(), scaledHeight);
+             SkSampler::Fill(fillInfo, fIncrDecDst, fIncrDecRowBytes, options().fZeroInitialized);
+         }
+     }
+ 
++    // The semantics of *rowsDecoded is: say you have a 10 pixel high image
++    // (both the frame and the image). If you only decoded the first 3 rows,
++    // set this to 3, and then SkCodec (or the caller of incrementalDecode)
++    // would zero-initialize the remaining 7 (unless the memory was already
++    // zero-initialized).
++    //
++    // Now let's say that the image is still 10 pixels high, but the frame is
++    // from row 5 to 9. If you only decoded 3 rows, but you initialized the
++    // first 5, you could return 8, and the caller would zero-initialize the
++    // final 2. For GIF (where a frame can be smaller than the image and can be
++    // interlaced), we just zero-initialize all 10 rows ahead of time and
++    // return the height of the image, so the caller knows it doesn't need to
++    // do anything.
++    //
++    // Similarly, if the output is scaled, we zero-initialized all
++    // |scaledHeight| rows (the scaled image height), so we inform the caller
++    // that it doesn't need to do anything.
++    if (rowsDecoded) {
++        *rowsDecoded = scaledHeight;
++    }
++
+     SkCodec::Result result = SkCodec::kSuccess;
+     const char*     status = this->decodeFrame();
+     if (status != nullptr) {
+         if (status == wuffs_base__suspension__short_read) {
+             result = SkCodec::kIncompleteInput;
+         } else {
+             SkCodecPrintf("decodeFrame: %s", status);
+             result = SkCodec::kErrorInInput;
+         }
+ 
+         if (!independent) {
+-            if (rowsDecoded) {
+-                // Though no rows were written by this call, the prior frame
+-                // initialized all the rows.
+-                *rowsDecoded = get_scaled_dimension(this->dstInfo().height(),
+-                                                    fSwizzler->sampleY());
+-            }
+             // For a dependent frame, we cannot blend the partial result, since
+             // that will overwrite the contribution from prior frames with all
+             // zeroes that were written to |pixels| above.
+             return result;
+         }
+     }
+ 
+-    wuffs_base__slice_u8 palette = fPixelBuffer.palette();
+-    SkASSERT(palette.len == 4 * 256);
+-    auto proc = choose_pack_color_proc(false, dstInfo().colorType());
+-    for (int i = 0; i < 256; i++) {
+-        uint8_t* p = palette.ptr + 4 * i;
+-        fColorTable[i] = proc(p[3], p[2], p[1], p[0]);
+-    }
+-
+-    std::unique_ptr<uint8_t[]> tmpBuffer;
+-    if (!independent) {
+-        tmpBuffer.reset(new uint8_t[dstInfo().minRowBytes()]);
+-    }
+-    const int            sampleY = fSwizzler->sampleY();
+-    const int            scaledHeight = get_scaled_dimension(dstInfo().height(), sampleY);
+-    for (uint32_t y = r.min_incl_y; y < r.max_excl_y; y++) {
+-        int dstY = y;
+-        if (sampleY != 1) {
+-            if (!fSwizzler->rowNeeded(y)) {
+-                continue;
+-            }
+-            dstY /= sampleY;
+-            if (dstY >= scaledHeight) {
+-                break;
+-            }
++    // If the frame rect is empty, no need to swizzle.
++    if (!r.is_empty()) {
++        wuffs_base__slice_u8 palette = fPixelBuffer.palette();
++        SkASSERT(palette.len == 4 * 256);
++        auto proc = choose_pack_color_proc(false, dstInfo().colorType());
++        for (int i = 0; i < 256; i++) {
++            uint8_t* p = palette.ptr + 4 * i;
++            fColorTable[i] = proc(p[3], p[2], p[1], p[0]);
+         }
+ 
+-        // We don't adjust d by (r.min_incl_x * dst_bpp) as we have already
+-        // accounted for that in swizzleRect, above.
+-        uint8_t* d = fIncrDecDst + (dstY * fIncrDecRowBytes);
+-
+-        // The Wuffs model is that the dst buffer is the image, not the frame.
+-        // The expectation is that you allocate the buffer once, but re-use it
+-        // for the N frames, regardless of each frame's top-left co-ordinate.
+-        //
+-        // To get from the start (in the X-direction) of the image to the start
+-        // of the frame, we adjust s by (r.min_incl_x * src_bpp).
+-        uint8_t* s = pixels.ptr + (y * pixels.stride) + (r.min_incl_x * src_bpp);
+-        if (independent) {
+-            fSwizzler->swizzle(d, s);
+-        } else {
+-            SkASSERT(tmpBuffer.get());
+-            fSwizzler->swizzle(tmpBuffer.get(), s);
+-            d = SkTAddOffset<uint8_t>(d, fSwizzler->swizzleOffsetBytes());
+-            const auto* swizzled = SkTAddOffset<uint32_t>(tmpBuffer.get(),
+-                                                          fSwizzler->swizzleOffsetBytes());
+-            blend(reinterpret_cast<uint32_t*>(d), swizzled, fSwizzler->swizzleWidth());
++        std::unique_ptr<uint8_t[]> tmpBuffer;
++        if (!independent) {
++            tmpBuffer.reset(new uint8_t[dstInfo().minRowBytes()]);
+         }
+-    }
++        const int sampleY = fSwizzler->sampleY();
++        for (uint32_t y = r.min_incl_y; y < r.max_excl_y; y++) {
++            int dstY = y;
++            if (sampleY != 1) {
++                if (!fSwizzler->rowNeeded(y)) {
++                    continue;
++                }
++                dstY /= sampleY;
++                if (dstY >= scaledHeight) {
++                    break;
++                }
++            }
+ 
+-    // The semantics of *rowsDecoded is: say you have a 10 pixel high image
+-    // (both the frame and the image). If you only decoded the first 3 rows,
+-    // set this to 3, and then SkCodec (or the caller of incrementalDecode)
+-    // would zero-initialize the remaining 7 (unless the memory was already
+-    // zero-initialized).
+-    //
+-    // Now let's say that the image is still 10 pixels high, but the frame is
+-    // from row 5 to 9. If you only decoded 3 rows, but you initialized the
+-    // first 5, you could return 8, and the caller would zero-initialize the
+-    // final 2. For GIF (where a frame can be smaller than the image and can be
+-    // interlaced), we just zero-initialize all 10 rows ahead of time and
+-    // return the height of the image, so the caller knows it doesn't need to
+-    // do anything.
+-    //
+-    // Similarly, if the output is scaled, we zero-initialized all
+-    // |scaledHeight| rows (the scaled image height), so we inform the caller
+-    // that it doesn't need to do anything.
+-    if (rowsDecoded) {
+-        *rowsDecoded = scaledHeight;
++            // We don't adjust d by (r.min_incl_x * dst_bpp) as we have already
++            // accounted for that in swizzleRect, above.
++            uint8_t* d = fIncrDecDst + (dstY * fIncrDecRowBytes);
++
++            // The Wuffs model is that the dst buffer is the image, not the frame.
++            // The expectation is that you allocate the buffer once, but re-use it
++            // for the N frames, regardless of each frame's top-left co-ordinate.
++            //
++            // To get from the start (in the X-direction) of the image to the start
++            // of the frame, we adjust s by (r.min_incl_x * src_bpp).
++            uint8_t* s = pixels.ptr + (y * pixels.stride) + (r.min_incl_x * src_bpp);
++            if (independent) {
++                fSwizzler->swizzle(d, s);
++            } else {
++                SkASSERT(tmpBuffer.get());
++                fSwizzler->swizzle(tmpBuffer.get(), s);
++                d = SkTAddOffset<uint8_t>(d, fSwizzler->swizzleOffsetBytes());
++                const auto* swizzled = SkTAddOffset<uint32_t>(tmpBuffer.get(),
++                                                              fSwizzler->swizzleOffsetBytes());
++                blend(reinterpret_cast<uint32_t*>(d), swizzled, fSwizzler->swizzleWidth());
++            }
++        }
+     }
+ 
+     if (result == SkCodec::kSuccess) {
+         fSpySampler.reset();
+         fIncrDecDst = nullptr;
+         fIncrDecRowBytes = 0;
+         fSwizzler = nullptr;
+     } else {
+         // Make fSpySampler return whatever fSwizzler would have for fillWidth.
+         fSpySampler.fFillWidth = fSwizzler->fillWidth();
+     }
+     return result;
+ }

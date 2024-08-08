@@ -1,0 +1,647 @@
+commit 68746b76af8b143daf477033a6799902be2f3cad
+Merge: 6b198e0ca 519915b50
+Author: Eduardo Silva <eduardo@treasure-data.com>
+Date:   Wed Jan 27 15:32:17 2021 -0600
+
+    Merge branch 'master' of github.com:fluent/fluent-bit
+
+diff --git a/include/fluent-bit/flb_oauth2.h b/include/fluent-bit/flb_oauth2.h
+index 71b237b4b..20e908455 100644
+--- a/include/fluent-bit/flb_oauth2.h
++++ b/include/fluent-bit/flb_oauth2.h
+@@ -61,6 +61,7 @@ struct flb_oauth2 *flb_oauth2_create(struct flb_config *config,
+                                      const char *auth_url, int expire_sec);
+ void flb_oauth2_destroy(struct flb_oauth2 *ctx);
+ int flb_oauth2_token_len(struct flb_oauth2 *ctx);
++void flb_oauth2_payload_clear(struct flb_oauth2 *ctx);
+ int flb_oauth2_payload_append(struct flb_oauth2 *ctx,
+                               const char *key_str, int key_len,
+                               const char *val_str, int val_len);
+diff --git a/plugins/out_stackdriver/stackdriver.c b/plugins/out_stackdriver/stackdriver.c
+index fd761c0b1..6359a54ac 100644
+--- a/plugins/out_stackdriver/stackdriver.c
++++ b/plugins/out_stackdriver/stackdriver.c
+@@ -1,50 +1,51 @@
+ /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+ 
+ /*  Fluent Bit
+  *  ==========
+  *  Copyright (C) 2019-2020 The Fluent Bit Authors
+  *  Copyright (C) 2015-2018 Treasure Data Inc.
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+  *  You may obtain a copy of the License at
+  *
+  *      http://www.apache.org/licenses/LICENSE-2.0
+  *
+  *  Unless required by applicable law or agreed to in writing, software
+  *  distributed under the License is distributed on an "AS IS" BASIS,
+  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+ 
+ #include <fluent-bit/flb_output_plugin.h>
+ #include <fluent-bit/flb_http_client.h>
+ #include <fluent-bit/flb_pack.h>
+ #include <fluent-bit/flb_utils.h>
+ #include <fluent-bit/flb_time.h>
+ #include <fluent-bit/flb_oauth2.h>
+ #include <fluent-bit/flb_regex.h>
+ 
+ #include <msgpack.h>
+ 
+ #include "gce_metadata.h"
+ #include "stackdriver.h"
+ #include "stackdriver_conf.h"
+ #include "stackdriver_operation.h"
+ #include "stackdriver_source_location.h"
+ #include "stackdriver_http_request.h"
+ #include "stackdriver_timestamp.h"
+ #include "stackdriver_helper.h"
+ #include <mbedtls/base64.h>
+ #include <mbedtls/sha256.h>
++#include <pthread.h>
+ 
+ /*
+  * Base64 Encoding in JWT must:
+  *
+  * - remove any trailing padding '=' character
+  * - replace '+' with '-'
+  * - replace '/' with '_'
+  *
+  * ref: https://www.rfc-editor.org/rfc/rfc7515.txt Appendix C
+  */
+@@ -194,92 +195,96 @@ static int jwt_encode(char *payload, char *secret,
+ /* Create a new oauth2 context and get a oauth2 token */
+ static int get_oauth2_token(struct flb_stackdriver *ctx)
+ {
+     int ret;
+     char *token;
+     char *sig_data;
+     size_t sig_size;
+     time_t issued;
+     time_t expires;
+     char payload[1024];
+ 
+-    /* Create oauth2 context */
+-    ctx->o = flb_oauth2_create(ctx->config, FLB_STD_AUTH_URL, 3000);
+-    if (!ctx->o) {
+-        flb_plg_error(ctx->ins, "cannot create oauth2 context");
+-        return -1;
+-    }
++    flb_oauth2_payload_clear(ctx->o);
+ 
+     /* In case of using metadata server, fetch token from there */
+     if (ctx->metadata_server_auth) {
+         return gce_metadata_read_token(ctx);
+     }
+ 
+     /* JWT encode for oauth2 */
+     issued = time(NULL);
+     expires = issued + FLB_STD_TOKEN_REFRESH;
+ 
+     snprintf(payload, sizeof(payload) - 1,
+              "{\"iss\": \"%s\", \"scope\": \"%s\", "
+              "\"aud\": \"%s\", \"exp\": %lu, \"iat\": %lu}",
+              ctx->client_email, FLB_STD_SCOPE,
+              FLB_STD_AUTH_URL,
+              expires, issued);
+ 
+     /* Compose JWT signature */
+     ret = jwt_encode(payload, ctx->private_key, &sig_data, &sig_size, ctx);
+     if (ret != 0) {
+         flb_plg_error(ctx->ins, "JWT signature generation failed");
+         return -1;
+     }
+     flb_plg_debug(ctx->ins, "JWT signature:\n%s", sig_data);
+ 
+     ret = flb_oauth2_payload_append(ctx->o,
+                                     "grant_type", -1,
+                                     "urn:ietf:params:oauth:"
+                                     "grant-type:jwt-bearer", -1);
+     if (ret == -1) {
+         flb_plg_error(ctx->ins, "error appending oauth2 params");
+         flb_sds_destroy(sig_data);
+         return -1;
+     }
+ 
+     ret = flb_oauth2_payload_append(ctx->o,
+                                     "assertion", -1,
+                                     sig_data, sig_size);
+     if (ret == -1) {
+         flb_plg_error(ctx->ins, "error appending oauth2 params");
+         flb_sds_destroy(sig_data);
+         return -1;
+     }
+     flb_sds_destroy(sig_data);
+ 
+     /* Retrieve access token */
+     token = flb_oauth2_token_get(ctx->o);
+     if (!token) {
+         flb_plg_error(ctx->ins, "error retrieving oauth2 access token");
+         return -1;
+     }
+ 
+     return 0;
+ }
+ 
+-static char *get_google_token(struct flb_stackdriver *ctx)
++static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
+ {
+     int ret = 0;
++    flb_sds_t output = NULL;
+ 
+-    if (!ctx->o) {
+-        ret = get_oauth2_token(ctx);
++    if (pthread_mutex_lock(&ctx->token_mutex)){
++        flb_plg_error(ctx->ins, "error locking mutex");
++        return NULL;
+     }
+-    else if (flb_oauth2_token_expired(ctx->o) == FLB_TRUE) {
+-        flb_oauth2_destroy(ctx->o);
++
++    if (flb_oauth2_token_expired(ctx->o) == FLB_TRUE) {
+         ret = get_oauth2_token(ctx);
+     }
+ 
+-    if (ret != 0) {
++    /* Copy string to prevent race conditions (get_oauth2 can free the string) */
++    if (ret == 0) {
++        output = flb_sds_create(ctx->o->access_token);
++    }
++
++    if (pthread_mutex_unlock(&ctx->token_mutex)){
++        flb_plg_error(ctx->ins, "error unlocking mutex");
+         return NULL;
+     }
+ 
+-    return ctx->o->access_token;
++
++    return output;
+ }
+ 
+ static bool validate_msgpack_unpacked_data(msgpack_object root)
+@@ -835,73 +840,87 @@ int extract_resource_labels_from_regex(struct flb_stackdriver *ctx,
+ static int cb_stackdriver_init(struct flb_output_instance *ins,
+                           struct flb_config *config, void *data)
+ {
+     int ret;
+     int io_flags = FLB_IO_TLS;
+     char *token;
+     struct flb_stackdriver *ctx;
+ 
+     /* Create config context */
+     ctx = flb_stackdriver_conf_create(ins, config);
+     if (!ctx) {
+         flb_plg_error(ins, "configuration failed");
+         return -1;
+     }
+ 
+     /* Set context */
+     flb_output_set_context(ins, ctx);
+ 
+     /* Network mode IPv6 */
+     if (ins->host.ipv6 == FLB_TRUE) {
+         io_flags |= FLB_IO_IPV6;
+     }
+ 
++    /* Create mutex for acquiring oauth tokens (they are shared across flush coroutines) */
++    pthread_mutex_init ( &ctx->token_mutex, NULL);
++
+     /* Create Upstream context for Stackdriver Logging (no oauth2 service) */
+     ctx->u = flb_upstream_create_url(config, FLB_STD_WRITE_URL,
+                                      io_flags, ins->tls);
+     ctx->metadata_u = flb_upstream_create_url(config, "http://metadata.google.internal",
+                                               FLB_IO_TCP, NULL);
++
++    /* Create oauth2 context */
++    ctx->o = flb_oauth2_create(ctx->config, FLB_STD_AUTH_URL, 3000);
++
+     if (!ctx->u) {
+         flb_plg_error(ctx->ins, "upstream creation failed");
+         return -1;
+     }
+     if (!ctx->metadata_u) {
+         flb_plg_error(ctx->ins, "metadata upstream creation failed");
+         return -1;
+     }
++    if (!ctx->o) {
++        flb_plg_error(ctx->ins, "cannot create oauth2 context");
++        return -1;
++    }
++    flb_output_upstream_set(ctx->u, ins);
+ 
+     /* Metadata Upstream Sync flags */
+     ctx->metadata_u->flags &= ~FLB_IO_ASYNC;
+ 
+     if (ins->test_mode == FLB_FALSE) {
+         /* Retrieve oauth2 token */
+         token = get_google_token(ctx);
+         if (!token) {
+             flb_plg_warn(ctx->ins, "token retrieval failed");
++        } else {
++            flb_sds_destroy(token);
+         }
+     }
+ 
+     if (ctx->metadata_server_auth) {
+         ret = gce_metadata_read_project_id(ctx);
+         if (ret == -1) {
+             return -1;
+         }
+ 
+         ret = gce_metadata_read_zone(ctx);
+         if (ret == -1) {
+             return -1;
+         }
+ 
+         ret = gce_metadata_read_instance_id(ctx);
+         if (ret == -1) {
+             return -1;
+         }
+     }
+ 
+     /* Validate project_id */
+     if (!ctx->project_id) {
+         flb_plg_error(ctx->ins, "property 'project_id' is not set");
+         return -1;
+     }
+ 
+     return 0;
+ }
+@@ -1870,97 +1889,98 @@ static void set_authorization_header(struct flb_http_client *c,
+ static void cb_stackdriver_flush(const void *data, size_t bytes,
+                                  const char *tag, int tag_len,
+                                  struct flb_input_instance *i_ins,
+                                  void *out_context,
+                                  struct flb_config *config)
+ {
+     (void) i_ins;
+     (void) config;
+     int ret;
+     int ret_code = FLB_RETRY;
+     size_t b_sent;
+-    char *token;
++    flb_sds_t token;
+     flb_sds_t payload_buf;
+     size_t payload_size;
+     void *out_buf;
+     size_t out_size;
+     struct flb_stackdriver *ctx = out_context;
+     struct flb_upstream_conn *u_conn;
+     struct flb_http_client *c;
+ 
+     /* Get upstream connection */
+     u_conn = flb_upstream_conn_get(ctx->u);
+     if (!u_conn) {
+         FLB_OUTPUT_RETURN(FLB_RETRY);
+     }
+ 
+     /* Reformat msgpack to stackdriver JSON payload */
+     ret = stackdriver_format(config, i_ins,
+                              ctx, NULL,
+                              tag, tag_len,
+                              data, bytes,
+                              &out_buf, &out_size);
+     if (ret != 0) {
+         flb_upstream_conn_release(u_conn);
+         FLB_OUTPUT_RETURN(FLB_RETRY);
+     }
+ 
+     payload_buf = (flb_sds_t) out_buf;
+     payload_size = out_size;
+ 
+     /* Get or renew Token */
+     token = get_google_token(ctx);
+     if (!token) {
+         flb_plg_error(ctx->ins, "cannot retrieve oauth2 token");
+         flb_upstream_conn_release(u_conn);
+         flb_sds_destroy(payload_buf);
+         FLB_OUTPUT_RETURN(FLB_RETRY);
+     }
+ 
+     /* Compose HTTP Client request */
+     c = flb_http_client(u_conn, FLB_HTTP_POST, FLB_STD_WRITE_URI,
+                         payload_buf, payload_size, NULL, 0, NULL, 0);
+ 
+     flb_http_buffer_size(c, 4192);
+ 
+     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
+     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
+ 
+     /* Compose and append Authorization header */
+     set_authorization_header(c, token);
+ 
+     /* Send HTTP request */
+     ret = flb_http_do(c, &b_sent);
+ 
+     /* validate response */
+     if (ret != 0) {
+         flb_plg_warn(ctx->ins, "http_do=%i", ret);
+         ret_code = FLB_RETRY;
+     }
+     else {
+         /* The request was issued successfully, validate the 'error' field */
+         flb_plg_debug(ctx->ins, "HTTP Status=%i", c->resp.status);
+         if (c->resp.status == 200) {
+             ret_code = FLB_OK;
+         }
+         else {
+             if (c->resp.payload_size > 0) {
+                 /* we got an error */
+                 flb_plg_warn(ctx->ins, "error\n%s",
+                              c->resp.payload);
+             }
+             else {
+                 flb_plg_debug(ctx->ins, "response\n%s",
+                               c->resp.payload);
+             }
+             ret_code = FLB_RETRY;
+         }
+     }
+ 
+     /* Cleanup */
+     flb_sds_destroy(payload_buf);
++    flb_sds_destroy(token);
+     flb_http_client_destroy(c);
+     flb_upstream_conn_release(u_conn);
+ 
+     /* Done */
+     FLB_OUTPUT_RETURN(ret_code);
+ }
+diff --git a/plugins/out_stackdriver/stackdriver.h b/plugins/out_stackdriver/stackdriver.h
+index 32778117e..37052b139 100644
+--- a/plugins/out_stackdriver/stackdriver.h
++++ b/plugins/out_stackdriver/stackdriver.h
+@@ -1,76 +1,77 @@
+ /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+ 
+ /*  Fluent Bit
+  *  ==========
+  *  Copyright (C) 2019-2020 The Fluent Bit Authors
+  *  Copyright (C) 2015-2018 Treasure Data Inc.
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+  *  You may obtain a copy of the License at
+  *
+  *      http://www.apache.org/licenses/LICENSE-2.0
+  *
+  *  Unless required by applicable law or agreed to in writing, software
+  *  distributed under the License is distributed on an "AS IS" BASIS,
+  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  *  See the License for the specific language governing permissions and
+  *  limitations under the License.
+  */
+ 
+ #ifndef FLB_OUT_STACKDRIVER_H
+ #define FLB_OUT_STACKDRIVER_H
+ 
+ #include <fluent-bit/flb_info.h>
+ #include <fluent-bit/flb_output.h>
+ #include <fluent-bit/flb_oauth2.h>
+ #include <fluent-bit/flb_sds.h>
++#include <pthread.h>
+ 
+ /* refresh token every 50 minutes */
+ #define FLB_STD_TOKEN_REFRESH 3000
+ 
+ /* Stackdriver Logging write scope */
+ #define FLB_STD_SCOPE     "https://www.googleapis.com/auth/logging.write"
+ 
+ /* Stackdriver authorization URL */
+ #define FLB_STD_AUTH_URL  "https://www.googleapis.com/oauth2/v4/token"
+ 
+ /* Stackdriver Logging 'write' end-point */
+ #define FLB_STD_WRITE_URI "/v2/entries:write"
+ #define FLB_STD_WRITE_URL \
+     "https://logging.googleapis.com" FLB_STD_WRITE_URI
+ 
+ /* Timestamp format */
+ #define FLB_STD_TIME_FMT  "%Y-%m-%dT%H:%M:%S"
+ 
+ /* Default Resource type */
+ #define FLB_SDS_RESOURCE_TYPE "global"
+ 
+ #define OPERATION_FIELD_IN_JSON "logging.googleapis.com/operation"
+ #define MONITORED_RESOURCE_KEY "logging.googleapis.com/monitored_resource"
+ #define LOCAL_RESOURCE_ID_KEY "logging.googleapis.com/local_resource_id"
+ #define DEFAULT_LABELS_KEY "logging.googleapis.com/labels"
+ #define DEFAULT_SEVERITY_KEY "logging.googleapis.com/severity"
+ #define DEFAULT_TRACE_KEY "logging.googleapis.com/trace"
+ #define DEFAULT_LOG_NAME_KEY "logging.googleapis.com/logName"
+ #define DEFAULT_INSERT_ID_KEY "logging.googleapis.com/insertId"
+ #define SOURCELOCATION_FIELD_IN_JSON "logging.googleapis.com/sourceLocation"
+ #define HTTPREQUEST_FIELD_IN_JSON "logging.googleapis.com/http_request"
+ #define INSERT_ID_SIZE 31
+ #define LEN_LOCAL_RESOURCE_ID_KEY 40
+ #define OPERATION_KEY_SIZE 32
+ #define SOURCE_LOCATION_SIZE 37
+ #define HTTP_REQUEST_KEY_SIZE 35
+ 
+ #define K8S_CONTAINER "k8s_container"
+ #define K8S_NODE      "k8s_node"
+ #define K8S_POD       "k8s_pod"
+ 
+ #define STREAM_STDOUT 1
+ #define STREAM_STDERR 2
+ #define STREAM_UNKNOWN 3
+ 
+ #define STDOUT "stdout"
+ #define STDERR "stderr"
+ 
+ #define DEFAULT_TAG_REGEX "(?<pod_name>[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-(?<docker_id>[a-z0-9]{64})\\.log$"
+@@ -78,55 +79,58 @@
+ struct flb_stackdriver {
+     /* credentials */
+     flb_sds_t credentials_file;
+ 
+     /* parsed credentials file */
+     flb_sds_t type;
+     flb_sds_t project_id;
+     flb_sds_t private_key_id;
+     flb_sds_t private_key;
+     flb_sds_t client_email;
+     flb_sds_t client_id;
+     flb_sds_t auth_uri;
+     flb_sds_t token_uri;
+     bool metadata_server_auth;
+ 
+     /* metadata server (GCP specific, WIP) */
+     flb_sds_t zone;
+     flb_sds_t instance_id;
+     flb_sds_t instance_name;
+ 
+     /* kubernetes specific */
+     flb_sds_t cluster_name;
+     flb_sds_t cluster_location;
+     flb_sds_t namespace_name;
+     flb_sds_t pod_name;
+     flb_sds_t container_name;
+     flb_sds_t node_name;
+     bool k8s_resource_type;
+ 
+     flb_sds_t labels_key;
+     flb_sds_t local_resource_id;
+     flb_sds_t tag_prefix;
+ 
+     /* other */
+     flb_sds_t resource;
+     flb_sds_t severity_key;
+     flb_sds_t trace_key;
+     flb_sds_t log_name_key;
+     bool autoformat_stackdriver_trace;
+ 
+     /* oauth2 context */
+     struct flb_oauth2 *o;
+ 
++    /* mutex for acquiring oauth tokens */
++    pthread_mutex_t token_mutex;
++
+     /* upstream context for stackdriver write end-point */
+     struct flb_upstream *u;
+ 
+     /* upstream context for metadata end-point */
+     struct flb_upstream *metadata_u;
+ 
+     /* plugin instance */
+     struct flb_output_instance *ins;
+ 
+     /* Fluent Bit context */
+     struct flb_config *config;
+ };
+diff --git a/src/flb_oauth2.c b/src/flb_oauth2.c
+index 44cad52f9..f223a2f70 100644
+--- a/src/flb_oauth2.c
++++ b/src/flb_oauth2.c
+@@ -133,113 +133,128 @@ int flb_oauth2_parse_json_response(const char *json_data, size_t json_size,
+ struct flb_oauth2 *flb_oauth2_create(struct flb_config *config,
+                                      const char *auth_url, int expire_sec)
+ {
+     int ret;
+     char *prot = NULL;
+     char *host = NULL;
+     char *port = NULL;
+     char *uri = NULL;
+     struct flb_oauth2 *ctx;
+ 
+     /* allocate context */
+     ctx = flb_calloc(1, sizeof(struct flb_oauth2));
+     if (!ctx) {
+         flb_errno();
+         return NULL;
+     }
+ 
+     /* register token url */
+     ctx->auth_url = flb_sds_create(auth_url);
+     if (!ctx->auth_url) {
+         flb_errno();
+         flb_free(ctx);
+         return NULL;
+     }
+ 
+     /* default payload size to 1kb */
+     ctx->payload = flb_sds_create_size(1024);
+     if (!ctx->payload) {
+         flb_errno();
+         flb_oauth2_destroy(ctx);
+         return NULL;
+     }
+ 
+     ctx->issued = time(NULL);
+     ctx->expires = ctx->issued + expire_sec;
+ 
+     /* Parse and split URL */
+     ret = flb_utils_url_split(auth_url, &prot, &host, &port, &uri);
+     if (ret == -1) {
+         flb_error("[oauth2] invalid URL: %s", auth_url);
+         goto error;
+     }
+ 
+     if (!prot || strcmp(prot, "https") != 0) {
+         flb_error("[oauth2] invalid endpoint protocol: %s", auth_url);
+         goto error;
+     }
+ 
+     if (!host) {
+         flb_error("[oauth2] invalid URL host: %s", auth_url);
+         goto error;
+     }
+ 
+     /* Populate context */
+     ctx->host = flb_sds_create(host);
+     if (!ctx->host) {
+         flb_errno();
+         goto error;
+     }
+     if (port) {
+         ctx->port = flb_sds_create(port);
+     }
+     else {
+         ctx->port = flb_sds_create(FLB_OAUTH2_PORT);
+     }
+     if (!ctx->port) {
+         flb_errno();
+         goto error;
+     }
+     ctx->uri = flb_sds_create(uri);
+     if (!ctx->uri) {
+         flb_errno();
+         goto error;
+     }
+ 
+     /* Create TLS context */
+     ctx->tls = flb_tls_create(FLB_TRUE,  /* verify */
+                               -1,        /* debug */
+                               NULL,      /* vhost */
+                               NULL,      /* ca_path */
+                               NULL,      /* ca_file */
+                               NULL,      /* crt_file */
+                               NULL,      /* key_file */
+                               NULL);     /* key_passwd */
+     if (!ctx->tls) {
+         flb_error("[oauth2] error initializing TLS context");
+         goto error;
+     }
+ 
+     /* Create Upstream context */
+     ctx->u = flb_upstream_create_url(config, auth_url,
+                                      FLB_IO_TLS, ctx->tls);
+     if (!ctx->u) {
+         flb_error("[oauth2] error creating upstream context");
+         goto error;
+     }
+ 
+     /* Remove Upstream Async flag */
+     ctx->u->flags &= ~(FLB_IO_ASYNC);
+ 
+     free_temporary_buffers();
+     return ctx;
+ 
+  error:
+     free_temporary_buffers();
+     flb_oauth2_destroy(ctx);
+ 
+     return NULL;
+ }
+ 
++/* Clear the current payload and token */
++void flb_oauth2_payload_clear(struct flb_oauth2 *ctx)
++{
++    ctx->payload[0] = '\0';
++    ctx->expires_in = 0;
++    if (ctx->access_token){
++        flb_sds_destroy(ctx->access_token);
++        ctx->access_token = NULL;
++    }
++    if (ctx->token_type){
++        flb_sds_destroy(ctx->token_type);
++        ctx->token_type = NULL;
++    }
++}
++
+ /* Append a key/value to the request body */
+ int flb_oauth2_payload_append(struct flb_oauth2 *ctx,
+                               const char *key_str, int key_len,

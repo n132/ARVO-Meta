@@ -1,0 +1,315 @@
+commit cb44cf0fc82cf19efb002bba0eb5cc42e9527c3f
+Author: Nathan Moinvaziri <nathan@nathanm.com>
+Date:   Thu Feb 18 18:00:58 2021 -0800
+
+    Added a more secure version of blosc_getitem called blosc2_getitem.
+    Use blosc2_getitem in frame get_coffset to ensure we don't read past the end of the frame boundary.
+    https://oss-fuzz.com/testcase-detail/5507944642904064
+
+diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+index 8e3a720e..f10cfce4 100644
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -2437,145 +2437,148 @@ int blosc_decompress(const void* src, void* dest, size_t destsize) {
+ /* Specific routine optimized for decompression a small number of
+    items out of a compressed chunk.  This does not use threads because
+    it would affect negatively to performance. */
+ int _blosc_getitem(blosc2_context* context, blosc_header* header, const void* src, int32_t srcsize,
+                    int start, int nitems, void* dest, int32_t destsize) {
+   uint8_t* _src = (uint8_t*)(src);  /* current pos for source buffer */
+   int32_t ntbytes = 0;              /* the number of uncompressed bytes */
+   int32_t bsize, bsize2, ebsize, leftoverblock;
+   int32_t cbytes;
+   int32_t startb, stopb;
+   int32_t stop = start + nitems;
+   int j, rc;
+ 
+   if (nitems == 0) {
+     // We have nothing to do
+     return 0;
+   }
+   if (nitems * header->typesize > destsize) {
+     BLOSC_TRACE_ERROR("`nitems`*`typesize` out of dest bounds.");
+     return BLOSC2_ERROR_WRITE_BUFFER;
+   }
+ 
+   // Is that a chunk with a special value (runlen)?
+   rc = handle_runlen(header, _src, dest, nitems * header->typesize);
+   if (rc < 0) {
+     return rc;
+   }
+   if (rc > 0) {
+     // This means that we have found a special value and we are done.
+     return rc;
+   }
+ 
+   context->bstarts = (int32_t*)(_src + context->header_overhead);
+ 
+   /* Check region boundaries */
+   if ((start < 0) || (start * header->typesize > header->nbytes)) {
+     BLOSC_TRACE_ERROR("`start` out of bounds.");
+     return BLOSC2_ERROR_INVALID_PARAM;
+   }
+ 
+   if ((stop < 0) || (stop * header->typesize > header->nbytes)) {
+     BLOSC_TRACE_ERROR("`start`+`nitems` out of bounds.");
+     return BLOSC2_ERROR_INVALID_PARAM;
+   }
+ 
+   if (_src + srcsize < (uint8_t *)(context->bstarts + context->nblocks)) {
+     BLOSC_TRACE_ERROR("`bstarts` out of bounds.");
+     return BLOSC2_ERROR_READ_BUFFER;
+   }
+ 
+   ebsize = header->blocksize + header->typesize * (signed)sizeof(int32_t);
+ 
+   for (j = 0; j < context->nblocks; j++) {
+     bsize = header->blocksize;
+     leftoverblock = 0;
+     if ((j == context->nblocks - 1) && (context->leftover > 0)) {
+       bsize = context->leftover;
+       leftoverblock = 1;
+     }
+ 
+     /* Compute start & stop for each block */
+     startb = start * header->typesize - j * header->blocksize;
+     stopb = stop * header->typesize - j * header->blocksize;
+     if (stopb <= 0) {
+       // We can exit as soon as this block is beyond stop
+       break;
+     }
+     if (startb >= header->blocksize) {
+       continue;
+     }
+     if (startb < 0) {
+       startb = 0;
+     }
+     if (stopb > header->blocksize) {
+       stopb = header->blocksize;
+     }
+     bsize2 = stopb - startb;
+ 
+     /* Do the actual data copy */
+     struct thread_context* scontext = context->serial_context;
+ 
+     /* Resize the temporaries in serial context if needed */
+     if (header->blocksize > scontext->tmp_blocksize) {
+       my_free(scontext->tmp);
+       scontext->tmp_nbytes = (size_t)4 * ebsize;
+       scontext->tmp = my_malloc(scontext->tmp_nbytes);
+       scontext->tmp2 = scontext->tmp + ebsize;
+       scontext->tmp3 = scontext->tmp2 + ebsize;
+       scontext->tmp4 = scontext->tmp3 + ebsize;
+       scontext->tmp_blocksize = (int32_t)header->blocksize;
+     }
+ 
+     // Regular decompression.  Put results in tmp2.
+     // If the block is aligned and the worst case fits in destination, let's avoid a copy
+     bool get_single_block = ((startb == 0) && (bsize == nitems * header->typesize));
+     uint8_t* tmp2 = get_single_block ? dest : scontext->tmp2;
+     bool memcpyed = header->flags & (uint8_t)BLOSC_MEMCPYED;
+     // If memcpyed we don't have a bstarts section (because it is not needed)
+     int32_t src_offset = memcpyed ?
+       context->header_overhead + j * bsize : sw32_(context->bstarts + j);
+ 
+     cbytes = blosc_d(context->serial_context, bsize, leftoverblock,
+                      src, srcsize, src_offset, j,
+                      tmp2, 0, scontext->tmp, scontext->tmp3);
+     if (cbytes < 0) {
+       ntbytes = cbytes;
+       break;
+     }
+     if (!get_single_block) {
+       /* Copy to destination */
+       memcpy((uint8_t *) dest + ntbytes, tmp2 + startb, (unsigned int) bsize2);
+     }
+     cbytes = (int)bsize2;
+     ntbytes += cbytes;
+   }
+ 
+   return ntbytes;
+ }
+ 
+-
+-/* Specific routine optimized for decompression a small number of
+-   items out of a compressed chunk.  Public non-contextual API. */
+-int blosc_getitem(const void* src, int start, int nitems, void* dest) {
++int blosc2_getitem(const void* src, int32_t srcsize, int start, int nitems, void* dest, int32_t destsize) {
+   blosc2_context context;
+   int result;
+ 
+   /* Minimally populate the context */
+   memset(&context, 0, sizeof(blosc2_context));
+ 
+   context.schunk = g_schunk;
+   context.nthreads = 1;  // force a serial decompression; fixes #95
+ 
+   /* Call the actual getitem function */
+-  result = blosc2_getitem_ctx(&context, src, INT32_MAX, start, nitems, dest, INT32_MAX);
++  result = blosc2_getitem_ctx(&context, src, srcsize, start, nitems, dest, destsize);
+ 
+   /* Release resources */
+   if (context.serial_context != NULL) {
+     free_thread_context(context.serial_context);
+   }
+   return result;
+ }
+ 
++/* Specific routine optimized for decompression a small number of
++   items out of a compressed chunk.  Public non-contextual API. */
++int blosc_getitem(const void* src, int start, int nitems, void* dest) {
++  return blosc2_getitem(src, INT32_MAX, start, nitems, dest, INT32_MAX);
++}
++
+ int blosc2_getitem_ctx(blosc2_context* context, const void* src, int32_t srcsize,
+     int start, int nitems, void* dest, int32_t destsize) {
+   blosc_header header;
+diff --git a/blosc/blosc2.h b/blosc/blosc2.h
+index 2afe5082..5022d0c9 100644
+--- a/blosc/blosc2.h
++++ b/blosc/blosc2.h
+@@ -428,23 +428,41 @@ BLOSC_EXPORT int blosc2_chunk_repeatval(size_t nbytes, size_t typesize,
+ /**
+  * @brief Get @p nitems (of @p typesize size) in @p src buffer starting in @p start.
+  * The items are returned in @p dest buffer, which has to have enough
+  * space for storing all items.
+  *
+  * @param src The compressed buffer from data will be decompressed.
+  * @param start The position of the first item (of @p typesize size) from where data
+  * will be retrieved.
+  * @param nitems The number of items (of @p typesize size) that will be retrieved.
+  * @param dest The buffer where the decompressed data retrieved will be put.
+  *
+  * @return The number of bytes copied to @p dest or a negative value if
+  * some error happens.
+  */
+ BLOSC_EXPORT int blosc_getitem(const void* src, int start, int nitems, void* dest);
+ 
++/**
++ * @brief Get @p nitems (of @p typesize size) in @p src buffer starting in @p start.
++ * The items are returned in @p dest buffer. The dest buffer should have enough space
++ * for storing all items. This function is a more secure version of #blosc_getitem.
++ *
++ * @param src The compressed buffer from data will be decompressed.
++ * @param srcsize Size of the compressed buffer from data will be decompressed.
++ * @param start The position of the first item (of @p typesize size) from where data
++ * will be retrieved.
++ * @param nitems The number of items (of @p typesize size) that will be retrieved.
++ * @param dest The buffer where the decompressed data retrieved will be put.
++ * @param destsize Size of the buffer where decompressed data received.
++ *
++ * @return The number of bytes copied to @p dest or a negative value if
++ * some error happens.
++ */
++BLOSC_EXPORT int blosc2_getitem(const void* src, int32_t srcsize, int start, int nitems,
++                                void* dest, int32_t destsize);
+ 
+ /**
+   Pointer to a callback function that executes `dojob(jobdata + i*jobdata_elsize)` for `i = 0 to numjobs-1`,
+   possibly in parallel threads (but not returning until all `dojob` calls have returned).   This allows the
+   caller to provide a custom threading backend as an alternative to the default Blosc-managed threads.
+   `callback_data` is passed through from `blosc_set_threads_callback`.
+  */
+diff --git a/blosc/frame.c b/blosc/frame.c
+index b3b09283..72559d3b 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -952,69 +952,70 @@ int64_t frame_from_schunk(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+ // Get the compressed data offsets
+ uint8_t* get_coffsets(blosc2_frame_s *frame, int32_t header_len, int64_t cbytes, int32_t *off_cbytes) {
+   if (frame->coffsets != NULL) {
+     if (off_cbytes != NULL) {
+       *off_cbytes = sw32_(frame->coffsets + BLOSC2_CHUNK_CBYTES);
+     }
+     return frame->coffsets;
+   }
+   if (frame->cframe != NULL) {
+     int64_t off_pos = header_len;
+     if (cbytes < INT64_MAX - header_len) {
+       off_pos += cbytes;
+     }
+     // Check that there is enough room to read Blosc header
+     if (off_pos < 0 || off_pos > INT64_MAX - BLOSC_EXTENDED_HEADER_LENGTH ||
+         off_pos + BLOSC_EXTENDED_HEADER_LENGTH > frame->len) {
+       BLOSC_TRACE_ERROR("Cannot read the offsets outside of frame boundary.");
+       return NULL;
+     }
+     // For in-memory frames, the coffset is just one pointer away
+     uint8_t* off_start = frame->cframe + off_pos;
+     if (off_cbytes != NULL) {
+       *off_cbytes = sw32_(off_start + BLOSC2_CHUNK_CBYTES);
+       if (*off_cbytes > frame->len) {
+         BLOSC_TRACE_ERROR("Cannot read the cbytes outside of frame boundary.");
+         return NULL;
+       }
+     }
+     return off_start;
+   }
+ 
+   int64_t trailer_offset = get_trailer_offset(frame, header_len, true);
+ 
+   if (trailer_offset < BLOSC_EXTENDED_HEADER_LENGTH || trailer_offset + FRAME_TRAILER_MINLEN > frame->len) {
+     BLOSC_TRACE_ERROR("Cannot read the trailer out of the frame.");
+     return NULL;
+   }
+ 
+   int32_t coffsets_cbytes;
+   if (frame->sframe) {
+     coffsets_cbytes = (int32_t) (trailer_offset - (header_len + 0));
+   }
+   else {
+     coffsets_cbytes = (int32_t) (trailer_offset - (header_len + cbytes));
+   }
+ 
+   if (off_cbytes != NULL) {
+     *off_cbytes = coffsets_cbytes;
+   }
++
+   FILE* fp = NULL;
+   uint8_t* coffsets = malloc((size_t)coffsets_cbytes);
+   if (frame->sframe) {
+     fp = sframe_open_index(frame->urlpath, "rb");
+     fseek(fp, header_len + 0, SEEK_SET);
+   }
+   else {
+     fp = fopen(frame->urlpath, "rb");
+     fseek(fp, header_len + cbytes, SEEK_SET);
+   }
+   size_t rbytes = fread(coffsets, 1, (size_t)coffsets_cbytes, fp);
+   fclose(fp);
+   if (rbytes != (size_t)coffsets_cbytes) {
+     BLOSC_TRACE_ERROR("Cannot read the offsets out of the frame.");
+     free(coffsets);
+     return NULL;
+   }
+   frame->coffsets = coffsets;
+   return coffsets;
+ }
+@@ -1670,24 +1671,25 @@ int sort_offset(const void* a, const void* b) {
+ 
+ 
+ int get_coffset(blosc2_frame_s* frame, int32_t header_len, int64_t cbytes, int32_t nchunk, int64_t *offset) {
++  int32_t off_cbytes;
+   // Get the offset to nchunk
+-  uint8_t *coffsets = get_coffsets(frame, header_len, cbytes, NULL);
++  uint8_t *coffsets = get_coffsets(frame, header_len, cbytes, &off_cbytes);
+   if (coffsets == NULL) {
+     BLOSC_TRACE_ERROR("Cannot get the offset for chunk %d for the frame.", nchunk);
+     return BLOSC2_ERROR_DATA;
+   }
+ 
+   // Get the 64-bit offset
+-  int rc = blosc_getitem(coffsets, nchunk, 1, offset);
++  int rc = blosc2_getitem(coffsets, frame->len - off_cbytes, nchunk, 1, offset, sizeof(int64_t));
+   if (rc < 0) {
+     BLOSC_TRACE_ERROR("Problems retrieving a chunk offset.");
+   } else if (*offset > frame->len) {
+     BLOSC_TRACE_ERROR("Cannot read chunk %d outside of frame boundary.", nchunk);
+     rc = BLOSC2_ERROR_READ_BUFFER;
+   }
+ 
+   return rc;
+ }
+ 
+ 
+ // Detect and return a chunk with special values in offsets (only zeros and NaNs)

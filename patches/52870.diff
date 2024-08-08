@@ -1,0 +1,918 @@
+commit fa394e79b7e2228aacc4c8366cd41c3b2d6b05f5
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Mon Oct 31 11:31:29 2022 +0000
+
+    OSS-fuzz 52879 "Global-buffer-overflow in get_unpack_proc"
+    
+    The PDF spec allows (more craziness) a JPX image in a PDF file to have
+    a different colour space to the declared space in the PDF file, and the
+    JPX should take precedence.
+    
+    In this case the JPX image has been fuzzed leading to it declaring that
+    the image has 48 bits per component, which is outside the legal values
+    for PDF. Although the PDF interpreter does check the BPC, it does it for
+    the image data in the PDF file, which has been overridden by the data
+    in the JPX image.
+    
+    So here we check the BPC value after potential overrides. We also add
+    a check in get_unpack_proc to make sure we don't over or under run the
+    array of procedures and finally we add a check in the XPS image writing
+    code to check the returned decode procedure and if it is NULL to exit
+    with an error (the only other place that uses this, the clist, already
+    exits cleanly if the returned proc is NULL)
+
+diff --git a/base/gximdecode.c b/base/gximdecode.c
+index e24c6c061..2454fa38c 100644
+--- a/base/gximdecode.c
++++ b/base/gximdecode.c
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2014-2021 Artifex Software, Inc.
++/* Copyright (C) 2014-2022 Artifex Software, Inc.
+ All Rights Reserved.
+ 
+ This software is provided AS-IS with no warranty, either express or
+@@ -25,47 +25,51 @@ void
+ get_unpack_proc(gx_image_enum_common_t *pie, image_decode_t *imd,
+                 gs_image_format_t format, const float *decode) {
+ 
+     static sample_unpack_proc_t procs[2][6] = {
+         { sample_unpack_1, sample_unpack_2,
+         sample_unpack_4, sample_unpack_8,
+         sample_unpack_12, sample_unpackicc_16
+         },
+         { sample_unpack_1_interleaved, sample_unpack_2_interleaved,
+         sample_unpack_4_interleaved, sample_unpack_8_interleaved,
+         sample_unpack_12, sample_unpackicc_16
+         } };
+     int num_planes = pie->num_planes;
+     bool interleaved = (num_planes == 1 && pie->plane_depths[0] != imd->bps);
+     int i;
+     int index_bps = (imd->bps < 8 ? imd->bps >> 1 : (imd->bps >> 2) + 1);
+     int log2_xbytes = (imd->bps <= 8 ? 0 : arch_log2_sizeof_frac);
+ 
++    imd->unpack = NULL;
++    if (index_bps < 0 || index_bps > 5)
++        return;
++
+     switch (format) {
+     case gs_image_format_chunky:
+         imd->spread = 1 << log2_xbytes;
+         break;
+     case gs_image_format_component_planar:
+         imd->spread = (imd->spp) << log2_xbytes;
+         break;
+     case gs_image_format_bit_planar:
+         imd->spread = (imd->spp) << log2_xbytes;
+         break;
+     default:
+         imd->spread = 0;
+     }
+ 
+     if (interleaved) {
+         int num_components = pie->plane_depths[0] / imd->bps;
+ 
+         for (i = 1; i < num_components; i++) {
+             if (decode[0] != decode[i * 2 + 0] ||
+                 decode[1] != decode[i * 2 + 1])
+                 break;
+         }
+         if (i == num_components)
+             interleaved = false; /* Use single table. */
+     }
+     imd->unpack = procs[interleaved][index_bps];
+ }
+ 
+ /* We also need the mapping method for the unpacking proc */
+diff --git a/devices/vector/gdevxps.c b/devices/vector/gdevxps.c
+index cb2ab4ee2..d0f02f5d0 100644
+--- a/devices/vector/gdevxps.c
++++ b/devices/vector/gdevxps.c
+@@ -1871,282 +1871,286 @@ static int
+ xps_begin_typed_image(gx_device               *dev,
+                 const gs_gstate               *pgs,
+                 const gs_matrix               *pmat,
+                 const gs_image_common_t       *pic,
+                 const gs_int_rect             *prect,
+                 const gx_drawing_color        *pdcolor,
+                 const gx_clip_path            *pcpath,
+                       gs_memory_t             *mem,
+                       gx_image_enum_common_t **pinfo)
+ {
+     gx_device_vector *vdev = (gx_device_vector *)dev;
+     gx_device_xps *xdev = (gx_device_xps *)dev;
+     const gs_image_t *pim = (const gs_image_t *)pic;
+     gs_color_space *pcs;
+     xps_image_enum_t *pie = NULL;
+     xps_icc_data_t *icc_data;
+     gs_matrix mat;
+     int code;
+     gx_clip_path cpath;
+     gs_fixed_rect bbox;
+     int bits_per_pixel;
+     int num_components;
+     int bsize;
+     cmm_profile_t *icc_profile = NULL;
+     gs_color_space_index csindex;
+     float index_decode[2];
+     gsicc_rendering_param_t rendering_params;
+     bool force8bit = false;
+ 
+     if (pic->type->index != 1)
+         goto use_default;
+ 
+     pcs = pim->ColorSpace;
+     /* No image mask yet.  Also, need a color space */
+     if (pcs == NULL || ((const gs_image1_t *)pim)->ImageMask)
+         goto use_default;
+ 
+     /* No indexed images that are not 8 bit. */
+     csindex = gs_color_space_get_index(pcs);
+     if (csindex == gs_color_space_index_Indexed && pim->BitsPerComponent != 8)
+         goto use_default;
+ 
+     /* Also need  gs_gstate for these color spaces */
+     if (pgs == NULL && (csindex == gs_color_space_index_Indexed ||
+         csindex == gs_color_space_index_Separation ||
+         csindex == gs_color_space_index_DeviceN))
+         goto use_default;
+ 
+     if (gs_matrix_invert(&pim->ImageMatrix, &mat) < 0)
+         goto use_default;
+     if (pmat == NULL)
+         pmat = &ctm_only(pgs);
+     if (pgs)
+         gs_matrix_multiply(&mat, pmat, &mat);
+ 
+     pie = gs_alloc_struct(mem, xps_image_enum_t, &st_xps_image_enum,
+                           "xps_begin_image");
+     if (pie == 0)
+         return_error(gs_error_VMerror);
+     pie->buffer = NULL;
+     pie->devc_buffer = NULL;
+     pie->pgs = NULL;
+     pie->tif = NULL;
+ 
+     /* Set the brush types to image */
+     xps_setstrokebrush(xdev, xps_imagebrush);
+     xps_setfillbrush(xdev, xps_imagebrush);
+     pie->mat = mat;
+     xdev->xps_pie = pie;
+     /* We need this set a bit early for the ICC relationship writing */
+     pie->dev = (gx_device*) xdev;
+ 
+     /* If the color space is DeviceN, Sep or indexed these end up getting
+        mapped to the color space defined by the device profile.  XPS only
+        support RGB indexed images so we just expand if for now. ICC link
+        creation etc is handled during the remap/concretization of the colors */
+     if (csindex == gs_color_space_index_Indexed ||
+         csindex == gs_color_space_index_Separation ||
+         csindex == gs_color_space_index_DeviceN) {
+         cmm_dev_profile_t *dev_profile;
+         pie->pcs = pcs;
+         rc_increment(pcs);
+         code = dev_proc(dev, get_profile)(dev, &(dev_profile));
+         /* Just use the "default" profile for now */
+         icc_profile = dev_profile->device_profile[GS_DEFAULT_DEVICE_PROFILE];
+         force8bit = true; /* Output image is 8 bit regardless of source */
+     } else {
+         /* An ICC, RGB, CMYK, Gray color space */
+         pie->pcs = NULL;
+         /* Get the ICC profile */
+         if (gs_color_space_is_PSCIE(pcs)) {
+             if (pcs->icc_equivalent == NULL) {
+                 bool is_lab;
+                 if (pgs == NULL) {
+                     gs_free_object(mem, *pinfo, "xps_begin_image");
+                     return_error(gs_error_invalidaccess);
+                 }
+                 gs_colorspace_set_icc_equivalent(pcs, &is_lab, pgs->memory);
+             }
+             icc_profile = pcs->icc_equivalent->cmm_icc_profile_data;
+         } else {
+             icc_profile = pcs->cmm_icc_profile_data;
+         }
+     }
+ 
+     /* Set up for handling case where we are in CIELAB. In this case, we are
+        going out to the default RGB color space */
+     if (icc_profile->islab) {
+         /* Create the link */
+         rendering_params.black_point_comp = gsBLACKPTCOMP_ON;
+         rendering_params.graphics_type_tag = GS_IMAGE_TAG;
+         rendering_params.override_icc = false;
+         rendering_params.preserve_black = gsBKPRESNOTSPECIFIED;
+         rendering_params.rendering_intent = gsPERCEPTUAL;
+         rendering_params.cmm = gsCMM_DEFAULT;
+         if (pgs == NULL) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_error_invalidaccess);
+         }
+         pie->icc_link = gsicc_get_link_profile(pgs, dev, icc_profile,
+             pgs->icc_manager->default_rgb, &rendering_params, pgs->memory, false);
+         icc_profile = pgs->icc_manager->default_rgb;
+     } else {
+         pie->icc_link = NULL;
+     }
+ 
+     /* Now we actually write out the image and icc profile data to the zip
+       package. Test if profile is already here. If not, add it. */
+     if (xps_find_icc(xdev, icc_profile) == NULL) {
+         icc_data = (xps_icc_data_t*)gs_alloc_bytes(dev->memory->non_gc_memory,
+             sizeof(xps_icc_data_t), "xps_begin_image");
+         if (icc_data == NULL) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             gs_throw(gs_error_VMerror, "Allocation of icc_data failed");
+             return_error(gs_error_VMerror);
+         }
+ 
+         icc_data->hash = gsicc_get_hash(icc_profile);
+         if (xdev->icc_data == NULL) {
+             icc_data->index = 0;
+             xdev->icc_data = icc_data;
+             xdev->icc_data->next = NULL;
+         } else {
+             icc_data->next = xdev->icc_data;
+             icc_data->index = icc_data->next->index + 1;
+             xdev->icc_data = icc_data;
+         }
+ 
+         /* Get name for mark up and for relationship. Have to wait and do
+            this after it is added to the package */
+         code = xps_create_icc_name(xdev, icc_profile, &(pie->icc_name[0]));
+         if (code < 0) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_rethrow_code(code));
+         }
+ 
+         /* Add profile to the package. Here like images we are going to write
+            the data now.  Rather than later. */
+         if (pgs == NULL) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_error_invalidaccess);
+         }
+         code = xps_write_profile(pgs, &(pie->icc_name[0]), icc_profile, xdev);
+         if (code < 0) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_rethrow_code(code));
+         }
+ 
+         /* Add ICC relationship */
+         xps_add_icc_relationship(pie);
+     } else {
+         /* Get name for mark up.  We already have it in the resource list */
+         code = xps_create_icc_name(xdev, icc_profile, &(pie->icc_name[0]));
+         if (code < 0) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_rethrow_code(code));
+         }
+ 
+         /* Add ICC relationship.  It may not yet be present for this page. */
+         xps_add_icc_relationship(pie);
+     }
+ 
+     /* Get image name for mark up */
+     xps_create_image_name(dev, &(pie->file_name[0]));
+     /* Set width and height here */
+     pie->width = pim->Width;
+     pie->height = pim->Height;
+ 
+     if (pcpath == NULL) {
+         (*dev_proc(dev, get_clipping_box)) (dev, &bbox);
+         gx_cpath_init_local(&cpath, dev->memory);
+         code = gx_cpath_from_rectangle(&cpath, &bbox);
+         if (code < 0) {
+             gs_free_object(mem, *pinfo, "xps_begin_image");
+             return_error(gs_rethrow_code(code));
+         }
+         pcpath = &cpath;
+     } else {
+         /* Force vector device to do new path as the clip path is the image
+            path.  I had a case where the clip path ids were the same but the
+            CTM was changing which resulted in subsequent images coming up
+            missing on the page. i.e. only the first one was shown. */
+         ((gx_device_vector*) vdev)->clip_path_id = vdev->no_clip_path_id;
+     }
+ 
+     if (pgs == NULL) {
+         gs_free_object(mem, *pinfo, "xps_begin_image");
+         return_error(gs_error_invalidaccess);
+     }
+     code = gdev_vector_begin_image(vdev, pgs, pim, pim->format, prect,
+         pdcolor, pcpath, mem, &xps_image_enum_procs,
+         (gdev_vector_image_enum_t *)pie);
+     if (code < 0) {
+         gs_free_object(mem, pie, "xps_begin_image");
+         return_error(gs_rethrow_code(code));
+     }
+ 
+     if ((pie->tif = tiff_from_name(xdev, pie->file_name, false, false)) == NULL) {
+         gs_free_object(mem, pie, "xps_begin_image");
+         return_error(gs_error_VMerror);
+     }
+ 
+     /* Null out pie.  Only needed for the above vector command and tiff set up */
+     xdev->xps_pie = NULL;
+     xps_tiff_set_handlers();
+     code = tiff_set_values(pie, pie->tif, icc_profile, force8bit);
+     if (code < 0) {
+         gs_free_object(mem, pie, "xps_begin_image");
+         return_error(gs_rethrow_code(code));
+     }
+     code = TIFFCheckpointDirectory(pie->tif);
+ 
+     num_components = gs_color_space_num_components(pcs);
+     bits_per_pixel = pim->BitsPerComponent * num_components;
+     pie->decode_st.bps = bits_per_pixel / num_components;
+     pie->bytes_comp = (pie->decode_st.bps > 8 ? 2 : 1);
+     pie->decode_st.spp = num_components;
+     pie->decode_st.unpack = NULL;
+     get_unpack_proc((gx_image_enum_common_t*)pie, &(pie->decode_st), pim->format,
+         pim->Decode);
++    if (pie->decode_st.unpack == NULL){
++        gs_free_object(mem, pie, "xps_begin_image");
++        return_error(gs_rethrow_code(gs_error_rangecheck));
++    }
+ 
+     /* The decode mapping for index colors needs an adjustment */
+     if (csindex == gs_color_space_index_Indexed) {
+         if (pim->Decode[0] == 0 &&
+             pim->Decode[1] == 255) {
+             index_decode[0] = 0;
+             index_decode[1] = 1.0;
+         } else {
+             index_decode[0] = pim->Decode[0];
+             index_decode[1] = pim->Decode[1];
+         }
+         get_map(&(pie->decode_st), pim->format, index_decode);
+     } else {
+         get_map(&(pie->decode_st), pim->format, pim->Decode);
+     }
+ 
+     /* Allocate our decode buffer. */
+     bsize = ((pie->decode_st.bps > 8 ? (pim->Width) * 2 : pim->Width) + 15) * num_components;
+     pie->buffer = gs_alloc_bytes(mem, bsize, "xps_begin_typed_image(buffer)");
+     if (pie->buffer == 0) {
+         gs_free_object(mem, pie, "xps_begin_typed_image");
+         *pinfo = NULL;
+         return_error(gs_error_VMerror);
+     }
+ 
+     /* If needed, allocate our device color buffer.  We will always do 8 bit here */
+     if (csindex == gs_color_space_index_Indexed ||
+         csindex == gs_color_space_index_Separation ||
+         csindex == gs_color_space_index_DeviceN) {
+         bsize = (pim->Width + 15) * icc_profile->num_comps;
+         pie->devc_buffer = gs_alloc_bytes(mem, bsize, "xps_begin_typed_image(devc_buffer)");
+         if (pie->devc_buffer == 0) {
+             gs_free_object(mem, pie, "xps_begin_typed_image");
+             *pinfo = NULL;
+             return_error(gs_error_VMerror);
+         }
+         /* Also, the color remaps need the gs_gstate */
+         pie->pgs = pgs;
+     }
+ 
+     *pinfo = (gx_image_enum_common_t *)pie;
+     return 0;
+diff --git a/pdf/pdf_image.c b/pdf/pdf_image.c
+index a268fd50b..c7c66f6f4 100644
+--- a/pdf/pdf_image.c
++++ b/pdf/pdf_image.c
+@@ -1648,532 +1648,537 @@ static int
+ pdfi_do_image(pdf_context *ctx, pdf_dict *page_dict, pdf_dict *stream_dict, pdf_stream *image_stream,
+               pdf_c_stream *source, bool inline_image)
+ {
+     pdf_c_stream *new_stream = NULL, *SFD_stream = NULL;
+     int code = 0, code1 = 0;
+     int comps = 0;
+     gs_color_space  *pcs = NULL;
+     gs_image1_t t1image;
+     gs_image4_t t4image;
+     gs_image3_t t3image;
+     gs_image3x_t t3ximage;
+     gs_pixel_image_t *pim = NULL;
+     pdf_stream *alt_stream = NULL;
+     pdfi_image_info_t image_info, mask_info, smask_info;
+     pdf_stream *mask_stream = NULL;
+     pdf_stream *smask_stream = NULL; /* only non-null for imagetype 3x (PreserveSMask) */
+     pdf_array *mask_array = NULL;
+     unsigned char *mask_buffer = NULL;
+     uint64_t mask_size = 0;
+     pdfi_int_gstate *igs = (pdfi_int_gstate *)ctx->pgs->client_data;
+     bool transparency_group = false;
+     bool op_blend_mode = false;
+     int blend_mode;
+     bool need_smask_cleanup = false;
+     bool maybe_jpxdecode = false;
+     pdfi_trans_state_t trans_state;
+     int saved_intent;
+     gs_offset_t stream_offset;
+     float save_strokeconstantalpha = 0.0f, save_fillconstantalpha = 0.0f;
+     int trans_required;
+ 
+ #if DEBUG_IMAGES
+     dbgmprintf(ctx->memory, "pdfi_do_image BEGIN\n");
+ #endif
+     memset(&mask_info, 0, sizeof(mask_info));
+     memset(&smask_info, 0, sizeof(mask_info));
+ 
+     /* Make sure the image is a stream (which we will assume in later code) */
+     if (pdfi_type_of(image_stream) != PDF_STREAM)
+         return_error(gs_error_typecheck);
+ 
+     if (!inline_image) {
+         pdf_dict *image_dict = NULL;
+ 
+         /* If we are not processing an inline image, check to see if any of the abbreviated
+          * keys are present in the image dictionary. If they are, and we need to abort, we'll
+          * get an error return, otherwise we can continue.
+          */
+         code = pdfi_dict_from_obj(ctx, (pdf_obj *)image_stream, &image_dict);
+         if (code < 0)
+             return code;
+ 
+         code = pdfi_check_inline_image_keys(ctx, image_dict);
+         if (code < 0)
+             return code;
+     }
+ 
+     /* Save current rendering intent so we can put it back if it is modified */
+     saved_intent = gs_currentrenderingintent(ctx->pgs);
+ 
+     code = pdfi_get_image_info(ctx, image_stream, page_dict, stream_dict, inline_image, &image_info);
+     if (code < 0)
+         goto cleanupExit;
+ 
+     /* Don't render this if turned off */
+     if (pdfi_oc_is_off(ctx))
+         goto cleanupExit;
+     /* If there is an OC dictionary, see if we even need to render this */
+     if (image_info.OC) {
+         if (!pdfi_oc_is_ocg_visible(ctx, image_info.OC))
+             goto cleanupExit;
+     }
+ 
+     /* If there is an alternate, swap it in */
+     /* If image_info.Alternates, look in the array, see if any of them are flagged as "DefaultForPrinting"
+      * and if so, substitute that one for the image we are processing.
+      * (it can probably be either an array, or a reference to an array, need an example to test/implement)
+      * see p.274 of PDFReference.pdf
+      */
+ 
+     if (image_info.Alternates != NULL) {
+         alt_stream = pdfi_find_alternate(ctx, image_info.Alternates);
+         if (alt_stream != NULL) {
+             image_stream = alt_stream;
+             pdfi_free_image_info_components(&image_info);
+             code = pdfi_get_image_info(ctx, image_stream, page_dict, stream_dict, inline_image, &image_info);
+             if (code < 0)
+                 goto cleanupExit;
+         }
+     }
+ 
+     /* Grab stream_offset after alternate has (possibly) set */
+     stream_offset = pdfi_stream_offset(ctx, image_stream);
+ 
+     /* See if it might be a JPXDecode image even though not in the header */
+     if (image_info.ColorSpace == NULL && !image_info.ImageMask)
+         maybe_jpxdecode = true;
+ 
+     /* Handle JPXDecode filter pre-scan of header */
+     if ((maybe_jpxdecode || image_info.is_JPXDecode) && !inline_image) {
+         pdfi_seek(ctx, source, stream_offset, SEEK_SET);
+         code = pdfi_scan_jpxfilter(ctx, source, image_info.Length, &image_info.jpx_info);
+         if (code < 0 && image_info.is_JPXDecode)
+             goto cleanupExit;
+ 
+         /* I saw this JPXDecode images that have SMaskInData */
+         if (image_info.jpx_info.no_data)
+             image_info.is_JPXDecode = false;
+ 
+         if (code == 0 && maybe_jpxdecode)
+             image_info.is_JPXDecode = true;
+     }
+ 
+     /* Set the rendering intent if applicable */
+     if (image_info.Intent) {
+         code = pdfi_setrenderingintent(ctx, image_info.Intent);
+         if (code < 0) {
+             /* TODO: Flag a warning on this?  Sample fts_17_1706.pdf has misspelled Intent
+                which gs renders without flagging an error */
+ #if DEBUG_IMAGES
+             dbgmprintf(ctx->memory, "WARNING: Image with unexpected Intent\n");
+ #endif
+         }
+     }
+ 
+     /* Get the color for this image */
+     code = pdfi_image_get_color(ctx, source, &image_info, &comps, image_stream->object_num, &pcs);
+     if (code < 0)
+         goto cleanupExit;
+ 
++    if (image_info.BPC != 1 && image_info.BPC != 2 && image_info.BPC != 4 && image_info.BPC != 8 && image_info.BPC != 16) {
++        code = gs_note_error(gs_error_rangecheck);
++        goto cleanupExit;
++    }
++
+     /* Set the colorspace */
+     if (pcs) {
+         gs_color_space  *pcs1 = pcs;
+ 
+         code = pdfi_gs_setcolorspace(ctx, pcs);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         if (pcs->type->index == gs_color_space_index_Indexed)
+             pcs1 = pcs->base_space;
+ 
+         /* It is possible that we get no error returned from setting an
+          * ICC space, but that we are not able when rendering to create a link
+          * between the ICC space and the output device profile.
+          * The PostScript PDF interpreter sets the colour after setting the space, which
+          * (eventually) causes us to set the device colour, and that actually creates the
+          * link. This is apparntly the only way we can detect this error. Otherwise we
+          * would carry on until we tried to render the image, and that would fail with
+          * a not terribly useful error of -1. So here we try to set the device colour,
+          * for images in an ICC profile space. If that fails then we try to manufacture
+          * a Device space from the number of components in the profile.
+          * I do feel this is something we should be able to handle better!
+          */
+         if (pcs1->type->index == gs_color_space_index_ICC)
+         {
+             gs_client_color         cc;
+             int comp = 0;
+             pdf_obj *ColorSpace = NULL;
+ 
+             cc.pattern = 0;
+             for (comp = 0; comp < pcs1->cmm_icc_profile_data->num_comps;comp++)
+                 cc.paint.values[comp] = 0;
+ 
+             code = gs_setcolor(ctx->pgs, &cc);
+             if (code < 0)
+                 goto cleanupExit;
+ 
+             code = gx_set_dev_color(ctx->pgs);
+             if (code < 0) {
+                 pdfi_set_warning(ctx, 0, NULL, W_PDF_BAD_ICC_PROFILE_LINK, "pdfi_do_image", "Attempting to use profile /N to create a device colour space");
+                 /* Possibly we couldn't create a link profile, soemthing wrong with the ICC profile, try to use a device space */
+                 switch(pcs1->cmm_icc_profile_data->num_comps) {
+                     case 1:
+                         code = pdfi_name_alloc(ctx, (byte *)"DeviceGray", 10, &ColorSpace);
+                         if (code < 0)
+                             goto cleanupExit;
+                         pdfi_countup(ColorSpace);
+                         break;
+                     case 3:
+                         code = pdfi_name_alloc(ctx, (byte *)"DeviceRGB", 9, &ColorSpace);
+                         if (code < 0)
+                             goto cleanupExit;
+                         pdfi_countup(ColorSpace);
+                         break;
+                     case 4:
+                         code = pdfi_name_alloc(ctx, (byte *)"DeviceCMYK", 10, &ColorSpace);
+                         if (code < 0)
+                             goto cleanupExit;
+                         pdfi_countup(ColorSpace);
+                         break;
+                     default:
+                         code = gs_error_unknownerror;
+                         goto cleanupExit;
+                         break;
+                 }
+                 if (pcs != NULL)
+                     rc_decrement_only_cs(pcs, "pdfi_do_image");
+                 /* At this point ColorSpace is either a string we just made, or the one from the Image */
+                 code = pdfi_create_colorspace(ctx, ColorSpace,
+                                   image_info.stream_dict, image_info.page_dict,
+                                   &pcs, image_info.inline_image);
+                 pdfi_countdown(ColorSpace);
+                 if (code < 0)
+                     goto cleanupExit;
+ 
+                 code = pdfi_gs_setcolorspace(ctx, pcs);
+                 if (code < 0)
+                     goto cleanupExit;
+ 
+                 /* Try to set the device color again as that failure
+                    is why we are here. If it fails again, something
+                    is very wrong */
+                 code = gx_set_dev_color(ctx->pgs);
+                 if (code < 0)
+                     goto cleanupExit;
+             }
+         }
+     }
+     else {
+         if (image_info.ImageMask == 0) {
+             code = gs_note_error(gs_error_undefined);
+             goto cleanupExit;
+         }
+     }
+ 
+     /* Make a fake SMask dict if needed for JPXDecode */
+     if (ctx->page.has_transparency && image_info.is_JPXDecode && image_info.SMaskInData != 0) {
+         code = pdfi_make_smask_dict(ctx, image_stream, &image_info, comps);
+         if (code < 0)
+             goto cleanupExit;
+     }
+ 
+     if (ctx->page.has_transparency == true && image_info.SMask != NULL) {
+         bool has_Matte = false;
+ 
+         /* If this flag is set, then device will process the SMask and we need do nothing
+          * here (e.g. pdfwrite).
+          */
+         if (!ctx->device_state.preserve_smask) {
+             code = pdfi_do_image_smask(ctx, source, &image_info, &has_Matte);
+             if (code < 0)
+                 goto cleanupExit;
+             need_smask_cleanup = true;
+         }
+ 
+         /* If we are in an overprint situation this group will need
+            to have its blend mode set to compatible overprint. */
+         if (ctx->page.needs_OP) {
+             if (pdfi_trans_okOPcs(ctx)) {
+                 if (gs_currentfilloverprint(ctx->pgs)) {
+                     blend_mode = gs_currentblendmode(ctx->pgs);
+                     code = gs_setblendmode(ctx->pgs, BLEND_MODE_CompatibleOverprint);
+                     op_blend_mode = true;
+                     if (code < 0)
+                         goto cleanupExit;
+                 }
+             }
+         }
+ 
+         if (has_Matte)
+             code = pdfi_trans_begin_isolated_group(ctx, true, pcs);
+         else
+             code = pdfi_trans_begin_isolated_group(ctx, true, NULL);
+         if (code < 0)
+             goto cleanupExit;
+         transparency_group = true;
+     } else if (igs->SMask) {
+         code = pdfi_trans_begin_isolated_group(ctx, false, NULL);
+         if (code < 0)
+             goto cleanupExit;
+         transparency_group = true;
+     }
+ 
+     if (transparency_group && !ctx->device_state.preserve_smask) {
+         save_strokeconstantalpha = gs_getstrokeconstantalpha(ctx->pgs);
+         save_fillconstantalpha = gs_getfillconstantalpha(ctx->pgs);
+         gs_setstrokeconstantalpha(ctx->pgs, 1.0);
+         gs_setfillconstantalpha(ctx->pgs, 1.0);
+     }
+ 
+     /* Get the Mask data either as an array or a dict, if present */
+     if (image_info.Mask != NULL) {
+         switch (pdfi_type_of(image_info.Mask)) {
+             case PDF_ARRAY:
+                 mask_array = (pdf_array *)image_info.Mask;
+                 break;
+             case PDF_STREAM:
+                 mask_stream = (pdf_stream *)image_info.Mask;
+                 code = pdfi_get_image_info(ctx, mask_stream, page_dict,
+                                            stream_dict, inline_image, &mask_info);
+                 if (code < 0)
+                     goto cleanupExit;
+                 break;
+             default:
+                 pdfi_countdown(image_info.Mask);
+                 image_info.Mask = NULL;
+                 pdfi_set_warning(ctx, 0, NULL, W_PDF_MASK_ERROR, "pdfi_do_image", NULL);
+         }
+     }
+ 
+     /* Get the SMask info if we will need it (Type 3x images) */
+     if (image_info.SMask && pdfi_type_of(image_info.SMask) == PDF_STREAM && ctx->device_state.preserve_smask) {
+         /* smask_dict non-NULL is used to flag a Type 3x image below */
+         smask_stream = (pdf_stream *)image_info.SMask;
+         code = pdfi_get_image_info(ctx, smask_stream, page_dict, stream_dict,
+                                    inline_image, &smask_info);
+         if (code < 0)
+             goto cleanupExit;
+     }
+ 
+     /* Get the image into a supported gs type (type1, type3, type4, type3x) */
+     if (!image_info.Mask && !smask_stream) { /* Type 1 and ImageMask */
+         memset(&t1image, 0, sizeof(t1image));
+         pim = (gs_pixel_image_t *)&t1image;
+ 
+         if (image_info.ImageMask) {
+             /* Sets up timage.ImageMask, amongst other things */
+             gs_image_t_init_adjust(&t1image, NULL, false);
+         } else {
+             gs_image_t_init_adjust(&t1image, pcs, true);
+         }
+     } else if (smask_stream) { /* Type 3x */
+         code = pdfi_image_setup_type3x(ctx, &image_info, &t3ximage, &smask_info, comps);
+         if (code < 0) {
+             /* If this got an error, setup as a Type 1 image */
+             /* NOTE: I did this error-handling the same as for Type 4 image below.
+              * Dunno if it's better to do this or to just abort the whole image?
+              */
+             memset(&t1image, 0, sizeof(t1image));
+             pim = (gs_pixel_image_t *)&t1image;
+             gs_image_t_init_adjust(&t1image, pcs, true);
+         } else {
+             pim = (gs_pixel_image_t *)&t3ximage;
+         }
+     } else {
+         if (mask_array) { /* Type 4 */
+             code = pdfi_image_setup_type4(ctx, &image_info, &t4image, mask_array, pcs);
+             if (code < 0) {
+                 /* If this got an error, setup as a Type 1 image */
+                 memset(&t1image, 0, sizeof(t1image));
+                 pim = (gs_pixel_image_t *)&t1image;
+                 gs_image_t_init_adjust(&t1image, pcs, true);
+             } else {
+                 pim = (gs_pixel_image_t *)&t4image;
+             }
+         } else { /* Type 3 */
+             memset(&t3image, 0, sizeof(t3image));
+             pim = (gs_pixel_image_t *)&t3image;
+             gs_image3_t_init(&t3image, NULL, interleave_separate_source);
+             code = pdfi_data_image_params(ctx, &mask_info, &t3image.MaskDict, 1, NULL);
+             if (code < 0)
+                 goto cleanupExit;
+         }
+     }
+ 
+ 
+     /* At this point pim points to a structure containing the specific type
+      * of image, and then we can handle it generically from here.
+      * The underlying gs image functions will do different things for different
+      * types of images.
+      */
+ 
+     /* Setup the common params */
+     pim->ColorSpace = pcs;
+     code = pdfi_data_image_params(ctx, &image_info, (gs_data_image_t *)pim, comps, pcs);
+     if (code < 0)
+         goto cleanupExit;
+ 
+     /* Grab the mask_image data buffer in advance.
+      * Doing it this way because I don't want to muck with reading from
+      * two streams simultaneously -- not even sure that is feasible?
+      */
+     if (mask_stream) {
+         /* Calculate expected mask size */
+         mask_size = ((((t3image.MaskDict.BitsPerComponent * (int64_t)t3image.MaskDict.Width) + 7) / 8) * (int64_t)t3image.MaskDict.Height);
+         code = pdfi_stream_to_buffer(ctx, mask_stream, &mask_buffer, (int64_t *)&mask_size);
+         if (code < 0)
+             goto cleanupExit;
+     } else if (smask_stream) {
+         mask_size = ((((smask_info.Width * smask_info.BPC) + 7) / 8) * smask_info.Height);
+         /* This will happen only in case of PreserveSMask (Type 3x) */
+         code = pdfi_stream_to_buffer(ctx, smask_stream, &mask_buffer, (int64_t *)&mask_size);
+         if (code < 0)
+             goto cleanupExit;
+     }
+ 
+     /* Setup the data stream for the image data */
+     if (!inline_image) {
+         pdfi_seek(ctx, source, stream_offset, SEEK_SET);
+ 
+         code = pdfi_apply_SubFileDecode_filter(ctx, 0, "endstream", source, &SFD_stream, false);
+         if (code < 0)
+             goto cleanupExit;
+         source = SFD_stream;
+     }
+ 
+     code = pdfi_filter(ctx, image_stream, source, &new_stream, inline_image);
+     if (code < 0)
+         goto cleanupExit;
+ 
+     /* This duplicates the code in gs_img.ps; if we have an imagemask, with 1 bit per component (is there any other kind ?)
+      * and the image is to be interpolated, and we are nto sending it to a high level device. Then check the scaling.
+      * If we are scaling up (in device space) by afactor of more than 2, then we install the ImScaleDecode filter,
+      * which interpolates the input data by a factor of 4.
+      * The scaling of 2 is arbitrary (says so in gs_img.ps) but we use it for consistency. The scaling of the input
+      * by 4 is just a magic number, the scaling is always by 4, and we need to know it so we can adjust the Image Matrix
+      * and Width and Height values.
+      */
+     if (image_info.ImageMask == 1 && image_info.BPC == 1 && image_info.Interpolate == 1 && !ctx->device_state.HighLevelDevice)
+     {
+         pdf_c_stream *s = new_stream;
+         gs_matrix mat4 = {4, 0, 0, 4, 0, 0}, inverseIM;
+         gs_point pt, pt1;
+         float s1, s2;
+ 
+         code = gs_matrix_invert(&pim->ImageMatrix, &inverseIM);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         code = gs_distance_transform(0, 1, &inverseIM, &pt);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         code = gs_distance_transform(pt.x, pt.y, &ctm_only(ctx->pgs), &pt1);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         s1 = sqrt(pt1.x * pt1.x + pt1.y * pt1.y);
+ 
+         code = gs_distance_transform(1, 0, &inverseIM, &pt);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         code = gs_distance_transform(pt.x, pt.y, &ctm_only(ctx->pgs), &pt1);
+         if (code < 0)
+             goto cleanupExit;
+ 
+         s2 = sqrt(pt1.x * pt1.x + pt1.y * pt1.y);
+ 
+         if (s1 > 2.0 || s2 > 2.0) {
+             code = pdfi_apply_imscale_filter(ctx, 0, image_info.Width, image_info.Height, s, &new_stream);
+             if (code < 0)
+                 goto cleanupExit;
+             /* This adds the filter to the 'chain' of filter we created. When we close this filter
+              * it closes all the filters in the chain, back to either the SubFileDecode filter or the
+              * original main stream. If we don't patch this up then we leak memory for any filters
+              * applied in pdfi_filter above.
+              */
+             new_stream->original = s->original;
+ 
+             /* We'e created a new 'new_stream', which is a C stream, to hold the filter chain
+              * but we still need to free the original C stream 'wrapper' we created with pdfi_filter()
+              * Do that now.
+              */
+             gs_free_object(ctx->memory, s, "free stream replaced by adding image scaling filter");
+             image_info.Width *= 4;
+             image_info.Height *= 4;
+             pim->Width *= 4;
+             pim->Height *= 4;
+             code = gs_matrix_multiply(&pim->ImageMatrix, &mat4, &pim->ImageMatrix);
+             if (code < 0)
+                 goto cleanupExit;
+         }
+     }
+ 
+     trans_required = pdfi_trans_required(ctx);
+ 
+     if (trans_required) {
+         code = pdfi_image_setup_trans(ctx, &trans_state);
+         if (code < 0)
+             goto cleanupExit;
+     }
+ 
+     /* Render the image */
+     code = pdfi_render_image(ctx, pim, new_stream,
+                              mask_buffer, mask_size,
+                              comps, image_info.ImageMask);
+     if (code < 0) {
+         if (ctx->args.pdfdebug)
+             dmprintf1(ctx->memory, "WARNING: pdfi_do_image: error %d from pdfi_render_image\n", code);
+     }
+ 
+     if (trans_required) {
+         code1 = pdfi_trans_teardown(ctx, &trans_state);
+         if (code == 0)
+             code = code1;
+     }
+ 
+  cleanupExit:
+     if (code < 0)
+         pdfi_set_warning(ctx, code, NULL, W_PDF_IMAGE_ERROR, "pdfi_do_image", NULL);
+ 
+     code = 0;  /* suppress errors */
+ 
+     if (transparency_group) {
+         if (!ctx->device_state.preserve_smask) {
+             gs_setstrokeconstantalpha(ctx->pgs, save_strokeconstantalpha);
+             gs_setfillconstantalpha(ctx->pgs, save_fillconstantalpha);
+         }
+         pdfi_trans_end_isolated_group(ctx);
+         if (need_smask_cleanup)
+             pdfi_trans_end_smask_notify(ctx);
+     }
+ 
+     if (op_blend_mode) {
+         code = gs_setblendmode(ctx->pgs, blend_mode);
+     }
+ 
+     if (new_stream)
+         pdfi_close_file(ctx, new_stream);
+     if (SFD_stream)
+         pdfi_close_file(ctx, SFD_stream);
+     if (mask_buffer)
+         gs_free_object(ctx->memory, mask_buffer, "pdfi_do_image (mask_buffer)");
+ 
+     pdfi_countdown(alt_stream);
+ 
+     pdfi_free_image_info_components(&image_info);
+     pdfi_free_image_info_components(&mask_info);
+     pdfi_free_image_info_components(&smask_info);
+ 
+     if (pcs != NULL)
+         rc_decrement_only_cs(pcs, "pdfi_do_image");
+ 
+     /* Restore the rendering intent */
+     gs_setrenderingintent(ctx->pgs, saved_intent);
+ 
+ #if DEBUG_IMAGES
+     dbgmprintf(ctx->memory, "pdfi_do_image END\n");
+ #endif
+     return code;
+ }

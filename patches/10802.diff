@@ -1,0 +1,274 @@
+commit 2c022949efff7f135686bd9007fffaaa6147f935
+Author: Yifeng Sun <pkusunyifeng@gmail.com>
+Date:   Fri Oct 5 14:50:39 2018 -0700
+
+    odp-util: Fix a use-after-free bug.
+    
+    After ofpbuf_put, actions may have been reallocated and
+    key will point to invalid memory address.
+    
+    Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10796
+    Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10802
+    Signed-off-by: Yifeng Sun <pkusunyifeng@gmail.com>
+    Signed-off-by: Ben Pfaff <blp@ovn.org>
+
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 890c71b7f..7705bb30a 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -2160,250 +2160,251 @@ static int
+ parse_odp_action(const char *s, const struct simap *port_names,
+                  struct ofpbuf *actions)
+ {
+     {
+         uint32_t port;
+         int n;
+ 
+         if (ovs_scan(s, "%"SCNi32"%n", &port, &n)) {
+             nl_msg_put_u32(actions, OVS_ACTION_ATTR_OUTPUT, port);
+             return n;
+         }
+     }
+ 
+     {
+         uint32_t max_len;
+         int n;
+ 
+         if (ovs_scan(s, "trunc(%"SCNi32")%n", &max_len, &n)) {
+             struct ovs_action_trunc *trunc;
+ 
+             trunc = nl_msg_put_unspec_uninit(actions,
+                      OVS_ACTION_ATTR_TRUNC, sizeof *trunc);
+             trunc->max_len = max_len;
+             return n;
+         }
+     }
+ 
+     if (port_names) {
+         int len = strcspn(s, delimiters);
+         struct simap_node *node;
+ 
+         node = simap_find_len(port_names, s, len);
+         if (node) {
+             nl_msg_put_u32(actions, OVS_ACTION_ATTR_OUTPUT, node->data);
+             return len;
+         }
+     }
+ 
+     {
+         uint32_t recirc_id;
+         int n = -1;
+ 
+         if (ovs_scan(s, "recirc(%"PRIu32")%n", &recirc_id, &n)) {
+             nl_msg_put_u32(actions, OVS_ACTION_ATTR_RECIRC, recirc_id);
+             return n;
+         }
+     }
+ 
+     if (!strncmp(s, "userspace(", 10)) {
+         return parse_odp_userspace_action(s, actions);
+     }
+ 
+     if (!strncmp(s, "set(", 4)) {
+         size_t start_ofs;
+         int retval;
+         struct nlattr mask[1024 / sizeof(struct nlattr)];
+         struct ofpbuf maskbuf = OFPBUF_STUB_INITIALIZER(mask);
+         struct nlattr *nested, *key;
+         size_t size;
+ 
+         start_ofs = nl_msg_start_nested(actions, OVS_ACTION_ATTR_SET);
+         retval = parse_odp_key_mask_attr(s + 4, port_names, actions, &maskbuf);
+         if (retval < 0) {
+             ofpbuf_uninit(&maskbuf);
+             return retval;
+         }
+         if (s[retval + 4] != ')') {
+             ofpbuf_uninit(&maskbuf);
+             return -EINVAL;
+         }
+ 
+         nested = ofpbuf_at_assert(actions, start_ofs, sizeof *nested);
+         key = nested + 1;
+ 
+         size = nl_attr_get_size(mask);
+         if (size == nl_attr_get_size(key)) {
+             /* Change to masked set action if not fully masked. */
+             if (!is_all_ones(mask + 1, size)) {
+                 /* Remove padding of eariler key payload  */
+                 actions->size -= NLA_ALIGN(key->nla_len) - key->nla_len;
+ 
+                 /* Put mask payload right after key payload */
+                 key->nla_len += size;
+                 ofpbuf_put(actions, mask + 1, size);
+ 
+-                /* Add new padding as needed */
+-                ofpbuf_put_zeros(actions, NLA_ALIGN(key->nla_len) -
+-                                          key->nla_len);
+-
+                 /* 'actions' may have been reallocated by ofpbuf_put(). */
+                 nested = ofpbuf_at_assert(actions, start_ofs, sizeof *nested);
+                 nested->nla_type = OVS_ACTION_ATTR_SET_MASKED;
++
++                key = nested + 1;
++                /* Add new padding as needed */
++                ofpbuf_put_zeros(actions, NLA_ALIGN(key->nla_len) -
++                                          key->nla_len);
+             }
+         }
+         ofpbuf_uninit(&maskbuf);
+ 
+         nl_msg_end_nested(actions, start_ofs);
+         return retval + 5;
+     }
+ 
+     {
+         struct ovs_action_push_vlan push;
+         int tpid = ETH_TYPE_VLAN;
+         int vid, pcp;
+         int cfi = 1;
+         int n = -1;
+ 
+         if (ovs_scan(s, "push_vlan(vid=%i,pcp=%i)%n", &vid, &pcp, &n)
+             || ovs_scan(s, "push_vlan(vid=%i,pcp=%i,cfi=%i)%n",
+                         &vid, &pcp, &cfi, &n)
+             || ovs_scan(s, "push_vlan(tpid=%i,vid=%i,pcp=%i)%n",
+                         &tpid, &vid, &pcp, &n)
+             || ovs_scan(s, "push_vlan(tpid=%i,vid=%i,pcp=%i,cfi=%i)%n",
+                         &tpid, &vid, &pcp, &cfi, &n)) {
+             push.vlan_tpid = htons(tpid);
+             push.vlan_tci = htons((vid << VLAN_VID_SHIFT)
+                                   | (pcp << VLAN_PCP_SHIFT)
+                                   | (cfi ? VLAN_CFI : 0));
+             nl_msg_put_unspec(actions, OVS_ACTION_ATTR_PUSH_VLAN,
+                               &push, sizeof push);
+ 
+             return n;
+         }
+     }
+ 
+     if (!strncmp(s, "pop_vlan", 8)) {
+         nl_msg_put_flag(actions, OVS_ACTION_ATTR_POP_VLAN);
+         return 8;
+     }
+ 
+     {
+         unsigned long long int meter_id;
+         int n = -1;
+ 
+         if (sscanf(s, "meter(%lli)%n", &meter_id, &n) > 0 && n > 0) {
+             nl_msg_put_u32(actions, OVS_ACTION_ATTR_METER, meter_id);
+             return n;
+         }
+     }
+ 
+     {
+         double percentage;
+         int n = -1;
+ 
+         if (ovs_scan(s, "sample(sample=%lf%%,actions(%n", &percentage, &n)
+             && percentage >= 0. && percentage <= 100.0) {
+             size_t sample_ofs, actions_ofs;
+             double probability;
+ 
+             probability = floor(UINT32_MAX * (percentage / 100.0) + .5);
+             sample_ofs = nl_msg_start_nested(actions, OVS_ACTION_ATTR_SAMPLE);
+             nl_msg_put_u32(actions, OVS_SAMPLE_ATTR_PROBABILITY,
+                            (probability <= 0 ? 0
+                             : probability >= UINT32_MAX ? UINT32_MAX
+                             : probability));
+ 
+             actions_ofs = nl_msg_start_nested(actions,
+                                               OVS_SAMPLE_ATTR_ACTIONS);
+             int retval = parse_action_list(s + n, port_names, actions);
+             if (retval < 0)
+                 return retval;
+ 
+             n += retval;
+             nl_msg_end_nested(actions, actions_ofs);
+             nl_msg_end_nested(actions, sample_ofs);
+ 
+             return s[n + 1] == ')' ? n + 2 : -EINVAL;
+         }
+     }
+ 
+     {
+         if (!strncmp(s, "clone(", 6)) {
+             size_t actions_ofs;
+             int n = 6;
+ 
+             actions_ofs = nl_msg_start_nested(actions, OVS_ACTION_ATTR_CLONE);
+             int retval = parse_action_list(s + n, port_names, actions);
+             if (retval < 0) {
+                 return retval;
+             }
+             n += retval;
+             nl_msg_end_nested(actions, actions_ofs);
+             return n + 1;
+         }
+     }
+ 
+     {
+         if (!strncmp(s, "push_nsh(", 9)) {
+             int retval = parse_odp_push_nsh_action(s, actions);
+             if (retval < 0) {
+                 return retval;
+             }
+             return retval + 1;
+         }
+     }
+ 
+     {
+         int n;
+         if (ovs_scan(s, "pop_nsh()%n", &n)) {
+             nl_msg_put_flag(actions, OVS_ACTION_ATTR_POP_NSH);
+             return n;
+         }
+     }
+ 
+     {
+         uint32_t port;
+         int n;
+ 
+         if (ovs_scan(s, "tnl_pop(%"SCNi32")%n", &port, &n)) {
+             nl_msg_put_u32(actions, OVS_ACTION_ATTR_TUNNEL_POP, port);
+             return n;
+         }
+     }
+ 
+     {
+         if (!strncmp(s, "ct_clear", 8)) {
+             nl_msg_put_flag(actions, OVS_ACTION_ATTR_CT_CLEAR);
+             return 8;
+         }
+     }
+ 
+     {
+         int retval;
+ 
+         retval = parse_conntrack_action(s, actions);
+         if (retval) {
+             return retval;
+         }
+     }
+ 
+     {
+         struct ovs_action_push_tnl data;
+         int n;
+ 
+         n = ovs_parse_tnl_push(s, &data);
+         if (n > 0) {
+             odp_put_tnl_push_action(actions, &data);
+             return n;
+         } else if (n < 0) {
+             return n;
+         }
+     }
+     return -EINVAL;
+ }
+ 
+ /* Parses the string representation of datapath actions, in the format output
+  * by format_odp_action().  Returns 0 if successful, otherwise a positive errno
+  * value.  On success, the ODP actions are appended to 'actions' as a series of
+  * Netlink attributes.  On failure, no data is appended to 'actions'.  Either
+  * way, 'actions''s data might be reallocated. */

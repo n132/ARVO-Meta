@@ -1,0 +1,242 @@
+commit 3249c757aed678780e22e99a1a49f4672851bca9
+Author: Jan Ekström <jeebjp@gmail.com>
+Date:   Thu Sep 3 19:50:08 2020 +0300
+
+    avformat/dashdec: drop arbitrary DASH manifest size limit
+    
+    Currently the utilized AVBPrint API is internally limited to unsigned
+    integers, so if we limit the file size as well as the amount to read
+    to UINT_MAX - 1, we do not require additional limiting to be performed
+    on the values.
+    
+    This change is based on the fact that initially the 8*1024 value added
+    in 96d70694aea64616c68db8be306c159c73fb3980 was only for the case where
+    the file size was not known. It was not a maximum file size limit.
+    
+    In 29121188983932f79aef8501652630d322a9974c this was reworked to be
+    a maximum manifest file size limit, while its commit message appears
+    to only note that it added support for larger manifest file sizes.
+    
+    This should enable various unfortunately large MPEG-DASH manifests,
+    such as Youtube's multi-megabyte live stream archives to load up
+    as well as bring back the original intent of the logic.
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index c5a5ff607b..1e9985f32c 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1,35 +1,35 @@
+ /*
+  * Dynamic Adaptive Streaming over HTTP demux
+  * Copyright (c) 2017 samsamsam@o2.pl based on HLS demux
+  * Copyright (c) 2017 Steven Liu
+  *
+  * This file is part of FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+  * version 2.1 of the License, or (at your option) any later version.
+  *
+  * FFmpeg is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  * Lesser General Public License for more details.
+  *
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ #include <libxml/parser.h>
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
+ #include "libavutil/parseutils.h"
+ #include "internal.h"
+ #include "avio_internal.h"
+ #include "dash.h"
+ 
+ #define INITIAL_BUFFER_SIZE 32768
+-#define MAX_MANIFEST_SIZE 50 * 1024
++#define MAX_BPRINT_READ_SIZE (UINT_MAX - 1)
+ #define DEFAULT_MANIFEST_SIZE 8 * 1024
+ 
+ struct fragment {
+@@ -1218,172 +1218,174 @@ static int parse_programinformation(AVFormatContext *s, xmlNodePtr node)
+ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
+ {
+     DASHContext *c = s->priv_data;
+     int ret = 0;
+     int close_in = 0;
+     uint8_t *new_url = NULL;
+     int64_t filesize = 0;
+     AVBPrint buf;
+     AVDictionary *opts = NULL;
+     xmlDoc *doc = NULL;
+     xmlNodePtr root_element = NULL;
+     xmlNodePtr node = NULL;
+     xmlNodePtr period_node = NULL;
+     xmlNodePtr tmp_node = NULL;
+     xmlNodePtr mpd_baseurl_node = NULL;
+     xmlNodePtr period_baseurl_node = NULL;
+     xmlNodePtr period_segmenttemplate_node = NULL;
+     xmlNodePtr period_segmentlist_node = NULL;
+     xmlNodePtr adaptionset_node = NULL;
+     xmlAttrPtr attr = NULL;
+     char *val  = NULL;
+     uint32_t period_duration_sec = 0;
+     uint32_t period_start_sec = 0;
+ 
+     if (!in) {
+         close_in = 1;
+ 
+         av_dict_copy(&opts, c->avio_opts, 0);
+         ret = avio_open2(&in, url, AVIO_FLAG_READ, c->interrupt_callback, &opts);
+         av_dict_free(&opts);
+         if (ret < 0)
+             return ret;
+     }
+ 
+     if (av_opt_get(in, "location", AV_OPT_SEARCH_CHILDREN, &new_url) >= 0) {
+         c->base_url = av_strdup(new_url);
+     } else {
+         c->base_url = av_strdup(url);
+     }
+ 
+     filesize = avio_size(in);
+-    if (filesize > MAX_MANIFEST_SIZE) {
++    filesize = filesize > 0 ? filesize : DEFAULT_MANIFEST_SIZE;
++
++    if (filesize > MAX_BPRINT_READ_SIZE) {
+         av_log(s, AV_LOG_ERROR, "Manifest too large: %"PRId64"\n", filesize);
+         return AVERROR_INVALIDDATA;
+     }
+ 
+-    av_bprint_init(&buf, (filesize > 0) ? filesize + 1 : DEFAULT_MANIFEST_SIZE, AV_BPRINT_SIZE_UNLIMITED);
++    av_bprint_init(&buf, filesize + 1, AV_BPRINT_SIZE_UNLIMITED);
+ 
+-    if ((ret = avio_read_to_bprint(in, &buf, MAX_MANIFEST_SIZE)) < 0 ||
++    if ((ret = avio_read_to_bprint(in, &buf, MAX_BPRINT_READ_SIZE)) < 0 ||
+         !avio_feof(in) ||
+         (filesize = buf.len) == 0) {
+         av_log(s, AV_LOG_ERROR, "Unable to read to manifest '%s'\n", url);
+         if (ret == 0)
+             ret = AVERROR_INVALIDDATA;
+     } else {
+         LIBXML_TEST_VERSION
+ 
+         doc = xmlReadMemory(buf.str, filesize, c->base_url, NULL, 0);
+         root_element = xmlDocGetRootElement(doc);
+         node = root_element;
+ 
+         if (!node) {
+             ret = AVERROR_INVALIDDATA;
+             av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing root node\n", url);
+             goto cleanup;
+         }
+ 
+         if (node->type != XML_ELEMENT_NODE ||
+             av_strcasecmp(node->name, (const char *)"MPD")) {
+             ret = AVERROR_INVALIDDATA;
+             av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - wrong root node name[%s] type[%d]\n", url, node->name, (int)node->type);
+             goto cleanup;
+         }
+ 
+         val = xmlGetProp(node, "type");
+         if (!val) {
+             av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing type attrib\n", url);
+             ret = AVERROR_INVALIDDATA;
+             goto cleanup;
+         }
+         if (!av_strcasecmp(val, (const char *)"dynamic"))
+             c->is_live = 1;
+         xmlFree(val);
+ 
+         attr = node->properties;
+         while (attr) {
+             val = xmlGetProp(node, attr->name);
+ 
+             if (!av_strcasecmp(attr->name, (const char *)"availabilityStartTime")) {
+                 c->availability_start_time = get_utc_date_time_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->availability_start_time = [%"PRId64"]\n", c->availability_start_time);
+             } else if (!av_strcasecmp(attr->name, (const char *)"availabilityEndTime")) {
+                 c->availability_end_time = get_utc_date_time_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->availability_end_time = [%"PRId64"]\n", c->availability_end_time);
+             } else if (!av_strcasecmp(attr->name, (const char *)"publishTime")) {
+                 c->publish_time = get_utc_date_time_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->publish_time = [%"PRId64"]\n", c->publish_time);
+             } else if (!av_strcasecmp(attr->name, (const char *)"minimumUpdatePeriod")) {
+                 c->minimum_update_period = get_duration_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->minimum_update_period = [%"PRId64"]\n", c->minimum_update_period);
+             } else if (!av_strcasecmp(attr->name, (const char *)"timeShiftBufferDepth")) {
+                 c->time_shift_buffer_depth = get_duration_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->time_shift_buffer_depth = [%"PRId64"]\n", c->time_shift_buffer_depth);
+             } else if (!av_strcasecmp(attr->name, (const char *)"minBufferTime")) {
+                 c->min_buffer_time = get_duration_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->min_buffer_time = [%"PRId64"]\n", c->min_buffer_time);
+             } else if (!av_strcasecmp(attr->name, (const char *)"suggestedPresentationDelay")) {
+                 c->suggested_presentation_delay = get_duration_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->suggested_presentation_delay = [%"PRId64"]\n", c->suggested_presentation_delay);
+             } else if (!av_strcasecmp(attr->name, (const char *)"mediaPresentationDuration")) {
+                 c->media_presentation_duration = get_duration_insec(s, (const char *)val);
+                 av_log(s, AV_LOG_TRACE, "c->media_presentation_duration = [%"PRId64"]\n", c->media_presentation_duration);
+             }
+             attr = attr->next;
+             xmlFree(val);
+         }
+ 
+         tmp_node = find_child_node_by_name(node, "BaseURL");
+         if (tmp_node) {
+             mpd_baseurl_node = xmlCopyNode(tmp_node,1);
+         } else {
+             mpd_baseurl_node = xmlNewNode(NULL, "BaseURL");
+         }
+ 
+         // at now we can handle only one period, with the longest duration
+         node = xmlFirstElementChild(node);
+         while (node) {
+             if (!av_strcasecmp(node->name, (const char *)"Period")) {
+                 period_duration_sec = 0;
+                 period_start_sec = 0;
+                 attr = node->properties;
+                 while (attr) {
+                     val = xmlGetProp(node, attr->name);
+                     if (!av_strcasecmp(attr->name, (const char *)"duration")) {
+                         period_duration_sec = get_duration_insec(s, (const char *)val);
+                     } else if (!av_strcasecmp(attr->name, (const char *)"start")) {
+                         period_start_sec = get_duration_insec(s, (const char *)val);
+                     }
+                     attr = attr->next;
+                     xmlFree(val);
+                 }
+                 if ((period_duration_sec) >= (c->period_duration)) {
+                     period_node = node;
+                     c->period_duration = period_duration_sec;
+                     c->period_start = period_start_sec;
+                     if (c->period_start > 0)
+                         c->media_presentation_duration = c->period_duration;
+                 }
+             } else if (!av_strcasecmp(node->name, "ProgramInformation")) {
+                 parse_programinformation(s, node);
+             }
+             node = xmlNextElementSibling(node);
+         }
+         if (!period_node) {
+             av_log(s, AV_LOG_ERROR, "Unable to parse '%s' - missing Period node\n", url);
+             ret = AVERROR_INVALIDDATA;
+             goto cleanup;
+         }
+ 
+         adaptionset_node = xmlFirstElementChild(period_node);
+         while (adaptionset_node) {
+             if (!av_strcasecmp(adaptionset_node->name, (const char *)"BaseURL")) {
+                 period_baseurl_node = adaptionset_node;
+             } else if (!av_strcasecmp(adaptionset_node->name, (const char *)"SegmentTemplate")) {
+                 period_segmenttemplate_node = adaptionset_node;
+             } else if (!av_strcasecmp(adaptionset_node->name, (const char *)"SegmentList")) {
+                 period_segmentlist_node = adaptionset_node;
+             } else if (!av_strcasecmp(adaptionset_node->name, (const char *)"AdaptationSet")) {
+                 parse_manifest_adaptationset(s, url, adaptionset_node, mpd_baseurl_node, period_baseurl_node, period_segmenttemplate_node, period_segmentlist_node);
+             }
+             adaptionset_node = xmlNextElementSibling(adaptionset_node);
+         }

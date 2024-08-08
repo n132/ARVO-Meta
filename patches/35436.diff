@@ -1,0 +1,1042 @@
+commit 1f8b6ac3c3ffcdc2f3878486602a7336baaf187e
+Author: Andreas Kling <kling@serenityos.org>
+Date:   Tue Jun 22 17:16:08 2021 +0200
+
+    LibJS: Begin implementing GlobalEnvironmentRecord
+    
+    These represent the outermost scope in the environment record
+    hierarchy. The spec says they should be a "composite" of two things:
+    
+    - An ObjectEnvironmentRecord wrapping the global object
+    - A DeclarativeEnvironmentRecord for other declarations
+    
+    It's not yet clear to me how this should work, so this patch only
+    implements the first part, an object record wrapping the global object.
+
+diff --git a/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp b/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
+index 0a9d77240c..988a9c16b7 100644
+--- a/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
++++ b/Userland/Libraries/LibJS/Bytecode/Interpreter.cpp
+@@ -1,15 +1,16 @@
+ /*
+  * Copyright (c) 2021, Andreas Kling <kling@serenityos.org>
+  *
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
+ #include <AK/Debug.h>
+ #include <AK/TemporaryChange.h>
+ #include <LibJS/Bytecode/BasicBlock.h>
+ #include <LibJS/Bytecode/Instruction.h>
+ #include <LibJS/Bytecode/Interpreter.h>
+ #include <LibJS/Bytecode/Op.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ 
+ namespace JS::Bytecode {
+@@ -38,110 +39,111 @@ Interpreter::~Interpreter()
+ Value Interpreter::run(Executable const& executable, BasicBlock const* entry_point)
+ {
+     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter will run unit {:p}", &executable);
+ 
+     TemporaryChange restore_executable { m_current_executable, &executable };
+ 
+     vm().set_last_value(Badge<Interpreter> {}, {});
+ 
+     CallFrame global_call_frame;
+     if (vm().call_stack().is_empty()) {
+         global_call_frame.this_value = &global_object();
+         static FlyString global_execution_context_name = "(*BC* global execution context)";
+         global_call_frame.function_name = global_execution_context_name;
+-        global_call_frame.lexical_environment = &global_object();
++        global_call_frame.lexical_environment = &global_object().environment_record();
++        global_call_frame.variable_environment = &global_object().environment_record();
+         VERIFY(!vm().exception());
+         // FIXME: How do we know if we're in strict mode? Maybe the Bytecode::Block should know this?
+         // global_call_frame.is_strict_mode = ???;
+         vm().push_call_frame(global_call_frame, global_object());
+         VERIFY(!vm().exception());
+     }
+ 
+     auto block = entry_point ?: &executable.basic_blocks.first();
+     if (m_manually_entered_frames) {
+         VERIFY(registers().size() >= executable.number_of_registers);
+     } else {
+         m_register_windows.append(make<RegisterWindow>());
+         registers().resize(executable.number_of_registers);
+         registers()[Register::global_object_index] = Value(&global_object());
+     }
+ 
+     for (;;) {
+         Bytecode::InstructionStreamIterator pc(block->instruction_stream());
+         bool will_jump = false;
+         bool will_return = false;
+         while (!pc.at_end()) {
+             auto& instruction = *pc;
+             instruction.execute(*this);
+             if (vm().exception()) {
+                 m_saved_exception = {};
+                 if (m_unwind_contexts.is_empty())
+                     break;
+                 auto& unwind_context = m_unwind_contexts.last();
+                 if (unwind_context.handler) {
+                     block = unwind_context.handler;
+                     unwind_context.handler = nullptr;
+                     accumulator() = vm().exception()->value();
+                     vm().clear_exception();
+                     will_jump = true;
+                 } else if (unwind_context.finalizer) {
+                     block = unwind_context.finalizer;
+                     m_unwind_contexts.take_last();
+                     will_jump = true;
+                     m_saved_exception = Handle<Exception>::create(vm().exception());
+                     vm().clear_exception();
+                 }
+             }
+             if (m_pending_jump.has_value()) {
+                 block = m_pending_jump.release_value();
+                 will_jump = true;
+                 break;
+             }
+             if (!m_return_value.is_empty()) {
+                 will_return = true;
+                 break;
+             }
+             ++pc;
+         }
+ 
+         if (will_return)
+             break;
+ 
+         if (pc.at_end() && !will_jump)
+             break;
+ 
+         if (vm().exception())
+             break;
+     }
+ 
+     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter did run unit {:p}", &executable);
+ 
+     if constexpr (JS_BYTECODE_DEBUG) {
+         for (size_t i = 0; i < registers().size(); ++i) {
+             String value_string;
+             if (registers()[i].is_empty())
+                 value_string = "(empty)";
+             else
+                 value_string = registers()[i].to_string_without_side_effects();
+             dbgln("[{:3}] {}", i, value_string);
+         }
+     }
+ 
+     vm().set_last_value(Badge<Interpreter> {}, accumulator());
+ 
+     if (!m_manually_entered_frames)
+         m_register_windows.take_last();
+ 
+     auto return_value = m_return_value.value_or(js_undefined());
+     m_return_value = {};
+ 
+     // NOTE: The return value from a called function is put into $0 in the caller context.
+     if (!m_register_windows.is_empty())
+         m_register_windows.last()[0] = return_value;
+ 
+     if (vm().call_stack().size() == 1)
+         vm().pop_call_frame();
+ 
+     vm().finish_execution_generation();
+ 
+     return return_value;
+ }
+diff --git a/Userland/Libraries/LibJS/CMakeLists.txt b/Userland/Libraries/LibJS/CMakeLists.txt
+index ff30f05704..8aeb7bbf63 100644
+--- a/Userland/Libraries/LibJS/CMakeLists.txt
++++ b/Userland/Libraries/LibJS/CMakeLists.txt
+@@ -1,137 +1,138 @@
+ set(SOURCES
+     AST.cpp
+     Bytecode/ASTCodegen.cpp
+     Bytecode/BasicBlock.cpp
+     Bytecode/Generator.cpp
+     Bytecode/Instruction.cpp
+     Bytecode/Interpreter.cpp
+     Bytecode/Op.cpp
+     Bytecode/Pass/DumpCFG.cpp
+     Bytecode/Pass/GenerateCFG.cpp
+     Bytecode/Pass/MergeBlocks.cpp
+     Bytecode/Pass/PlaceBlocks.cpp
+     Bytecode/Pass/UnifySameBlocks.cpp
+     Bytecode/StringTable.cpp
+     Console.cpp
+     Heap/CellAllocator.cpp
+     Heap/BlockAllocator.cpp
+     Heap/Handle.cpp
+     Heap/HeapBlock.cpp
+     Heap/Heap.cpp
+     Interpreter.cpp
+     Lexer.cpp
+     MarkupGenerator.cpp
+     Parser.cpp
+     Runtime/AbstractOperations.cpp
+     Runtime/AggregateError.cpp
+     Runtime/AggregateErrorConstructor.cpp
+     Runtime/AggregateErrorPrototype.cpp
+     Runtime/Array.cpp
+     Runtime/ArrayBuffer.cpp
+     Runtime/ArrayBufferConstructor.cpp
+     Runtime/ArrayBufferPrototype.cpp
+     Runtime/ArrayConstructor.cpp
+     Runtime/ArrayIterator.cpp
+     Runtime/ArrayIteratorPrototype.cpp
+     Runtime/ArrayPrototype.cpp
+     Runtime/BigInt.cpp
+     Runtime/BigIntConstructor.cpp
+     Runtime/BigIntObject.cpp
+     Runtime/BigIntPrototype.cpp
+     Runtime/BooleanConstructor.cpp
+     Runtime/BooleanObject.cpp
+     Runtime/BooleanPrototype.cpp
+     Runtime/BoundFunction.cpp
+     Runtime/ConsoleObject.cpp
+     Runtime/DataView.cpp
+     Runtime/DataViewConstructor.cpp
+     Runtime/DataViewPrototype.cpp
+     Runtime/DateConstructor.cpp
+     Runtime/Date.cpp
+     Runtime/DatePrototype.cpp
+     Runtime/DeclarativeEnvironmentRecord.cpp
+     Runtime/EnvironmentRecord.cpp
+     Runtime/ErrorConstructor.cpp
+     Runtime/Error.cpp
+     Runtime/ErrorPrototype.cpp
+     Runtime/ErrorTypes.cpp
+     Runtime/Exception.cpp
+     Runtime/FinalizationRegistry.cpp
+     Runtime/FinalizationRegistryConstructor.cpp
+     Runtime/FinalizationRegistryPrototype.cpp
+     Runtime/FunctionConstructor.cpp
+     Runtime/Function.cpp
+     Runtime/FunctionEnvironmentRecord.cpp
+     Runtime/FunctionPrototype.cpp
+     Runtime/GeneratorFunctionConstructor.cpp
+     Runtime/GeneratorFunctionPrototype.cpp
+     Runtime/GeneratorObject.cpp
+     Runtime/GeneratorObjectPrototype.cpp
++    Runtime/GlobalEnvironmentRecord.cpp
+     Runtime/GlobalObject.cpp
+     Runtime/IndexedProperties.cpp
+     Runtime/IteratorOperations.cpp
+     Runtime/IteratorPrototype.cpp
+     Runtime/JSONObject.cpp
+     Runtime/Map.cpp
+     Runtime/MapConstructor.cpp
+     Runtime/MapIterator.cpp
+     Runtime/MapIteratorPrototype.cpp
+     Runtime/MapPrototype.cpp
+     Runtime/MarkedValueList.cpp
+     Runtime/MathObject.cpp
+     Runtime/NativeFunction.cpp
+     Runtime/NativeProperty.cpp
+     Runtime/NumberConstructor.cpp
+     Runtime/NumberObject.cpp
+     Runtime/NumberPrototype.cpp
+     Runtime/Object.cpp
+     Runtime/ObjectConstructor.cpp
+     Runtime/ObjectEnvironmentRecord.cpp
+     Runtime/ObjectPrototype.cpp
+     Runtime/PrimitiveString.cpp
+     Runtime/Promise.cpp
+     Runtime/PromiseConstructor.cpp
+     Runtime/PromiseJobs.cpp
+     Runtime/PromisePrototype.cpp
+     Runtime/PromiseReaction.cpp
+     Runtime/PromiseResolvingFunction.cpp
+     Runtime/ProxyConstructor.cpp
+     Runtime/ProxyObject.cpp
+     Runtime/Reference.cpp
+     Runtime/ReflectObject.cpp
+     Runtime/RegExpConstructor.cpp
+     Runtime/RegExpObject.cpp
+     Runtime/RegExpPrototype.cpp
+     Runtime/ScriptFunction.cpp
+     Runtime/Set.cpp
+     Runtime/SetConstructor.cpp
+     Runtime/SetIterator.cpp
+     Runtime/SetIteratorPrototype.cpp
+     Runtime/SetPrototype.cpp
+     Runtime/Shape.cpp
+     Runtime/StringConstructor.cpp
+     Runtime/StringIterator.cpp
+     Runtime/StringIteratorPrototype.cpp
+     Runtime/StringObject.cpp
+     Runtime/StringPrototype.cpp
+     Runtime/Symbol.cpp
+     Runtime/SymbolConstructor.cpp
+     Runtime/SymbolObject.cpp
+     Runtime/SymbolPrototype.cpp
+     Runtime/TypedArray.cpp
+     Runtime/TypedArrayConstructor.cpp
+     Runtime/TypedArrayPrototype.cpp
+     Runtime/VM.cpp
+     Runtime/Value.cpp
+     Runtime/WeakMap.cpp
+     Runtime/WeakMapConstructor.cpp
+     Runtime/WeakMapPrototype.cpp
+     Runtime/WeakRef.cpp
+     Runtime/WeakRefConstructor.cpp
+     Runtime/WeakRefPrototype.cpp
+     Runtime/WeakSet.cpp
+     Runtime/WeakSetConstructor.cpp
+     Runtime/WeakSetPrototype.cpp
+     SyntaxHighlighter.cpp
+     Token.cpp
+ )
+diff --git a/Userland/Libraries/LibJS/Forward.h b/Userland/Libraries/LibJS/Forward.h
+index 3af5edad7e..5e1ba35db2 100644
+--- a/Userland/Libraries/LibJS/Forward.h
++++ b/Userland/Libraries/LibJS/Forward.h
+@@ -129,6 +129,7 @@ class Exception;
+ class Expression;
+ class FunctionEnvironmentRecord;
+ class FunctionNode;
++class GlobalEnvironmentRecord;
+ class GlobalObject;
+ class HandleImpl;
+ class Heap;
+diff --git a/Userland/Libraries/LibJS/Interpreter.cpp b/Userland/Libraries/LibJS/Interpreter.cpp
+index df7f4ec42c..b70671b788 100644
+--- a/Userland/Libraries/LibJS/Interpreter.cpp
++++ b/Userland/Libraries/LibJS/Interpreter.cpp
+@@ -1,18 +1,19 @@
+ /*
+  * Copyright (c) 2020, Andreas Kling <kling@serenityos.org>
+  * Copyright (c) 2020-2021, Linus Groh <linusg@serenityos.org>
+  *
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
+ #include <AK/ScopeGuard.h>
+ #include <AK/StringBuilder.h>
+ #include <LibJS/AST.h>
+ #include <LibJS/Interpreter.h>
+ #include <LibJS/Runtime/FunctionEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/Object.h>
+ #include <LibJS/Runtime/Reference.h>
+ #include <LibJS/Runtime/ScriptFunction.h>
+ #include <LibJS/Runtime/Shape.h>
+ #include <LibJS/Runtime/Value.h>
+@@ -39,33 +40,33 @@ Interpreter::~Interpreter()
+ void Interpreter::run(GlobalObject& global_object, const Program& program)
+ {
+     auto& vm = this->vm();
+     VERIFY(!vm.exception());
+ 
+     VM::InterpreterExecutionScope scope(*this);
+ 
+     vm.set_last_value(Badge<Interpreter> {}, {});
+ 
+     CallFrame global_call_frame;
+     global_call_frame.current_node = &program;
+     global_call_frame.this_value = &global_object;
+     static FlyString global_execution_context_name = "(global execution context)";
+     global_call_frame.function_name = global_execution_context_name;
+-    global_call_frame.lexical_environment = &global_object;
+-    global_call_frame.variable_environment = &global_object;
++    global_call_frame.lexical_environment = &global_object.environment_record();
++    global_call_frame.variable_environment = &global_object.environment_record();
+     VERIFY(!vm.exception());
+     global_call_frame.is_strict_mode = program.is_strict_mode();
+     vm.push_call_frame(global_call_frame, global_object);
+     VERIFY(!vm.exception());
+     auto value = program.execute(*this, global_object);
+     vm.set_last_value(Badge<Interpreter> {}, value.value_or(js_undefined()));
+ 
+     vm.pop_call_frame();
+ 
+     // At this point we may have already run any queued promise jobs via on_call_stack_emptied,
+     // in which case this is a no-op.
+     vm.run_queued_promise_jobs();
+ 
+     vm.run_queued_finalization_registry_cleanup_jobs();
+ 
+     vm.finish_execution_generation();
+ }
+diff --git a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
+index 5349d84687..165b47792e 100644
+--- a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
++++ b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.cpp
+@@ -15,11 +15,6 @@ EnvironmentRecord::EnvironmentRecord(EnvironmentRecord* outer_environment)
+ {
+ }
+ 
+-EnvironmentRecord::EnvironmentRecord(GlobalObjectTag tag)
+-    : Object(tag)
+-{
+-}
+-
+ void EnvironmentRecord::visit_edges(Visitor& visitor)
+ {
+     Base::visit_edges(visitor);
+diff --git a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
+index c0eecf6dca..cb954ec651 100644
+--- a/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
++++ b/Userland/Libraries/LibJS/Runtime/EnvironmentRecord.h
+@@ -32,7 +32,6 @@ public:
+ 
+ protected:
+     explicit EnvironmentRecord(EnvironmentRecord* parent);
+-    explicit EnvironmentRecord(GlobalObjectTag);
+ 
+     virtual void visit_edges(Visitor&) override;
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp
+new file mode 100644
+index 0000000000..cca3f175fa
+--- /dev/null
++++ b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.cpp
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (c) 2020-2021, Andreas Kling <kling@serenityos.org>
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#include <LibJS/AST.h>
++#include <LibJS/Runtime/DeclarativeEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalObject.h>
++#include <LibJS/Runtime/ObjectEnvironmentRecord.h>
++
++namespace JS {
++
++GlobalEnvironmentRecord::GlobalEnvironmentRecord(GlobalObject& global_object)
++    : EnvironmentRecord(nullptr)
++    , m_global_object(global_object)
++{
++    m_object_record = global_object.heap().allocate<ObjectEnvironmentRecord>(global_object, global_object, nullptr);
++    m_declarative_record = global_object.heap().allocate<DeclarativeEnvironmentRecord>(global_object);
++}
++
++void GlobalEnvironmentRecord::visit_edges(Cell::Visitor& visitor)
++{
++    Base::visit_edges(visitor);
++    visitor.visit(m_object_record);
++    visitor.visit(m_declarative_record);
++}
++
++Optional<Variable> GlobalEnvironmentRecord::get_from_environment_record(FlyString const& name) const
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    return m_object_record->get_from_environment_record(name);
++}
++
++void GlobalEnvironmentRecord::put_into_environment_record(FlyString const& name, Variable variable)
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    m_object_record->put_into_environment_record(name, variable);
++}
++
++bool GlobalEnvironmentRecord::delete_from_environment_record(FlyString const& name)
++{
++    // FIXME: This should be a "composite" of the object record and the declarative record.
++    return object_record().delete_property(name);
++}
++
++Value GlobalEnvironmentRecord::get_this_binding(GlobalObject&) const
++{
++    return &m_global_object;
++}
++
++Value GlobalEnvironmentRecord::global_this_value() const
++{
++    return &m_global_object;
++}
++
++}
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h
+new file mode 100644
+index 0000000000..1b76340e22
+--- /dev/null
++++ b/Userland/Libraries/LibJS/Runtime/GlobalEnvironmentRecord.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (c) 2021, Andreas Kling <kling@serenityos.org>
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#pragma once
++
++#include <LibJS/Runtime/EnvironmentRecord.h>
++
++namespace JS {
++
++class GlobalEnvironmentRecord final : public EnvironmentRecord {
++    JS_OBJECT(GlobalEnvironmentRecord, EnvironmentRecord);
++
++public:
++    explicit GlobalEnvironmentRecord(GlobalObject&);
++
++    virtual Optional<Variable> get_from_environment_record(FlyString const&) const override;
++    virtual void put_into_environment_record(FlyString const&, Variable) override;
++    virtual bool delete_from_environment_record(FlyString const&) override;
++    virtual bool has_this_binding() const final { return true; }
++    virtual Value get_this_binding(GlobalObject&) const final;
++
++    Value global_this_value() const;
++
++    // [[ObjectRecord]]
++    ObjectEnvironmentRecord& object_record() { return *m_object_record; }
++
++    // [[DeclarativeReco rd]]
++    DeclarativeEnvironmentRecord& declarative_record() { return *m_declarative_record; }
++
++private:
++    virtual bool is_global_environment_record() const override { return true; }
++    virtual void visit_edges(Visitor&) override;
++
++    GlobalObject& m_global_object;
++
++    ObjectEnvironmentRecord* m_object_record { nullptr };
++    DeclarativeEnvironmentRecord* m_declarative_record { nullptr };
++};
++
++template<>
++inline bool Object::fast_is<GlobalEnvironmentRecord>() const { return is_global_environment_record(); }
++
++}
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp b/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
+index e05a861c8f..cdd4dddff3 100644
+--- a/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
++++ b/Userland/Libraries/LibJS/Runtime/GlobalObject.cpp
+@@ -1,80 +1,81 @@
+ /*
+  * Copyright (c) 2020, Andreas Kling <kling@serenityos.org>
+  * Copyright (c) 2020-2021, Linus Groh <linusg@serenityos.org>
+  *
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
+ #include <AK/CharacterTypes.h>
+ #include <AK/Hex.h>
+ #include <AK/Platform.h>
+ #include <AK/TemporaryChange.h>
+ #include <AK/Utf8View.h>
+ #include <LibJS/Console.h>
+ #include <LibJS/Heap/DeferGC.h>
+ #include <LibJS/Interpreter.h>
+ #include <LibJS/Lexer.h>
+ #include <LibJS/Parser.h>
+ #include <LibJS/Runtime/AggregateErrorConstructor.h>
+ #include <LibJS/Runtime/AggregateErrorPrototype.h>
+ #include <LibJS/Runtime/ArrayBufferConstructor.h>
+ #include <LibJS/Runtime/ArrayBufferPrototype.h>
+ #include <LibJS/Runtime/ArrayConstructor.h>
+ #include <LibJS/Runtime/ArrayIteratorPrototype.h>
+ #include <LibJS/Runtime/ArrayPrototype.h>
+ #include <LibJS/Runtime/BigIntConstructor.h>
+ #include <LibJS/Runtime/BigIntPrototype.h>
+ #include <LibJS/Runtime/BooleanConstructor.h>
+ #include <LibJS/Runtime/BooleanPrototype.h>
+ #include <LibJS/Runtime/ConsoleObject.h>
+ #include <LibJS/Runtime/DataViewConstructor.h>
+ #include <LibJS/Runtime/DataViewPrototype.h>
+ #include <LibJS/Runtime/DateConstructor.h>
+ #include <LibJS/Runtime/DatePrototype.h>
+ #include <LibJS/Runtime/ErrorConstructor.h>
+ #include <LibJS/Runtime/ErrorPrototype.h>
+ #include <LibJS/Runtime/FinalizationRegistryConstructor.h>
+ #include <LibJS/Runtime/FinalizationRegistryPrototype.h>
+ #include <LibJS/Runtime/FunctionConstructor.h>
+ #include <LibJS/Runtime/FunctionPrototype.h>
+ #include <LibJS/Runtime/GeneratorFunctionConstructor.h>
+ #include <LibJS/Runtime/GeneratorFunctionPrototype.h>
+ #include <LibJS/Runtime/GeneratorObjectPrototype.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/IteratorPrototype.h>
+ #include <LibJS/Runtime/JSONObject.h>
+ #include <LibJS/Runtime/MapConstructor.h>
+ #include <LibJS/Runtime/MapIteratorPrototype.h>
+ #include <LibJS/Runtime/MapPrototype.h>
+ #include <LibJS/Runtime/MathObject.h>
+ #include <LibJS/Runtime/NativeFunction.h>
+ #include <LibJS/Runtime/NumberConstructor.h>
+ #include <LibJS/Runtime/NumberPrototype.h>
+ #include <LibJS/Runtime/Object.h>
+ #include <LibJS/Runtime/ObjectConstructor.h>
+ #include <LibJS/Runtime/ObjectPrototype.h>
+ #include <LibJS/Runtime/PromiseConstructor.h>
+ #include <LibJS/Runtime/PromisePrototype.h>
+ #include <LibJS/Runtime/ProxyConstructor.h>
+ #include <LibJS/Runtime/ReflectObject.h>
+ #include <LibJS/Runtime/RegExpConstructor.h>
+ #include <LibJS/Runtime/RegExpPrototype.h>
+ #include <LibJS/Runtime/SetConstructor.h>
+ #include <LibJS/Runtime/SetIteratorPrototype.h>
+ #include <LibJS/Runtime/SetPrototype.h>
+ #include <LibJS/Runtime/Shape.h>
+ #include <LibJS/Runtime/StringConstructor.h>
+ #include <LibJS/Runtime/StringIteratorPrototype.h>
+ #include <LibJS/Runtime/StringPrototype.h>
+ #include <LibJS/Runtime/SymbolConstructor.h>
+ #include <LibJS/Runtime/SymbolPrototype.h>
+ #include <LibJS/Runtime/TypedArray.h>
+ #include <LibJS/Runtime/TypedArrayConstructor.h>
+ #include <LibJS/Runtime/TypedArrayPrototype.h>
+ #include <LibJS/Runtime/Value.h>
+ #include <LibJS/Runtime/WeakMapConstructor.h>
+ #include <LibJS/Runtime/WeakMapPrototype.h>
+ #include <LibJS/Runtime/WeakRefConstructor.h>
+ #include <LibJS/Runtime/WeakRefPrototype.h>
+ #include <LibJS/Runtime/WeakSetConstructor.h>
+ #include <LibJS/Runtime/WeakSetPrototype.h>
+@@ -82,7 +83,7 @@
+ namespace JS {
+ 
+ GlobalObject::GlobalObject()
+-    : EnvironmentRecord(GlobalObjectTag::Tag)
++    : Object(GlobalObjectTag::Tag)
+     , m_console(make<Console>(*this))
+ {
+ }
+@@ -90,106 +91,108 @@ GlobalObject::GlobalObject()
+ void GlobalObject::initialize_global_object()
+ {
+     auto& vm = this->vm();
+ 
+     ensure_shape_is_unique();
+ 
+     // These are done first since other prototypes depend on their presence.
+     m_empty_object_shape = heap().allocate_without_global_object<Shape>(*this);
+     m_object_prototype = heap().allocate_without_global_object<ObjectPrototype>(*this);
+     m_function_prototype = heap().allocate_without_global_object<FunctionPrototype>(*this);
+ 
++    m_environment_record = heap().allocate_without_global_object<GlobalEnvironmentRecord>(*this);
++
+     m_new_object_shape = vm.heap().allocate_without_global_object<Shape>(*this);
+     m_new_object_shape->set_prototype_without_transition(m_object_prototype);
+ 
+     m_new_script_function_prototype_object_shape = vm.heap().allocate_without_global_object<Shape>(*this);
+     m_new_script_function_prototype_object_shape->set_prototype_without_transition(m_object_prototype);
+     m_new_script_function_prototype_object_shape->add_property_without_transition(vm.names.constructor, Attribute::Writable | Attribute::Configurable);
+ 
+     static_cast<FunctionPrototype*>(m_function_prototype)->initialize(*this);
+     static_cast<ObjectPrototype*>(m_object_prototype)->initialize(*this);
+ 
+     Object::set_prototype(m_object_prototype);
+ 
+     // This must be initialized before allocating AggregateErrorPrototype, which uses ErrorPrototype as its prototype.
+     m_error_prototype = heap().allocate<ErrorPrototype>(*this, *this);
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name) \
+     if (!m_##snake_name##_prototype)          \
+         m_##snake_name##_prototype = heap().allocate<ClassName##Prototype>(*this, *this);
+     JS_ENUMERATE_ITERATOR_PROTOTYPES
+ #undef __JS_ENUMERATE
+ 
+     // %GeneratorFunction.prototype.prototype% must be initialized separately as it has no
+     // companion constructor
+     m_generator_object_prototype = heap().allocate<GeneratorObjectPrototype>(*this, *this);
+     m_generator_object_prototype->define_property(vm.names.constructor, m_generator_function_constructor, Attribute::Configurable);
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     if (!m_##snake_name##_prototype)                                                     \
+         m_##snake_name##_prototype = heap().allocate<PrototypeName>(*this, *this);
+     JS_ENUMERATE_BUILTIN_TYPES
+ #undef __JS_ENUMERATE
+ 
+     u8 attr = Attribute::Writable | Attribute::Configurable;
+     define_native_function(vm.names.gc, gc, 0, attr);
+     define_native_function(vm.names.isNaN, is_nan, 1, attr);
+     define_native_function(vm.names.isFinite, is_finite, 1, attr);
+     define_native_function(vm.names.parseFloat, parse_float, 1, attr);
+     define_native_function(vm.names.parseInt, parse_int, 2, attr);
+     define_native_function(vm.names.eval, eval, 1, attr);
+     define_native_function(vm.names.encodeURI, encode_uri, 1, attr);
+     define_native_function(vm.names.decodeURI, decode_uri, 1, attr);
+     define_native_function(vm.names.encodeURIComponent, encode_uri_component, 1, attr);
+     define_native_function(vm.names.decodeURIComponent, decode_uri_component, 1, attr);
+     define_native_function(vm.names.escape, escape, 1, attr);
+     define_native_function(vm.names.unescape, unescape, 1, attr);
+ 
+     define_property(vm.names.NaN, js_nan(), 0);
+     define_property(vm.names.Infinity, js_infinity(), 0);
+     define_property(vm.names.undefined, js_undefined(), 0);
+ 
+     define_property(vm.names.globalThis, this, attr);
+     define_property(vm.names.console, heap().allocate<ConsoleObject>(*this, *this), attr);
+     define_property(vm.names.Math, heap().allocate<MathObject>(*this, *this), attr);
+     define_property(vm.names.JSON, heap().allocate<JSONObject>(*this, *this), attr);
+     define_property(vm.names.Reflect, heap().allocate<ReflectObject>(*this, *this), attr);
+ 
+     // This must be initialized before allocating AggregateErrorConstructor, which uses ErrorConstructor as its prototype.
+     initialize_constructor(vm.names.Error, m_error_constructor, m_error_prototype);
+ 
+     add_constructor(vm.names.AggregateError, m_aggregate_error_constructor, m_aggregate_error_prototype);
+     add_constructor(vm.names.Array, m_array_constructor, m_array_prototype);
+     add_constructor(vm.names.ArrayBuffer, m_array_buffer_constructor, m_array_buffer_prototype);
+     add_constructor(vm.names.BigInt, m_bigint_constructor, m_bigint_prototype);
+     add_constructor(vm.names.Boolean, m_boolean_constructor, m_boolean_prototype);
+     add_constructor(vm.names.DataView, m_data_view_constructor, m_data_view_prototype);
+     add_constructor(vm.names.Date, m_date_constructor, m_date_prototype);
+     add_constructor(vm.names.Error, m_error_constructor, m_error_prototype);
+     add_constructor(vm.names.FinalizationRegistry, m_finalization_registry_constructor, m_finalization_registry_prototype);
+     add_constructor(vm.names.Function, m_function_constructor, m_function_prototype);
+     add_constructor(vm.names.Map, m_map_constructor, m_map_prototype);
+     add_constructor(vm.names.Number, m_number_constructor, m_number_prototype);
+     add_constructor(vm.names.Object, m_object_constructor, m_object_prototype);
+     add_constructor(vm.names.Promise, m_promise_constructor, m_promise_prototype);
+     add_constructor(vm.names.Proxy, m_proxy_constructor, nullptr);
+     add_constructor(vm.names.RegExp, m_regexp_constructor, m_regexp_prototype);
+     add_constructor(vm.names.Set, m_set_constructor, m_set_prototype);
+     add_constructor(vm.names.String, m_string_constructor, m_string_prototype);
+     add_constructor(vm.names.Symbol, m_symbol_constructor, m_symbol_prototype);
+     add_constructor(vm.names.WeakMap, m_weak_map_constructor, m_weak_map_prototype);
+     add_constructor(vm.names.WeakRef, m_weak_ref_constructor, m_weak_ref_prototype);
+     add_constructor(vm.names.WeakSet, m_weak_set_constructor, m_weak_set_prototype);
+ 
+     initialize_constructor(vm.names.TypedArray, m_typed_array_constructor, m_typed_array_prototype);
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     add_constructor(vm.names.ClassName, m_##snake_name##_constructor, m_##snake_name##_prototype);
+     JS_ENUMERATE_NATIVE_ERRORS
+     JS_ENUMERATE_TYPED_ARRAYS
+ #undef __JS_ENUMERATE
+ 
+     // The generator constructor cannot be initialized with add_constructor as it has no global binding
+     m_generator_function_constructor = heap().allocate<GeneratorFunctionConstructor>(*this, *this);
+     // 27.3.3.1 GeneratorFunction.prototype.constructor, https://tc39.es/ecma262/#sec-generatorfunction.prototype.constructor
+     m_generator_function_prototype->define_property(vm.names.constructor, m_generator_function_constructor, Attribute::Configurable);
+ }
+@@ -201,22 +204,23 @@ GlobalObject::~GlobalObject()
+ void GlobalObject::visit_edges(Visitor& visitor)
+ {
+     Base::visit_edges(visitor);
+ 
+     visitor.visit(m_empty_object_shape);
+     visitor.visit(m_new_object_shape);
+     visitor.visit(m_new_script_function_prototype_object_shape);
+     visitor.visit(m_proxy_constructor);
+     visitor.visit(m_generator_object_prototype);
++    visitor.visit(m_environment_record);
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     visitor.visit(m_##snake_name##_constructor);                                         \
+     visitor.visit(m_##snake_name##_prototype);
+     JS_ENUMERATE_NATIVE_ERRORS
+     JS_ENUMERATE_BUILTIN_TYPES
+ #undef __JS_ENUMERATE
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name) \
+     visitor.visit(m_##snake_name##_prototype);
+     JS_ENUMERATE_ITERATOR_PROTOTYPES
+ #undef __JS_ENUMERATE
+ }
+@@ -328,24 +332,6 @@ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::parse_int)
+     return Value(sign * number);
+ }
+ 
+-Optional<Variable> GlobalObject::get_from_environment_record(FlyString const& name) const
+-{
+-    auto value = get(name);
+-    if (value.is_empty())
+-        return {};
+-    return Variable { value, DeclarationKind::Var };
+-}
+-
+-void GlobalObject::put_into_environment_record(FlyString const& name, Variable variable)
+-{
+-    put(name, variable.value);
+-}
+-
+-bool GlobalObject::delete_from_environment_record(FlyString const& name)
+-{
+-    return delete_property(name);
+-}
+-
+ // 19.2.1 eval ( x ), https://tc39.es/ecma262/#sec-eval-x
+ JS_DEFINE_NATIVE_FUNCTION(GlobalObject::eval)
+ {
+diff --git a/Userland/Libraries/LibJS/Runtime/GlobalObject.h b/Userland/Libraries/LibJS/Runtime/GlobalObject.h
+index b59254dac1..8451169460 100644
+--- a/Userland/Libraries/LibJS/Runtime/GlobalObject.h
++++ b/Userland/Libraries/LibJS/Runtime/GlobalObject.h
+@@ -12,41 +12,37 @@
+ 
+ namespace JS {
+ 
+-class GlobalObject : public EnvironmentRecord {
+-    JS_OBJECT(GlobalObject, EnvironmentRecord);
++class GlobalObject : public Object {
++    JS_OBJECT(GlobalObject, Object);
+ 
+ public:
+     explicit GlobalObject();
+     virtual void initialize_global_object();
+ 
+     virtual ~GlobalObject() override;
+ 
+-    virtual Optional<Variable> get_from_environment_record(FlyString const&) const override;
+-    virtual void put_into_environment_record(FlyString const&, Variable) override;
+-    virtual bool delete_from_environment_record(FlyString const&) override;
+-    virtual bool has_this_binding() const final { return true; }
+-    virtual Value get_this_binding(GlobalObject&) const final { return this; }
++    GlobalEnvironmentRecord& environment_record() { return *m_environment_record; }
+ 
+     Console& console() { return *m_console; }
+ 
+     Shape* empty_object_shape() { return m_empty_object_shape; }
+ 
+     Shape* new_object_shape() { return m_new_object_shape; }
+     Shape* new_script_function_prototype_object_shape() { return m_new_script_function_prototype_object_shape; }
+ 
+     // Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct prototype
+     ProxyConstructor* proxy_constructor() { return m_proxy_constructor; }
+ 
+     // Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct constructor
+     GeneratorObjectPrototype* generator_object_prototype() { return m_generator_object_prototype; }
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     ConstructorName* snake_name##_constructor() { return m_##snake_name##_constructor; } \
+     Object* snake_name##_prototype() { return m_##snake_name##_prototype; }
+     JS_ENUMERATE_BUILTIN_TYPES
+ #undef __JS_ENUMERATE
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name) \
+     Object* snake_name##_prototype() { return m_##snake_name##_prototype; }
+     JS_ENUMERATE_ITERATOR_PROTOTYPES
+ #undef __JS_ENUMERATE
+@@ -62,39 +58,41 @@ protected:
+ private:
+     virtual bool is_global_object() const final { return true; }
+ 
+     JS_DECLARE_NATIVE_FUNCTION(gc);
+     JS_DECLARE_NATIVE_FUNCTION(is_nan);
+     JS_DECLARE_NATIVE_FUNCTION(is_finite);
+     JS_DECLARE_NATIVE_FUNCTION(parse_float);
+     JS_DECLARE_NATIVE_FUNCTION(parse_int);
+     JS_DECLARE_NATIVE_FUNCTION(eval);
+     JS_DECLARE_NATIVE_FUNCTION(encode_uri);
+     JS_DECLARE_NATIVE_FUNCTION(decode_uri);
+     JS_DECLARE_NATIVE_FUNCTION(encode_uri_component);
+     JS_DECLARE_NATIVE_FUNCTION(decode_uri_component);
+     JS_DECLARE_NATIVE_FUNCTION(escape);
+     JS_DECLARE_NATIVE_FUNCTION(unescape);
+ 
+     NonnullOwnPtr<Console> m_console;
+ 
+     Shape* m_empty_object_shape { nullptr };
+     Shape* m_new_object_shape { nullptr };
+     Shape* m_new_script_function_prototype_object_shape { nullptr };
+ 
+     // Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct prototype
+     ProxyConstructor* m_proxy_constructor { nullptr };
+ 
+     // Not included in JS_ENUMERATE_NATIVE_OBJECTS due to missing distinct constructor
+     GeneratorObjectPrototype* m_generator_object_prototype { nullptr };
+ 
++    GlobalEnvironmentRecord* m_environment_record { nullptr };
++
+ #define __JS_ENUMERATE(ClassName, snake_name, PrototypeName, ConstructorName, ArrayType) \
+     ConstructorName* m_##snake_name##_constructor { nullptr };                           \
+     Object* m_##snake_name##_prototype { nullptr };
+     JS_ENUMERATE_BUILTIN_TYPES
+ #undef __JS_ENUMERATE
+ 
+ #define __JS_ENUMERATE(ClassName, snake_name) \
+     Object* m_##snake_name##_prototype { nullptr };
+     JS_ENUMERATE_ITERATOR_PROTOTYPES
+ #undef __JS_ENUMERATE
+ };
+diff --git a/Userland/Libraries/LibJS/Runtime/Object.h b/Userland/Libraries/LibJS/Runtime/Object.h
+index 4fbc23de43..9ff166729f 100644
+--- a/Userland/Libraries/LibJS/Runtime/Object.h
++++ b/Userland/Libraries/LibJS/Runtime/Object.h
+@@ -42,121 +42,122 @@ class Object : public Cell {
+ public:
+     static Object* create(GlobalObject&, Object* prototype);
+ 
+     explicit Object(Object& prototype);
+     explicit Object(Shape&);
+     virtual void initialize(GlobalObject&) override;
+     virtual ~Object();
+ 
+     enum class PropertyKind {
+         Key,
+         Value,
+         KeyAndValue,
+     };
+ 
+     enum class GetOwnPropertyReturnType {
+         All,
+         StringOnly,
+         SymbolOnly,
+     };
+ 
+     enum class PutOwnPropertyMode {
+         Put,
+         DefineProperty,
+     };
+ 
+     enum class IntegrityLevel {
+         Sealed,
+         Frozen,
+     };
+ 
+     Shape& shape() { return *m_shape; }
+     const Shape& shape() const { return *m_shape; }
+ 
+     GlobalObject& global_object() const { return *shape().global_object(); }
+ 
+     virtual Value get(const PropertyName&, Value receiver = {}, AllowSideEffects = AllowSideEffects::Yes) const;
+     Value get_without_side_effects(const PropertyName&) const;
+ 
+     virtual bool has_property(const PropertyName&) const;
+     bool has_own_property(const PropertyName&) const;
+ 
+     virtual bool put(const PropertyName&, Value, Value receiver = {});
+ 
+     Value get_own_property(const PropertyName&, Value receiver, AllowSideEffects = AllowSideEffects::Yes) const;
+     MarkedValueList get_own_properties(PropertyKind, bool only_enumerable_properties = false, GetOwnPropertyReturnType = GetOwnPropertyReturnType::All) const;
+     MarkedValueList get_enumerable_own_property_names(PropertyKind) const;
+     virtual Optional<PropertyDescriptor> get_own_property_descriptor(const PropertyName&) const;
+     Value get_own_property_descriptor_object(const PropertyName&) const;
+ 
+     virtual bool define_property(const StringOrSymbol& property_name, const Object& descriptor, bool throw_exceptions = true);
+     bool define_property(const PropertyName&, Value value, PropertyAttributes attributes = default_attributes, bool throw_exceptions = true);
+     bool define_property_without_transition(const PropertyName&, Value value, PropertyAttributes attributes = default_attributes, bool throw_exceptions = true);
+     bool define_accessor(const PropertyName&, Function* getter, Function* setter, PropertyAttributes attributes = default_attributes, bool throw_exceptions = true);
+ 
+     bool define_native_function(PropertyName const&, AK::Function<Value(VM&, GlobalObject&)>, i32 length = 0, PropertyAttributes attributes = default_attributes);
+     bool define_native_property(PropertyName const&, AK::Function<Value(VM&, GlobalObject&)> getter, AK::Function<void(VM&, GlobalObject&, Value)> setter, PropertyAttributes attributes = default_attributes);
+     bool define_native_accessor(PropertyName const&, AK::Function<Value(VM&, GlobalObject&)> getter, AK::Function<Value(VM&, GlobalObject&)> setter, PropertyAttributes attributes = default_attributes);
+ 
+     void define_properties(Value properties);
+ 
+     virtual bool delete_property(const PropertyName&);
+ 
+     virtual bool is_array() const { return false; }
+     virtual bool is_function() const { return false; }
+     virtual bool is_typed_array() const { return false; }
+     virtual bool is_string_object() const { return false; }
+     virtual bool is_global_object() const { return false; }
+     virtual bool is_proxy_object() const { return false; }
+     virtual bool is_native_function() const { return false; }
++    virtual bool is_global_environment_record() const { return false; }
+     virtual bool is_declarative_environment_record() const { return false; }
+     virtual bool is_function_environment_record() const { return false; }
+ 
+     // B.3.7 The [[IsHTMLDDA]] Internal Slot, https://tc39.es/ecma262/#sec-IsHTMLDDA-internal-slot
+     virtual bool is_htmldda() const { return false; }
+ 
+     virtual const char* class_name() const override { return "Object"; }
+     virtual void visit_edges(Cell::Visitor&) override;
+ 
+     virtual Object* prototype();
+     virtual const Object* prototype() const;
+     virtual bool set_prototype(Object* prototype);
+     bool has_prototype(const Object* prototype) const;
+ 
+     virtual bool is_extensible() const { return m_is_extensible; }
+     virtual bool prevent_extensions();
+ 
+     bool set_integrity_level(IntegrityLevel);
+     bool test_integrity_level(IntegrityLevel);
+ 
+     virtual Value value_of() const { return Value(const_cast<Object*>(this)); }
+     virtual Value ordinary_to_primitive(Value::PreferredType preferred_type) const;
+ 
+     Value get_direct(size_t index) const { return m_storage[index]; }
+ 
+     const IndexedProperties& indexed_properties() const { return m_indexed_properties; }
+     IndexedProperties& indexed_properties() { return m_indexed_properties; }
+     void set_indexed_property_elements(Vector<Value>&& values) { m_indexed_properties = IndexedProperties(move(values)); }
+ 
+     void install_error_cause(Value options);
+ 
+     [[nodiscard]] Value invoke_internal(const StringOrSymbol& property_name, Optional<MarkedValueList> arguments);
+ 
+     template<typename... Args>
+     [[nodiscard]] ALWAYS_INLINE Value invoke(const StringOrSymbol& property_name, Args... args)
+     {
+         if constexpr (sizeof...(Args) > 0) {
+             MarkedValueList arglist { heap() };
+             (..., arglist.append(move(args)));
+             return invoke(property_name, move(arglist));
+         }
+ 
+         return invoke(property_name);
+     }
+ 
+     void ensure_shape_is_unique();
+ 
+     void enable_transitions() { m_transitions_enabled = true; }
+     void disable_transitions() { m_transitions_enabled = false; }
+ 
+     template<typename T>
+     bool fast_is() const = delete;
+diff --git a/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h b/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
+index c6c2bf1f32..4c55b813ba 100644
+--- a/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
++++ b/Userland/Libraries/LibJS/Runtime/ObjectEnvironmentRecord.h
+@@ -20,6 +20,8 @@ public:
+     virtual void put_into_environment_record(FlyString const&, Variable) override;
+     virtual bool delete_from_environment_record(FlyString const&) override;
+ 
++    Object& object() { return m_object; }
++
+ private:
+     virtual void visit_edges(Visitor&) override;
+ 
+diff --git a/Userland/Libraries/LibJS/Runtime/VM.cpp b/Userland/Libraries/LibJS/Runtime/VM.cpp
+index 238db115f9..ff1d41eedf 100644
+--- a/Userland/Libraries/LibJS/Runtime/VM.cpp
++++ b/Userland/Libraries/LibJS/Runtime/VM.cpp
+@@ -1,25 +1,26 @@
+ /*
+  * Copyright (c) 2020-2021, Andreas Kling <kling@serenityos.org>
+  * Copyright (c) 2020-2021, Linus Groh <linusg@serenityos.org>
+  *
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
+ #include <AK/Debug.h>
+ #include <AK/ScopeGuard.h>
+ #include <AK/StringBuilder.h>
+ #include <LibJS/Interpreter.h>
+ #include <LibJS/Runtime/AbstractOperations.h>
+ #include <LibJS/Runtime/Array.h>
+ #include <LibJS/Runtime/Error.h>
+ #include <LibJS/Runtime/FinalizationRegistry.h>
+ #include <LibJS/Runtime/FunctionEnvironmentRecord.h>
++#include <LibJS/Runtime/GlobalEnvironmentRecord.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/IteratorOperations.h>
+ #include <LibJS/Runtime/NativeFunction.h>
+ #include <LibJS/Runtime/PromiseReaction.h>
+ #include <LibJS/Runtime/Reference.h>
+ #include <LibJS/Runtime/ScriptFunction.h>
+ #include <LibJS/Runtime/Symbol.h>
+ #include <LibJS/Runtime/TemporaryClearException.h>
+ #include <LibJS/Runtime/VM.h>
+@@ -394,14 +395,10 @@ Value VM::get_variable(const FlyString& name, GlobalObject& global_object)
+ 
+ Reference VM::get_reference(const FlyString& name)
+ {
+-    if (m_call_stack.size()) {
+-        for (auto* environment_record = lexical_environment(); environment_record; environment_record = environment_record->outer_environment()) {
+-            if (is<GlobalObject>(environment_record))
+-                break;
+-            auto possible_match = environment_record->get_from_environment_record(name);
+-            if (possible_match.has_value())
+-                return { Reference::LocalVariable, name };
+-        }
++    for (auto* environment_record = lexical_environment(); environment_record && environment_record->outer_environment(); environment_record = environment_record->outer_environment()) {
++        auto possible_match = environment_record->get_from_environment_record(name);
++        if (possible_match.has_value())
++            return { Reference::LocalVariable, name };
+     }
+     return { Reference::GlobalVariable, name };
+ }

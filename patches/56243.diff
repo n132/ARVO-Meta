@@ -1,0 +1,174 @@
+commit ceefa0b74674f32aeedb1e93bcb6ec9cb12842b1
+Author: Igor Mammedov <imammedo@redhat.com>
+Date:   Thu Mar 2 17:15:21 2023 +0100
+
+    pci: fix 'hotplugglable' property behavior
+    
+    Currently the property may flip its state
+    during VM bring up or just doesn't work as
+    the name implies.
+    
+    In particular with PCIE root port that has
+    'hotplug={on|off}' property, and when it's
+    turned off, one would expect
+      'hotpluggable' == false
+    for any devices attached to it.
+    Which is not the case since qbus_is_hotpluggable()
+    used by the property just checks for presence
+    of any hotplug_handler set on bus.
+    
+    The problem is that name BusState::hotplug_handler
+    from its inception is misnomer, as it handles
+    not only hotplug but also in many cases coldplug
+    as well (i.e. generic wiring interface), and
+    it's fine to have hotplug_handler set on bus
+    while it doesn't support hotplug (ex. pcie-slot
+    with hotplug=off).
+    
+    Another case of root port flipping 'hotpluggable'
+    state when ACPI PCI hotplug is enabled in this
+    case root port with 'hotplug=off' starts as
+    hotpluggable and then later on, pcihp
+    hotplug_handler clears hotplug_handler
+    explicitly after checking root port's 'hotplug'
+    property.
+    
+    So root-port hotpluggablity check sort of works
+    if pcihp is enabled but is broken if pcihp is
+    disabled.
+    
+    One way to deal with the issue is to ask
+    hotplug_handler if bus it controls is hotpluggable
+    or not. To do that add is_hotpluggable_bus()
+    hook to HotplugHandler interface and use it in
+    'hotpluggable' property + teach pcie-slot to
+    actually look into 'hotplug' property state
+    before deciding if bus is hotpluggable.
+    
+    Signed-off-by: Igor Mammedov <imammedo@redhat.com>
+    Message-Id: <20230302161543.286002-13-imammedo@redhat.com>
+    Reviewed-by: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+
+diff --git a/hw/pci/pcie_port.c b/hw/pci/pcie_port.c
+index 65a397ad23..000633fec1 100644
+--- a/hw/pci/pcie_port.c
++++ b/hw/pci/pcie_port.c
+@@ -161,6 +161,13 @@ PCIDevice *pcie_find_port_by_pn(PCIBus *bus, uint8_t pn)
+     return NULL;
+ }
+ 
++static bool pcie_slot_is_hotpluggbale_bus(HotplugHandler *plug_handler,
++                                          BusState *bus)
++{
++    PCIESlot *s = PCIE_SLOT(bus->parent);
++    return s->hotplug;
++}
++
+ static const TypeInfo pcie_port_type_info = {
+     .name = TYPE_PCIE_PORT,
+     .parent = TYPE_PCI_BRIDGE,
+@@ -181,13 +188,14 @@ static Property pcie_slot_props[] = {
+ static void pcie_slot_class_init(ObjectClass *oc, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(oc);
+     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
+ 
+     device_class_set_props(dc, pcie_slot_props);
+     hc->pre_plug = pcie_cap_slot_pre_plug_cb;
+     hc->plug = pcie_cap_slot_plug_cb;
+     hc->unplug = pcie_cap_slot_unplug_cb;
+     hc->unplug_request = pcie_cap_slot_unplug_request_cb;
++    hc->is_hotpluggable_bus = pcie_slot_is_hotpluggbale_bus;
+ }
+ 
+ static const TypeInfo pcie_slot_type_info = {
+diff --git a/include/hw/hotplug.h b/include/hw/hotplug.h
+index e15f59c8b3..a9840ed485 100644
+--- a/include/hw/hotplug.h
++++ b/include/hw/hotplug.h
+@@ -27,41 +27,43 @@ typedef struct HotplugHandler HotplugHandler;
+ /**
+  * hotplug_fn:
+  * @plug_handler: a device performing plug/uplug action
+  * @plugged_dev: a device that has been (un)plugged
+  * @errp: returns an error if this function fails
+  */
+ typedef void (*hotplug_fn)(HotplugHandler *plug_handler,
+                            DeviceState *plugged_dev, Error **errp);
+ 
+ /**
+  * HotplugDeviceClass:
+  *
+  * Interface to be implemented by a device performing
+  * hardware (un)plug functions.
+  *
+  * @parent: Opaque parent interface.
+  * @pre_plug: pre plug callback called at start of device.realize(true)
+  * @plug: plug callback called at end of device.realize(true).
+  * @unplug_request: unplug request callback.
+  *                  Used as a means to initiate device unplug for devices that
+  *                  require asynchronous unplug handling.
+  * @unplug: unplug callback.
+  *          Used for device removal with devices that implement
+  *          asynchronous and synchronous (surprise) removal.
++ * @is_hotpluggable_bus: called to check if bus/its parent allow hotplug on bus
+  */
+ struct HotplugHandlerClass {
+     /* <private> */
+     InterfaceClass parent;
+ 
+     /* <public> */
+     hotplug_fn pre_plug;
+     hotplug_fn plug;
+     hotplug_fn unplug_request;
+     hotplug_fn unplug;
++    bool (*is_hotpluggable_bus)(HotplugHandler *plug_handler, BusState *bus);
+ };
+ 
+ /**
+  * hotplug_handler_plug:
+  *
+  * Call #HotplugHandlerClass.plug callback of @plug_handler.
+  */
+diff --git a/include/hw/qdev-core.h b/include/hw/qdev-core.h
+index f5b3b2f89a..bd50ad5ee1 100644
+--- a/include/hw/qdev-core.h
++++ b/include/hw/qdev-core.h
+@@ -812,24 +812,35 @@ void qbus_set_bus_hotplug_handler(BusState *bus);
+ 
+ static inline bool qbus_is_hotpluggable(BusState *bus)
+ {
+-   return bus->hotplug_handler;
++    HotplugHandler *plug_handler = bus->hotplug_handler;
++    bool ret = !!plug_handler;
++
++    if (plug_handler) {
++        HotplugHandlerClass *hdc;
++
++        hdc = HOTPLUG_HANDLER_GET_CLASS(plug_handler);
++        if (hdc->is_hotpluggable_bus) {
++            ret = hdc->is_hotpluggable_bus(plug_handler, bus);
++        }
++    }
++    return ret;
+ }
+ 
+ /**
+  * qbus_mark_full: Mark this bus as full, so no more devices can be attached
+  * @bus: Bus to mark as full
+  *
+  * By default, QEMU will allow devices to be plugged into a bus up
+  * to the bus class's device count limit. Calling this function
+  * marks a particular bus as full, so that no more devices can be
+  * plugged into it. In particular this means that the bus will not
+  * be considered as a candidate for plugging in devices created by
+  * the user on the commandline or via the monitor.
+  * If a machine has multiple buses of a given type, such as I2C,
+  * where some of those buses in the real hardware are used only for
+  * internal devices and some are exposed via expansion ports, you
+  * can use this function to mark the internal-only buses as full
+  * after you have created all their internal devices. Then user
+  * created devices will appear on the expansion-port bus where
+  * guest software expects them.
+  */

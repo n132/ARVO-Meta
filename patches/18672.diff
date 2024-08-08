@@ -1,0 +1,155 @@
+commit 9433d1dd1951639182487582671bcc4b1256f824
+Author: Even Rouault <even.rouault@spatialys.com>
+Date:   Sat Nov 2 03:15:53 2019 +0100
+
+    VICAR: avoid out of buffer read. master only. Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=18672
+
+diff --git a/gdal/frmts/pds/vicarkeywordhandler.cpp b/gdal/frmts/pds/vicarkeywordhandler.cpp
+index 149e626fa7..b048af2512 100644
+--- a/gdal/frmts/pds/vicarkeywordhandler.cpp
++++ b/gdal/frmts/pds/vicarkeywordhandler.cpp
+@@ -71,141 +71,143 @@ VICARKeywordHandler::~VICARKeywordHandler()
+ bool VICARKeywordHandler::Ingest( VSILFILE *fp, GByte *pabyHeader )
+ 
+ {
+ /* -------------------------------------------------------------------- */
+ /*      Read in label at beginning of file.                             */
+ /* -------------------------------------------------------------------- */
+     if( VSIFSeekL( fp, 0, SEEK_SET ) != 0 )
+         return false;
+ 
+     // Find LBLSIZE Entry
+     const char* pszLBLSIZE = strstr(reinterpret_cast<char *>( pabyHeader ), "LBLSIZE");
+     if( !pszLBLSIZE )
+         return false;
+ 
+     const char *pch1 = strchr(pszLBLSIZE, '=');
+     if( pch1 == nullptr )
+         return false;
+     ++pch1;
+     while( isspace(static_cast<unsigned char>(*pch1)) )
+         ++pch1;
+     const char *pch2 = strchr(pch1, ' ');
+     if( pch2 == nullptr )
+         return false;
+ 
+     std::string keyval;
+     keyval.assign(pch1, static_cast<size_t>(pch2 - pch1));
+     int LabelSize = atoi( keyval.c_str() );
+     if( LabelSize <= 0 || LabelSize > 10 * 1024 * 124 )
+         return false;
+ 
+     char* pszChunk = reinterpret_cast<char *>(  VSIMalloc( LabelSize + 1 ) );
+     if( pszChunk == nullptr )
+         return false;
+     int nBytesRead = static_cast<int>(VSIFReadL( pszChunk, 1, LabelSize, fp ));
+     pszChunk[nBytesRead] = '\0';
+ 
+     osHeaderText += pszChunk ;
+     VSIFree( pszChunk );
+     pszHeaderNext = osHeaderText.c_str();
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Process name/value pairs                                        */
+ /* -------------------------------------------------------------------- */
+     if( !Parse() )
+         return false;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      Now check for the Vicar End-of-Dataset Label...                 */
+ /* -------------------------------------------------------------------- */
+     const char *pszResult = CSLFetchNameValueDef( papszKeywordList, "EOL", "0" );
+     if( !EQUAL(pszResult,"1") )
+         return true;
+ 
+ /* -------------------------------------------------------------------- */
+ /*      There is a EOL!   e.G.  h4231_0000.nd4.06                       */
+ /* -------------------------------------------------------------------- */
+ 
+     GUInt64 nPixelOffset;
+     GUInt64 nLineOffset;
+     GUInt64 nBandOffset;
+     GUInt64 nImageOffsetWithoutNBB;
+     GUInt64 nNBB;
+     GUInt64 nImageSize;
+     if( !VICARDataset::GetSpacings(*this, nPixelOffset, nLineOffset, nBandOffset,
+                                    nImageOffsetWithoutNBB, nNBB, nImageSize) )
+         return false;
+ 
+     // Position of EOL in case of compressed data
+     const vsi_l_offset nEOCI1 = static_cast<vsi_l_offset>(
+         CPLAtoGIntBig(CSLFetchNameValueDef(papszKeywordList, "EOCI1", "0")));
+     const vsi_l_offset nEOCI2 = static_cast<vsi_l_offset>(
+         CPLAtoGIntBig(CSLFetchNameValueDef(papszKeywordList, "EOCI2", "0")));
+     const vsi_l_offset nEOCI = (nEOCI2 << 32) | nEOCI1;
+ 
+     const vsi_l_offset nStartEOL = nEOCI ? nEOCI :
+                                         nImageOffsetWithoutNBB + nImageSize;
+ 
+     if( VSIFSeekL( fp, nStartEOL, SEEK_SET ) != 0 )
+     {
+         CPLError(CE_Failure, CPLE_AppDefined, "Error seeking to EOL");
+         return false;
+     }
+     char* pszEOLHeader = static_cast<char*>(VSIMalloc(32));
+     if( pszEOLHeader == nullptr )
+         return false;
+     nBytesRead = static_cast<int>(VSIFReadL( pszEOLHeader, 1, 31, fp ));
+     pszEOLHeader[nBytesRead] = '\0';
+     pszLBLSIZE=strstr(pszEOLHeader,"LBLSIZE");
+     if( !pszLBLSIZE )
+     {
+         CPLError(CE_Failure, CPLE_AppDefined, "END-OF-DATASET LABEL NOT FOUND!");
+         VSIFree(pszEOLHeader);
+         return false;
+     }
+     pch1 = strchr( pszLBLSIZE, '=' );
+     if( pch1 == nullptr )
+     {
+         CPLError(CE_Failure, CPLE_AppDefined, "END-OF-DATASET LABEL NOT FOUND!");
+         VSIFree(pszEOLHeader);
+         return false;
+     }
+     ++pch1;
+     while( isspace(static_cast<unsigned char>(*pch1)) )
+         ++pch1;
+     pch2 = strchr( pch1, ' ' );
+     if( pch2 == nullptr )
+     {
+         CPLError(CE_Failure, CPLE_AppDefined, "END-OF-DATASET LABEL NOT FOUND!");
+         VSIFree(pszEOLHeader);
+         return false;
+     }
+     keyval.assign(pch1, static_cast<size_t>(pch2 - pch1));
+     const auto nSkipEOLLBLSize = static_cast<size_t>(pch2 - pszEOLHeader);
+     VSIFree(pszEOLHeader);
+ 
+     int EOLabelSize = atoi( keyval.c_str() );
+-    if( EOLabelSize <= 0 || EOLabelSize > 100 * 1024 * 1024 )
++    if( EOLabelSize <= 0 ||
++        static_cast<size_t>(EOLabelSize) <= nSkipEOLLBLSize ||
++        EOLabelSize > 100 * 1024 * 1024 )
+         return false;
+     if( VSIFSeekL( fp, nStartEOL, SEEK_SET ) != 0 )
+     {
+         CPLError(CE_Failure, CPLE_AppDefined, "Error seeking to EOL");
+         return false;
+     }
+     char* pszChunkEOL = (char*) VSIMalloc(EOLabelSize+1);
+     if( pszChunkEOL == nullptr )
+         return false;
+     nBytesRead = static_cast<int>(VSIFReadL( pszChunkEOL, 1, EOLabelSize, fp ));
+     pszChunkEOL[nBytesRead] = '\0';
+     osHeaderText += pszChunkEOL + nSkipEOLLBLSize;
+     VSIFree(pszChunkEOL);
+     CSLDestroy(papszKeywordList);
+     papszKeywordList = nullptr;
+     pszHeaderNext = osHeaderText.c_str();
+     return Parse();
+ }
+ 
+ /************************************************************************/
+ /*                               Parse()                                */
+ /************************************************************************/
+ 
+ #define SYNTHETIC_END_MARKER    "__END__"

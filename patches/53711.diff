@@ -1,0 +1,474 @@
+commit f4bcc37667d82541eaf8a29e0b021fe1d7aa7b5b
+Author: Ken Sharp <ken.sharp@artifex.com>
+Date:   Thu Nov 24 14:58:43 2022 +0000
+
+    GhostPDF - Correct main stream parsing
+    
+    This was noticed while I was working on the N-up problem, the test file
+    for that problem was the 1.7 PDF Reference and the device was pdfwrite.
+    After fixing the N-up problem I had tried running the full file, and it
+    failed badly.
+    
+    The reason turns out to be that at some time in the distant past (long
+    before we merged the pdfi branch to master) I wrapped the main stream
+    in a SubFileDeocde filter, with a 'triler' EODString, before parsing
+    objects when dereferencing in indirect reference.
+    
+    The PDF_Reference has an annotation which includes, in the text, the
+    word 'trailer'. Because it isn't an ObjStm it isn't compressed, and so
+    the SubFileDecode filter signals EOF when it hits that word, leading to
+    errors.
+    
+    This commit removes the SubFileDecode filter, which led on to a couple
+    of other problems; the offset calculation in pdfi_read_stream_object()
+    was assuming it was never reading from the main stream, because we
+    always had a filter in place. That meant the calculation was incorrect
+    when we are reading from the main stream.
+    
+    /tests_private/comparefiles/Bug696541.pdf has strings in its Info
+    dictionary which are invalid, this causes us to read to the end of file.
+    Previously the SubFileDecode would have prevented us triggering the
+    'eof' in the main stream but because we aren't using that any more we
+    were falling foul of it because we would rewind the stream, then the
+    PDF stream object would still have eof set, so we'd be unable to read
+    anything from it.
+    
+    So have pdfi_seek() reset the 'eof' flag if we alter the file position
+    and it is currently set.
+    
+    There may be more fallout from this change, the cluster runs clean but
+    that does not test very many broken files. I'll be testing a moderate
+    collection of files, including the OSS-fuzz files, over the next few
+    days and may make more fixes.
+
+diff --git a/pdf/pdf_deref.c b/pdf/pdf_deref.c
+index 3e1a80465..31eb62961 100644
+--- a/pdf/pdf_deref.c
++++ b/pdf/pdf_deref.c
+@@ -198,236 +198,240 @@ int is_compressed_object(pdf_context *ctx, uint32_t obj, uint32_t gen)
+ /* We should never read a 'stream' keyword from a compressed object stream
+  * so this case should never end up here.
+  */
+ static int pdfi_read_stream_object(pdf_context *ctx, pdf_c_stream *s, gs_offset_t stream_offset,
+                                    uint32_t objnum, uint32_t gen)
+ {
+     int code = 0;
+     int64_t i;
+     pdf_dict *dict = NULL;
+     gs_offset_t offset;
+     pdf_stream *stream_obj = NULL;
+ 
+     /* Strange code time....
+      * If we are using a stream which is *not* the PDF uncompressed main file stream
+      * then doing stell on it will only tell us how many bytes have been read from
+      * that stream, it won't tell us the underlying file position. So we add on the
+      * 'unread' bytes, *and* we add on the position of the start of the stream in
+      * the actual main file. This is all done so that we can check the /Length
+      * of the object. Note that this will *only* work for regular objects it can
+      * not be used for compressed object streams, but those don't need checking anyway
+      * they have a different mechanism altogether and should never get here.
+      */
+-    offset = stell(s->s) - s->unread_size + stream_offset;
+-    code = pdfi_seek(ctx, ctx->main_stream, offset, SEEK_SET);
++    if (s != ctx->main_stream) {
++        offset = stell(s->s) - s->unread_size + stream_offset;
++        code = pdfi_seek(ctx, ctx->main_stream, offset, SEEK_SET);
++    } else {
++        offset = stell(s->s) - s->unread_size;
++    }
+ 
+     if (pdfi_count_stack(ctx) < 1)
+         return_error(gs_error_stackunderflow);
+ 
+     dict = (pdf_dict *)ctx->stack_top[-1];
+ 
+     if (pdfi_type_of(dict) != PDF_DICT) {
+         pdfi_pop(ctx, 1);
+         return_error(gs_error_syntaxerror);
+     }
+ 
+     dict->indirect_num = dict->object_num = objnum;
+     dict->indirect_gen = dict->generation_num = gen;
+ 
+     /* Convert the dict into a stream */
+     code = pdfi_obj_dict_to_stream(ctx, dict, &stream_obj, true);
+     if (code < 0) {
+         pdfi_pop(ctx, 1);
+         return code;
+     }
+     /* Pop off the dict and push the stream */
+     pdfi_pop(ctx, 1);
+     dict = NULL;
+     pdfi_push(ctx, (pdf_obj *)stream_obj);
+ 
+     stream_obj->stream_dict->indirect_num = stream_obj->stream_dict->object_num = objnum;
+     stream_obj->stream_dict->indirect_gen = stream_obj->stream_dict->generation_num = gen;
+     stream_obj->stream_offset = offset;
+ 
+     /* Exceptional code. Normally we do not need to worry about detecting circular references
+      * when reading objects, because we do not dereference any indirect objects. However streams
+      * are a slight exception in that we do get the Length from the stream dictionay and if that
+      * is an indirect reference, then we dereference it.
+      * OSS-fuzz bug 43247 has a stream where the value associated iwht the /Length is an indirect
+      * reference to the same stream object, and leads to infinite recursion. So deal with that
+      * possibility here.
+      */
+     code = pdfi_loop_detector_mark(ctx);
+     if (code < 0) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         return code;
+     }
+     if (pdfi_loop_detector_check_object(ctx, stream_obj->object_num)) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         pdfi_loop_detector_cleartomark(ctx);
+         return_error(gs_error_circular_reference);
+     }
+ 
+     code = pdfi_loop_detector_add_object(ctx, stream_obj->object_num);
+     if (code < 0) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         pdfi_loop_detector_cleartomark(ctx);
+         return code;
+     }
+ 
+     /* This code may be a performance overhead, it simply skips over the stream contents
+      * and checks that the stream ends with a 'endstream endobj' pair. We could add a
+      * 'go faster' flag for users who are certain their PDF files are well-formed. This
+      * could also allow us to skip all kinds of other checking.....
+      */
+ 
+     code = pdfi_dict_get_int(ctx, (pdf_dict *)stream_obj->stream_dict, "Length", &i);
+     if (code < 0) {
+         char extra_info[gp_file_name_sizeof];
+ 
+         (void)pdfi_loop_detector_cleartomark(ctx);
+         gs_snprintf(extra_info, sizeof(extra_info), "Stream object %u missing mandatory keyword /Length, unable to verify the stream length.\n", objnum);
+         pdfi_set_error(ctx, 0, NULL, E_PDF_BADSTREAM, "pdfi_read_stream_object", extra_info);
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         return 0;
+     }
+     code = pdfi_loop_detector_cleartomark(ctx);
+     if (code < 0) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         return code;
+     }
+ 
+     if (i < 0 || (i + offset)> ctx->main_stream_length) {
+         char extra_info[gp_file_name_sizeof];
+ 
+         gs_snprintf(extra_info, sizeof(extra_info), "Stream object %u has /Length which, when added to offset of object, exceeds file size.\n", objnum);
+         pdfi_set_error(ctx, 0, NULL, E_PDF_BADSTREAM, "pdfi_read_stream_object", extra_info);
+     } else {
+         code = pdfi_seek(ctx, ctx->main_stream, i, SEEK_CUR);
+         if (code < 0) {
+             pdfi_pop(ctx, 1);
+             pdfi_countdown(stream_obj); /* get rid of extra ref */
+             return code;
+         }
+ 
+         stream_obj->Length = 0;
+         stream_obj->length_valid = false;
+ 
+         code = pdfi_read_bare_keyword(ctx, ctx->main_stream);
+         if (code == 0) {
+             char extra_info[gp_file_name_sizeof];
+ 
+             gs_snprintf(extra_info, sizeof(extra_info), "Failed to find a valid object at end of stream object %u.\n", objnum);
+             pdfi_log_info(ctx, "pdfi_read_stream_object", extra_info);
+             /* It is possible for pdfi_read_token to clear the stack, losing the stream object. If that
+              * happens give up.
+              */
+             if (pdfi_count_stack(ctx) == 0) {
+                 pdfi_countdown(stream_obj); /* get rid of extra ref */
+                 return code;
+             }
+         } else if (code < 0) {
+             char extra_info[gp_file_name_sizeof];
+ 
+             gs_snprintf(extra_info, sizeof(extra_info), "Failed to find 'endstream' keyword at end of stream object %u.\n", objnum);
+             pdfi_set_error(ctx, 0, NULL, E_PDF_MISSINGENDOBJ, "pdfi_read_stream_object", extra_info);
+         } else if (code != TOKEN_ENDSTREAM) {
+             char extra_info[gp_file_name_sizeof];
+ 
+             gs_snprintf(extra_info, sizeof(extra_info), "Stream object %u has an incorrect /Length of %"PRIu64"\n", objnum, i);
+             pdfi_log_info(ctx, "pdfi_read_stream_object", extra_info);
+         } else {
+             /* Cache the Length in the stream object and mark it valid */
+             stream_obj->Length = i;
+             stream_obj->length_valid = true;
+         }
+     }
+ 
+     /* If we failed to find a valid object, or the object wasn't a keyword, or the
+      * keywrod wasn't 'endstream' then the Length is wrong. We need to have the correct
+      * Length for streams if we have encrypted files, because we must install a
+      * SubFileDecode filter with a Length (EODString is incompatible with AES encryption)
+      * Rather than mess about checking for encryption, we'll choose to just correctly
+      * calculate the Length of all streams. Although this takes time, it will only
+      * happen for files which are invalid.
+      */
+     if (stream_obj->length_valid != true) {
+         char Buffer[10];
+         unsigned int bytes, total = 0;
+         int c = 0;
+ 
+         code = pdfi_seek(ctx, ctx->main_stream, stream_obj->stream_offset, SEEK_SET);
+         if (code < 0) {
+             pdfi_countdown(stream_obj); /* get rid of extra ref */
+             pdfi_pop(ctx, 1);
+             return code;
+         }
+         memset(Buffer, 0x00, 10);
+         bytes = pdfi_read_bytes(ctx, (byte *)Buffer, 1, 9, ctx->main_stream);
+         if (bytes < 9) {
+             pdfi_countdown(stream_obj); /* get rid of extra ref */
+             return_error(gs_error_ioerror);
+         }
+ 
+         total = bytes;
+         do {
+             if (memcmp(Buffer, "endstream", 9) == 0) {
+                 stream_obj->Length = total - 9;
+                 stream_obj->length_valid = true;
+                 break;
+             }
+             if (memcmp(Buffer, "endobj", 6) == 0) {
+                 stream_obj->Length = total - 6;
+                 stream_obj->length_valid = true;
+                 break;
+             }
+             memmove(Buffer, Buffer+1, 9);
+             c = pdfi_read_byte(ctx, ctx->main_stream);
+             if (c < 0)
+                 break;
+             Buffer[9] = (byte)c;
+             total++;
+         } while(1);
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         if (c < 0)
+             return_error(gs_error_ioerror);
+         return 0;
+     }
+ 
+     code = pdfi_read_bare_keyword(ctx, ctx->main_stream);
+     if (code < 0) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         if (ctx->args.pdfstoponerror)
+             return code;
+         else
+             /* Something went wrong looking for endobj, but we found endstream, so assume
+              * for now that will suffice.
+              */
+             pdfi_set_error(ctx, 0, NULL, E_PDF_MISSINGENDOBJ, "pdfi_read_stream_object", NULL);
+         return 0;
+     }
+ 
+     if (code == 0) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         return_error(gs_error_stackunderflow);
+     }
+ 
+     if (code != TOKEN_ENDOBJ) {
+         pdfi_countdown(stream_obj); /* get rid of extra ref */
+         if (ctx->args.pdfstoponerror)
+             return_error(gs_error_typecheck);
+         pdfi_set_error(ctx, 0, NULL, E_PDF_MISSINGENDOBJ, "pdfi_read_stream_object", NULL);
+         /* Didn't find an endobj, but we have an endstream, so assume
+          * for now that will suffice
+          */
+         return 0;
+     }
+     pdfi_countdown(stream_obj); /* get rid of extra ref */
+ 
+     return 0;
+ }
+ 
+ /* This reads an object *after* the x y obj keyword has been found. Its broken out
+  * separately for the benefit of the repair code when reading the dictionary following
+  * the 'trailer' keyword, which does not have a 'obj' keyword. Note that it also does
+  * not have an 'endobj', we rely on the error handling to take care of that for us.
+  */
+@@ -878,151 +882,145 @@ static int pdfi_deref_compressed(pdf_context *ctx, uint64_t obj, uint64_t gen, p
+ /* pdf_dereference returns an object with a reference count of at least 1, this represents the
+  * reference being held by the caller (in **object) when we return from this function.
+  */
+ static int pdfi_dereference_main(pdf_context *ctx, uint64_t obj, uint64_t gen, pdf_obj **object, bool cache)
+ {
+     xref_entry *entry;
+     int code, stack_depth = pdfi_count_stack(ctx);
+     gs_offset_t saved_stream_offset;
+     bool saved_decrypt_strings = ctx->encryption.decrypt_strings;
+ 
+     *object = NULL;
+ 
+     if (ctx->xref_table == NULL)
+         return_error(gs_error_typecheck);
+ 
+     if (obj >= ctx->xref_table->xref_size) {
+         char extra_info[gp_file_name_sizeof];
+ 
+         gs_snprintf(extra_info, sizeof(extra_info), "Error, attempted to dereference object %"PRIu64", which is not present in the xref table\n", obj);
+         pdfi_set_error(ctx, 0, NULL, E_PDF_BADOBJNUMBER, "pdfi_dereference", extra_info);
+ 
+         if(ctx->args.pdfstoponerror)
+             return_error(gs_error_rangecheck);
+ 
+         code = pdfi_repair_file(ctx);
+         if (code < 0) {
+             *object = NULL;
+             return code;
+         }
+         if (obj >= ctx->xref_table->xref_size) {
+             *object = NULL;
+             return_error(gs_error_rangecheck);
+         }
+     }
+ 
+     entry = &ctx->xref_table->xref[obj];
+ 
+     if(entry->object_num == 0)
+         return_error(gs_error_undefined);
+ 
+     if (entry->free) {
+         char extra_info[gp_file_name_sizeof];
+ 
+         gs_snprintf(extra_info, sizeof(extra_info), "Attempt to dereference free object %"PRIu64", trying next object number as offset.\n", entry->object_num);
+         pdfi_set_error(ctx, 0, NULL, E_PDF_DEREF_FREE_OBJ, "pdfi_dereference", extra_info);
+     }
+ 
+     if (ctx->loop_detection) {
+         if (pdfi_loop_detector_check_object(ctx, obj) == true)
+             return_error(gs_error_circular_reference);
+         if (entry->free) {
+             code = pdfi_loop_detector_add_object(ctx, obj);
+             if (code < 0)
+                 return code;
+         }
+     }
+     if (entry->cache != NULL){
+         pdf_obj_cache_entry *cache_entry = entry->cache;
+ 
+ #if CACHE_STATISTICS
+         ctx->hits++;
+ #endif
+         *object = cache_entry->o;
+         pdfi_countup(*object);
+ 
+         pdfi_promote_cache_entry(ctx, cache_entry);
+     } else {
+         saved_stream_offset = pdfi_unread_tell(ctx);
+ 
+         if (entry->compressed) {
+             /* This is an object in a compressed object stream */
+             ctx->encryption.decrypt_strings = false;
+ 
+             code = pdfi_deref_compressed(ctx, obj, gen, object, entry, cache);
+             if (code < 0 || *object == NULL)
+                 goto error;
+         } else {
+             pdf_c_stream *SubFile_stream = NULL;
+ #if CACHE_STATISTICS
+             ctx->misses++;
+ #endif
+             ctx->encryption.decrypt_strings = true;
+ 
+             code = pdfi_seek(ctx, ctx->main_stream, entry->u.uncompressed.offset, SEEK_SET);
+             if (code < 0)
+                 goto error;
+ 
+-            code = pdfi_apply_SubFileDecode_filter(ctx, 0, "trailer", ctx->main_stream, &SubFile_stream, false);
+-            if (code < 0)
+-                goto error;
+-
+-            code = pdfi_read_object(ctx, SubFile_stream, entry->u.uncompressed.offset);
++            code = pdfi_read_object(ctx, ctx->main_stream, entry->u.uncompressed.offset);
+ 
+             /* pdfi_read_object() could do a repair, which would invalidate the xref and rebuild it.
+              * reload the xref entry to be certain it is valid.
+              */
+             entry = &ctx->xref_table->xref[obj];
+-
+-            pdfi_close_file(ctx, SubFile_stream);
+             if (code < 0) {
+                 int code1 = 0;
+                 if (entry->free) {
+                     dmprintf2(ctx->memory, "Dereference of free object %"PRIu64", next object number as offset failed (code = %d), returning NULL object.\n", entry->object_num, code);
+                     *object = PDF_NULL_OBJ;
+                     goto free_obj;
+                 }
+                 ctx->encryption.decrypt_strings = saved_decrypt_strings;
+                 (void)pdfi_seek(ctx, ctx->main_stream, saved_stream_offset, SEEK_SET);
+                 pdfi_pop(ctx, pdfi_count_stack(ctx) - stack_depth);
+ 
+                 code1 = pdfi_repair_file(ctx);
+                 if (code1 == 0)
+                     return pdfi_dereference_main(ctx, obj, gen, object, cache);
+                 /* Repair failed, just give up and return an error */
+                 return code;
+             }
+ 
+             if (pdfi_count_stack(ctx) > 0 &&
+                 (ctx->stack_top[-1] > PDF_TOKEN_AS_OBJ(TOKEN__LAST_KEY) &&
+                 (ctx->stack_top[-1])->object_num == obj)) {
+                 *object = ctx->stack_top[-1];
+                 pdfi_countup(*object);
+                 pdfi_pop(ctx, 1);
+                 if (pdfi_type_of(*object) == PDF_INDIRECT) {
+                     pdf_indirect_ref *iref = (pdf_indirect_ref *)*object;
+ 
+                     if (iref->ref_object_num == obj) {
+                         code = gs_note_error(gs_error_circular_reference);
+                         pdfi_countdown(*object);
+                         *object = NULL;
+                         goto error;
+                     }
+                 }
+                 if (cache) {
+                     code = pdfi_add_to_cache(ctx, *object);
+                     if (code < 0) {
+                         pdfi_countdown(*object);
+                         goto error;
+                     }
+                 }
+             } else {
+                 pdfi_pop(ctx, 1);
+                 if (entry->free) {
+                     dmprintf1(ctx->memory, "Dereference of free object %"PRIu64", next object number as offset failed, returning NULL object.\n", entry->object_num);
+                     *object = PDF_NULL_OBJ;
+                     return 0;
+                 }
+                 code = gs_note_error(gs_error_undefined);
+                 goto error;
+             }
+         }
+diff --git a/pdf/pdf_file.c b/pdf/pdf_file.c
+index b92d1cb86..95366fe01 100644
+--- a/pdf/pdf_file.c
++++ b/pdf/pdf_file.c
+@@ -1516,19 +1516,25 @@ void pdfi_close_file(pdf_context *ctx, pdf_c_stream *s)
+ 
+ int pdfi_seek(pdf_context *ctx, pdf_c_stream *s, gs_offset_t offset, uint32_t origin)
+ {
++    int code = 0;
++
+     if (origin == SEEK_CUR && s->unread_size != 0)
+         offset -= s->unread_size;
+ 
+     s->unread_size = 0;;
+ 
+-    return (sfseek(s->s, offset, origin));
++    code = sfseek(s->s, offset, origin);
++    if (s->eof && code >= 0)
++        s->eof = 0;
++
++    return code;
+ }
+ 
+ /* We use 'stell' sometimes to save the position of the underlying file
+  * when reading a compressed stream, so that we can return to the same
+  * point in the underlying file after performing some other operation. This
+  * allows us (for instance) to load a font while interpreting a content stream.
+  * However, if we've 'unread' any bytes we need to take that into account.
+  * NOTE! this is only going to be valid when performed on the main stream
+  * the original PDF file, not any compressed stream!
+  */

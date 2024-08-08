@@ -1,0 +1,178 @@
+commit 85cb417d37323a4eb059225e4f16dcd6d5abc9df
+Merge: 10f102d790 8360e9d6d1
+Author: Nikita Popov <nikita.ppv@gmail.com>
+Date:   Tue Oct 5 11:28:55 2021 +0200
+
+    Merge branch 'PHP-8.1'
+    
+    * PHP-8.1:
+      Fix COPY_TMP live range construction after optimization
+
+diff --git a/Zend/tests/coalesce_assign_optimization.phpt b/Zend/tests/coalesce_assign_optimization.phpt
+new file mode 100644
+index 0000000000..ff076b03e0
+--- /dev/null
++++ b/Zend/tests/coalesce_assign_optimization.phpt
+@@ -0,0 +1,17 @@
++--TEST--
++Live range construction should not break if colesce assign branch is optimized away
++--FILE--
++<?php
++function test() {
++    $a[X] ??= Y;
++    var_dump($a);
++}
++define('X', 1);
++define('Y', 2);
++test();
++?>
++--EXPECT--
++array(1) {
++  [1]=>
++  int(2)
++}
+diff --git a/Zend/zend_opcode.c b/Zend/zend_opcode.c
+index 38ba89db2b..ad41b9f699 100644
+--- a/Zend/zend_opcode.c
++++ b/Zend/zend_opcode.c
+@@ -686,132 +686,137 @@ static void emit_live_range_raw(
+ static void emit_live_range(
+ 		zend_op_array *op_array, uint32_t var_num, uint32_t start, uint32_t end,
+ 		zend_needs_live_range_cb needs_live_range) {
+ 	zend_op *def_opline = &op_array->opcodes[start], *orig_def_opline = def_opline;
+ 	zend_op *use_opline = &op_array->opcodes[end];
+ 	uint32_t kind;
+ 
+ 	switch (def_opline->opcode) {
+ 		/* These should never be the first def. */
+ 		case ZEND_ADD_ARRAY_ELEMENT:
+ 		case ZEND_ADD_ARRAY_UNPACK:
+ 		case ZEND_ROPE_ADD:
+ 			ZEND_UNREACHABLE();
+ 			return;
+ 		/* Result is boolean, it doesn't have to be destroyed. */
+ 		case ZEND_JMPZ_EX:
+ 		case ZEND_JMPNZ_EX:
+ 		case ZEND_BOOL:
+ 		case ZEND_BOOL_NOT:
+ 		/* Classes don't have to be destroyed. */
+ 		case ZEND_FETCH_CLASS:
+ 		case ZEND_DECLARE_ANON_CLASS:
+ 		/* FAST_CALLs don't have to be destroyed. */
+ 		case ZEND_FAST_CALL:
+ 			return;
+ 		case ZEND_BEGIN_SILENCE:
+ 			kind = ZEND_LIVE_SILENCE;
+ 			start++;
+ 			break;
+ 		case ZEND_ROPE_INIT:
+ 			kind = ZEND_LIVE_ROPE;
+ 			/* ROPE live ranges include the generating opcode. */
+ 			def_opline--;
+ 			break;
+ 		case ZEND_FE_RESET_R:
+ 		case ZEND_FE_RESET_RW:
+ 			kind = ZEND_LIVE_LOOP;
+ 			start++;
+ 			break;
+ 		/* Objects created via ZEND_NEW are only fully initialized
+ 		 * after the DO_FCALL (constructor call).
+ 		 * We are creating two live-ranges: ZEND_LINE_NEW for uninitialized
+ 		 * part, and ZEND_LIVE_TMPVAR for initialized.
+ 		 */
+ 		case ZEND_NEW:
+ 		{
+ 			int level = 0;
+ 			uint32_t orig_start = start;
+ 
+ 			while (def_opline + 1 < use_opline) {
+ 				def_opline++;
+ 				start++;
+ 				if (def_opline->opcode == ZEND_DO_FCALL) {
+ 					if (level == 0) {
+ 						break;
+ 					}
+ 					level--;
+ 				} else {
+ 					switch (def_opline->opcode) {
+ 						case ZEND_INIT_FCALL:
+ 						case ZEND_INIT_FCALL_BY_NAME:
+ 						case ZEND_INIT_NS_FCALL_BY_NAME:
+ 						case ZEND_INIT_DYNAMIC_CALL:
+ 						case ZEND_INIT_USER_CALL:
+ 						case ZEND_INIT_METHOD_CALL:
+ 						case ZEND_INIT_STATIC_METHOD_CALL:
+ 						case ZEND_NEW:
+ 							level++;
+ 							break;
+ 						case ZEND_DO_ICALL:
+ 						case ZEND_DO_UCALL:
+ 						case ZEND_DO_FCALL_BY_NAME:
+ 							level--;
+ 							break;
+ 					}
+ 				}
+ 			}
+ 			emit_live_range_raw(op_array, var_num, ZEND_LIVE_NEW, orig_start + 1, start + 1);
+ 			if (start + 1 == end) {
+ 				/* Trivial live-range, no need to store it. */
+ 				return;
+ 			}
+ 		}
+ 		ZEND_FALLTHROUGH;
+ 		default:
+ 			start++;
+ 			kind = ZEND_LIVE_TMPVAR;
+ 
+ 			/* Check hook to determine whether a live range is necessary,
+ 			 * e.g. based on type info. */
+ 			if (needs_live_range && !needs_live_range(op_array, orig_def_opline)) {
+ 				return;
+ 			}
+ 			break;
+ 		case ZEND_COPY_TMP:
+ 		{
+ 			/* COPY_TMP has a split live-range: One from the definition until the use in
+ 			 * "null" branch, and another from the start of the "non-null" branch to the
+ 			 * FREE opcode. */
+ 			uint32_t rt_var_num = EX_NUM_TO_VAR(op_array->last_var + var_num);
+-			zend_op *block_start_op = use_opline;
+-
+ 			if (needs_live_range && !needs_live_range(op_array, orig_def_opline)) {
+ 				return;
+ 			}
+ 
++			kind = ZEND_LIVE_TMPVAR;
++			if (use_opline->opcode != ZEND_FREE) {
++				/* This can happen if one branch of the coalesce has been optimized away.
++				 * In this case we should emit a normal live-range instead. */
++				break;
++			}
++
++			zend_op *block_start_op = use_opline;
+ 			while ((block_start_op-1)->opcode == ZEND_FREE) {
+ 				block_start_op--;
+ 			}
+ 
+-			kind = ZEND_LIVE_TMPVAR;
+ 			start = block_start_op - op_array->opcodes;
+ 			if (start != end) {
+ 				emit_live_range_raw(op_array, var_num, kind, start, end);
+ 			}
+ 
+ 			do {
+ 				use_opline--;
+ 			} while (!(
+ 				((use_opline->op1_type & (IS_TMP_VAR|IS_VAR)) && use_opline->op1.var == rt_var_num) ||
+ 				((use_opline->op2_type & (IS_TMP_VAR|IS_VAR)) && use_opline->op2.var == rt_var_num)
+ 			));
+ 
+ 			start = def_opline + 1 - op_array->opcodes;
+ 			end = use_opline - op_array->opcodes;
+ 			emit_live_range_raw(op_array, var_num, kind, start, end);
+ 			return;
+ 		}
+ 	}
+ 
+ 	emit_live_range_raw(op_array, var_num, kind, start, end);
+ }

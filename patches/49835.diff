@@ -1,0 +1,411 @@
+commit d931554f668186729bf290ed9afa6e9a4417328b
+Author: Vignesh Venkatasubramanian <vigneshv-at-google.com@ffmpeg.org>
+Date:   Thu Jul 28 11:25:16 2022 -0700
+
+    avformat/mov: Rework the AVIF parser to handle multiple items
+    
+    Stores the item ids of all the items found in the file and
+    processes the primary item at the end of the meta box. This patch
+    does not change any behavior. It sets up the code for parsing
+    alpha channel (and possibly images with 'grid') in follow up
+    patches.
+    
+    Reviewed-by: Andreas Rheinhardt <andreas.rheinhardt@outlook.com>
+    Signed-off-by: Vignesh Venkatasubramanian <vigneshv@google.com>
+    Signed-off-by: James Zern <jzern@google.com>
+
+diff --git a/libavformat/isom.h b/libavformat/isom.h
+index f05c2d9c28..9d8646d2ea 100644
+--- a/libavformat/isom.h
++++ b/libavformat/isom.h
+@@ -263,61 +263,67 @@ typedef struct MOVStreamContext {
+ typedef struct MOVContext {
+     const AVClass *class; ///< class for private options
+     AVFormatContext *fc;
+     int time_scale;
+     int64_t duration;     ///< duration of the longest track
+     int found_moov;       ///< 'moov' atom has been found
+     int found_mdat;       ///< 'mdat' atom has been found
+     int found_hdlr_mdta;  ///< 'hdlr' atom with type 'mdta' has been found
+     int trak_index;       ///< Index of the current 'trak'
+     char **meta_keys;
+     unsigned meta_keys_count;
+     DVDemuxContext *dv_demux;
+     AVFormatContext *dv_fctx;
+     int isom;             ///< 1 if file is ISO Media (mp4/3gp)
+     MOVFragment fragment; ///< current fragment in moof atom
+     MOVTrackExt *trex_data;
+     unsigned trex_count;
+     int itunes_metadata;  ///< metadata are itunes style
+     int handbrake_version;
+     int *chapter_tracks;
+     unsigned int nb_chapter_tracks;
+     int use_absolute_path;
+     int ignore_editlist;
+     int advanced_editlist;
+     int ignore_chapters;
+     int seek_individually;
+     int64_t next_root_atom; ///< offset of the next root atom
+     int export_all;
+     int export_xmp;
+     int *bitrates;          ///< bitrates read before streams creation
+     int bitrates_count;
+     int moov_retry;
+     int use_mfra_for;
+     int has_looked_for_mfra;
+     int use_tfdt;
+     MOVFragmentIndex frag_index;
+     int atom_depth;
+     unsigned int aax_mode;  ///< 'aax' file has been detected
+     uint8_t file_key[20];
+     uint8_t file_iv[20];
+     void *activation_bytes;
+     int activation_bytes_size;
+     void *audible_fixed_key;
+     int audible_fixed_key_size;
+     void *audible_key;
+     int audible_key_size;
+     void *audible_iv;
+     int audible_iv_size;
+     struct AVAES *aes_decrypt;
+     uint8_t *decryption_key;
+     int decryption_key_len;
+     int enable_drefs;
+     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
+     int have_read_mfra_size;
+     uint32_t mfra_size;
+     uint32_t max_stts_delta;
+     int is_still_picture_avif;
+     int primary_item_id;
++    struct {
++        int item_id;
++        int extent_length;
++        int64_t extent_offset;
++    } *avif_info;
++    int avif_info_size;
+ } MOVContext;
+ 
+ int ff_mp4_read_descr_len(AVIOContext *pb);
+diff --git a/libavformat/mov.c b/libavformat/mov.c
+index a09a762d91..6ee6ed0950 100644
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -4698,28 +4698,105 @@ static int mov_read_custom(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+     return ret;
+ }
+ 
++static int avif_add_stream(MOVContext *c, int item_id)
++{
++    MOVStreamContext *sc;
++    AVStream *st;
++    int item_index = -1;
++    for (int i = 0; i < c->avif_info_size; i++)
++        if (c->avif_info[i].item_id == item_id) {
++            item_index = i;
++            break;
++        }
++    if (item_index < 0)
++        return AVERROR_INVALIDDATA;
++    st = avformat_new_stream(c->fc, NULL);
++    if (!st)
++        return AVERROR(ENOMEM);
++    st->id = c->fc->nb_streams;
++    sc = av_mallocz(sizeof(MOVStreamContext));
++    if (!sc)
++        return AVERROR(ENOMEM);
++
++    st->priv_data = sc;
++    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
++    st->codecpar->codec_id = AV_CODEC_ID_AV1;
++    sc->ffindex = st->index;
++    c->trak_index = st->index;
++    st->avg_frame_rate.num = st->avg_frame_rate.den = 1;
++    st->time_base.num = st->time_base.den = 1;
++    st->nb_frames = 1;
++    sc->time_scale = 1;
++    sc = st->priv_data;
++    sc->pb = c->fc->pb;
++    sc->pb_is_copied = 1;
++
++    // Populate the necessary fields used by mov_build_index.
++    sc->stsc_count = 1;
++    sc->stsc_data = av_malloc_array(1, sizeof(*sc->stsc_data));
++    if (!sc->stsc_data)
++        return AVERROR(ENOMEM);
++    sc->stsc_data[0].first = 1;
++    sc->stsc_data[0].count = 1;
++    sc->stsc_data[0].id = 1;
++    sc->chunk_count = 1;
++    sc->chunk_offsets = av_malloc_array(1, sizeof(*sc->chunk_offsets));
++    if (!sc->chunk_offsets)
++        return AVERROR(ENOMEM);
++    sc->sample_count = 1;
++    sc->sample_sizes = av_malloc_array(1, sizeof(*sc->sample_sizes));
++    if (!sc->sample_sizes)
++        return AVERROR(ENOMEM);
++    sc->stts_count = 1;
++    sc->stts_data = av_malloc_array(1, sizeof(*sc->stts_data));
++    if (!sc->stts_data)
++        return AVERROR(ENOMEM);
++    sc->stts_data[0].count = 1;
++    // Not used for still images. But needed by mov_build_index.
++    sc->stts_data[0].duration = 0;
++    sc->sample_sizes[0] = c->avif_info[item_index].extent_length;
++    sc->chunk_offsets[0] = c->avif_info[item_index].extent_offset;
++
++    mov_build_index(c, st);
++    return 0;
++}
++
+ static int mov_read_meta(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+ {
+     while (atom.size > 8) {
+         uint32_t tag;
+         if (avio_feof(pb))
+             return AVERROR_EOF;
+         tag = avio_rl32(pb);
+         atom.size -= 4;
+         if (tag == MKTAG('h','d','l','r')) {
++            int ret;
+             avio_seek(pb, -8, SEEK_CUR);
+             atom.size += 8;
+-            return mov_read_default(c, pb, atom);
++            if ((ret = mov_read_default(c, pb, atom)) < 0)
++                return ret;
++            if (c->is_still_picture_avif) {
++                int ret;
++                // Add a stream for the YUV planes (primary item).
++                if ((ret = avif_add_stream(c, c->primary_item_id)) < 0)
++                    return ret;
++                // For still AVIF images, the meta box contains all the
++                // necessary information that would generally be provided by the
++                // moov box. So simply mark that we have found the moov box so
++                // that parsing can continue.
++                c->found_moov = 1;
++            }
++            return ret;
+         }
+     }
+     return 0;
+ }
+ 
+ // return 1 when matrix is identity, 0 otherwise
+ #define IS_MATRIX_IDENT(matrix)            \
+     ( (matrix)[0][0] == (1 << 16) &&       \
+       (matrix)[1][1] == (1 << 16) &&       \
+       (matrix)[2][2] == (1 << 30) &&       \
+      !(matrix)[0][1] && !(matrix)[0][2] && \
+      !(matrix)[1][0] && !(matrix)[1][2] && \
+      !(matrix)[2][0] && !(matrix)[2][1])
+@@ -7475,117 +7552,68 @@ static int mov_read_pitm(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+ static int mov_read_iloc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+ {
+     int version, offset_size, length_size, base_offset_size, index_size;
+     int item_count, extent_count;
+     uint64_t base_offset, extent_offset, extent_length;
+     uint8_t value;
+-    AVStream *st;
+-    MOVStreamContext *sc;
+ 
+     if (!c->is_still_picture_avif) {
+         // * For non-avif, we simply ignore the iloc box.
+         // * For animated avif, we don't care about the iloc box as all the
+         //   necessary information can be found in the moov box.
+         return 0;
+     }
+ 
+     if (c->fc->nb_streams) {
+         av_log(c->fc, AV_LOG_INFO, "Duplicate iloc box found\n");
+         return 0;
+     }
+ 
+-    st = avformat_new_stream(c->fc, NULL);
+-    if (!st)
+-        return AVERROR(ENOMEM);
+-    st->id = c->fc->nb_streams;
+-    sc = av_mallocz(sizeof(MOVStreamContext));
+-    if (!sc)
+-        return AVERROR(ENOMEM);
+-
+-    st->priv_data = sc;
+-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+-    st->codecpar->codec_id = AV_CODEC_ID_AV1;
+-    sc->ffindex = st->index;
+-    c->trak_index = st->index;
+-    st->avg_frame_rate.num = st->avg_frame_rate.den = 1;
+-    st->time_base.num = st->time_base.den = 1;
+-    st->nb_frames = 1;
+-    sc->time_scale = 1;
+-    sc = st->priv_data;
+-    sc->pb = c->fc->pb;
+-    sc->pb_is_copied = 1;
+-
+     version = avio_r8(pb);
+     avio_rb24(pb);  // flags.
+ 
+     value = avio_r8(pb);
+     offset_size = (value >> 4) & 0xF;
+     length_size = value & 0xF;
+     value = avio_r8(pb);
+     base_offset_size = (value >> 4) & 0xF;
+     index_size = !version ? 0 : (value & 0xF);
+     if (index_size) {
+         av_log(c->fc, AV_LOG_ERROR, "iloc: index_size != 0 not supported.\n");
+         return AVERROR_PATCHWELCOME;
+     }
+     item_count = (version < 2) ? avio_rb16(pb) : avio_rb32(pb);
+ 
+-    // Populate the necessary fields used by mov_build_index.
+-    sc->stsc_count = 1;
+-    sc->stsc_data = av_malloc_array(1, sizeof(*sc->stsc_data));
+-    if (!sc->stsc_data)
+-        return AVERROR(ENOMEM);
+-    sc->stsc_data[0].first = 1;
+-    sc->stsc_data[0].count = 1;
+-    sc->stsc_data[0].id = 1;
+-    sc->chunk_count = 1;
+-    sc->chunk_offsets = av_malloc_array(1, sizeof(*sc->chunk_offsets));
+-    if (!sc->chunk_offsets)
++    c->avif_info = av_malloc_array(item_count, sizeof(*c->avif_info));
++    if (!c->avif_info)
+         return AVERROR(ENOMEM);
+-    sc->sample_count = 1;
+-    sc->sample_sizes = av_malloc_array(1, sizeof(*sc->sample_sizes));
+-    if (!sc->sample_sizes)
+-        return AVERROR(ENOMEM);
+-    sc->stts_count = 1;
+-    sc->stts_data = av_malloc_array(1, sizeof(*sc->stts_data));
+-    if (!sc->stts_data)
+-        return AVERROR(ENOMEM);
+-    sc->stts_data[0].count = 1;
+-    // Not used for still images. But needed by mov_build_index.
+-    sc->stts_data[0].duration = 0;
++    c->avif_info_size = item_count;
+ 
+     for (int i = 0; i < item_count; i++) {
+         int item_id = (version < 2) ? avio_rb16(pb) : avio_rb32(pb);
+         if (avio_feof(pb))
+             return AVERROR_INVALIDDATA;
++        c->avif_info[i].item_id = item_id;
++
+         if (version > 0)
+             avio_rb16(pb);  // construction_method.
+         avio_rb16(pb);  // data_reference_index.
+         if (rb_size(pb, &base_offset, base_offset_size) < 0)
+             return AVERROR_INVALIDDATA;
+         extent_count = avio_rb16(pb);
+         if (extent_count > 1) {
+             // For still AVIF images, we only support one extent item.
+             av_log(c->fc, AV_LOG_ERROR, "iloc: extent_count > 1 not supported.\n");
+             return AVERROR_PATCHWELCOME;
+         }
+         for (int j = 0; j < extent_count; j++) {
+             if (rb_size(pb, &extent_offset, offset_size) < 0 ||
+                 rb_size(pb, &extent_length, length_size) < 0)
+                 return AVERROR_INVALIDDATA;
+-            if (item_id == c->primary_item_id) {
+-                sc->sample_sizes[0] = extent_length;
+-                sc->chunk_offsets[0] = base_offset + extent_offset;
+-            }
++            c->avif_info[i].extent_length = extent_length;
++            c->avif_info[i].extent_offset = base_offset + extent_offset;
+         }
+     }
+ 
+-    mov_build_index(c, st);
+-
+-    // For still AVIF images, the iloc box contains all the necessary
+-    // information that would generally be provided by the moov box. So simply
+-    // mark that we have found the moov box so that parsing can continue.
+-    c->found_moov = 1;
+-
+     return atom.size;
+ }
+ 
+@@ -8110,85 +8138,86 @@ static void mov_free_encryption_index(MOVEncryptionIndex **index) {
+ static int mov_read_close(AVFormatContext *s)
+ {
+     MOVContext *mov = s->priv_data;
+     int i, j;
+ 
+     for (i = 0; i < s->nb_streams; i++) {
+         AVStream *st = s->streams[i];
+         MOVStreamContext *sc = st->priv_data;
+ 
+         if (!sc)
+             continue;
+ 
+         av_freep(&sc->ctts_data);
+         for (j = 0; j < sc->drefs_count; j++) {
+             av_freep(&sc->drefs[j].path);
+             av_freep(&sc->drefs[j].dir);
+         }
+         av_freep(&sc->drefs);
+ 
+         sc->drefs_count = 0;
+ 
+         if (!sc->pb_is_copied)
+             ff_format_io_close(s, &sc->pb);
+ 
+         sc->pb = NULL;
+         av_freep(&sc->chunk_offsets);
+         av_freep(&sc->stsc_data);
+         av_freep(&sc->sample_sizes);
+         av_freep(&sc->keyframes);
+         av_freep(&sc->stts_data);
+         av_freep(&sc->sdtp_data);
+         av_freep(&sc->stps_data);
+         av_freep(&sc->elst_data);
+         av_freep(&sc->rap_group);
+         av_freep(&sc->sync_group);
+         av_freep(&sc->sgpd_sync);
+         av_freep(&sc->sample_offsets);
+         av_freep(&sc->open_key_samples);
+         av_freep(&sc->display_matrix);
+         av_freep(&sc->index_ranges);
+ 
+         if (sc->extradata)
+             for (j = 0; j < sc->stsd_count; j++)
+                 av_free(sc->extradata[j]);
+         av_freep(&sc->extradata);
+         av_freep(&sc->extradata_size);
+ 
+         mov_free_encryption_index(&sc->cenc.encryption_index);
+         av_encryption_info_free(sc->cenc.default_encrypted_sample);
+         av_aes_ctr_free(sc->cenc.aes_ctr);
+ 
+         av_freep(&sc->stereo3d);
+         av_freep(&sc->spherical);
+         av_freep(&sc->mastering);
+         av_freep(&sc->coll);
+     }
+ 
+     av_freep(&mov->dv_demux);
+     avformat_free_context(mov->dv_fctx);
+     mov->dv_fctx = NULL;
+ 
+     if (mov->meta_keys) {
+         for (i = 1; i < mov->meta_keys_count; i++) {
+             av_freep(&mov->meta_keys[i]);
+         }
+         av_freep(&mov->meta_keys);
+     }
+ 
+     av_freep(&mov->trex_data);
+     av_freep(&mov->bitrates);
+ 
+     for (i = 0; i < mov->frag_index.nb_items; i++) {
+         MOVFragmentStreamInfo *frag = mov->frag_index.item[i].stream_info;
+         for (j = 0; j < mov->frag_index.item[i].nb_stream_info; j++) {
+             mov_free_encryption_index(&frag[j].encryption_index);
+         }
+         av_freep(&mov->frag_index.item[i].stream_info);
+     }
+     av_freep(&mov->frag_index.item);
+ 
+     av_freep(&mov->aes_decrypt);
+     av_freep(&mov->chapter_tracks);
++    av_freep(&mov->avif_info);
+ 
+     return 0;
+ }

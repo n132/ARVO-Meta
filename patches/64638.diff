@@ -1,0 +1,111 @@
+commit bb40f2ac075e5605970f159f5438dc001a92f9f3
+Author: Richard Patel <me@terorie.dev>
+Date:   Sat Dec 2 03:46:33 2023 +0100
+
+    Fix security issues in coff plugin ##bin
+    
+    - Fix out-of-bounds read in XCOFF ldsym handling
+    - Fix unbounded memory allocation in (X)COFF section handling
+
+diff --git a/libr/bin/format/coff/coff.c b/libr/bin/format/coff/coff.c
+index 84d3cce0c9..476bd6e591 100644
+--- a/libr/bin/format/coff/coff.c
++++ b/libr/bin/format/coff/coff.c
+@@ -302,25 +302,26 @@ static bool r_bin_xcoff_init_ldhdr(RBinCoffObj *obj) {
+ static bool r_bin_xcoff_init_ldsyms(RBinCoffObj *obj) {
+ 	int ret;
+ 	size_t size;
+-	ut64 offset = obj->scn_hdrs[obj->x_opt_hdr.o_snloader-1].s_scnptr + sizeof (struct xcoff32_ldhdr);
++	ut64 offset;
+ 	if (!obj->x_ldhdr.l_nsyms) {
+ 		return true;
+ 	}
++	offset = obj->scn_hdrs[obj->x_opt_hdr.o_snloader-1].s_scnptr + sizeof (struct xcoff32_ldhdr);
+ 	if (obj->x_ldhdr.l_nsyms >= 0xffff) { // too much symbols, probably not allocatable
+ 		R_LOG_DEBUG ("too many loader symbols (%u)", obj->x_ldhdr.l_nsyms);
+ 		return false;
+ 	}
+ 	// USHORT_MAX * 24UL cannot overflow size_t
+ 	size = obj->x_ldhdr.l_nsyms * sizeof (struct xcoff32_ldsym);
+ 	obj->x_ldsyms = calloc (1, size);
+ 	if (!obj->x_ldsyms) {
+ 		return false;
+ 	}
+ 	ret = r_buf_fread_at (obj->b, offset, (ut8 *)obj->x_ldsyms, "8cIS2c2I", obj->x_ldhdr.l_nsyms);
+ 	if (ret != size) {
+ 		R_LOG_DEBUG ("failed to read loader symbol table (%lu, %lu)", ret, size);
+ 		R_FREE (obj->x_ldsyms);
+ 		return false;
+ 	}
+ 	return true;
+ }
+diff --git a/libr/bin/p/bin_coff.c b/libr/bin/p/bin_coff.c
+index d0e7ce571a..63c8c128dc 100644
+--- a/libr/bin/p/bin_coff.c
++++ b/libr/bin/p/bin_coff.c
+@@ -238,6 +238,25 @@ static const char *xcoff_section_type_tostring(int i) {
+ 	return NULL;
+ }
+ 
++// XXX: This should probably be generic
++static void truncate_section(RBinSection *ptr, const struct r_bin_coff_obj *obj) {
++	// The section size might exceed the binary size, which causes
++	// DoS problems via unbounded memory allocations.  Thus, truncate
++	// section size.
++	ut64 file_start = (ut64)ptr->paddr;
++	ut64 file_end = file_start + (ut64)ptr->size;
++	// file_end in [0,2^33) as both arguments in [0,2^32), thus no overflow.
++	if (R_UNLIKELY (file_start > obj->size)) {
++		R_LOG_WARN ("File range of section \"%s\" is fully out of bounds (%#" PRIx64 "..%#" PRIx64 "), but file size is %#" PRIx64 ")",
++			    ptr->name, file_start, file_end);
++		ptr->size = 0;
++	} else if (R_UNLIKELY (file_end > obj->size)) {
++		R_LOG_WARN ("File range of section \"%s\" is partially out of bounds (%#" PRIx64 "..%#" PRIx64 "), but file size is %#" PRIx64 ")",
++			    ptr->name, file_start, file_end, obj->size);
++		ptr->size = obj->size - file_start;
++	}
++}
++
+ static void coff_section(RBinSection *ptr, const struct r_bin_coff_obj *obj, size_t i) {
+ 	if (strstr (ptr->name, "data")) {
+ 		ptr->is_data = true;
+@@ -283,36 +302,37 @@ static void xcoff_section(RBinSection *ptr, const struct r_bin_coff_obj *obj, si
+ static RList *sections(RBinFile *bf) {
+ 	char *tmp = NULL;
+ 	size_t i;
+ 	RBinSection *ptr = NULL;
+ 	struct r_bin_coff_obj *obj = (struct r_bin_coff_obj*)bf->bo->bin_obj;
+ 
+ 	RList *ret = r_list_newf ((RListFree)r_bin_section_free);
+ 	if (!ret) {
+ 		return NULL;
+ 	}
+ 	if (obj && obj->scn_hdrs) {
+ 		for (i = 0; i < obj->hdr.f_nscns; i++) {
+ 			tmp = r_coff_symbol_name (obj, &obj->scn_hdrs[i]);
+ 			if (!tmp) {
+ 				r_list_free (ret);
+ 				return NULL;
+ 			}
+ 			//IO does not like sections with the same name append idx
+ 			//since it will update it
+ 			ptr = R_NEW0 (RBinSection);
+ 			if (!ptr) {
+ 				free (tmp);
+ 				return ret;
+ 			}
+ 			ptr->name = r_str_newf ("%s-%u", tmp, (unsigned int)i);
+ 			free (tmp);
+ 			if (obj->xcoff) {
+-				xcoff_section(ptr, obj, i);
++				xcoff_section (ptr, obj, i);
+ 			} else {
+-				coff_section(ptr, obj, i);
++				coff_section (ptr, obj, i);
+ 			}
++			truncate_section (ptr, obj);
+ 			r_list_append (ret, ptr);
+ 		}
+ 	}
+ 	return ret;
+ }

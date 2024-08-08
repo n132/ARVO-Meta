@@ -1,0 +1,302 @@
+commit 86658df5d29308d66ddead03f1112442df04ec27
+Author: Behdad Esfahbod <behdad@behdad.org>
+Date:   Fri May 5 16:10:46 2023 -0600
+
+    [ClassDef] Fix a fuzzer issue
+    
+    Don't qsort an array that failed to allocate!
+    
+    Fixes https://oss-fuzz.com/testcase-detail/6512559172485120
+
+diff --git a/src/hb-ot-layout-common.hh b/src/hb-ot-layout-common.hh
+index 2c9e75914..7439d528e 100644
+--- a/src/hb-ot-layout-common.hh
++++ b/src/hb-ot-layout-common.hh
+@@ -1739,285 +1739,287 @@ template <typename Types>
+ struct ClassDefFormat2_4
+ {
+   friend struct ClassDef;
+ 
+   private:
+   unsigned int get_class (hb_codepoint_t glyph_id) const
+   {
+     return rangeRecord.bsearch (glyph_id).value;
+   }
+ 
+   unsigned get_population () const
+   {
+     typename Types::large_int ret = 0;
+     for (const auto &r : rangeRecord)
+       ret += r.get_population ();
+     return ret > UINT_MAX ? UINT_MAX : (unsigned) ret;
+   }
+ 
+   template<typename Iterator,
+ 	   hb_requires (hb_is_sorted_source_of (Iterator, hb_codepoint_t))>
+   bool serialize (hb_serialize_context_t *c,
+ 		  Iterator it)
+   {
+     TRACE_SERIALIZE (this);
+     if (unlikely (!c->extend_min (this))) return_trace (false);
+ 
+     if (unlikely (!it))
+     {
+       classFormat = 2;
+       rangeRecord.len = 0;
+       return_trace (true);
+     }
+ 
+     unsigned num_ranges = 1;
+     hb_codepoint_t prev_gid = (*it).first;
+     unsigned prev_klass = (*it).second;
+ 
+     RangeRecord<Types> range_rec;
+     range_rec.first = prev_gid;
+     range_rec.last = prev_gid;
+     range_rec.value = prev_klass;
+ 
+     auto *record = c->copy (range_rec);
+     if (unlikely (!record)) return_trace (false);
+ 
+     for (const auto gid_klass_pair : + (++it))
+     {
+       hb_codepoint_t cur_gid = gid_klass_pair.first;
+       unsigned cur_klass = gid_klass_pair.second;
+ 
+       if (cur_gid != prev_gid + 1 ||
+ 	  cur_klass != prev_klass)
+       {
+ 	if (unlikely (!record)) break;
+ 	record->last = prev_gid;
+ 	num_ranges++;
+ 
+ 	range_rec.first = cur_gid;
+ 	range_rec.last = cur_gid;
+ 	range_rec.value = cur_klass;
+ 
+ 	record = c->copy (range_rec);
+       }
+ 
+       prev_klass = cur_klass;
+       prev_gid = cur_gid;
+     }
+ 
++    if (unlikely (c->in_error ())) return_trace (false);
++
+     if (likely (record)) record->last = prev_gid;
+     rangeRecord.len = num_ranges;
+     rangeRecord.as_array ().qsort (RangeRecord<Types>::cmp_range); // To handle unsorted glyph order.
+ 
+     return_trace (true);
+   }
+ 
+   bool subset (hb_subset_context_t *c,
+ 	       hb_map_t *klass_map = nullptr /*OUT*/,
+                bool keep_empty_table = true,
+                bool use_class_zero = true,
+                const Coverage* glyph_filter = nullptr) const
+   {
+     TRACE_SUBSET (this);
+     const hb_map_t &glyph_map = c->plan->glyph_map_gsub;
+     const hb_set_t &glyph_set = *c->plan->glyphset_gsub ();
+ 
+     hb_sorted_vector_t<hb_pair_t<hb_codepoint_t, hb_codepoint_t>> glyph_and_klass;
+     hb_set_t orig_klasses;
+ 
+     if (glyph_set.get_population () * hb_bit_storage ((unsigned) rangeRecord.len) / 2
+ 	< get_population ())
+     {
+       for (hb_codepoint_t g : glyph_set)
+       {
+ 	unsigned klass = get_class (g);
+ 	if (!klass) continue;
+ 	hb_codepoint_t new_gid = glyph_map[g];
+ 	if (new_gid == HB_MAP_VALUE_INVALID) continue;
+ 	if (glyph_filter && !glyph_filter->has (g)) continue;
+ 	glyph_and_klass.push (hb_pair (new_gid, klass));
+ 	orig_klasses.add (klass);
+       }
+     }
+     else
+     {
+       unsigned num_source_glyphs = c->plan->source->get_num_glyphs ();
+       for (auto &range : rangeRecord)
+       {
+ 	unsigned klass = range.value;
+ 	if (!klass) continue;
+ 	hb_codepoint_t start = range.first;
+ 	hb_codepoint_t end   = hb_min (range.last + 1, num_source_glyphs);
+ 	for (hb_codepoint_t g = start; g < end; g++)
+ 	{
+ 	  hb_codepoint_t new_gid = glyph_map[g];
+ 	  if (new_gid == HB_MAP_VALUE_INVALID) continue;
+ 	  if (glyph_filter && !glyph_filter->has (g)) continue;
+ 
+ 	  glyph_and_klass.push (hb_pair (new_gid, klass));
+ 	  orig_klasses.add (klass);
+ 	}
+       }
+     }
+ 
+     const hb_set_t& glyphset = *c->plan->glyphset_gsub ();
+     unsigned glyph_count = glyph_filter
+                            ? hb_len (hb_iter (glyphset) | hb_filter (glyph_filter))
+                            : glyph_map.get_population ();
+     use_class_zero = use_class_zero && glyph_count <= glyph_and_klass.length;
+     if (!ClassDef_remap_and_serialize (c->serializer,
+                                        orig_klasses,
+                                        use_class_zero,
+                                        glyph_and_klass,
+                                        klass_map))
+       return_trace (false);
+     return_trace (keep_empty_table || (bool) glyph_and_klass);
+   }
+ 
+   bool sanitize (hb_sanitize_context_t *c) const
+   {
+     TRACE_SANITIZE (this);
+     return_trace (rangeRecord.sanitize (c));
+   }
+ 
+   unsigned cost () const { return hb_bit_storage ((unsigned) rangeRecord.len); /* bsearch cost */ }
+ 
+   template <typename set_t>
+   bool collect_coverage (set_t *glyphs) const
+   {
+     for (auto &range : rangeRecord)
+       if (range.value)
+ 	if (unlikely (!range.collect_coverage (glyphs)))
+ 	  return false;
+     return true;
+   }
+ 
+   template <typename set_t>
+   bool collect_class (set_t *glyphs, unsigned int klass) const
+   {
+     for (auto &range : rangeRecord)
+     {
+       if (range.value == klass)
+ 	if (unlikely (!range.collect_coverage (glyphs)))
+ 	  return false;
+     }
+     return true;
+   }
+ 
+   bool intersects (const hb_set_t *glyphs) const
+   {
+     if (rangeRecord.len > glyphs->get_population () * hb_bit_storage ((unsigned) rangeRecord.len) / 2)
+     {
+       for (hb_codepoint_t g = HB_SET_VALUE_INVALID; glyphs->next (&g);)
+         if (get_class (g))
+ 	  return true;
+       return false;
+     }
+ 
+     return hb_any (+ hb_iter (rangeRecord)
+                    | hb_map ([glyphs] (const RangeRecord<Types> &range) { return range.intersects (*glyphs) && range.value; }));
+   }
+   bool intersects_class (const hb_set_t *glyphs, uint16_t klass) const
+   {
+     if (klass == 0)
+     {
+       /* Match if there's any glyph that is not listed! */
+       hb_codepoint_t g = HB_SET_VALUE_INVALID;
+       for (auto &range : rangeRecord)
+       {
+ 	if (!glyphs->next (&g))
+ 	  break;
+ 	if (g < range.first)
+ 	  return true;
+ 	g = range.last;
+       }
+       if (g != HB_SET_VALUE_INVALID && glyphs->next (&g))
+ 	return true;
+       /* Fall through. */
+     }
+     for (const auto &range : rangeRecord)
+       if (range.value == klass && range.intersects (*glyphs))
+ 	return true;
+     return false;
+   }
+ 
+   void intersected_class_glyphs (const hb_set_t *glyphs, unsigned klass, hb_set_t *intersect_glyphs) const
+   {
+     if (klass == 0)
+     {
+       hb_codepoint_t g = HB_SET_VALUE_INVALID;
+       for (auto &range : rangeRecord)
+       {
+ 	if (!glyphs->next (&g))
+ 	  goto done;
+ 	while (g < range.first)
+ 	{
+ 	  intersect_glyphs->add (g);
+ 	  if (!glyphs->next (&g))
+ 	    goto done;
+         }
+         g = range.last;
+       }
+       while (glyphs->next (&g))
+ 	intersect_glyphs->add (g);
+       done:
+ 
+       return;
+     }
+ 
+     unsigned count = rangeRecord.len;
+     if (count > glyphs->get_population () * hb_bit_storage (count) * 8)
+     {
+       for (hb_codepoint_t g = HB_SET_VALUE_INVALID;
+ 	   glyphs->next (&g);)
+       {
+         unsigned i;
+         if (rangeRecord.as_array ().bfind (g, &i) &&
+ 	    rangeRecord.arrayZ[i].value == klass)
+ 	  intersect_glyphs->add (g);
+       }
+       return;
+     }
+ 
+     for (auto &range : rangeRecord)
+     {
+       if (range.value != klass) continue;
+ 
+       unsigned end = range.last + 1;
+       for (hb_codepoint_t g = range.first - 1;
+ 	   glyphs->next (&g) && g < end;)
+ 	intersect_glyphs->add (g);
+     }
+   }
+ 
+   void intersected_classes (const hb_set_t *glyphs, hb_set_t *intersect_classes) const
+   {
+     if (glyphs->is_empty ()) return;
+ 
+     hb_codepoint_t g = HB_SET_VALUE_INVALID;
+     for (auto &range : rangeRecord)
+     {
+       if (!glyphs->next (&g))
+         break;
+       if (g < range.first)
+       {
+         intersect_classes->add (0);
+         break;
+       }
+       g = range.last;
+     }
+     if (g != HB_SET_VALUE_INVALID && glyphs->next (&g))
+       intersect_classes->add (0);
+ 
+     for (const auto& range : rangeRecord)
+       if (range.intersects (*glyphs))
+         intersect_classes->add (range.value);
+   }
+ 
+   protected:
+   HBUINT16	classFormat;	/* Format identifier--format = 2 */
+   typename Types::template SortedArrayOf<RangeRecord<Types>>
+ 		rangeRecord;	/* Array of glyph ranges--ordered by
+ 				 * Start GlyphID */
+   public:
+   DEFINE_SIZE_ARRAY (2 + Types::size, rangeRecord);
+ };

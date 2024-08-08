@@ -1,0 +1,341 @@
+commit 6fd0c14775db5d10563f8b0401ee9f3f6bd29310
+Author: Chris Liddell <chris.liddell@artifex.com>
+Date:   Tue Jul 5 12:56:22 2022 +0100
+
+    oss-fuzz 48745: Don't free font data unless FAPI owns it.
+
+diff --git a/base/fapi_ft.c b/base/fapi_ft.c
+index 1d04bb309..267d57df4 100644
+--- a/base/fapi_ft.c
++++ b/base/fapi_ft.c
+@@ -1127,328 +1127,329 @@ static gs_fapi_retcode
+ gs_fapi_ft_get_scaled_font(gs_fapi_server * a_server, gs_fapi_font * a_font,
+                 const gs_fapi_font_scale * a_font_scale,
+                 const char *a_map, gs_fapi_descendant_code a_descendant_code)
+ {
+     ff_server *s = (ff_server *) a_server;
+     ff_face *face = (ff_face *) a_font->server_font_data;
+     FT_Error ft_error = 0;
+     int i, j, code;
+     FT_CharMap cmap = NULL;
+     bool data_owned = true;
+ 
+     if (s->bitmap_glyph) {
+         FT_Bitmap_Done(s->freetype_library, &s->bitmap_glyph->bitmap);
+         FF_free(s->ftmemory, s->bitmap_glyph);
+         s->bitmap_glyph = NULL;
+     }
+     if (s->outline_glyph) {
+         FT_Outline_Done(s->freetype_library, &s->outline_glyph->outline);
+         FF_free(s->ftmemory, s->outline_glyph);
+         s->outline_glyph = NULL;
+     }
+ 
+     /* dpf("gs_fapi_ft_get_scaled_font enter: is_type1=%d is_cid=%d font_file_path='%s' a_descendant_code=%d\n",
+        a_font->is_type1, a_font->is_cid, a_font->font_file_path ? a_font->font_file_path : "", a_descendant_code); */
+ 
+     /* If this font is the top level font of an embedded CID type 0 font (font type 9)
+      * do nothing. See the comment in FAPI_prepare_font. The descendant fonts are
+      * passed in individually.
+      */
+     if (a_font->is_cid && a_font->is_type1 && a_font->font_file_path == NULL
+         && (a_descendant_code == gs_fapi_toplevel_begin
+             || a_descendant_code == gs_fapi_toplevel_complete)) {
+         /* dpf("gs_fapi_ft_get_scaled_font return 0\n"); */
+         return 0;
+     }
+ 
+     /* Create the face if it doesn't already exist. */
+     if (!face) {
+         FT_Face ft_face = NULL;
+         FT_Parameter ft_param;
+         FT_Incremental_InterfaceRec *ft_inc_int = NULL;
+         unsigned char *own_font_data = NULL;
+         int own_font_data_len = -1;
+         FT_Stream ft_strm = NULL;
+ 
+         /* dpf("gs_fapi_ft_get_scaled_font creating face\n"); */
+ 
+         if (a_font->full_font_buf) {
+ 
+             own_font_data =
+                 gs_malloc(((gs_memory_t *) (s->ftmemory->user)),
+                           a_font->full_font_buf_len, 1,
+                           "gs_fapi_ft_get_scaled_font - full font buf");
+             if (!own_font_data) {
+                 return_error(gs_error_VMerror);
+             }
+ 
+             own_font_data_len = a_font->full_font_buf_len;
+             memcpy(own_font_data, a_font->full_font_buf,
+                    a_font->full_font_buf_len);
+ 
+             ft_error =
+                 FT_New_Memory_Face(s->freetype_library,
+                                    (const FT_Byte *)own_font_data,
+                                    own_font_data_len, a_font->subfont,
+                                    &ft_face);
+ 
+             if (ft_error) {
+                 gs_memory_t * mem = (gs_memory_t *) s->ftmemory->user;
+                 gs_free(mem, own_font_data, 0, 0, "FF_open_read_stream");
+                 return ft_to_gs_error(ft_error);
+             }
+         }
+         /* Load a typeface from a file. */
+         else if (a_font->font_file_path) {
+             FT_Open_Args args;
+ 
+             memset(&args, 0x00, sizeof(args));
+ 
+             if ((code =
+                  FF_open_read_stream((gs_memory_t *) (s->ftmemory->user),
+                                      (char *)a_font->font_file_path,
+                                      &ft_strm)) < 0) {
+                 return (code);
+             }
+ 
+             args.flags = FT_OPEN_STREAM;
+             args.stream = ft_strm;
+ 
+             ft_error =
+                 FT_Open_Face(s->freetype_library, &args, a_font->subfont,
+                              &ft_face);
+             if (ft_error) {
+                 /* in the event of an error, Freetype should cleanup the stream */
+                 return ft_to_gs_error(ft_error);
+             }
+         }
+ 
+         /* Load a typeface from a representation in GhostScript's memory. */
+         else {
+             FT_Open_Args open_args;
+ 
+             open_args.flags = FT_OPEN_MEMORY;
+             open_args.stream = NULL;
+ 
+             if (a_font->is_type1) {
+                 long length;
+                 unsigned short type = 0;
+ 
+                 code = a_font->get_word(a_font, gs_fapi_font_feature_FontType, 0, &type);
+                 if (code < 0) {
+                     return code;
+                 }
+ 
+                 /* Tell the FAPI interface that we need to decrypt the /Subrs data. */
+                 a_font->need_decrypt = true;
+ 
+                 /*
+                    Serialise a type 1 font in PostScript source form, or
+                    a Type 2 font in binary form, so that FreeType can read it.
+                  */
+                 if (type == 1)
+                     length = gs_fapi_serialize_type1_font(a_font, NULL, 0);
+                 else
+                     length = gs_fapi_serialize_type2_font(a_font, NULL, 0);
+ 
+                 open_args.memory_base = own_font_data =
+                     FF_alloc(s->ftmemory, length);
+                 if (!open_args.memory_base)
+                     return_error(gs_error_VMerror);
+                 own_font_data_len = length;
+                 if (type == 1)
+                     open_args.memory_size =
+                         gs_fapi_serialize_type1_font(a_font, own_font_data, length);
+                 else
+                     open_args.memory_size =
+                         gs_fapi_serialize_type2_font(a_font, own_font_data, length);
+ 
+                 if (open_args.memory_size != length)
+                     return_error(gs_error_unregistered);        /* Must not happen. */
+ 
+                 ft_inc_int = new_inc_int(a_server, a_font);
+                 if (!ft_inc_int) {
+                     FF_free(s->ftmemory, own_font_data);
+                     return_error(gs_error_VMerror);
+                 }
+             }
+ 
+             /* It must be type 42 (see code in FAPI_FF_get_glyph in zfapi.c). */
+             else {
+                 /* Get the length of the TrueType data. */
+                 unsigned long ms;
+ 
+                 if (a_font->retrieve_tt_font != NULL) {
+                     code = a_font->retrieve_tt_font(a_font, &own_font_data, &ms);
+                     if (code == 0) {
+                         data_owned = false;
+                         open_args.memory_base = own_font_data;
+                         open_args.memory_size = own_font_data_len = ms;
+                     }
+                 }
+                 else
+                     code = gs_error_unregistered;
+ 
+                 if (code < 0) {
+                     code = a_font->get_long(a_font, gs_fapi_font_feature_TT_size, 0, &ms);
+                     if (code < 0)
+                         return code;
+                     if (ms == 0)
+                         return_error(gs_error_invalidfont);
+ 
+                     open_args.memory_size = (FT_Long)ms;
+ 
+                     /* Load the TrueType data into a single buffer. */
+                     open_args.memory_base = own_font_data =
+                         FF_alloc(s->ftmemory, open_args.memory_size);
+                     if (!own_font_data)
+                         return_error(gs_error_VMerror);
+ 
+                     own_font_data_len = open_args.memory_size;
+ 
+                     code = a_font->serialize_tt_font(a_font, own_font_data,
+                                           open_args.memory_size);
+                     if (code < 0)
+                         return code;
+                 }
+ 
+                 /* We always load incrementally. */
+                 ft_inc_int = new_inc_int(a_server, a_font);
+                 if (!ft_inc_int) {
+                     FF_free(s->ftmemory, own_font_data);
+                     return_error(gs_error_VMerror);
+                 }
+             }
+ 
+             if (ft_inc_int) {
+                 open_args.flags =
+                     (FT_UInt) (open_args.flags | FT_OPEN_PARAMS);
+                 ft_param.tag = FT_PARAM_TAG_INCREMENTAL;
+                 ft_param.data = ft_inc_int;
+                 open_args.num_params = 1;
+                 open_args.params = &ft_param;
+             }
+             ft_error =
+                 FT_Open_Face(s->freetype_library, &open_args, a_font->subfont,
+                              &ft_face);
+             if (ft_error) {
+                 delete_inc_int (a_server, ft_inc_int);
+-                FF_free(s->ftmemory, own_font_data);
++                if (data_owned)
++                    FF_free(s->ftmemory, own_font_data);
+                 return ft_to_gs_error(ft_error);
+             }
+         }
+ 
+         if (ft_face) {
+             face =
+                 new_face(a_server, ft_face, ft_inc_int, ft_strm,
+                          own_font_data, own_font_data_len, data_owned);
+             if (!face) {
+                 FF_free(s->ftmemory, own_font_data);
+                 FT_Done_Face(ft_face);
+                 delete_inc_int(a_server, ft_inc_int);
+                 return_error(gs_error_VMerror);
+             }
+             a_font->server_font_data = face;
+ 
+             if (!a_font->is_type1) {
+                 for (i = 0; i < GS_FAPI_NUM_TTF_CMAP_REQ && !cmap; i++) {
+                     if (a_font->ttf_cmap_req[i].platform_id > 0) {
+                         for (j = 0; j < face->ft_face->num_charmaps; j++) {
+                             if (FT_Get_CMap_Format(face->ft_face->charmaps[j]) >= 0
+                              && face->ft_face->charmaps[j]->platform_id == a_font->ttf_cmap_req[i].platform_id
+                              && face->ft_face->charmaps[j]->encoding_id == a_font->ttf_cmap_req[i].encoding_id) {
+ 
+                                 cmap = face->ft_face->charmaps[j];
+                                 break;
+                             }
+                         }
+                     }
+                     else {
+                         break;
+                     }
+                 }
+                 if (cmap) {
+                     (void)FT_Set_Charmap(face->ft_face, cmap);
+                 }
+                 else if (a_font->full_font_buf != NULL || a_font->font_file_path != NULL) {
+                     /* If we've passed a complete TTF to Freetype, but *haven't* requested a
+                      * specific cmap table above, try to use a Unicode one
+                      * If that doesn't work, just leave the default in place.
+                      */
+                     (void)FT_Select_Charmap(face->ft_face, ft_encoding_unicode);
+                 }
+                 /* For PDF, we have to know which cmap table actually was selected */
+                 if (face->ft_face->charmap != NULL) {
+                     a_font->ttf_cmap_selected.platform_id = face->ft_face->charmap->platform_id;
+                     a_font->ttf_cmap_selected.encoding_id = face->ft_face->charmap->encoding_id;
+                 }
+                 else {
+                     /* Just in case */
+                     a_font->ttf_cmap_selected.platform_id = -1;
+                     a_font->ttf_cmap_selected.encoding_id = -1;
+                 }
+             }
+             else {
+                 /* Just in case */
+                 a_font->ttf_cmap_selected.platform_id = -1;
+                 a_font->ttf_cmap_selected.encoding_id = -1;
+             }
+         }
+         else
+             a_font->server_font_data = NULL;
+     }
+ 
+     /* Set the point size and transformation.
+      * The matrix is scaled by the shift specified in the server, 16,
+      * so we divide by 65536 when converting to a gs_matrix.
+      */
+     if (face) {
+         /* Convert the GS transform into an FT transform.
+          * Ignore the translation elements because they contain very large values
+          * derived from the current transformation matrix and so are of no use.
+          */
+         face->ft_transform.xx = a_font_scale->matrix[0];
+         face->ft_transform.xy = a_font_scale->matrix[2];
+         face->ft_transform.yx = a_font_scale->matrix[1];
+         face->ft_transform.yy = a_font_scale->matrix[3];
+ 
+         face->horz_res = a_font_scale->HWResolution[0] >> 16;
+         face->vert_res = a_font_scale->HWResolution[1] >> 16;
+ 
+         /* Split the transform into scale factors and a rotation-and-shear
+          * transform.
+          */
+         transform_decompose(&face->ft_transform, &face->horz_res,
+                             &face->vert_res, &face->width, &face->height, face->ft_face->units_per_EM);
+ 
+         ft_error = FT_Set_Char_Size(face->ft_face, face->width, face->height,
+                                     face->horz_res, face->vert_res);
+ 
+         if (ft_error) {
+             /* The code originally cleaned up the face data here, but the "top level"
+                font object still has references to the face data, and we've no way
+                to tell it it's gone. So we defer releasing the data until the garbage
+                collector collects the font object, and the font's finalize call will
+                free the data correctly for us.
+              */
+             return ft_to_gs_error(ft_error);
+         }
+ 
+         /* Concatenate the transform to a reflection around (y=0) so that it
+          * produces a glyph that is upside down in FreeType terms, with its
+          * first row at the bottom. That is what GhostScript needs.
+          */
+ 
+         FT_Set_Transform(face->ft_face, &face->ft_transform, NULL);
+ 
+     }
+ 
+     /* dpf("gs_fapi_ft_get_scaled_font return %d\n", a_font->server_font_data ? 0 : -1); */
+     return a_font->server_font_data ? 0 : -1;
+ }
+ 
+ /*
+  * Return the name of a resource which maps names to character codes. Do this
+  * by setting a_decoding_id to point to a null-terminated string. The resource
+  * is in the 'decoding' directory in the directory named by /GenericResourceDir
+  * in lib/gs_res.ps.
+  */

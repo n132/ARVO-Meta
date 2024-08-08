@@ -1,0 +1,135 @@
+commit 550e6fe6fcd96e507763db66873791b96f19fe2b
+Author: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date:   Mon Oct 11 23:08:10 2021 +0200
+
+    QUIC: fix an integer overflow (#1337)
+    
+    Long standing bug: credits to @lnslbrty for digging into it and to
+    @aouinizied for the CI improvements
+
+diff --git a/src/lib/protocols/quic.c b/src/lib/protocols/quic.c
+index dbdb9e6f..af19fe7e 100644
+--- a/src/lib/protocols/quic.c
++++ b/src/lib/protocols/quic.c
+@@ -1312,94 +1312,92 @@ static void process_tls(struct ndpi_detection_module_struct *ndpi_struct,
+   /* DNS-over-QUIC: ALPN is "doq" or "doq-XXX" (for drafts versions) */
+   if(flow->protos.tls_quic_stun.tls_quic.alpn &&
+      strncmp(flow->protos.tls_quic_stun.tls_quic.alpn, "doq", 3) == 0) {
+     NDPI_LOG_DBG(ndpi_struct, "Found DOQ (ALPN: [%s])\n", flow->protos.tls_quic_stun.tls_quic.alpn);
+     ndpi_int_change_protocol(ndpi_struct, flow, NDPI_PROTOCOL_DOH_DOT, NDPI_PROTOCOL_QUIC);
+   }
+ }
+ static void process_chlo(struct ndpi_detection_module_struct *ndpi_struct,
+ 			 struct ndpi_flow_struct *flow,
+ 			 const u_int8_t *crypto_data, uint32_t crypto_data_len)
+ {
+   const uint8_t *tag;
+   uint32_t i;
+   uint16_t num_tags;
+   uint32_t prev_offset;
+   uint32_t tag_offset_start, offset, len, sni_len;
+   ndpi_protocol_match_result ret_match;
+   int sni_found = 0, ua_found = 0;
+ 
+   if(crypto_data_len < 6)
+     return;
+   if(memcmp(crypto_data, "CHLO", 4) != 0) {
+ #ifdef QUIC_DEBUG
+     NDPI_LOG_ERR(ndpi_struct, "Unexpected handshake message");
+ #endif
+     return;
+   }
+   num_tags = le16toh(*(uint16_t *)&crypto_data[4]);
+ 
+   tag_offset_start = 8 + 8 * num_tags;
+   prev_offset = 0;
+   for(i = 0; i < num_tags; i++) {
+     if(8 + 8 * i + 8 >= crypto_data_len)
+       break;
+     tag = &crypto_data[8 + 8 * i];
+     offset = le32toh(*((u_int32_t *)&crypto_data[8 + 8 * i + 4]));
+     if(prev_offset > offset)
+       break;
+     len = offset - prev_offset;
+-    if(tag_offset_start + prev_offset + len > crypto_data_len)
++    /* Promote to uint64_t to avoid unsigned wrapping */
++    if((uint64_t)tag_offset_start + prev_offset + len > (uint64_t)crypto_data_len)
+       break;
+ #if 0
+-    printf("crypto_data_len %u prev_offset %u offset %u len %d\n",
+-	   crypto_data_len, prev_offset, offset, len);
++    printf("crypto_data_len %u tag_offset_start %u prev_offset %u offset %u len %u\n",
++	   crypto_data_len, tag_offset_start, prev_offset, offset, len);
+ #endif
+-    if((memcmp(tag, "SNI\0", 4) == 0) &&
+-       (tag_offset_start + prev_offset + len < crypto_data_len)) {
++    if(memcmp(tag, "SNI\0", 4) == 0) {
+       sni_len = MIN(len, sizeof(flow->protos.tls_quic_stun.tls_quic.client_requested_server_name) - 1);
+       memcpy(flow->protos.tls_quic_stun.tls_quic.client_requested_server_name,
+              &crypto_data[tag_offset_start + prev_offset], sni_len);
+       flow->protos.tls_quic_stun.tls_quic.client_requested_server_name[sni_len] = '\0';
+ 
+       NDPI_LOG_DBG2(ndpi_struct, "SNI: [%s]\n",
+                     flow->protos.tls_quic_stun.tls_quic.client_requested_server_name);
+ 
+       ndpi_match_host_subprotocol(ndpi_struct, flow,
+                                   (char *)flow->protos.tls_quic_stun.tls_quic.client_requested_server_name,
+                                   strlen((const char*)flow->protos.tls_quic_stun.tls_quic.client_requested_server_name),
+                                   &ret_match, NDPI_PROTOCOL_QUIC);
+       flow->protos.tls_quic_stun.tls_quic.hello_processed = 1; /* Allow matching of custom categories */
+ 
+       ndpi_check_dga_name(ndpi_struct, flow,
+                           flow->protos.tls_quic_stun.tls_quic.client_requested_server_name, 1);
+ 
+       sni_found = 1;
+       if (ua_found)
+         return;
+     }
+ 
+     if(memcmp(tag, "UAID", 4) == 0) {
+       u_int uaid_offset = tag_offset_start + prev_offset;
+             
+-      if((uaid_offset + len) < crypto_data_len) {      
+-	NDPI_LOG_DBG2(ndpi_struct, "UA: [%.*s]\n", len, &crypto_data[uaid_offset]);
++      NDPI_LOG_DBG2(ndpi_struct, "UA: [%.*s]\n", len, &crypto_data[uaid_offset]);
+ 	
+-	http_process_user_agent(ndpi_struct, flow, &crypto_data[uaid_offset], len); /* http.c */
+-	ua_found = 1;
++      http_process_user_agent(ndpi_struct, flow, &crypto_data[uaid_offset], len); /* http.c */
++      ua_found = 1;
+ 	
+-	if (sni_found)
+-	  return;
+-      }
++      if (sni_found)
++        return;
+     }
+ 
+     prev_offset = offset;
+   }
+   if(i != num_tags)
+     NDPI_LOG_DBG(ndpi_struct, "Something went wrong in tags iteration\n");
+ 
+   /* Add check for missing SNI */
+   if(flow->protos.tls_quic_stun.tls_quic.client_requested_server_name[0] == '\0') {
+     /* This is a bit suspicious */
+     ndpi_set_risk(ndpi_struct, flow, NDPI_TLS_MISSING_SNI);
+   }
+ }
+diff --git a/tests/pcap/quic-fuzz-overflow.pcapng b/tests/pcap/quic-fuzz-overflow.pcapng
+new file mode 100644
+index 00000000..9d8ee61e
+Binary files /dev/null and b/tests/pcap/quic-fuzz-overflow.pcapng differ
+diff --git a/tests/result/quic-fuzz-overflow.pcapng.out b/tests/result/quic-fuzz-overflow.pcapng.out
+new file mode 100644
+index 00000000..1c517a3a
+--- /dev/null
++++ b/tests/result/quic-fuzz-overflow.pcapng.out
+@@ -0,0 +1,7 @@
++Guessed flow protos:	0
++
++DPI Packets (UDP):	1	(1.00 pkts/flow)
++
++QUIC	1	1280	1
++
++	1	UDP 255.255.255.255:8224 -> 255.255.255.32:8224 [proto: 188/QUIC][Encrypted][cat: Web/5][1 pkts/1280 bytes -> 0 pkts/0 bytes][Goodput ratio: 98/0][< 1 sec][Risk: ** Known protocol on non standard port **** SNI TLS extension was missing **][Risk Score: 60][PLAIN TEXT (         )][Plen Bins: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,100,0,0,0,0,0,0,0,0]

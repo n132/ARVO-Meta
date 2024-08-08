@@ -1,0 +1,276 @@
+commit 8f88d89796d0ab7fefb302b21e03cc186dfc8bc3
+Author: Florin Malita <fmalita@chromium.org>
+Date:   Thu Apr 19 21:07:19 2018 -0400
+
+    Fix use-of-uninitialized-value in SkPictureShader::onMakeContext
+    
+    SkPictureShader::refBitmapShader is expected to always initialize the
+    scale adjust vector when returning a non-null shader.  But the code path
+    returning EmptyShader does not do that.
+    
+    Instead of hauling around a separate scale adjustment, we can refactor
+    to avoid this problem by adjusting the local matrix directly, if needed,
+    in refBitmapShader.  The local matrix is conveniently already stored in
+    a SkTCopyOnFirstWrite.
+    
+    Bug: chromium:835048, oss-fuzz:7738
+    Change-Id: I2df3bde7d6237f01bc71857c2fe254e86b186dc0
+    Reviewed-on: https://skia-review.googlesource.com/122544
+    Auto-Submit: Florin Malita <fmalita@chromium.org>
+    Reviewed-by: Kevin Lubick <kjlubick@google.com>
+    Commit-Queue: Florin Malita <fmalita@chromium.org>
+
+diff --git a/src/shaders/SkPictureShader.cpp b/src/shaders/SkPictureShader.cpp
+index bbed6d695a..42f5c3e497 100644
+--- a/src/shaders/SkPictureShader.cpp
++++ b/src/shaders/SkPictureShader.cpp
+@@ -164,163 +164,143 @@ sk_sp<SkFlattenable> SkPictureShader::CreateProc(SkReadBuffer& buffer) {
+ void SkPictureShader::flatten(SkWriteBuffer& buffer) const {
+     buffer.writeMatrix(this->getLocalMatrix());
+     buffer.write32(fTmx);
+     buffer.write32(fTmy);
+     buffer.writeRect(fTile);
+ 
+     buffer.writeBool(true);
+     fPicture->flatten(buffer);
+ }
+ 
+-// This helper returns two artifacts:
+-//
+-// 1) a cached image shader, which wraps a single picture tile at the given CTM/local matrix
+-//
+-// 2) a tile scale adjustment, to be applied downstream when dispatching createContext(),
+-//    appendStages() and asFragmentProcessor() in callers
+-//
+-// The composite local matrix includes the actual local matrix, any inherited/outer local matrix
+-// and a scale component (to mape the actual tile bitmap size -> fTile size).
+-//
++// Returns a cached image shader, which wraps a single picture tile at the given
++// CTM/local matrix.  Also adjusts the local matrix for tile scaling.
+ sk_sp<SkShader> SkPictureShader::refBitmapShader(const SkMatrix& viewMatrix,
+-                                                 const SkMatrix& localMatrix,
++                                                 SkTCopyOnFirstWrite<SkMatrix>* localMatrix,
+                                                  SkColorSpace* dstColorSpace,
+-                                                 SkVector* scaleAdjust,
+                                                  const int maxTextureSize) const {
+     SkASSERT(fPicture && !fPicture->cullRect().isEmpty());
+ 
+-    const SkMatrix m = SkMatrix::Concat(viewMatrix, localMatrix);
++    const SkMatrix m = SkMatrix::Concat(viewMatrix, **localMatrix);
+ 
+     // Use a rotation-invariant scale
+     SkPoint scale;
+     //
+     // TODO: replace this with decomposeScale() -- but beware LayoutTest rebaselines!
+     //
+     if (!SkDecomposeUpper2x2(m, nullptr, &scale, nullptr)) {
+         // Decomposition failed, use an approximation.
+         scale.set(SkScalarSqrt(m.getScaleX() * m.getScaleX() + m.getSkewX() * m.getSkewX()),
+                   SkScalarSqrt(m.getScaleY() * m.getScaleY() + m.getSkewY() * m.getSkewY()));
+     }
+     SkSize scaledSize = SkSize::Make(SkScalarAbs(scale.x() * fTile.width()),
+                                      SkScalarAbs(scale.y() * fTile.height()));
+ 
+     // Clamp the tile size to about 4M pixels
+     static const SkScalar kMaxTileArea = 2048 * 2048;
+     SkScalar tileArea = scaledSize.width() * scaledSize.height();
+     if (tileArea > kMaxTileArea) {
+         SkScalar clampScale = SkScalarSqrt(kMaxTileArea / tileArea);
+         scaledSize.set(scaledSize.width() * clampScale,
+                        scaledSize.height() * clampScale);
+     }
+ #if SK_SUPPORT_GPU
+     // Scale down the tile size if larger than maxTextureSize for GPU Path or it should fail on create texture
+     if (maxTextureSize) {
+         if (scaledSize.width() > maxTextureSize || scaledSize.height() > maxTextureSize) {
+             SkScalar downScale = maxTextureSize / SkMaxScalar(scaledSize.width(), scaledSize.height());
+             scaledSize.set(SkScalarFloorToScalar(scaledSize.width() * downScale),
+                            SkScalarFloorToScalar(scaledSize.height() * downScale));
+         }
+     }
+ #endif
+ 
+     const SkISize tileSize = scaledSize.toCeil();
+     if (tileSize.isEmpty()) {
+         return SkShader::MakeEmptyShader();
+     }
+ 
+     // The actual scale, compensating for rounding & clamping.
+     const SkSize tileScale = SkSize::Make(SkIntToScalar(tileSize.width()) / fTile.width(),
+                                           SkIntToScalar(tileSize.height()) / fTile.height());
+ 
+     // |fColorSpace| will only be set when using an SkColorSpaceXformCanvas to do pre-draw xforms.
+     // This canvas is strictly for legacy mode.  A non-null |dstColorSpace| indicates that we
+     // should perform color correct rendering and xform at draw time.
+     SkASSERT(!fColorSpace || !dstColorSpace);
+     sk_sp<SkColorSpace> keyCS = dstColorSpace ? sk_ref_sp(dstColorSpace) : fColorSpace;
+     SkTransferFunctionBehavior blendBehavior = dstColorSpace ? SkTransferFunctionBehavior::kRespect
+                                                              : SkTransferFunctionBehavior::kIgnore;
+ 
+     sk_sp<SkShader> tileShader;
+     BitmapShaderKey key(std::move(keyCS),
+                         fUniqueID,
+                         fTile,
+                         fTmx,
+                         fTmy,
+                         tileScale,
+                         blendBehavior);
+ 
+     if (!SkResourceCache::Find(key, BitmapShaderRec::Visitor, &tileShader)) {
+         SkMatrix tileMatrix;
+         tileMatrix.setRectToRect(fTile, SkRect::MakeIWH(tileSize.width(), tileSize.height()),
+                                  SkMatrix::kFill_ScaleToFit);
+ 
+         sk_sp<SkImage> tileImage = SkImage::MakeFromGenerator(
+                 SkPictureImageGenerator::Make(tileSize, fPicture, &tileMatrix, nullptr,
+                                               SkImage::BitDepth::kU8, sk_ref_sp(dstColorSpace)));
+         if (!tileImage) {
+             return nullptr;
+         }
+ 
+         if (fColorSpace) {
+             tileImage = tileImage->makeColorSpace(fColorSpace, SkTransferFunctionBehavior::kIgnore);
+         }
+ 
+         tileShader = tileImage->makeShader(fTmx, fTmy);
+ 
+         SkResourceCache::Add(new BitmapShaderRec(key, tileShader.get()));
+         fAddedToCache.store(true);
+     }
+ 
+-    scaleAdjust->set(1 / tileScale.width(), 1 / tileScale.height());
++    if (tileScale.width() != 1 || tileScale.height() != 1) {
++        localMatrix->writable()->preScale(1 / tileScale.width(), 1 / tileScale.height());
++    }
+ 
+     return tileShader;
+ }
+ 
+ bool SkPictureShader::onAppendStages(const StageRec& rec) const {
+     auto lm = this->totalLocalMatrix(rec.fLocalM);
+-    SkVector scaleAdjust;
+ 
+     // Keep bitmapShader alive by using alloc instead of stack memory
+     auto& bitmapShader = *rec.fAlloc->make<sk_sp<SkShader>>();
+-    bitmapShader = this->refBitmapShader(rec.fCTM, *lm, rec.fDstCS, &scaleAdjust);
++    bitmapShader = this->refBitmapShader(rec.fCTM, &lm, rec.fDstCS);
+ 
+     if (!bitmapShader) {
+         return false;
+     }
+ 
+-    if (scaleAdjust != SkVector::Make(1, 1)) {
+-        lm.writable()->preScale(scaleAdjust.fX, scaleAdjust.fY);
+-    }
+-
+     StageRec localRec = rec;
+     localRec.fLocalM = lm->isIdentity() ? nullptr : lm.get();
+ 
+     return as_SB(bitmapShader)->appendStages(localRec);
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+ SkShaderBase::Context* SkPictureShader::onMakeContext(const ContextRec& rec, SkArenaAlloc* alloc)
+ const {
+     auto lm = this->totalLocalMatrix(rec.fLocalMatrix);
+-    SkVector scaleAdjust;
+-    sk_sp<SkShader> bitmapShader = this->refBitmapShader(*rec.fMatrix,
+-                                                         *lm,
+-                                                         rec.fDstColorSpace,
+-                                                         &scaleAdjust);
++    sk_sp<SkShader> bitmapShader = this->refBitmapShader(*rec.fMatrix, &lm, rec.fDstColorSpace);
+     if (!bitmapShader) {
+         return nullptr;
+     }
+ 
+-    if (scaleAdjust != SkVector::Make(1, 1)) {
+-        lm.writable()->preScale(scaleAdjust.fX, scaleAdjust.fY);
+-    }
+-
+     ContextRec localRec = rec;
+     localRec.fLocalMatrix = lm->isIdentity() ? nullptr : lm.get();
+ 
+     PictureShaderContext* ctx =
+         alloc->make<PictureShaderContext>(*this, localRec, std::move(bitmapShader), alloc);
+     if (nullptr == ctx->fBitmapShaderContext) {
+         ctx = nullptr;
+     }
+     return ctx;
+ }
+@@ -376,28 +356,23 @@ void SkPictureShader::toString(SkString* str) const {
+ #if SK_SUPPORT_GPU
+ std::unique_ptr<GrFragmentProcessor> SkPictureShader::asFragmentProcessor(
+         const GrFPArgs& args) const {
+     int maxTextureSize = 0;
+     if (args.fContext) {
+         maxTextureSize = args.fContext->caps()->maxTextureSize();
+     }
+ 
+     auto lm = this->totalLocalMatrix(args.fPreLocalMatrix, args.fPostLocalMatrix);
+-    SkVector scaleAdjust;
+-    sk_sp<SkShader> bitmapShader(this->refBitmapShader(*args.fViewMatrix,*lm,
++    sk_sp<SkShader> bitmapShader(this->refBitmapShader(*args.fViewMatrix, &lm,
+                                                        args.fDstColorSpaceInfo->colorSpace(),
+-                                                       &scaleAdjust, maxTextureSize));
++                                                       maxTextureSize));
+     if (!bitmapShader) {
+         return nullptr;
+     }
+ 
+-    if (scaleAdjust != SkVector::Make(1, 1)) {
+-        lm.writable()->preScale(scaleAdjust.fX, scaleAdjust.fY);
+-    }
+-
+     // We want to *reset* args.fPreLocalMatrix, not compose it.
+     GrFPArgs newArgs(args.fContext, args.fViewMatrix, args.fFilterQuality, args.fDstColorSpaceInfo);
+     newArgs.fPreLocalMatrix = lm.get();
+ 
+     return as_SB(bitmapShader)->asFragmentProcessor(newArgs);
+ }
+ #endif
+diff --git a/src/shaders/SkPictureShader.h b/src/shaders/SkPictureShader.h
+index 5f28b6074b..6e5201e8fb 100644
+--- a/src/shaders/SkPictureShader.h
++++ b/src/shaders/SkPictureShader.h
+@@ -45,40 +45,39 @@ protected:
+ private:
+     SkPictureShader(sk_sp<SkPicture>, TileMode, TileMode, const SkMatrix*, const SkRect*,
+                     sk_sp<SkColorSpace>);
+ 
+-    sk_sp<SkShader> refBitmapShader(const SkMatrix&, const SkMatrix& localMatrix,
++    sk_sp<SkShader> refBitmapShader(const SkMatrix&, SkTCopyOnFirstWrite<SkMatrix>* localMatrix,
+                                     SkColorSpace* dstColorSpace,
+-                                    SkVector* scaleAdjust,
+                                     const int maxTextureSize = 0) const;
+ 
+     class PictureShaderContext : public Context {
+     public:
+         PictureShaderContext(
+             const SkPictureShader&, const ContextRec&, sk_sp<SkShader> bitmapShader, SkArenaAlloc*);
+ 
+         uint32_t getFlags() const override;
+ 
+         void shadeSpan(int x, int y, SkPMColor dstC[], int count) override;
+ 
+         sk_sp<SkShader>         fBitmapShader;
+         SkShaderBase::Context*  fBitmapShaderContext;
+         void*                   fBitmapShaderContextStorage;
+ 
+         typedef Context INHERITED;
+     };
+ 
+     sk_sp<SkPicture>    fPicture;
+     SkRect              fTile;
+     TileMode            fTmx, fTmy;
+ 
+     // Should never be set by a public constructor.  This is only used when onMakeColorSpace()
+     // forces a deferred color space xform.
+     sk_sp<SkColorSpace>    fColorSpace;
+ 
+     const uint32_t         fUniqueID;
+     mutable SkAtomic<bool> fAddedToCache;
+ 
+     typedef SkShaderBase INHERITED;
+ };
+ 
+ #endif // SkPictureShader_DEFINED

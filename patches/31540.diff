@@ -1,0 +1,376 @@
+commit 40c50a3a4219308aae90f6efd7b10213794a8d86
+Author: Jakub Jelen <jjelen@redhat.com>
+Date:   Mon Mar 1 11:57:06 2021 +0100
+
+    oberthur: Handle more memory issues during initialization
+    
+    Thanks oss-fuzz
+    
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=31540
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=31448
+
+diff --git a/src/libopensc/pkcs15-oberthur.c b/src/libopensc/pkcs15-oberthur.c
+index bf88a06a..ebaca47a 100644
+--- a/src/libopensc/pkcs15-oberthur.c
++++ b/src/libopensc/pkcs15-oberthur.c
+@@ -657,78 +657,94 @@ static int
+ sc_pkcs15emu_oberthur_add_cert(struct sc_pkcs15_card *p15card, unsigned int file_id)
+ {
+ 	struct sc_context *ctx = p15card->card->ctx;
+ 	struct sc_pkcs15_cert_info cinfo;
+ 	struct sc_pkcs15_object cobj;
+-	unsigned char *info_blob, *cert_blob;
++	unsigned char *info_blob = NULL, *cert_blob = NULL;
+ 	size_t info_len, cert_len, len, offs;
+ 	unsigned flags;
+ 	int rv;
+ 	char ch_tmp[0x20];
+ 
+ 	LOG_FUNC_CALLED(ctx);
+ 	sc_log(ctx, "add certificate(file-id:%04X)", file_id);
+ 
+ 	memset(&cinfo, 0, sizeof(cinfo));
+ 	memset(&cobj, 0, sizeof(cobj));
+ 
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", AWP_OBJECTS_DF_PUB, file_id | 0x100);
+ 	rv = sc_oberthur_read_file(p15card, ch_tmp, &info_blob, &info_len, 1);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add certificate: read oberthur file error");
+ 
+-	if (info_len < 2)
++	if (info_len < 2) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add certificate: no 'tag'");
++	}
+ 	flags = *(info_blob + 0) * 0x100 + *(info_blob + 1);
+ 	offs = 2;
+ 
+ 	/* Label */
+-	if (offs + 2 > info_len)
++	if (offs + 2 > info_len) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add certificate: no 'CN'");
++	}
+ 	len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
+-	if (len)   {
++	if (len + offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid 'CN' length");
++	} else if (len) {
+ 		if (len > sizeof(cobj.label) - 1)
+ 			len = sizeof(cobj.label) - 1;
+ 		memcpy(cobj.label, info_blob + offs + 2, len);
+ 	}
+ 	offs += 2 + len;
+ 
+ 	/* ID */
+-	if (offs > info_len)
++	if (offs + 2 > info_len) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add certificate: no 'ID'");
++	}
+ 	len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
+-	if (len > sizeof(cinfo.id.value))
++	if (len + offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid 'ID' length");
++	} else if (len > sizeof(cinfo.id.value)) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_DATA, "Failed to add certificate: invalid 'ID' length");
++	}
+ 	memcpy(cinfo.id.value, info_blob + offs + 2, len);
+ 	cinfo.id.len = len;
+ 
++	free(info_blob);
++
+ 	/* Ignore subject, issuer and serial */
+ 
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", AWP_OBJECTS_DF_PUB, file_id);
+ 	sc_format_path(ch_tmp, &cinfo.path);
+ 	rv = sc_oberthur_read_file(p15card, ch_tmp, &cert_blob, &cert_len, 1);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add certificate: read certificate error");
+ 
+ 	cinfo.value.value = cert_blob;
+ 	cinfo.value.len = cert_len;
+ 
+ 	rv = sc_oberthur_get_certificate_authority(&cinfo.value, &cinfo.authority);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add certificate: get certificate attributes error");
+ 
+ 	if (flags & OBERTHUR_ATTR_MODIFIABLE)
+ 		cobj.flags |= SC_PKCS15_CO_FLAG_MODIFIABLE;
+ 
+ 	rv = sc_pkcs15emu_add_x509_cert(p15card, &cobj, &cinfo);
+ 
+ 	LOG_FUNC_RETURN(p15card->card->ctx, rv);
+ }
+ 
+ 
+ /* Private key info:
+  * 	flags:2,
+  * 	CN(len:2,value:),
+  * 	ID(len:2,value:(SHA1 value)),
+  * 	StartDate(Ascii:8)
+  * 	EndDate(Ascii:8)
+  * 	Subject in ASN.1(len:2,value:)
+  * 	modulus(value:)
+  *	exponent(length:1, value:3)
+  */
+@@ -736,118 +752,143 @@ static int
+ sc_pkcs15emu_oberthur_add_prvkey(struct sc_pkcs15_card *p15card,
+ 		unsigned int file_id, unsigned int size)
+ {
+ 	struct sc_context *ctx = p15card->card->ctx;
+ 	struct sc_pkcs15_prkey_info kinfo;
+ 	struct sc_pkcs15_object kobj;
+ 	struct crypto_container ccont;
+ 	unsigned char *info_blob = NULL;
+ 	size_t info_len = 0;
+ 	unsigned flags;
+ 	size_t offs, len;
+ 	char ch_tmp[0x100];
+ 	int rv;
+ 
+ 	LOG_FUNC_CALLED(ctx);
+ 	sc_log(ctx, "add private key(file-id:%04X,size:%04X)", file_id, size);
+ 
+ 	memset(&kinfo, 0, sizeof(kinfo));
+ 	memset(&kobj, 0, sizeof(kobj));
+ 	memset(&ccont, 0, sizeof(ccont));
+ 
+ 	rv = sc_oberthur_get_friends (file_id, &ccont);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add private key: get friends error");
+ 
+ 	if (ccont.id_cert)   {
+ 		struct sc_pkcs15_object *objs[32];
+ 		int ii;
+ 
+ 		sc_log(ctx, "friend certificate %04X", ccont.id_cert);
+ 		rv = sc_pkcs15_get_objects(p15card, SC_PKCS15_TYPE_CERT_X509, objs, 32);
+ 		LOG_TEST_RET(ctx, rv, "Failed to add private key: get certificates error");
+ 
+ 		for (ii=0; ii<rv; ii++) {
+ 			struct sc_pkcs15_cert_info *cert = (struct sc_pkcs15_cert_info *)objs[ii]->data;
+ 			struct sc_path path = cert->path;
+ 			unsigned int id = path.value[path.len - 2] * 0x100 + path.value[path.len - 1];
+ 
+ 			if (id == ccont.id_cert)   {
+ 				strlcpy(kobj.label, objs[ii]->label, sizeof(kobj.label));
+ 				break;
+ 			}
+ 		}
+ 
+ 		if (ii == rv)
+ 			LOG_TEST_RET(ctx, SC_ERROR_INCONSISTENT_PROFILE, "Failed to add private key: friend not found");
+ 	}
+ 
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", AWP_OBJECTS_DF_PRV, file_id | 0x100);
+ 	rv = sc_oberthur_read_file(p15card, ch_tmp, &info_blob, &info_len, 1);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add private key: read oberthur file error");
+ 
+-	if (info_len < 2)
++	if (info_len < 2) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add private key: no 'tag'");
++	}
+ 	flags = *(info_blob + 0) * 0x100 + *(info_blob + 1);
+ 	offs = 2;
+ 
+ 	/* CN */
+-	if (offs > info_len)
++	if (offs + 2 > info_len) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add private key: no 'CN'");
++	}
+ 	len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
++	if (len + offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid 'CN' length");
++	}
+ 	if (len && !strlen(kobj.label))   {
+ 		if (len > sizeof(kobj.label) - 1)
+ 			len = sizeof(kobj.label) - 1;
+ 		strncpy(kobj.label, (char *)(info_blob + offs + 2), len);
+ 	}
+ 	offs += 2 + len;
+ 
+ 	/* ID */
+-	if (offs > info_len)
++	if (offs + 2 > info_len) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add private key: no 'ID'");
++	}
+ 	len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
+-	if (!len)
++	if (!len) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add private key: zero length ID");
+-	else if (len > sizeof(kinfo.id.value))
++	} else if (len + offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid 'ID' length");
++	} else if (len > sizeof(kinfo.id.value)) {
++		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_DATA, "Failed to add private key: invalid ID length");
++	}
+ 	memcpy(kinfo.id.value, info_blob + offs + 2, len);
+ 	kinfo.id.len = len;
+ 	offs += 2 + len;
+ 
+ 	/* Ignore Start/End dates */
+ 	offs += 16;
+ 
+ 	/* Subject encoded in ASN1 */
+-	if (offs > info_len)
+-		return SC_ERROR_UNKNOWN_DATA_RECEIVED;
++	if (offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add private key: no 'subject'");
++	}
+ 	len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
+-	if (len)   {
++	if (len + offs + 2 > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid 'subject' length");
++	} else if (len) {
+ 		kinfo.subject.value = malloc(len);
+-		if (!kinfo.subject.value)
++		if (!kinfo.subject.value) {
++			free(info_blob);
+ 			LOG_TEST_RET(ctx, SC_ERROR_OUT_OF_MEMORY, "Failed to add private key: memory allocation error");
++		}
+ 		kinfo.subject.len = len;
+ 		memcpy(kinfo.subject.value, info_blob + offs + 2, len);
+ 	}
+ 
+ 	/* Modulus and exponent are ignored */
+ 
++	free(info_blob);
++
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", AWP_OBJECTS_DF_PRV, file_id);
+ 	sc_format_path(ch_tmp, &kinfo.path);
+ 	sc_log(ctx, "Private key info path %s", ch_tmp);
+ 
+ 	kinfo.modulus_length	= size;
+ 	kinfo.native		= 1;
+ 	kinfo.key_reference	 = file_id & 0xFF;
+ 
+ 	kinfo.usage = sc_oberthur_decode_usage(flags);
+ 	kobj.flags = SC_PKCS15_CO_FLAG_PRIVATE;
+ 	if (flags & OBERTHUR_ATTR_MODIFIABLE)
+ 		kobj.flags |= SC_PKCS15_CO_FLAG_MODIFIABLE;
+ 
+ 	kobj.auth_id.len = sizeof(PinDomainID) > sizeof(kobj.auth_id.value)
+ 			? sizeof(kobj.auth_id.value) : sizeof(PinDomainID);
+ 	memcpy(kobj.auth_id.value, PinDomainID, kobj.auth_id.len);
+ 
+ 	sc_log(ctx, "Parsed private key(reference:%i,usage:%X,flags:%X)", kinfo.key_reference, kinfo.usage, kobj.flags);
+ 
+ 	rv = sc_pkcs15emu_add_rsa_prkey(p15card, &kobj, &kinfo);
+ 	LOG_FUNC_RETURN(ctx, rv);
+ }
+@@ -857,96 +898,104 @@ static int
+ sc_pkcs15emu_oberthur_add_data(struct sc_pkcs15_card *p15card,
+ 		unsigned int file_id, unsigned int size, int private)
+ {
+ 	struct sc_context *ctx = p15card->card->ctx;
+ 	struct sc_pkcs15_data_info dinfo;
+ 	struct sc_pkcs15_object dobj;
+ 	unsigned flags;
+ 	unsigned char *info_blob = NULL, *label = NULL, *app = NULL, *oid = NULL;
+ 	size_t info_len, label_len, app_len, oid_len, offs;
+ 	char ch_tmp[0x100];
+ 	int rv;
+ 
+ 	SC_FUNC_CALLED(ctx, SC_LOG_DEBUG_VERBOSE);
+ 	sc_log(ctx, "Add data(file-id:%04X,size:%i,is-private:%i)", file_id, size, private);
+ 	memset(&dinfo, 0, sizeof(dinfo));
+ 	memset(&dobj, 0, sizeof(dobj));
+ 
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", private ? AWP_OBJECTS_DF_PRV : AWP_OBJECTS_DF_PUB, file_id | 0x100);
+ 
+ 	rv = sc_oberthur_read_file(p15card, ch_tmp, &info_blob, &info_len, 1);
+ 	LOG_TEST_RET(ctx, rv, "Failed to add data: read oberthur file error");
+ 
+ 	if (info_len < 2) {
+ 		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add certificate: no 'tag'");
+ 	}
+ 	flags = *(info_blob + 0) * 0x100 + *(info_blob + 1);
+ 	offs = 2;
+ 
+ 	/* Label */
+ 	if (offs + 2 > info_len) {
+ 		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add data: no 'label'");
+ 	}
+ 	label = info_blob + offs + 2;
+ 	label_len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
+ 	if (offs + 2 + label_len > info_len) {
+ 		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid length of 'label' received");
+ 	}
+ 	if (label_len > sizeof(dobj.label) - 1)
+ 		label_len = sizeof(dobj.label) - 1;
+ 	offs += 2 + *(info_blob + offs + 1);
+ 
+ 	/* Application */
+-	if (offs > info_len) {
++	if (offs + 2 > info_len) {
+ 		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add data: no 'application'");
+ 	}
+ 	app = info_blob + offs + 2;
+ 	app_len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
++	if (offs + 2 + app_len > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid length of 'application' received");
++	}
+ 	if (app_len > sizeof(dinfo.app_label) - 1)
+ 		app_len = sizeof(dinfo.app_label) - 1;
+ 	offs += 2 + app_len;
+ 
+ 	/* OID encode like DER(ASN.1(oid)) */
+-	if (offs + 1 > info_len) {
++	if (offs + 2 > info_len) {
+ 		free(info_blob);
+ 		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add data: no 'OID'");
+ 	}
+ 	oid_len = *(info_blob + offs + 1) + *(info_blob + offs) * 0x100;
++	if (offs + 2 + oid_len > info_len) {
++		free(info_blob);
++		LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Invalid length of 'oid' received");
++	}
+ 	if (oid_len)   {
+ 		oid = info_blob + offs + 2;
+ 		if (*oid != 0x06 || (*(oid + 1) != oid_len - 2)) {
+ 			free(info_blob);
+ 			LOG_TEST_RET(ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED, "Failed to add data: invalid 'OID' format");
+ 		}
+ 		oid += 2;
+ 		oid_len -= 2;
+ 	}
+ 
+ 	snprintf(ch_tmp, sizeof(ch_tmp), "%s%04X", private ? AWP_OBJECTS_DF_PRV : AWP_OBJECTS_DF_PUB, file_id);
+ 
+ 	sc_format_path(ch_tmp, &dinfo.path);
+ 
+ 	memcpy(dobj.label, label, label_len);
+ 	memcpy(dinfo.app_label, app, app_len);
+ 	if (oid_len)
+ 		sc_asn1_decode_object_id(oid, oid_len, &dinfo.app_oid);
+ 
+ 	if (flags & OBERTHUR_ATTR_MODIFIABLE)
+ 		dobj.flags |= SC_PKCS15_CO_FLAG_MODIFIABLE;
+ 
+ 	if (private)   {
+ 		dobj.auth_id.len = sizeof(PinDomainID) > sizeof(dobj.auth_id.value)
+ 				? sizeof(dobj.auth_id.value) : sizeof(PinDomainID);
+ 		memcpy(dobj.auth_id.value, PinDomainID, dobj.auth_id.len);
+ 
+ 		dobj.flags |= SC_PKCS15_CO_FLAG_PRIVATE;
+ 	}
+ 
+ 	rv = sc_pkcs15emu_add_data_object(p15card, &dobj, &dinfo);
+ 
+ 	free(info_blob);
+ 	LOG_FUNC_RETURN(p15card->card->ctx, rv);
+ }

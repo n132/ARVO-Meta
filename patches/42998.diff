@@ -1,0 +1,159 @@
+commit 4affbf8fe0e5982058c498a33689cc5182eab0ed
+Author: Chris Liddell <chris.liddell@artifex.com>
+Date:   Wed Jan 12 11:08:36 2022 +0000
+
+    oss-fuzz 42998: Drawing text: don't rely on the stack reference
+    
+    for the string operand.
+    
+    We were relying on the operand stack reference for the string object to remain
+    valid for the duration of the text drawing operation, but this is not sure to
+    be the case. If a pdfi error occurs during the text drawing it can cause the
+    entire stack to be cleared. Thus we need to a "local", counted reference to the
+    string, so the object remains valid until we're finished with it.
+
+diff --git a/pdf/pdf_text.c b/pdf/pdf_text.c
+index 819035315..d8296bed0 100644
+--- a/pdf/pdf_text.c
++++ b/pdf/pdf_text.c
+@@ -1,34 +1,34 @@
+-/* Copyright (C) 2018-2021 Artifex Software, Inc.
++/* Copyright (C) 2018-2022 Artifex Software, Inc.
+    All Rights Reserved.
+ 
+    This software is provided AS-IS with no warranty, either express or
+    implied.
+ 
+    This software is distributed under license and may not be copied,
+    modified or distributed except as expressly authorized under the terms
+    of the license contained in the file LICENSE in this distribution.
+ 
+    Refer to licensing information at http://www.artifex.com or contact
+    Artifex Software, Inc.,  1305 Grant Avenue - Suite 200, Novato,
+    CA 94945, U.S.A., +1(415)492-9861, for further information.
+ */
+ 
+ /* Text operations for the PDF interpreter */
+ 
+ #include "pdf_int.h"
+ #include "pdf_array.h"
+ #include "pdf_text.h"
+ #include "pdf_image.h"
+ #include "pdf_colour.h"
+ #include "pdf_stack.h"
+ #include "pdf_gstate.h"
+ #include "pdf_font.h"
+ #include "pdf_font_types.h"
+ #include "pdf_trans.h"
+ #include "pdf_optcontent.h"
+ 
+ #include "gsstate.h"
+ #include "gsmatrix.h"
+ #include "gdevbbox.h"
+ #include "gspaint.h"        /* For gs_fill() and friends */
+ #include "gscoord.h"        /* For gs_setmatrix() */
+@@ -1066,82 +1066,89 @@ out:
+ int pdfi_Tj(pdf_context *ctx)
+ {
+     int code = 0;
+     pdf_string *s = NULL;
+     gs_matrix saved, Trm;
+     gs_point initial_point, current_point, pt;
+     double linewidth = ctx->pgs->line_params.half_width;
+ 
+     if (pdfi_count_stack(ctx) < 1)
+         return_error(gs_error_stackunderflow);
+ 
+     if (pdfi_oc_is_off(ctx))
+         goto exit;
+ 
+     s = (pdf_string *)ctx->stack_top[-1];
+     if (s->type != PDF_STRING)
+         return_error(gs_error_typecheck);
+ 
++    /* We can't rely on the stack reference because an error during
++       the text operation (i.e. retrieving objects for glyph metrics
++       may cause the stack to be cleared.
++     */
++    pdfi_countup(s);
++    pdfi_pop(ctx, 1);
++
+     /* Save the CTM for later restoration */
+     saved = ctm_only(ctx->pgs);
+     gs_currentpoint(ctx->pgs, &initial_point);
+ 
+     Trm.xx = ctx->pgs->PDFfontsize * (ctx->pgs->texthscaling / 100);
+     Trm.xy = 0;
+     Trm.yx = 0;
+     Trm.yy = ctx->pgs->PDFfontsize;
+     Trm.tx = 0;
+     Trm.ty = ctx->pgs->textrise;
+ 
+     gs_matrix_multiply(&Trm, &ctx->pgs->textmatrix, &Trm);
+ 
+     if (!ctx->device_state.preserve_tr_mode) {
+         gs_distance_transform_inverse(ctx->pgs->line_params.half_width, 0, &Trm, &pt);
+         ctx->pgs->line_params.half_width = sqrt((pt.x * pt.x) + (pt.y * pt.y));
+     } else {
+         /* We have to adjust the stroke width for pdfwrite so that we take into
+          * account the CTM, but we do not spply the font scaling. Because of
+          * the disconnect between pdfwrite and the interpreter, we also have to
+          * remove the scaling due to the resolution.
+          */
+         gs_matrix devmatrix, matrix;
+         gx_device *device = gs_currentdevice(ctx->pgs);
+ 
+         devmatrix.xx = 72.0 / device->HWResolution[0];
+         devmatrix.xy = 0;
+         devmatrix.yx = 0;
+         devmatrix.yy = 72.0 / device->HWResolution[1];
+         devmatrix.tx = 0;
+         devmatrix.ty = 0;
+ 
+         code = gs_matrix_multiply(&saved, &devmatrix, &matrix);
+         if (code < 0)
+             goto exit;
+ 
+         gs_distance_transform(ctx->pgs->line_params.half_width, 0, &matrix, &pt);
+         ctx->pgs->line_params.half_width = sqrt((pt.x * pt.x) + (pt.y * pt.y));
+     }
+ 
+     gs_matrix_multiply(&Trm, &ctm_only(ctx->pgs), &Trm);
+     gs_setmatrix(ctx->pgs, &Trm);
+ 
+     code = gs_moveto(ctx->pgs, 0, 0);
+     if (code < 0)
+         goto Tj_error;
+ 
+     code = pdfi_show(ctx, s);
+ 
+     ctx->pgs->line_params.half_width = linewidth;
+     /* Update the Text matrix with the current point, for the next operation
+      */
+     gs_currentpoint(ctx->pgs, &current_point);
+     Trm.xx = ctx->pgs->PDFfontsize * (ctx->pgs->texthscaling / 100);
+     Trm.xy = 0;
+     Trm.yx = 0;
+     Trm.yy = ctx->pgs->PDFfontsize;
+     Trm.tx = 0;
+     Trm.ty = 0;
+     gs_matrix_multiply(&Trm, &ctx->pgs->textmatrix, &Trm);
+ 
+     gs_distance_transform(current_point.x, current_point.y, &Trm, &pt);
+     ctx->pgs->textmatrix.tx += pt.x;
+     ctx->pgs->textmatrix.ty += pt.y;
+@@ -1149,13 +1156,13 @@ int pdfi_Tj(pdf_context *ctx)
+ Tj_error:
+     /* Restore the CTM to the saved value */
+     gs_setmatrix(ctx->pgs, &saved);
+     /* And restore the currentpoint */
+     gs_moveto(ctx->pgs, initial_point.x, initial_point.y);
+     /* And the line width */
+     ctx->pgs->line_params.half_width = linewidth;
+ 
+  exit:
+-    pdfi_pop(ctx, 1);
++    pdfi_countdown(s);
+     return code;
+ }
+ 

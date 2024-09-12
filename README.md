@@ -47,7 +47,7 @@ In the [patches][5] folder, we provide the patches ARVO located for each vulnera
 
 If you find any cases that are not reproducible, please [open an issue][6] for the case.
 
-# Tip
+# Known Issues
 
 There is a reported bug that some cases can't be re-compiled for recent versions of Kernel (V5.15.0 was confirmed not affected). After investigation, it could be related to MSAN's improper parsing of `/proc/.*/maps` file. We suggest you try to turn off ASLR and re-compile. 
 

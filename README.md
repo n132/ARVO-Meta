@@ -2,7 +2,7 @@
 
 This repository contains metadata and usage instructions for the ARVO vulnerability dataset described in our paper [ARVO: Atlas of Reproducible Vulnerabilities for Open Source Software](https://arxiv.org/abs/2408.02153).
 
-The code to generate the ARVO dataset will be published soon. The generated dataset and related metadata are updated in this repository. Each report file represents one found vulnerability on OSS-Fuzz.
+The code to generate the ARVO dataset is public on [ARVO][8]. The generated dataset and related metadata are updated in this repository. Each report file represents one found vulnerability on OSS-Fuzz.
 
 # TL;DR
 
@@ -59,3 +59,4 @@ There is a reported bug that some cases can't be re-compiled for recent versions
 [5]: ./patches
 [6]: https://github.com/n132/ARVO-Meta/issues/new
 [7]: ./meta/25402.json
+[8]: https://github.com/n132/ARVO

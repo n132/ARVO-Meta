@@ -2,7 +2,7 @@
 
 This repository contains metadata and usage instructions for the ARVO vulnerability dataset described in our paper [ARVO: Atlas of Reproducible Vulnerabilities for Open Source Software](https://arxiv.org/abs/2408.02153).
 
-The code to generate the ARVO dataset is public on [ARVO][8]. The generated dataset and related metadata are updated in this repository. Each report file represents one found vulnerability on OSS-Fuzz.
+The code to generate the ARVO dataset is public on [ARVO][8]. The generated dataset and related metadata are updated in releases. arvo.db is a SQLite3 database containing the corresponding static data for the docker-images.
 
 # TL;DR
 

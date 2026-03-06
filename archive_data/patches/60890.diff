@@ -1,0 +1,1889 @@
+commit 6d07f7602a716a7ec6eea4d1c1ee00e52bbee15a
+Author: Max Gabrielsson <max@gabrielsson.com>
+Date:   Fri Sep 8 13:06:21 2023 +0200
+
+    remove buffered de/serializer
+
+diff --git a/extension/parquet/column_writer.cpp b/extension/parquet/column_writer.cpp
+index 1f96f8681c..3a9fda6527 100644
+--- a/extension/parquet/column_writer.cpp
++++ b/extension/parquet/column_writer.cpp
+@@ -1,26 +1,26 @@
+ #include "column_writer.hpp"
+ 
+ #include "duckdb.hpp"
+ #include "parquet_rle_bp_decoder.hpp"
+ #include "parquet_rle_bp_encoder.hpp"
+ #include "parquet_writer.hpp"
+ #ifndef DUCKDB_AMALGAMATION
+ #include "duckdb/common/common.hpp"
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/mutex.hpp"
+ #include "duckdb/common/operator/comparison_operators.hpp"
+ #include "duckdb/common/serializer/buffered_file_writer.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+ #include "duckdb/common/string_map_set.hpp"
+ #include "duckdb/common/types/chunk_collection.hpp"
+ #include "duckdb/common/types/date.hpp"
+ #include "duckdb/common/types/hugeint.hpp"
+ #include "duckdb/common/types/string_heap.hpp"
+ #include "duckdb/common/types/time.hpp"
+ #include "duckdb/common/types/timestamp.hpp"
+ #include "duckdb/common/serializer/write_stream.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
+ #endif
+ 
+ #include "miniz_wrapper.hpp"
+ #include "snappy.h"
+ #include "zstd.h"
+@@ -184,47 +184,47 @@ ColumnWriter::~ColumnWriter() {
+ ColumnWriterState::~ColumnWriterState() {
+ }
+ 
+-void ColumnWriter::CompressPage(BufferedSerializer &temp_writer, size_t &compressed_size, data_ptr_t &compressed_data,
++void ColumnWriter::CompressPage(MemoryStream &temp_writer, size_t &compressed_size, data_ptr_t &compressed_data,
+                                 unique_ptr<data_t[]> &compressed_buf) {
+ 	switch (writer.GetCodec()) {
+ 	case CompressionCodec::UNCOMPRESSED:
+-		compressed_size = temp_writer.blob.size;
+-		compressed_data = temp_writer.blob.data.get();
++		compressed_size = temp_writer.GetPosition();
++		compressed_data = temp_writer.GetData();
+ 		break;
+ 	case CompressionCodec::SNAPPY: {
+-		compressed_size = duckdb_snappy::MaxCompressedLength(temp_writer.blob.size);
++		compressed_size = duckdb_snappy::MaxCompressedLength(temp_writer.GetPosition());
+ 		compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+-		duckdb_snappy::RawCompress(const_char_ptr_cast(temp_writer.blob.data.get()), temp_writer.blob.size,
++		duckdb_snappy::RawCompress(const_char_ptr_cast(temp_writer.GetData()), temp_writer.GetPosition(),
+ 		                           char_ptr_cast(compressed_buf.get()), &compressed_size);
+ 		compressed_data = compressed_buf.get();
+-		D_ASSERT(compressed_size <= duckdb_snappy::MaxCompressedLength(temp_writer.blob.size));
++		D_ASSERT(compressed_size <= duckdb_snappy::MaxCompressedLength(temp_writer.GetPosition()));
+ 		break;
+ 	}
+ 	case CompressionCodec::GZIP: {
+ 		MiniZStream s;
+-		compressed_size = s.MaxCompressedLength(temp_writer.blob.size);
++		compressed_size = s.MaxCompressedLength(temp_writer.GetPosition());
+ 		compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+-		s.Compress(const_char_ptr_cast(temp_writer.blob.data.get()), temp_writer.blob.size,
++		s.Compress(const_char_ptr_cast(temp_writer.GetData()), temp_writer.GetPosition(),
+ 		           char_ptr_cast(compressed_buf.get()), &compressed_size);
+ 		compressed_data = compressed_buf.get();
+ 		break;
+ 	}
+ 	case CompressionCodec::ZSTD: {
+-		compressed_size = duckdb_zstd::ZSTD_compressBound(temp_writer.blob.size);
++		compressed_size = duckdb_zstd::ZSTD_compressBound(temp_writer.GetPosition());
+ 		compressed_buf = unique_ptr<data_t[]>(new data_t[compressed_size]);
+ 		compressed_size = duckdb_zstd::ZSTD_compress((void *)compressed_buf.get(), compressed_size,
+-		                                             (const void *)temp_writer.blob.data.get(), temp_writer.blob.size,
++		                                             (const void *)temp_writer.GetData(), temp_writer.GetPosition(),
+ 		                                             ZSTD_CLEVEL_DEFAULT);
+ 		compressed_data = compressed_buf.get();
+ 		break;
+ 	}
+ 	default:
+ 		throw InternalException("Unsupported codec for Parquet Writer");
+ 	}
+ 
+ 	if (compressed_size > idx_t(NumericLimits<int32_t>::Maximum())) {
+ 		throw InternalException("Parquet writer: %d compressed page size out of range for type integer",
+-		                        temp_writer.blob.size);
++		                        temp_writer.GetPosition());
+ 	}
+ }
+ 
+@@ -304,12 +304,12 @@ struct PageInformation {
+ 
+ struct PageWriteInformation {
+ 	PageHeader page_header;
+-	unique_ptr<BufferedSerializer> temp_writer;
++	unique_ptr<MemoryStream> temp_writer;
+ 	unique_ptr<ColumnWriterPageState> page_state;
+ 	idx_t write_page_idx = 0;
+ 	idx_t write_count = 0;
+ 	idx_t max_write_count = 0;
+ 	size_t compressed_size;
+ 	data_ptr_t compressed_data;
+ 	unique_ptr<data_t[]> compressed_buf;
+ };
+@@ -365,35 +365,35 @@ public:
+ protected:
+ 	void WriteLevels(WriteStream &temp_writer, const vector<uint16_t> &levels, idx_t max_value, idx_t start_offset,
+ 	                 idx_t count);
+ 
+ 	virtual duckdb_parquet::format::Encoding::type GetEncoding(BasicColumnWriterState &state);
+ 
+ 	void NextPage(BasicColumnWriterState &state);
+ 	void FlushPage(BasicColumnWriterState &state);
+ 
+ 	//! Initializes the state used to track statistics during writing. Only used for scalar types.
+ 	virtual unique_ptr<ColumnWriterStatistics> InitializeStatsState();
+ 
+ 	//! Initialize the writer for a specific page. Only used for scalar types.
+ 	virtual unique_ptr<ColumnWriterPageState> InitializePageState(BasicColumnWriterState &state);
+ 
+ 	//! Flushes the writer for a specific page. Only used for scalar types.
+ 	virtual void FlushPageState(WriteStream &temp_writer, ColumnWriterPageState *state);
+ 
+ 	//! Retrieves the row size of a vector at the specified location. Only used for scalar types.
+ 	virtual idx_t GetRowSize(Vector &vector, idx_t index, BasicColumnWriterState &state);
+ 	//! Writes a (subset of a) vector to the specified serializer. Only used for scalar types.
+ 	virtual void WriteVector(WriteStream &temp_writer, ColumnWriterStatistics *stats, ColumnWriterPageState *page_state,
+ 	                         Vector &vector, idx_t chunk_start, idx_t chunk_end) = 0;
+ 
+ 	virtual bool HasDictionary(BasicColumnWriterState &state_p) {
+ 		return false;
+ 	}
+ 	//! The number of elements in the dictionary
+ 	virtual idx_t DictionarySize(BasicColumnWriterState &state_p);
+-	void WriteDictionary(BasicColumnWriterState &state, unique_ptr<BufferedSerializer> temp_writer, idx_t row_count);
++	void WriteDictionary(BasicColumnWriterState &state, unique_ptr<MemoryStream> temp_writer, idx_t row_count);
+ 	virtual void FlushDictionary(BasicColumnWriterState &state, ColumnWriterStatistics *stats);
+ 
+ 	void SetParquetStatistics(BasicColumnWriterState &state, duckdb_parquet::format::ColumnChunk &column);
+ 	void RegisterToRowGroup(duckdb_parquet::format::RowGroup &row_group);
+ };
+@@ -460,39 +460,39 @@ duckdb_parquet::format::Encoding::type BasicColumnWriter::GetEncoding(BasicColum
+ void BasicColumnWriter::BeginWrite(ColumnWriterState &state_p) {
+ 	auto &state = state_p.Cast<BasicColumnWriterState>();
+ 
+ 	// set up the page write info
+ 	state.stats_state = InitializeStatsState();
+ 	for (idx_t page_idx = 0; page_idx < state.page_info.size(); page_idx++) {
+ 		auto &page_info = state.page_info[page_idx];
+ 		if (page_info.row_count == 0) {
+ 			D_ASSERT(page_idx + 1 == state.page_info.size());
+ 			state.page_info.erase(state.page_info.begin() + page_idx);
+ 			break;
+ 		}
+ 		PageWriteInformation write_info;
+ 		// set up the header
+ 		auto &hdr = write_info.page_header;
+ 		hdr.compressed_page_size = 0;
+ 		hdr.uncompressed_page_size = 0;
+ 		hdr.type = PageType::DATA_PAGE;
+ 		hdr.__isset.data_page_header = true;
+ 
+ 		hdr.data_page_header.num_values = page_info.row_count;
+ 		hdr.data_page_header.encoding = GetEncoding(state);
+ 		hdr.data_page_header.definition_level_encoding = Encoding::RLE;
+ 		hdr.data_page_header.repetition_level_encoding = Encoding::RLE;
+ 
+-		write_info.temp_writer = make_uniq<BufferedSerializer>();
++		write_info.temp_writer = make_uniq<MemoryStream>();
+ 		write_info.write_count = page_info.empty_count;
+ 		write_info.max_write_count = page_info.row_count;
+ 		write_info.page_state = InitializePageState(state);
+ 
+ 		write_info.compressed_size = 0;
+ 		write_info.compressed_data = nullptr;
+ 
+ 		state.write_info.push_back(std::move(write_info));
+ 	}
+ 
+ 	// start writing the first page
+ 	NextPage(state);
+ }
+@@ -547,32 +547,32 @@ void BasicColumnWriter::NextPage(BasicColumnWriterState &state) {
+ void BasicColumnWriter::FlushPage(BasicColumnWriterState &state) {
+ 	D_ASSERT(state.current_page > 0);
+ 	if (state.current_page > state.write_info.size()) {
+ 		return;
+ 	}
+ 
+ 	// compress the page info
+ 	auto &write_info = state.write_info[state.current_page - 1];
+ 	auto &temp_writer = *write_info.temp_writer;
+ 	auto &hdr = write_info.page_header;
+ 
+ 	FlushPageState(temp_writer, write_info.page_state.get());
+ 
+ 	// now that we have finished writing the data we know the uncompressed size
+-	if (temp_writer.blob.size > idx_t(NumericLimits<int32_t>::Maximum())) {
++	if (temp_writer.GetPosition() > idx_t(NumericLimits<int32_t>::Maximum())) {
+ 		throw InternalException("Parquet writer: %d uncompressed page size out of range for type integer",
+-		                        temp_writer.blob.size);
++		                        temp_writer.GetPosition());
+ 	}
+-	hdr.uncompressed_page_size = temp_writer.blob.size;
++	hdr.uncompressed_page_size = temp_writer.GetPosition();
+ 
+ 	// compress the data
+ 	CompressPage(temp_writer, write_info.compressed_size, write_info.compressed_data, write_info.compressed_buf);
+ 	hdr.compressed_page_size = write_info.compressed_size;
+ 	D_ASSERT(hdr.uncompressed_page_size > 0);
+ 	D_ASSERT(hdr.compressed_page_size > 0);
+ 
+ 	if (write_info.compressed_buf) {
+ 		// if the data has been compressed, we no longer need the compressed data
+ 		D_ASSERT(write_info.compressed_buf.get() == write_info.compressed_data);
+ 		write_info.temp_writer.reset();
+ 	}
+ }
+@@ -696,36 +696,36 @@ idx_t BasicColumnWriter::DictionarySize(BasicColumnWriterState &state) {
+ 	throw InternalException("This page does not have a dictionary");
+ }
+ 
+-void BasicColumnWriter::WriteDictionary(BasicColumnWriterState &state, unique_ptr<BufferedSerializer> temp_writer,
++void BasicColumnWriter::WriteDictionary(BasicColumnWriterState &state, unique_ptr<MemoryStream> temp_writer,
+                                         idx_t row_count) {
+ 	D_ASSERT(temp_writer);
+-	D_ASSERT(temp_writer->blob.size > 0);
++	D_ASSERT(temp_writer->GetPosition() > 0);
+ 
+ 	// write the dictionary page header
+ 	PageWriteInformation write_info;
+ 	// set up the header
+ 	auto &hdr = write_info.page_header;
+-	hdr.uncompressed_page_size = temp_writer->blob.size;
++	hdr.uncompressed_page_size = temp_writer->GetPosition();
+ 	hdr.type = PageType::DICTIONARY_PAGE;
+ 	hdr.__isset.dictionary_page_header = true;
+ 
+ 	hdr.dictionary_page_header.encoding = Encoding::PLAIN;
+ 	hdr.dictionary_page_header.is_sorted = false;
+ 	hdr.dictionary_page_header.num_values = row_count;
+ 
+ 	write_info.temp_writer = std::move(temp_writer);
+ 	write_info.write_count = 0;
+ 	write_info.max_write_count = 0;
+ 
+ 	// compress the contents of the dictionary page
+ 	CompressPage(*write_info.temp_writer, write_info.compressed_size, write_info.compressed_data,
+ 	             write_info.compressed_buf);
+ 	hdr.compressed_page_size = write_info.compressed_size;
+ 
+ 	// insert the dictionary page as the first page to write for this column
+ 	state.write_info.insert(state.write_info.begin(), std::move(write_info));
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Standard Column Writer
+ //===--------------------------------------------------------------------===//
+@@ -1242,187 +1242,187 @@ public:
+ public:
+ 	unique_ptr<ColumnWriterStatistics> InitializeStatsState() override {
+ 		return make_uniq<StringStatisticsState>();
+ 	}
+ 
+ 	unique_ptr<ColumnWriterState> InitializeWriteState(duckdb_parquet::format::RowGroup &row_group) override {
+ 		auto result = make_uniq<StringColumnWriterState>(row_group, row_group.columns.size());
+ 		RegisterToRowGroup(row_group);
+ 		return std::move(result);
+ 	}
+ 
+ 	bool HasAnalyze() override {
+ 		return true;
+ 	}
+ 
+ 	void Analyze(ColumnWriterState &state_p, ColumnWriterState *parent, Vector &vector, idx_t count) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 
+ 		idx_t vcount = parent ? parent->definition_levels.size() - state.definition_levels.size() : count;
+ 		idx_t parent_index = state.definition_levels.size();
+ 		auto &validity = FlatVector::Validity(vector);
+ 		idx_t vector_index = 0;
+ 		uint32_t new_value_index = state.dictionary.size();
+ 		uint32_t last_value_index = -1;
+ 		idx_t run_length = 0;
+ 		idx_t run_count = 0;
+ 		auto strings = FlatVector::GetData<string_t>(vector);
+ 		for (idx_t i = 0; i < vcount; i++) {
+ 
+ 			if (parent && !parent->is_empty.empty() && parent->is_empty[parent_index + i]) {
+ 				continue;
+ 			}
+ 
+ 			if (validity.RowIsValid(vector_index)) {
+ 				run_length++;
+ 				const auto &value = strings[vector_index];
+ 				// Try to insert into the dictionary. If it's already there, we get back the value index
+ 				auto found = state.dictionary.insert(string_map_t<uint32_t>::value_type(value, new_value_index));
+ 				state.estimated_plain_size += value.GetSize() + STRING_LENGTH_SIZE;
+ 				if (found.second) {
+ 					// string didn't exist yet in the dictionary
+ 					new_value_index++;
+ 					state.estimated_dict_page_size += value.GetSize() + MAX_DICTIONARY_KEY_SIZE;
+ 				}
+ 				// if the value changed, we will encode it in the page
+ 				if (last_value_index != found.first->second) {
+ 					// we will add the value index size later, when we know the total number of keys
+ 					state.estimated_rle_pages_size += GetVarintSize(run_length);
+ 					run_length = 0;
+ 					run_count++;
+ 					last_value_index = found.first->second;
+ 				}
+ 			}
+ 			vector_index++;
+ 		}
+ 		// Add the costs of keys sizes. We don't know yet how many bytes the keys need as we haven't
+ 		// seen all the values. therefore we use an over-estimation of
+ 		state.estimated_rle_pages_size += MAX_DICTIONARY_KEY_SIZE * run_count;
+ 	}
+ 
+ 	void FinalizeAnalyze(ColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 
+ 		// check if a dictionary will require more space than a plain write, or if the dictionary page is going to
+ 		// be too large
+ 		if (state.estimated_dict_page_size > MAX_UNCOMPRESSED_DICT_PAGE_SIZE ||
+ 		    state.estimated_rle_pages_size + state.estimated_dict_page_size > state.estimated_plain_size) {
+ 			// clearing the dictionary signals a plain write
+ 			state.dictionary.clear();
+ 			state.key_bit_width = 0;
+ 		} else {
+ 			state.key_bit_width = RleBpDecoder::ComputeBitWidth(state.dictionary.size());
+ 		}
+ 	}
+ 
+ 	void WriteVector(WriteStream &temp_writer, ColumnWriterStatistics *stats_p, ColumnWriterPageState *page_state_p,
+ 	                 Vector &input_column, idx_t chunk_start, idx_t chunk_end) override {
+ 		auto &page_state = page_state_p->Cast<StringWriterPageState>();
+ 		auto &mask = FlatVector::Validity(input_column);
+ 		auto &stats = stats_p->Cast<StringStatisticsState>();
+ 
+ 		auto *ptr = FlatVector::GetData<string_t>(input_column);
+ 		if (page_state.IsDictionaryEncoded()) {
+ 			// dictionary based page
+ 			for (idx_t r = chunk_start; r < chunk_end; r++) {
+ 				if (!mask.RowIsValid(r)) {
+ 					continue;
+ 				}
+ 				auto value_index = page_state.dictionary.at(ptr[r]);
+ 				if (!page_state.written_value) {
+ 					// first value
+ 					// write the bit-width as a one-byte entry
+ 					temp_writer.Write<uint8_t>(page_state.bit_width);
+ 					// now begin writing the actual value
+ 					page_state.encoder.BeginWrite(temp_writer, value_index);
+ 					page_state.written_value = true;
+ 				} else {
+ 					page_state.encoder.WriteValue(temp_writer, value_index);
+ 				}
+ 			}
+ 		} else {
+ 			// plain page
+ 			for (idx_t r = chunk_start; r < chunk_end; r++) {
+ 				if (!mask.RowIsValid(r)) {
+ 					continue;
+ 				}
+ 				stats.Update(ptr[r]);
+ 				temp_writer.Write<uint32_t>(ptr[r].GetSize());
+ 				temp_writer.WriteData(const_data_ptr_cast(ptr[r].GetData()), ptr[r].GetSize());
+ 			}
+ 		}
+ 	}
+ 
+ 	unique_ptr<ColumnWriterPageState> InitializePageState(BasicColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		return make_uniq<StringWriterPageState>(state.key_bit_width, state.dictionary);
+ 	}
+ 
+ 	void FlushPageState(WriteStream &temp_writer, ColumnWriterPageState *state_p) override {
+ 		auto &page_state = state_p->Cast<StringWriterPageState>();
+ 		if (page_state.bit_width != 0) {
+ 			if (!page_state.written_value) {
+ 				// all values are null
+ 				// just write the bit width
+ 				temp_writer.Write<uint8_t>(page_state.bit_width);
+ 				return;
+ 			}
+ 			page_state.encoder.FinishWrite(temp_writer);
+ 		}
+ 	}
+ 
+ 	duckdb_parquet::format::Encoding::type GetEncoding(BasicColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		return state.IsDictionaryEncoded() ? Encoding::RLE_DICTIONARY : Encoding::PLAIN;
+ 	}
+ 
+ 	bool HasDictionary(BasicColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		return state.IsDictionaryEncoded();
+ 	}
+ 
+ 	idx_t DictionarySize(BasicColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		D_ASSERT(state.IsDictionaryEncoded());
+ 		return state.dictionary.size();
+ 	}
+ 
+ 	void FlushDictionary(BasicColumnWriterState &state_p, ColumnWriterStatistics *stats_p) override {
+ 		auto &stats = stats_p->Cast<StringStatisticsState>();
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		if (!state.IsDictionaryEncoded()) {
+ 			return;
+ 		}
+ 		// first we need to sort the values in index order
+ 		auto values = vector<string_t>(state.dictionary.size());
+ 		for (const auto &entry : state.dictionary) {
+ 			D_ASSERT(values[entry.second].GetSize() == 0);
+ 			values[entry.second] = entry.first;
+ 		}
+ 		// first write the contents of the dictionary page to a temporary buffer
+-		auto temp_writer = make_uniq<BufferedSerializer>();
++		auto temp_writer = make_uniq<MemoryStream>();
+ 		for (idx_t r = 0; r < values.size(); r++) {
+ 			auto &value = values[r];
+ 			// update the statistics
+ 			stats.Update(value);
+ 			// write this string value to the dictionary
+ 			temp_writer->Write<uint32_t>(value.GetSize());
+ 			temp_writer->WriteData(const_data_ptr_cast((value.GetData())), value.GetSize());
+ 		}
+ 		// flush the dictionary page and add it to the to-be-written pages
+ 		WriteDictionary(state, std::move(temp_writer), values.size());
+ 	}
+ 
+ 	idx_t GetRowSize(Vector &vector, idx_t index, BasicColumnWriterState &state_p) override {
+ 		auto &state = state_p.Cast<StringColumnWriterState>();
+ 		if (state.IsDictionaryEncoded()) {
+ 			return (state.key_bit_width + 7) / 8;
+ 		} else {
+ 			auto strings = FlatVector::GetData<string_t>(vector);
+ 			return strings[index].GetSize();
+ 		}
+ 	}
+ };
+ 
+ //===--------------------------------------------------------------------===//
+ // Enum Column Writer
+ //===--------------------------------------------------------------------===//
+@@ -1451,99 +1451,99 @@ public:
+ public:
+ 	unique_ptr<ColumnWriterStatistics> InitializeStatsState() override {
+ 		return make_uniq<StringStatisticsState>();
+ 	}
+ 
+ 	template <class T>
+ 	void WriteEnumInternal(WriteStream &temp_writer, Vector &input_column, idx_t chunk_start, idx_t chunk_end,
+ 	                       EnumWriterPageState &page_state) {
+ 		auto &mask = FlatVector::Validity(input_column);
+ 		auto *ptr = FlatVector::GetData<T>(input_column);
+ 		for (idx_t r = chunk_start; r < chunk_end; r++) {
+ 			if (mask.RowIsValid(r)) {
+ 				if (!page_state.written_value) {
+ 					// first value
+ 					// write the bit-width as a one-byte entry
+ 					temp_writer.Write<uint8_t>(bit_width);
+ 					// now begin writing the actual value
+ 					page_state.encoder.BeginWrite(temp_writer, ptr[r]);
+ 					page_state.written_value = true;
+ 				} else {
+ 					page_state.encoder.WriteValue(temp_writer, ptr[r]);
+ 				}
+ 			}
+ 		}
+ 	}
+ 
+ 	void WriteVector(WriteStream &temp_writer, ColumnWriterStatistics *stats_p, ColumnWriterPageState *page_state_p,
+ 	                 Vector &input_column, idx_t chunk_start, idx_t chunk_end) override {
+ 		auto &page_state = page_state_p->Cast<EnumWriterPageState>();
+ 		switch (enum_type.InternalType()) {
+ 		case PhysicalType::UINT8:
+ 			WriteEnumInternal<uint8_t>(temp_writer, input_column, chunk_start, chunk_end, page_state);
+ 			break;
+ 		case PhysicalType::UINT16:
+ 			WriteEnumInternal<uint16_t>(temp_writer, input_column, chunk_start, chunk_end, page_state);
+ 			break;
+ 		case PhysicalType::UINT32:
+ 			WriteEnumInternal<uint32_t>(temp_writer, input_column, chunk_start, chunk_end, page_state);
+ 			break;
+ 		default:
+ 			throw InternalException("Unsupported internal enum type");
+ 		}
+ 	}
+ 
+ 	unique_ptr<ColumnWriterPageState> InitializePageState(BasicColumnWriterState &state) override {
+ 		return make_uniq<EnumWriterPageState>(bit_width);
+ 	}
+ 
+ 	void FlushPageState(WriteStream &temp_writer, ColumnWriterPageState *state_p) override {
+ 		auto &page_state = state_p->Cast<EnumWriterPageState>();
+ 		if (!page_state.written_value) {
+ 			// all values are null
+ 			// just write the bit width
+ 			temp_writer.Write<uint8_t>(bit_width);
+ 			return;
+ 		}
+ 		page_state.encoder.FinishWrite(temp_writer);
+ 	}
+ 
+ 	duckdb_parquet::format::Encoding::type GetEncoding(BasicColumnWriterState &state) override {
+ 		return Encoding::RLE_DICTIONARY;
+ 	}
+ 
+ 	bool HasDictionary(BasicColumnWriterState &state) override {
+ 		return true;
+ 	}
+ 
+ 	idx_t DictionarySize(BasicColumnWriterState &state_p) override {
+ 		return EnumType::GetSize(enum_type);
+ 	}
+ 
+ 	void FlushDictionary(BasicColumnWriterState &state, ColumnWriterStatistics *stats_p) override {
+ 		auto &stats = stats_p->Cast<StringStatisticsState>();
+ 		// write the enum values to a dictionary page
+ 		auto &enum_values = EnumType::GetValuesInsertOrder(enum_type);
+ 		auto enum_count = EnumType::GetSize(enum_type);
+ 		auto string_values = FlatVector::GetData<string_t>(enum_values);
+ 		// first write the contents of the dictionary page to a temporary buffer
+-		auto temp_writer = make_uniq<BufferedSerializer>();
++		auto temp_writer = make_uniq<MemoryStream>();
+ 		for (idx_t r = 0; r < enum_count; r++) {
+ 			D_ASSERT(!FlatVector::IsNull(enum_values, r));
+ 			// update the statistics
+ 			stats.Update(string_values[r]);
+ 			// write this string value to the dictionary
+ 			temp_writer->Write<uint32_t>(string_values[r].GetSize());
+ 			temp_writer->WriteData(const_data_ptr_cast(string_values[r].GetData()), string_values[r].GetSize());
+ 		}
+ 		// flush the dictionary page and add it to the to-be-written pages
+ 		WriteDictionary(state, std::move(temp_writer), enum_count);
+ 	}
+ 
+ 	idx_t GetRowSize(Vector &vector, idx_t index, BasicColumnWriterState &state) override {
+ 		return (bit_width + 7) / 8;
+ 	}
+ };
+ 
+ //===--------------------------------------------------------------------===//
+ // Struct Column Writer
+ //===--------------------------------------------------------------------===//
+diff --git a/extension/parquet/include/column_writer.hpp b/extension/parquet/include/column_writer.hpp
+index 31b423ff7f..eb3ca519e6 100644
+--- a/extension/parquet/include/column_writer.hpp
++++ b/extension/parquet/include/column_writer.hpp
+@@ -12,7 +12,7 @@
+ #include "parquet_types.h"
+ 
+ namespace duckdb {
+-class BufferedSerializer;
++class MemoryStream;
+ class ParquetWriter;
+ class ColumnWriterPageState;
+ class BasicColumnWriterState;
+@@ -111,10 +111,10 @@ public:
+ protected:
+ 	void HandleDefineLevels(ColumnWriterState &state, ColumnWriterState *parent, ValidityMask &validity, idx_t count,
+ 	                        uint16_t define_value, uint16_t null_value);
+ 	void HandleRepeatLevels(ColumnWriterState &state_p, ColumnWriterState *parent, idx_t count, idx_t max_repeat);
+ 
+-	void CompressPage(BufferedSerializer &temp_writer, size_t &compressed_size, data_ptr_t &compressed_data,
++	void CompressPage(MemoryStream &temp_writer, size_t &compressed_size, data_ptr_t &compressed_data,
+ 	                  unique_ptr<data_t[]> &compressed_buf);
+ };
+ 
+ } // namespace duckdb
+diff --git a/scripts/amalgamation.py b/scripts/amalgamation.py
+index 1ef641c581..de132730d9 100644
+--- a/scripts/amalgamation.py
++++ b/scripts/amalgamation.py
+@@ -20,26 +20,26 @@ include_dir = os.path.join('src', 'include')
+ # files included in the amalgamated "duckdb.hpp" file
+ main_header_files = [
+     os.path.join(include_dir, 'duckdb.hpp'),
+     os.path.join(include_dir, 'duckdb.h'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'date.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'adbc', 'adbc.h'),
+     os.path.join(include_dir, 'duckdb', 'common', 'adbc', 'adbc.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'arrow', 'arrow.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'arrow', 'arrow_converter.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'arrow', 'arrow_wrapper.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'blob.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'decimal.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'hugeint.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'uuid.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'interval.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'timestamp.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'types', 'time.hpp'),
+     os.path.join(include_dir, 'duckdb', 'common', 'serializer', 'buffered_file_writer.hpp'),
+-    os.path.join(include_dir, 'duckdb', 'common', 'serializer', 'buffered_serializer.hpp'),
++    os.path.join(include_dir, 'duckdb', 'common', 'serializer', 'memory_stream.hpp'),
+     os.path.join(include_dir, 'duckdb', 'main', 'appender.hpp'),
+     os.path.join(include_dir, 'duckdb', 'main', 'client_context.hpp'),
+     os.path.join(include_dir, 'duckdb', 'function', 'function.hpp'),
+     os.path.join(include_dir, 'duckdb', 'function', 'table_function.hpp'),
+     os.path.join(include_dir, 'duckdb', 'parser', 'parsed_data', 'create_table_function_info.hpp'),
+     os.path.join(include_dir, 'duckdb', 'parser', 'parsed_data', 'create_copy_function_info.hpp'),
+ ]
+diff --git a/src/common/serializer/CMakeLists.txt b/src/common/serializer/CMakeLists.txt
+index 1852d77a3e..11530e4224 100644
+--- a/src/common/serializer/CMakeLists.txt
++++ b/src/common/serializer/CMakeLists.txt
+@@ -1,12 +1,10 @@
+ add_library_unity(
+   duckdb_common_serializer
+   OBJECT
+   binary_serializer.cpp
+   binary_deserializer.cpp
+-  buffered_deserializer.cpp
+   buffered_file_reader.cpp
+   buffered_file_writer.cpp
+-  buffered_serializer.cpp
+   memory_stream.cpp
+   serializer.cpp)
+ set(ALL_OBJECT_FILES
+diff --git a/src/common/serializer/buffered_deserializer.cpp b/src/common/serializer/buffered_deserializer.cpp
+deleted file mode 100644
+index b5f8a19a1f..0000000000
+--- a/src/common/serializer/buffered_deserializer.cpp
++++ /dev/null
+@@ -1,22 +0,0 @@
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+-
+-#include <cstring>
+-
+-namespace duckdb {
+-
+-BufferedDeserializer::BufferedDeserializer(data_ptr_t ptr, idx_t data_size) : ptr(ptr), endptr(ptr + data_size) {
+-}
+-
+-BufferedDeserializer::BufferedDeserializer(BufferedSerializer &serializer)
+-    : BufferedDeserializer(serializer.data, serializer.maximum_size) {
+-}
+-
+-void BufferedDeserializer::ReadData(data_ptr_t buffer, idx_t read_size) {
+-	if (ptr + read_size > endptr) {
+-		throw SerializationException("Failed to deserialize: not enough data in buffer to fulfill read request");
+-	}
+-	memcpy(buffer, ptr, read_size);
+-	ptr += read_size;
+-}
+-
+-} // namespace duckdb
+diff --git a/src/common/serializer/buffered_serializer.cpp b/src/common/serializer/buffered_serializer.cpp
+deleted file mode 100644
+index af2ec931b1..0000000000
+--- a/src/common/serializer/buffered_serializer.cpp
++++ /dev/null
+@@ -1,36 +0,0 @@
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+-
+-#include <cstring>
+-
+-namespace duckdb {
+-
+-BufferedSerializer::BufferedSerializer(idx_t maximum_size)
+-    : BufferedSerializer(make_unsafe_uniq_array<data_t>(maximum_size), maximum_size) {
+-}
+-
+-BufferedSerializer::BufferedSerializer(unsafe_unique_array<data_t> data, idx_t size)
+-    : maximum_size(size), data(data.get()) {
+-	blob.size = 0;
+-	blob.data = std::move(data);
+-}
+-
+-BufferedSerializer::BufferedSerializer(data_ptr_t data, idx_t size) : maximum_size(size), data(data) {
+-	blob.size = 0;
+-}
+-
+-void BufferedSerializer::WriteData(const_data_ptr_t buffer, idx_t write_size) {
+-	if (blob.size + write_size >= maximum_size) {
+-		do {
+-			maximum_size *= 2;
+-		} while (blob.size + write_size > maximum_size);
+-		auto new_data = new data_t[maximum_size];
+-		memcpy(new_data, data, blob.size);
+-		data = new_data;
+-		blob.data = unsafe_unique_array<data_t>(new_data);
+-	}
+-
+-	memcpy(data + blob.size, buffer, write_size);
+-	blob.size += write_size;
+-}
+-
+-} // namespace duckdb
+diff --git a/src/function/table/copy_csv.cpp b/src/function/table/copy_csv.cpp
+index d728002a59..092910d5c1 100644
+--- a/src/function/table/copy_csv.cpp
++++ b/src/function/table/copy_csv.cpp
+@@ -1,17 +1,17 @@
+ #include "duckdb/common/bind_helpers.hpp"
+ #include "duckdb/common/file_system.hpp"
+ #include "duckdb/common/multi_file_reader.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+ #include "duckdb/common/string_util.hpp"
+ #include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/common/types/string_type.hpp"
+ #include "duckdb/common/vector_operations/vector_operations.hpp"
+ #include "duckdb/execution/operator/scan/csv/csv_sniffer.hpp"
+ #include "duckdb/function/copy_function.hpp"
+ #include "duckdb/function/scalar/string_functions.hpp"
+ #include "duckdb/function/table/read_csv.hpp"
+ #include "duckdb/parser/parsed_data/copy_info.hpp"
+ #include "duckdb/common/serializer/write_stream.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
+ 
+ #include <limits>
+ 
+@@ -217,57 +217,57 @@ static bool RequiresQuotes(WriteCSVData &csv_data, const char *str, idx_t len) {
+ static void WriteQuotedString(WriteStream &writer, WriteCSVData &csv_data, const char *str, idx_t len,
+                               bool force_quote) {
+ 	auto &options = csv_data.options;
+ 	if (!force_quote) {
+ 		// force quote is disabled: check if we need to add quotes anyway
+ 		force_quote = RequiresQuotes(csv_data, str, len);
+ 	}
+ 	if (force_quote) {
+ 		// quoting is enabled: we might need to escape things in the string
+ 		bool requires_escape = false;
+ 		// simple CSV
+ 		// do a single loop to check for a quote or escape value
+ 		for (idx_t i = 0; i < len; i++) {
+ 			if (str[i] == options.dialect_options.state_machine_options.quote ||
+ 			    str[i] == options.dialect_options.state_machine_options.escape) {
+ 				requires_escape = true;
+ 				break;
+ 			}
+ 		}
+ 
+ 		if (!requires_escape) {
+ 			// fast path: no need to escape anything
+ 			WriteQuoteOrEscape(writer, options.dialect_options.state_machine_options.quote);
+ 			writer.WriteData(const_data_ptr_cast(str), len);
+ 			WriteQuoteOrEscape(writer, options.dialect_options.state_machine_options.quote);
+ 			return;
+ 		}
+ 
+ 		// slow path: need to add escapes
+ 		string new_val(str, len);
+ 		new_val = AddEscapes(options.dialect_options.state_machine_options.escape,
+ 		                     options.dialect_options.state_machine_options.escape, new_val);
+ 		if (options.dialect_options.state_machine_options.escape !=
+ 		    options.dialect_options.state_machine_options.quote) {
+ 			// need to escape quotes separately
+ 			new_val = AddEscapes(options.dialect_options.state_machine_options.quote,
+ 			                     options.dialect_options.state_machine_options.escape, new_val);
+ 		}
+ 		WriteQuoteOrEscape(writer, options.dialect_options.state_machine_options.quote);
+-		writer.WriteBufferData(new_val);
++		writer.WriteData(const_data_ptr_cast(new_val.c_str()), new_val.size());
+ 		WriteQuoteOrEscape(writer, options.dialect_options.state_machine_options.quote);
+ 	} else {
+ 		writer.WriteData(const_data_ptr_cast(str), len);
+ 	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Sink
+ //===--------------------------------------------------------------------===//
+ struct LocalWriteCSVData : public LocalFunctionData {
+ 	//! The thread-local buffer to write data into
+-	BufferedSerializer serializer;
++	MemoryStream stream;
+ 	//! A chunk with VARCHAR columns to cast intermediates into
+ 	DataChunk cast_chunk;
+ 	//! If we've written any rows yet, allows us to prevent a trailing comma when writing JSON ARRAY
+ 	bool written_anything = false;
+ };
+@@ -324,87 +324,87 @@ static unique_ptr<LocalFunctionData> WriteCSVInitializeLocal(ExecutionContext &c
+ static unique_ptr<GlobalFunctionData> WriteCSVInitializeGlobal(ClientContext &context, FunctionData &bind_data,
+                                                                const string &file_path) {
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+ 	auto &options = csv_data.options;
+ 	auto global_data =
+ 	    make_uniq<GlobalWriteCSVData>(FileSystem::GetFileSystem(context), file_path, options.compression);
+ 
+ 	if (!options.prefix.empty()) {
+ 		global_data->WriteData(options.prefix.c_str(), options.prefix.size());
+ 	}
+ 
+ 	if (options.dialect_options.header) {
+-		BufferedSerializer serializer;
++		MemoryStream stream;
+ 		// write the header line to the file
+ 		for (idx_t i = 0; i < csv_data.options.name_list.size(); i++) {
+ 			if (i != 0) {
+-				WriteQuoteOrEscape(serializer, options.dialect_options.state_machine_options.delimiter);
++				WriteQuoteOrEscape(stream, options.dialect_options.state_machine_options.delimiter);
+ 			}
+-			WriteQuotedString(serializer, csv_data, csv_data.options.name_list[i].c_str(),
++			WriteQuotedString(stream, csv_data, csv_data.options.name_list[i].c_str(),
+ 			                  csv_data.options.name_list[i].size(), false);
+ 		}
+-		serializer.WriteBufferData(csv_data.newline);
++		stream.WriteData(const_data_ptr_cast(csv_data.newline.c_str()), csv_data.newline.size());
+ 
+-		global_data->WriteData(serializer.blob.data.get(), serializer.blob.size);
++		global_data->WriteData(stream.GetData(), stream.GetPosition());
+ 	}
+ 
+ 	return std::move(global_data);
+ }
+ 
+ static void WriteCSVChunkInternal(ClientContext &context, FunctionData &bind_data, DataChunk &cast_chunk,
+-                                  BufferedSerializer &writer, DataChunk &input, bool &written_anything) {
++                                  MemoryStream &writer, DataChunk &input, bool &written_anything) {
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+ 	auto &options = csv_data.options;
+ 
+ 	// first cast the columns of the chunk to varchar
+ 	cast_chunk.Reset();
+ 	cast_chunk.SetCardinality(input);
+ 	for (idx_t col_idx = 0; col_idx < input.ColumnCount(); col_idx++) {
+ 		if (csv_data.sql_types[col_idx].id() == LogicalTypeId::VARCHAR) {
+ 			// VARCHAR, just reinterpret (cannot reference, because LogicalTypeId::VARCHAR is used by the JSON type too)
+ 			cast_chunk.data[col_idx].Reinterpret(input.data[col_idx]);
+ 		} else if (options.dialect_options.has_format[LogicalTypeId::DATE] &&
+ 		           csv_data.sql_types[col_idx].id() == LogicalTypeId::DATE) {
+ 			// use the date format to cast the chunk
+ 			csv_data.options.write_date_format[LogicalTypeId::DATE].ConvertDateVector(
+ 			    input.data[col_idx], cast_chunk.data[col_idx], input.size());
+ 		} else if (options.dialect_options.has_format[LogicalTypeId::TIMESTAMP] &&
+ 		           (csv_data.sql_types[col_idx].id() == LogicalTypeId::TIMESTAMP ||
+ 		            csv_data.sql_types[col_idx].id() == LogicalTypeId::TIMESTAMP_TZ)) {
+ 			// use the timestamp format to cast the chunk
+ 			csv_data.options.write_date_format[LogicalTypeId::TIMESTAMP].ConvertTimestampVector(
+ 			    input.data[col_idx], cast_chunk.data[col_idx], input.size());
+ 		} else {
+ 			// non varchar column, perform the cast
+ 			VectorOperations::Cast(context, input.data[col_idx], cast_chunk.data[col_idx], input.size());
+ 		}
+ 	}
+ 
+ 	cast_chunk.Flatten();
+ 	// now loop over the vectors and output the values
+ 	for (idx_t row_idx = 0; row_idx < cast_chunk.size(); row_idx++) {
+ 		if (row_idx == 0 && !written_anything) {
+ 			written_anything = true;
+ 		} else {
+-			writer.WriteBufferData(csv_data.newline);
++			writer.WriteData(const_data_ptr_cast(csv_data.newline.c_str()), csv_data.newline.size());
+ 		}
+ 		// write values
+ 		for (idx_t col_idx = 0; col_idx < cast_chunk.ColumnCount(); col_idx++) {
+ 			if (col_idx != 0) {
+ 				WriteQuoteOrEscape(writer, options.dialect_options.state_machine_options.delimiter);
+ 			}
+ 			if (FlatVector::IsNull(cast_chunk.data[col_idx], row_idx)) {
+ 				// write null value
+-				writer.WriteBufferData(options.null_str);
++				writer.WriteData(const_data_ptr_cast(options.null_str.c_str()), options.null_str.size());
+ 				continue;
+ 			}
+ 
+ 			// non-null value, fetch the string value from the cast chunk
+ 			auto str_data = FlatVector::GetData<string_t>(cast_chunk.data[col_idx]);
+ 			// FIXME: we could gain some performance here by checking for certain types if they ever require quotes
+ 			// (e.g. integers only require quotes if the delimiter is a number, decimals only require quotes if the
+ 			// delimiter is a number or "." character)
+ 			WriteQuotedString(writer, csv_data, str_data[row_idx].GetData(), str_data[row_idx].GetSize(),
+ 			                  csv_data.options.force_quote[col_idx]);
+ 		}
+ 	}
+ }
+@@ -412,58 +412,58 @@ static void WriteCSVChunkInternal(ClientContext &context, FunctionData &bind_dat
+ static void WriteCSVSink(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                          LocalFunctionData &lstate, DataChunk &input) {
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+ 	auto &local_data = lstate.Cast<LocalWriteCSVData>();
+ 	auto &global_state = gstate.Cast<GlobalWriteCSVData>();
+ 
+ 	// write data into the local buffer
+-	WriteCSVChunkInternal(context.client, bind_data, local_data.cast_chunk, local_data.serializer, input,
++	WriteCSVChunkInternal(context.client, bind_data, local_data.cast_chunk, local_data.stream, input,
+ 	                      local_data.written_anything);
+ 
+ 	// check if we should flush what we have currently written
+-	auto &writer = local_data.serializer;
+-	if (writer.blob.size >= csv_data.flush_size) {
+-		global_state.WriteRows(writer.blob.data.get(), writer.blob.size, csv_data.newline);
+-		writer.Reset();
++	auto &writer = local_data.stream;
++	if (writer.GetPosition() >= csv_data.flush_size) {
++		global_state.WriteRows(writer.GetData(), writer.GetPosition(), csv_data.newline);
++		writer.Rewind();
+ 		local_data.written_anything = false;
+ 	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Combine
+ //===--------------------------------------------------------------------===//
+ static void WriteCSVCombine(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                             LocalFunctionData &lstate) {
+ 	auto &local_data = lstate.Cast<LocalWriteCSVData>();
+ 	auto &global_state = gstate.Cast<GlobalWriteCSVData>();
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+-	auto &writer = local_data.serializer;
++	auto &writer = local_data.stream;
+ 	// flush the local writer
+ 	if (local_data.written_anything) {
+-		global_state.WriteRows(writer.blob.data.get(), writer.blob.size, csv_data.newline);
+-		writer.Reset();
++		global_state.WriteRows(writer.GetData(), writer.GetPosition(), csv_data.newline);
++		writer.Rewind();
+ 	}
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Finalize
+ //===--------------------------------------------------------------------===//
+ void WriteCSVFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+ 	auto &global_state = gstate.Cast<GlobalWriteCSVData>();
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+ 	auto &options = csv_data.options;
+ 
+-	BufferedSerializer serializer;
++	MemoryStream stream;
+ 	if (!options.suffix.empty()) {
+-		serializer.WriteBufferData(options.suffix);
++		stream.WriteData(const_data_ptr_cast(options.suffix.c_str()), options.suffix.size());
+ 	} else if (global_state.written_anything) {
+-		serializer.WriteBufferData(csv_data.newline);
++		stream.WriteData(const_data_ptr_cast(csv_data.newline.c_str()), csv_data.newline.size());
+ 	}
+-	global_state.WriteData(serializer.blob.data.get(), serializer.blob.size);
++	global_state.WriteData(stream.GetData(), stream.GetPosition());
+ 
+ 	global_state.handle->Close();
+ 	global_state.handle.reset();
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Execution Mode
+ //===--------------------------------------------------------------------===//
+@@ -471,50 +471,50 @@ CopyFunctionExecutionMode WriteCSVExecutionMode(bool preserve_insertion_order, b
+ 	if (!preserve_insertion_order) {
+ 		return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+ 	}
+ 	if (supports_batch_index) {
+ 		return CopyFunctionExecutionMode::BATCH_COPY_TO_FILE;
+ 	}
+ 	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+ }
+ //===--------------------------------------------------------------------===//
+ // Prepare Batch
+ //===--------------------------------------------------------------------===//
+ struct WriteCSVBatchData : public PreparedBatchData {
+ 	//! The thread-local buffer to write data into
+-	BufferedSerializer serializer;
++	MemoryStream stream;
+ };
+ 
+ unique_ptr<PreparedBatchData> WriteCSVPrepareBatch(ClientContext &context, FunctionData &bind_data,
+                                                    GlobalFunctionData &gstate,
+                                                    unique_ptr<ColumnDataCollection> collection) {
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+ 
+ 	// create the cast chunk with VARCHAR types
+ 	vector<LogicalType> types;
+ 	types.resize(csv_data.options.name_list.size(), LogicalType::VARCHAR);
+ 	DataChunk cast_chunk;
+ 	cast_chunk.Initialize(Allocator::Get(context), types);
+ 
+ 	// write CSV chunks to the batch data
+ 	bool written_anything = false;
+ 	auto batch = make_uniq<WriteCSVBatchData>();
+ 	for (auto &chunk : collection->Chunks()) {
+-		WriteCSVChunkInternal(context, bind_data, cast_chunk, batch->serializer, chunk, written_anything);
++		WriteCSVChunkInternal(context, bind_data, cast_chunk, batch->stream, chunk, written_anything);
+ 	}
+ 	return std::move(batch);
+ }
+ 
+ //===--------------------------------------------------------------------===//
+ // Flush Batch
+ //===--------------------------------------------------------------------===//
+ void WriteCSVFlushBatch(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                         PreparedBatchData &batch) {
+ 	auto &csv_batch = batch.Cast<WriteCSVBatchData>();
+ 	auto &global_state = gstate.Cast<GlobalWriteCSVData>();
+ 	auto &csv_data = bind_data.Cast<WriteCSVData>();
+-	auto &writer = csv_batch.serializer;
+-	global_state.WriteRows(writer.blob.data.get(), writer.blob.size, csv_data.newline);
+-	writer.Reset();
++	auto &writer = csv_batch.stream;
++	global_state.WriteRows(writer.GetData(), writer.GetPosition(), csv_data.newline);
++	writer.Rewind();
+ }
+ 
+ void CSVCopyFunction::RegisterFunction(BuiltinFunctions &set) {
+diff --git a/src/include/duckdb/common/serializer/buffered_deserializer.hpp b/src/include/duckdb/common/serializer/buffered_deserializer.hpp
+deleted file mode 100644
+index d31e55d918..0000000000
+--- a/src/include/duckdb/common/serializer/buffered_deserializer.hpp
++++ /dev/null
+@@ -1,29 +0,0 @@
+-//===----------------------------------------------------------------------===//
+-//                         DuckDB
+-//
+-// duckdb/common/serializer/buffered_deserializer.hpp
+-//
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#pragma once
+-
+-#include "duckdb/common/serializer/read_stream.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+-
+-namespace duckdb {
+-class ClientContext;
+-
+-class BufferedDeserializer : public ReadStream {
+-public:
+-	BufferedDeserializer(data_ptr_t ptr, idx_t data_size);
+-	explicit BufferedDeserializer(BufferedSerializer &serializer);
+-
+-	data_ptr_t ptr;
+-	data_ptr_t endptr;
+-
+-public:
+-	void ReadData(data_ptr_t buffer, uint64_t read_size) override;
+-};
+-
+-} // namespace duckdb
+diff --git a/src/include/duckdb/common/serializer/buffered_serializer.hpp b/src/include/duckdb/common/serializer/buffered_serializer.hpp
+deleted file mode 100644
+index a4746872d3..0000000000
+--- a/src/include/duckdb/common/serializer/buffered_serializer.hpp
++++ /dev/null
+@@ -1,50 +0,0 @@
+-//===----------------------------------------------------------------------===//
+-//                         DuckDB
+-//
+-// duckdb/common/serializer/buffered_serializer.hpp
+-//
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#pragma once
+-
+-#include "duckdb/common/serializer/write_stream.hpp"
+-#include "duckdb/common/unique_ptr.hpp"
+-
+-namespace duckdb {
+-
+-#define SERIALIZER_DEFAULT_SIZE 1024
+-
+-struct BinaryData {
+-	unsafe_unique_array<data_t> data;
+-	idx_t size;
+-};
+-
+-class BufferedSerializer : public WriteStream {
+-public:
+-	//! Serializes to a buffer allocated by the serializer, will expand when
+-	//! writing past the initial threshold
+-	DUCKDB_API explicit BufferedSerializer(idx_t maximum_size = SERIALIZER_DEFAULT_SIZE);
+-	//! Serializes to a provided (owned) data pointer
+-	BufferedSerializer(unsafe_unique_array<data_t> data, idx_t size);
+-	BufferedSerializer(data_ptr_t data, idx_t size);
+-
+-	idx_t maximum_size;
+-	data_ptr_t data;
+-
+-	BinaryData blob;
+-
+-public:
+-	void WriteData(const_data_ptr_t buffer, idx_t write_size) override;
+-
+-	//! Retrieves the data after the writing has been completed
+-	BinaryData GetData() {
+-		return std::move(blob);
+-	}
+-
+-	void Reset() {
+-		blob.size = 0;
+-	}
+-};
+-
+-} // namespace duckdb
+diff --git a/src/include/duckdb/common/serializer/read_stream.hpp b/src/include/duckdb/common/serializer/read_stream.hpp
+index bbf1b9d6a4..d15c870af1 100644
+--- a/src/include/duckdb/common/serializer/read_stream.hpp
++++ b/src/include/duckdb/common/serializer/read_stream.hpp
+@@ -20,36 +20,16 @@ class ReadStream {
+ public:
+ 	virtual ~ReadStream() {
+ 	}
+ 
+ 	//! Reads [read_size] bytes into the buffer
+ 	virtual void ReadData(data_ptr_t buffer, idx_t read_size) = 0;
+ 
+ 	template <class T>
+ 	T Read() {
+ 		T value;
+ 		ReadData(data_ptr_cast(&value), sizeof(T));
+ 		return value;
+ 	}
+-
+-	template <class T, typename... ARGS>
+-	void ReadList(vector<unique_ptr<T>> &list, ARGS &&... args) {
+-		auto select_count = Read<uint32_t>();
+-		for (uint32_t i = 0; i < select_count; i++) {
+-			auto child = T::Deserialize(*this, std::forward<ARGS>(args)...);
+-			list.push_back(std::move(child));
+-		}
+-	}
+-
+-	template <class T, class RETURN_TYPE = T, typename... ARGS>
+-	unique_ptr<RETURN_TYPE> ReadOptional(ARGS &&... args) {
+-		auto has_entry = Read<bool>();
+-		if (has_entry) {
+-			return T::Deserialize(*this, std::forward<ARGS>(args)...);
+-		}
+-		return nullptr;
+-	}
+-
+-	void ReadStringVector(vector<string> &list);
+ };
+ 
+ template <>
+diff --git a/src/include/duckdb/common/serializer/write_stream.hpp b/src/include/duckdb/common/serializer/write_stream.hpp
+index 45ea08c390..1749fc0825 100644
+--- a/src/include/duckdb/common/serializer/write_stream.hpp
++++ b/src/include/duckdb/common/serializer/write_stream.hpp
+@@ -20,53 +20,55 @@ class WriteStream {
+ public:
+ 	virtual ~WriteStream() {
+ 	}
+ 
+ 	virtual void WriteData(const_data_ptr_t buffer, idx_t write_size) = 0;
+ 
+ 	template <class T>
+ 	void Write(T element) {
+ 		static_assert(std::is_trivially_destructible<T>(), "Write element must be trivially destructible");
+ 
+ 		WriteData(const_data_ptr_cast(&element), sizeof(T));
+ 	}
+ 
++	/*
+ 	//! Write data from a string buffer directly (without length prefix)
+ 	void WriteBufferData(const string &str) {
+-		WriteData(const_data_ptr_cast(str.c_str()), str.size());
++	    WriteData(const_data_ptr_cast(str.c_str()), str.size());
+ 	}
+ 	//! Write a string with a length prefix
+ 	void WriteString(const string &val) {
+-		WriteStringLen(const_data_ptr_cast(val.c_str()), val.size());
++	    WriteStringLen(const_data_ptr_cast(val.c_str()), val.size());
+ 	}
+ 	void WriteStringLen(const_data_ptr_t val, idx_t len) {
+-		Write<uint32_t>((uint32_t)len);
+-		if (len > 0) {
+-			WriteData(val, len);
+-		}
++	    Write<uint32_t>((uint32_t)len);
++	    if (len > 0) {
++	        WriteData(val, len);
++	    }
+ 	}
+ 
+ 	template <class T>
+ 	void WriteList(const vector<unique_ptr<T>> &list) {
+-		Write<uint32_t>((uint32_t)list.size());
+-		for (auto &child : list) {
+-			child->Serialize(*this);
+-		}
++	    Write<uint32_t>((uint32_t)list.size());
++	    for (auto &child : list) {
++	        child->Serialize(*this);
++	    }
+ 	}
+ 
+ 	void WriteStringVector(const vector<string> &list) {
+-		Write<uint32_t>((uint32_t)list.size());
+-		for (auto &child : list) {
+-			WriteString(child);
+-		}
++	    Write<uint32_t>((uint32_t)list.size());
++	    for (auto &child : list) {
++	        WriteString(child);
++	    }
+ 	}
+ 
+ 	template <class T>
+ 	void WriteOptional(const unique_ptr<T> &element) {
+-		Write<bool>(element ? true : false);
+-		if (element) {
+-			element->Serialize(*this);
+-		}
++	    Write<bool>(element ? true : false);
++	    if (element) {
++	        element->Serialize(*this);
++	    }
+ 	}
++	 */
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/duckdb/storage/write_ahead_log.hpp b/src/include/duckdb/storage/write_ahead_log.hpp
+index 289e0bd572..3844dff8e6 100644
+--- a/src/include/duckdb/storage/write_ahead_log.hpp
++++ b/src/include/duckdb/storage/write_ahead_log.hpp
+@@ -24,7 +24,6 @@ namespace duckdb {
+ struct AlterInfo;
+ 
+ class AttachedDatabase;
+-class BufferedSerializer;
+ class Catalog;
+ class DatabaseInstance;
+ class SchemaCatalogEntry;
+diff --git a/src/main/client_context.cpp b/src/main/client_context.cpp
+index 61701e8320..157f0be76b 100644
+--- a/src/main/client_context.cpp
++++ b/src/main/client_context.cpp
+@@ -1,51 +1,45 @@
+ #include "duckdb/main/client_context.hpp"
+ 
+ #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+ #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ #include "duckdb/catalog/catalog_search_path.hpp"
+ #include "duckdb/common/file_system.hpp"
+ #include "duckdb/common/http_state.hpp"
+ #include "duckdb/common/preserved_error.hpp"
+ #include "duckdb/common/progress_bar/progress_bar.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+ #include "duckdb/common/serializer/buffered_file_writer.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+ #include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/execution/column_binding_resolver.hpp"
+ #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/main/appender.hpp"
+ #include "duckdb/main/attached_database.hpp"
+ #include "duckdb/main/client_context_file_opener.hpp"
+ #include "duckdb/main/client_data.hpp"
+ #include "duckdb/main/database.hpp"
+ #include "duckdb/main/database_manager.hpp"
+ #include "duckdb/main/error_manager.hpp"
+ #include "duckdb/main/materialized_query_result.hpp"
+ #include "duckdb/main/query_profiler.hpp"
+ #include "duckdb/main/query_result.hpp"
+ #include "duckdb/main/relation.hpp"
+ #include "duckdb/main/stream_query_result.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+-#include "duckdb/parallel/task_scheduler.hpp"
+ #include "duckdb/parser/expression/constant_expression.hpp"
+ #include "duckdb/parser/expression/parameter_expression.hpp"
+ #include "duckdb/parser/parsed_data/create_function_info.hpp"
+-#include "duckdb/parser/parsed_expression_iterator.hpp"
+ #include "duckdb/parser/parser.hpp"
+ #include "duckdb/parser/query_node/select_node.hpp"
+ #include "duckdb/parser/statement/drop_statement.hpp"
+ #include "duckdb/parser/statement/execute_statement.hpp"
+ #include "duckdb/parser/statement/explain_statement.hpp"
+ #include "duckdb/parser/statement/prepare_statement.hpp"
+ #include "duckdb/parser/statement/relation_statement.hpp"
+ #include "duckdb/parser/statement/select_statement.hpp"
+ #include "duckdb/planner/operator/logical_execute.hpp"
+ #include "duckdb/planner/planner.hpp"
+ #include "duckdb/planner/pragma_handler.hpp"
+-#include "duckdb/storage/data_table.hpp"
+ #include "duckdb/transaction/meta_transaction.hpp"
+-#include "duckdb/transaction/transaction.hpp"
+ #include "duckdb/transaction/transaction_manager.hpp"
+ 
+ namespace duckdb {
+diff --git a/src/planner/logical_operator.cpp b/src/planner/logical_operator.cpp
+index d9444e7d74..132bff044e 100644
+--- a/src/planner/logical_operator.cpp
++++ b/src/planner/logical_operator.cpp
+@@ -1,18 +1,13 @@
+ #include "duckdb/planner/logical_operator.hpp"
+ 
+ #include "duckdb/common/printer.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+ #include "duckdb/common/string_util.hpp"
+ #include "duckdb/common/tree_renderer.hpp"
+ #include "duckdb/parser/parser.hpp"
+ #include "duckdb/planner/operator/list.hpp"
+-#include "duckdb/planner/operator/logical_extension_operator.hpp"
+-#include "duckdb/planner/operator/logical_dependent_join.hpp"
+ #include "duckdb/common/serializer/binary_serializer.hpp"
+ #include "duckdb/common/serializer/binary_deserializer.hpp"
+ #include "duckdb/common/serializer/memory_stream.hpp"
+-#include "duckdb/common/serializer/binary_serializer.hpp"
+-#include "duckdb/common/serializer/binary_deserializer.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -103,54 +98,54 @@ string LogicalOperator::ToString() const {
+ void LogicalOperator::Verify(ClientContext &context) {
+ #ifdef DEBUG
+ 	// verify expressions
+ 	for (idx_t expr_idx = 0; expr_idx < expressions.size(); expr_idx++) {
+ 		auto str = expressions[expr_idx]->ToString();
+ 		// verify that we can (correctly) copy this expression
+ 		auto copy = expressions[expr_idx]->Copy();
+ 		auto original_hash = expressions[expr_idx]->Hash();
+ 		auto copy_hash = copy->Hash();
+ 		// copy should be identical to original
+ 		D_ASSERT(expressions[expr_idx]->ToString() == copy->ToString());
+ 		D_ASSERT(original_hash == copy_hash);
+ 		D_ASSERT(Expression::Equals(expressions[expr_idx], copy));
+ 
+ 		for (idx_t other_idx = 0; other_idx < expr_idx; other_idx++) {
+ 			// comparison with other expressions
+ 			auto other_hash = expressions[other_idx]->Hash();
+ 			bool expr_equal = Expression::Equals(expressions[expr_idx], expressions[other_idx]);
+ 			if (original_hash != other_hash) {
+ 				// if the hashes are not equal the expressions should not be equal either
+ 				D_ASSERT(!expr_equal);
+ 			}
+ 		}
+ 		D_ASSERT(!str.empty());
+ 
+ 		// verify that serialization + deserialization round-trips correctly
+ 		if (expressions[expr_idx]->HasParameter()) {
+ 			continue;
+ 		}
+-		BufferedSerializer sink;
++		MemoryStream stream;
+ 		// We are serializing a query plan
+ 		try {
+-			BinarySerializer::Serialize(*expressions[expr_idx], sink);
++			BinarySerializer::Serialize(*expressions[expr_idx], stream);
+ 		} catch (NotImplementedException &ex) {
+ 			// ignore for now (FIXME)
+ 			continue;
+ 		}
++		// Rewind the stream
++		stream.Rewind();
+ 
+-		auto data = sink.GetData();
+-		BufferedDeserializer source(data.data.get(), data.size);
+ 		bound_parameter_map_t parameters;
+-		auto deserialized_expression = BinaryDeserializer::Deserialize<Expression>(source, context, parameters);
++		auto deserialized_expression = BinaryDeserializer::Deserialize<Expression>(stream, context, parameters);
+ 
+ 		// FIXME: expressions might not be equal yet because of statistics propagation
+ 		continue;
+ 		D_ASSERT(Expression::Equals(expressions[expr_idx], deserialized_expression));
+ 		D_ASSERT(expressions[expr_idx]->Hash() == deserialized_expression->Hash());
+ 	}
+ 	D_ASSERT(!ToString().empty());
+ 	for (auto &child : children) {
+ 		child->Verify(context);
+ 	}
+ #endif
+ }
+diff --git a/src/storage/checkpoint/table_data_writer.cpp b/src/storage/checkpoint/table_data_writer.cpp
+index 4dd6d788d8..1205b5ede4 100644
+--- a/src/storage/checkpoint/table_data_writer.cpp
++++ b/src/storage/checkpoint/table_data_writer.cpp
+@@ -1,8 +1,7 @@
+ #include "duckdb/storage/checkpoint/table_data_writer.hpp"
+ 
+ #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+ #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+ #include "duckdb/storage/table/column_checkpoint_state.hpp"
+ #include "duckdb/storage/table/table_statistics.hpp"
+ #include "duckdb/common/serializer/binary_serializer.hpp"
+diff --git a/src/storage/single_file_block_manager.cpp b/src/storage/single_file_block_manager.cpp
+index f0751e39f4..998d7d448a 100644
+--- a/src/storage/single_file_block_manager.cpp
++++ b/src/storage/single_file_block_manager.cpp
+@@ -1,14 +1,13 @@
+ #include "duckdb/storage/single_file_block_manager.hpp"
+ 
+ #include "duckdb/common/allocator.hpp"
+ #include "duckdb/common/checksum.hpp"
+ #include "duckdb/common/exception.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
+ #include "duckdb/storage/metadata/metadata_reader.hpp"
+ #include "duckdb/storage/metadata/metadata_writer.hpp"
+ #include "duckdb/storage/buffer_manager.hpp"
+ #include "duckdb/main/config.hpp"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -92,13 +91,13 @@ DatabaseHeader DatabaseHeader::Read(ReadStream &source) {
+ 
+ template <class T>
+ void SerializeHeaderStructure(T header, data_ptr_t ptr) {
+-	BufferedSerializer ser(ptr, Storage::FILE_HEADER_SIZE);
++	MemoryStream ser(ptr, Storage::FILE_HEADER_SIZE);
+ 	header.Write(ser);
+ }
+ 
+ template <class T>
+ T DeserializeHeaderStructure(data_ptr_t ptr) {
+-	BufferedDeserializer source(ptr, Storage::FILE_HEADER_SIZE);
++	MemoryStream source(ptr, Storage::FILE_HEADER_SIZE);
+ 	return T::Read(source);
+ }
+ 
+@@ -432,67 +431,67 @@ protected:
+ void SingleFileBlockManager::WriteHeader(DatabaseHeader header) {
+ 	// set the iteration count
+ 	header.iteration = ++iteration_count;
+ 
+ 	auto free_list_blocks = GetFreeListBlocks();
+ 
+ 	// now handle the free list
+ 	// add all modified blocks to the free list: they can now be written to again
+ 	for (auto &block : modified_blocks) {
+ 		free_list.insert(block);
+ 	}
+ 	modified_blocks.clear();
+ 
+ 	auto &metadata_manager = GetMetadataManager();
+ 	if (!free_list_blocks.empty()) {
+ 		// there are blocks to write, either in the free_list or in the modified_blocks
+ 		// we write these blocks specifically to the free_list_blocks
+ 		// a normal MetadataWriter will fetch blocks to use from the free_list
+ 		// but since we are WRITING the free_list, this behavior is sub-optimal
+ 		FreeListBlockWriter writer(metadata_manager, std::move(free_list_blocks));
+ 
+ 		auto ptr = writer.GetMetaBlockPointer();
+ 		header.free_list = ptr.block_pointer;
+ 
+ 		writer.Write<uint64_t>(free_list.size());
+ 		for (auto &block_id : free_list) {
+ 			writer.Write<block_id_t>(block_id);
+ 		}
+ 		writer.Write<uint64_t>(multi_use_blocks.size());
+ 		for (auto &entry : multi_use_blocks) {
+ 			writer.Write<block_id_t>(entry.first);
+ 			writer.Write<uint32_t>(entry.second);
+ 		}
+ 		GetMetadataManager().Write(writer);
+ 		writer.Flush();
+ 	} else {
+ 		// no blocks in the free list
+ 		header.free_list = DConstants::INVALID_INDEX;
+ 	}
+ 	metadata_manager.Flush();
+ 	header.block_count = max_block;
+ 
+ 	auto &config = DBConfig::Get(db);
+ 	if (config.options.checkpoint_abort == CheckpointAbort::DEBUG_ABORT_AFTER_FREE_LIST_WRITE) {
+ 		throw FatalException("Checkpoint aborted after free list write because of PRAGMA checkpoint_abort flag");
+ 	}
+ 
+ 	if (!options.use_direct_io) {
+ 		// if we are not using Direct IO we need to fsync BEFORE we write the header to ensure that all the previous
+ 		// blocks are written as well
+ 		handle->Sync();
+ 	}
+ 	// set the header inside the buffer
+ 	header_buffer.Clear();
+-	BufferedSerializer serializer;
++	MemoryStream serializer;
+ 	header.Write(serializer);
+-	memcpy(header_buffer.buffer, serializer.blob.data.get(), serializer.blob.size);
++	memcpy(header_buffer.buffer, serializer.GetData(), serializer.GetPosition());
+ 	// now write the header to the file, active_header determines whether we write to h1 or h2
+ 	// note that if active_header is h1 we write to h2, and vice versa
+ 	ChecksumAndWrite(header_buffer, active_header == 1 ? Storage::FILE_HEADER_SIZE : Storage::FILE_HEADER_SIZE * 2);
+ 	// switch active header to the other header
+ 	active_header = 1 - active_header;
+ 	//! Ensure the header write ends up on disk
+ 	handle->Sync();
+ }
+ 
+ } // namespace duckdb
+diff --git a/test/api/serialized_plans/test_plan_serialization_bwc.cpp b/test/api/serialized_plans/test_plan_serialization_bwc.cpp
+index 11b7f27286..31f82c5f24 100644
+--- a/test/api/serialized_plans/test_plan_serialization_bwc.cpp
++++ b/test/api/serialized_plans/test_plan_serialization_bwc.cpp
+@@ -81,36 +81,36 @@ TEST_CASE("Test deserialized plans from file", "[.][serialization]") {
+ void test_deserialization(const string &file_location) {
+ 	DuckDB db;
+ 	Connection con(db);
+ 	load_db(con);
+ 	BufferedFileReader file_source(db.GetFileSystem(), file_location.c_str());
+ 
+ 	std::ifstream queries(get_full_file_name("queries.sql"));
+ 	string query;
+ 	while (std::getline(queries, query)) {
+ 		INFO("evaluating " << query)
+ 		con.BeginTransaction();
+ 		Parser p;
+ 		p.ParseQuery(query);
+ 		Planner planner(*con.context);
+ 		planner.CreatePlan(std::move(p.statements[0]));
+ 		auto expected_plan = std::move(planner.plan);
+ 		expected_plan->ResolveOperatorTypes();
+-		auto expected_results = con.context->Query(make_uniq<LogicalPlanStatement>(std::move(expected_plan)),
+- false); 		REQUIRE_NO_FAIL(*expected_results);
++		auto expected_results = con.context->Query(make_uniq<LogicalPlanStatement>(std::move(expected_plan)), false);
++		REQUIRE_NO_FAIL(*expected_results);
+ 
+ 		BinaryDeserializer deserializer(file_source);
+ 		deserializer.Set<ClientContext &>(*con.context);
+ 		deserializer.Begin();
+ 		auto deserialized_plan = LogicalOperator::FormatDeserialize(deserializer);
+ 		deserializer.End();
+ 
+ 		deserialized_plan->ResolveOperatorTypes();
+ 		auto deserialized_results =
+-			con.context->Query(make_uniq<LogicalPlanStatement>(std::move(deserialized_plan)), false);
++		    con.context->Query(make_uniq<LogicalPlanStatement>(std::move(deserialized_plan)), false);
+ 		REQUIRE_NO_FAIL(*deserialized_results);
+ 
+ 		REQUIRE(deserialized_results->Equals(*expected_results));
+ 
+ 		con.Rollback();
+ 	}
+ }
+diff --git a/test/api/test_plan_serialization.cpp b/test/api/test_plan_serialization.cpp
+index defac1737f..851e3513b6 100644
+--- a/test/api/test_plan_serialization.cpp
++++ b/test/api/test_plan_serialization.cpp
+@@ -1,12 +1,10 @@
+ #include "catch.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+-#include "duckdb/common/serializer/buffered_serializer.hpp"
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+ #include "duckdb/parallel/thread_context.hpp"
+ #include "duckdb/planner/planner.hpp"
+ #include "test_helpers.hpp"
+ #include "duckdb/parser/parser.hpp"
+ 
+ #include <map>
+ #include <set>
+diff --git a/test/extension/loadable_extension_optimizer_demo.cpp b/test/extension/loadable_extension_optimizer_demo.cpp
+index d5fdf5283a..66b074d4eb 100644
+--- a/test/extension/loadable_extension_optimizer_demo.cpp
++++ b/test/extension/loadable_extension_optimizer_demo.cpp
+@@ -1,12 +1,12 @@
+ #define DUCKDB_EXTENSION_MAIN
+ #include "duckdb.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
+ #include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/optimizer/optimizer_extension.hpp"
+ #include "duckdb/planner/operator/logical_column_data_get.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/common/serializer/binary_serializer.hpp"
+ #include "duckdb/common/serializer/binary_deserializer.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
+ 
+ using namespace duckdb;
+ 
+@@ -32,118 +32,119 @@ class WaggleExtension : public OptimizerExtension {
+ public:
+ 	WaggleExtension() {
+ 		optimize_function = WaggleOptimizeFunction;
+ 	}
+ 
+ 	static bool HasParquetScan(LogicalOperator &op) {
+ 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+ 			auto &get = op.Cast<LogicalGet>();
+ 			return get.function.name == "parquet_scan";
+ 		}
+ 		for (auto &child : op.children) {
+ 			if (HasParquetScan(*child)) {
+ 				return true;
+ 			}
+ 		}
+ 		return false;
+ 	}
+ 
+ 	static void WriteChecked(int sockfd, void *data, idx_t write_size) {
+ 		auto bytes_written = write(sockfd, data, write_size);
+ 		if (bytes_written < 0) {
+ 			throw InternalException("Failed to write \"%lld\" bytes to socket: %s", write_size, strerror(errno));
+ 		}
+ 		if (idx_t(bytes_written) != write_size) {
+ 			throw InternalException("Failed to write \"%llu\" bytes from socket - wrote %llu instead", write_size,
+ 			                        bytes_written);
+ 		}
+ 	}
+ 	static void ReadChecked(int sockfd, void *data, idx_t read_size) {
+ 		auto bytes_read = read(sockfd, data, read_size);
+ 		if (bytes_read < 0) {
+ 			throw InternalException("Failed to read \"%lld\" bytes from socket: %s", read_size, strerror(errno));
+ 		}
+ 		if (idx_t(bytes_read) != read_size) {
+ 			throw InternalException("Failed to read \"%llu\" bytes from socket - read %llu instead", read_size,
+ 			                        bytes_read);
+ 		}
+ 	}
+ 
+ 	static void WaggleOptimizeFunction(ClientContext &context, OptimizerExtensionInfo *info,
+ 	                                   duckdb::unique_ptr<LogicalOperator> &plan) {
+ 		if (!HasParquetScan(*plan)) {
+ 			return;
+ 		}
+ 		// rpc
+ 
+ 		Value host, port;
+ 		if (!context.TryGetCurrentSetting("waggle_location_host", host) ||
+ 		    !context.TryGetCurrentSetting("waggle_location_port", port)) {
+ 			throw InvalidInputException("Need the parameters damnit");
+ 		}
+ 
+ 		// socket create and verification
+ 		auto sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+ 		if (sockfd == -1) {
+ 			throw InternalException("Failed to create socket");
+ 		}
+ 
+ 		struct sockaddr_in servaddr;
+ 		bzero(&servaddr, sizeof(servaddr));
+ 		// assign IP, PORT
+ 		servaddr.sin_family = AF_INET;
+ 		auto host_string = host.ToString();
+ 		servaddr.sin_addr.s_addr = inet_addr(host_string.c_str());
+ 		servaddr.sin_port = htons(port.GetValue<int32_t>());
+ 
+ 		// connect the client socket to server socket
+ 		if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) != 0) {
+ 			throw IOException("Failed to connect socket %s", string(strerror(errno)));
+ 		}
+ 
+-			BufferedSerializer target;
+-			BinarySerializer serializer(target);
+-			serializer.Begin();
+-			plan->FormatSerialize(serializer);
+-			serializer.End();
+-			auto data = target.GetData();
+-
+-			idx_t len = data.size;
+-			WriteChecked(sockfd, &len, sizeof(idx_t));
+-			WriteChecked(sockfd, data.data.get(), len);
+-
+-			auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
+-			idx_t n_chunks;
+-			ReadChecked(sockfd, &n_chunks, sizeof(idx_t));
+-			for (idx_t i = 0; i < n_chunks; i++) {
+-				idx_t chunk_len;
+-				ReadChecked(sockfd, &chunk_len, sizeof(idx_t));
+-				auto buffer = malloc(chunk_len);
+-				D_ASSERT(buffer);
+-				ReadChecked(sockfd, buffer, chunk_len);
+-				BufferedDeserializer source(data_ptr_cast(buffer), chunk_len);
+-				DataChunk chunk;
+-
+-				BinaryDeserializer deserializer(source);
+-
+-				deserializer.Begin();
+-				chunk.FormatDeserialize(deserializer);
+-				deserializer.End();
+-				chunk_collection->Initialize(chunk.GetTypes());
+-				chunk_collection->Append(chunk);
+-				free(buffer);
+-			}
++		MemoryStream stream;
++		BinarySerializer serializer(stream);
++		serializer.Begin();
++		plan->FormatSerialize(serializer);
++		serializer.End();
++		auto data = stream.GetData();
++		idx_t len = stream.GetPosition();
++
++		WriteChecked(sockfd, &len, sizeof(idx_t));
++		WriteChecked(sockfd, data, len);
++
++		auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
++		idx_t n_chunks;
++		ReadChecked(sockfd, &n_chunks, sizeof(idx_t));
++		for (idx_t i = 0; i < n_chunks; i++) {
++			idx_t chunk_len;
++			ReadChecked(sockfd, &chunk_len, sizeof(idx_t));
++			auto buffer = malloc(chunk_len);
++			D_ASSERT(buffer);
++			ReadChecked(sockfd, buffer, chunk_len);
++
++			MemoryStream source(data_ptr_cast(buffer), chunk_len);
++			DataChunk chunk;
++
++			BinaryDeserializer deserializer(source);
++
++			deserializer.Begin();
++			chunk.FormatDeserialize(deserializer);
++			deserializer.End();
++			chunk_collection->Initialize(chunk.GetTypes());
++			chunk_collection->Append(chunk);
++			free(buffer);
++		}
+ 
+-			auto types = chunk_collection->Types();
+-			plan = make_uniq<LogicalColumnDataGet>(0, types, std::move(chunk_collection));
++		auto types = chunk_collection->Types();
++		plan = make_uniq<LogicalColumnDataGet>(0, types, std::move(chunk_collection));
+ 
+-			len = 0;
+-			(void)len;
+-			WriteChecked(sockfd, &len, sizeof(idx_t));
+-			// close the socket
+-			close(sockfd);
++		len = 0;
++		(void)len;
++		WriteChecked(sockfd, &len, sizeof(idx_t));
++		// close the socket
++		close(sockfd);
+ 	}
+ };
+ 
+ //===--------------------------------------------------------------------===//
+ // Extension load + setup
+ //===--------------------------------------------------------------------===//
+diff --git a/test/extension/test_remote_optimizer.cpp b/test/extension/test_remote_optimizer.cpp
+index de55952191..1c93c1d45b 100644
+--- a/test/extension/test_remote_optimizer.cpp
++++ b/test/extension/test_remote_optimizer.cpp
+@@ -1,25 +1,25 @@
+ #include "catch.hpp"
+ #include "test_helpers.hpp"
+ #include "duckdb/main/appender.hpp"
+-#include "duckdb/common/serializer/buffered_deserializer.hpp"
++#include "duckdb/common/serializer/memory_stream.hpp"
+ #include "duckdb/parser/statement/logical_plan_statement.hpp"
+ #include "duckdb/common/serializer/binary_serializer.hpp"
+ #include "duckdb/common/serializer/binary_deserializer.hpp"
+ 
+ // whatever
+ #include <signal.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <stdio.h>
+ #include <netdb.h>
+ #include <netinet/in.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <arpa/inet.h>
+ 
+ #ifdef __MVS__
+ #define _XOPEN_SOURCE_EXTENDED 1
+ #include <strings.h>
+ #endif
+@@ -30,128 +30,128 @@ using namespace std;
+ TEST_CASE("Test using a remote optimizer pass in case thats important to someone", "[extension]") {
+ 	pid_t pid = fork();
+ 
+ 	int port = 4242;
+ 
+ 	if (pid == 0) { // child process
+ 		// sockets, man, how do they work?!
+ 		struct sockaddr_in servaddr, cli;
+ 
+ 		auto sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+ 		if (sockfd == -1) {
+ 			printf("Failed to set up socket in child process: %s", strerror(errno));
+ 			exit(1);
+ 		}
+ 		bzero(&servaddr, sizeof(servaddr));
+ 
+ 		servaddr.sin_family = AF_INET;
+ 		servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+ 		servaddr.sin_port = htons(port);
+ 		auto res = ::bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+ 		if (res != 0) {
+ 			printf("Failed to bind socket in child process: %s", strerror(errno));
+ 			exit(1);
+ 		}
+ 		res = listen(sockfd, 5);
+ 		if (res != 0) {
+ 			printf("Failed to listen to socked in child process: %s", strerror(errno));
+ 			exit(1);
+ 		}
+ 
+ 		socklen_t len = sizeof(cli);
+ 		auto connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
+ 		if (connfd < 0) {
+ 			printf("Failed to set up socket in child process: %s", strerror(errno));
+ 			exit(1);
+ 		}
+ 
+ 		DBConfig config;
+ 		config.options.allow_unsigned_extensions = true;
+ 		DuckDB db2(nullptr, &config);
+ 		Connection con2(db2);
+ 		auto load_parquet = con2.Query("LOAD parquet");
+ 		if (load_parquet->HasError()) {
+ 			printf("Failed to load Parquet in child process: %s", load_parquet->GetError().c_str());
+ 			exit(1);
+ 		}
+ 
+ 		while (true) {
+ 			idx_t bytes;
+ 			REQUIRE(read(connfd, &bytes, sizeof(idx_t)) == sizeof(idx_t));
+ 
+ 			if (bytes == 0) {
+ 				break;
+ 			}
+ 
+ 			auto buffer = malloc(bytes);
+ 			REQUIRE(buffer);
+ 			REQUIRE(read(connfd, buffer, bytes) == ssize_t(bytes));
+ 
+-			BufferedDeserializer source(data_ptr_cast(buffer), bytes);
++			// Non-owning stream
++			MemoryStream stream(data_ptr_cast(buffer), bytes);
+ 			con2.BeginTransaction();
+ 
+-			BinaryDeserializer deserializer(source);
++			BinaryDeserializer deserializer(stream);
+ 			deserializer.Set<ClientContext &>(*con2.context);
+ 			deserializer.Begin();
+ 			auto plan = LogicalOperator::FormatDeserialize(deserializer);
+ 			deserializer.End();
+ 
+ 			plan->ResolveOperatorTypes();
+ 			con2.Commit();
+ 
+ 			auto statement = make_uniq<LogicalPlanStatement>(std::move(plan));
+ 			auto result = con2.Query(std::move(statement));
+ 			auto &collection = result->Collection();
+ 			idx_t num_chunks = collection.ChunkCount();
+ 			REQUIRE(write(connfd, &num_chunks, sizeof(idx_t)) == sizeof(idx_t));
+ 			for (auto &chunk : collection.Chunks()) {
+-				BufferedSerializer target;
+-
++				MemoryStream target;
+ 				BinarySerializer serializer(target);
+ 				serializer.Begin();
+ 				chunk.FormatSerialize(serializer);
+ 				serializer.End();
+ 				auto data = target.GetData();
+-				idx_t len = data.size;
++				idx_t len = target.GetPosition();
+ 				REQUIRE(write(connfd, &len, sizeof(idx_t)) == sizeof(idx_t));
+-				REQUIRE(write(connfd, data.data.get(), len) == ssize_t(len));
++				REQUIRE(write(connfd, data, len) == ssize_t(len));
+ 			}
+ 		}
+ 		exit(0);
+ 	} else if (pid > 0) { // parent process
+ 		DBConfig config;
+ 		config.options.allow_unsigned_extensions = true;
+ 		DuckDB db1(nullptr, &config);
+ 		Connection con1(db1);
+ 		auto load_parquet = con1.Query("LOAD 'parquet'");
+ 		if (load_parquet->HasError()) {
+ 			// Do not execute the test.
+ 			if (kill(pid, SIGKILL) != 0) {
+ 				FAIL();
+ 			}
+ 			return;
+ 		}
+ 
+ 		REQUIRE_NO_FAIL(con1.Query("LOAD '" DUCKDB_BUILD_DIRECTORY
+ 		                           "/test/extension/loadable_extension_optimizer_demo.duckdb_extension'"));
+ 		REQUIRE_NO_FAIL(con1.Query("SET waggle_location_host='127.0.0.1'"));
+ 		REQUIRE_NO_FAIL(con1.Query("SET waggle_location_port=4242"));
+ 		usleep(10000); // need to wait a bit till socket is up
+ 
+ 		// check if the child PID is still there
+ 		if (kill(pid, 0) != 0) {
+ 			// child is gone!
+ 			printf("Failed to execute remote optimizer test - child exited unexpectedly");
+ 			FAIL();
+ 		}
+ 
+ 		REQUIRE_NO_FAIL(con1.Query(
+ 		    "SELECT first_name FROM PARQUET_SCAN('data/parquet-testing/userdata1.parquet') GROUP BY first_name"));
+ 
+ 		if (kill(pid, SIGKILL) != 0) {
+ 			FAIL();
+ 		}
+ 
+ 	} else {
+ 		FAIL();
+ 	}
+ }

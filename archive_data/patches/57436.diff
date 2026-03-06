@@ -1,0 +1,208 @@
+commit 075b6087785d7ba3dd6904f117ef9d0b9aa36a2b
+Author: Nick Wellnhofer <wellnhofer@aevum.de>
+Date:   Mon Mar 27 20:25:02 2023 +0200
+
+    malloc-fail: Fix use-after-free in xsltCompileAttr
+    
+    Found by OSS-Fuzz, see #84.
+
+diff --git a/libxslt/attrvt.c b/libxslt/attrvt.c
+index 6157fcdf..9d74a81b 100644
+--- a/libxslt/attrvt.c
++++ b/libxslt/attrvt.c
+@@ -153,24 +153,23 @@ static xsltAttrVTPtr
+ xsltSetAttrVTsegment(xsltAttrVTPtr avt, void *val) {
+     if (avt->nb_seg >= avt->max_seg) {
+         size_t size = sizeof(xsltAttrVT) +
+                       (avt->max_seg + MAX_AVT_SEG) * sizeof(void *);
+-	xsltAttrVTPtr tmp = (xsltAttrVTPtr) xmlRealloc(avt, size);
+-	if (tmp == NULL)
++	avt = (xsltAttrVTPtr) xmlRealloc(avt, size);
++	if (avt == NULL)
+ 	    return NULL;
+-        avt = tmp;
+ 	memset(&avt->segments[avt->nb_seg], 0, MAX_AVT_SEG*sizeof(void *));
+ 	avt->max_seg += MAX_AVT_SEG;
+     }
+     avt->segments[avt->nb_seg++] = val;
+     return avt;
+ }
+ 
+ /**
+  * xsltCompileAttr:
+  * @style:  a XSLT process context
+  * @attr: the attribute coming from the stylesheet.
+  *
+  * Precompile an attribute in a stylesheet, basically it checks if it is
+  * an attribute value template, and if yes, establish some structures needed
+  * to process it at transformation time.
+  */
+@@ -178,159 +177,163 @@ void
+ xsltCompileAttr(xsltStylesheetPtr style, xmlAttrPtr attr) {
+     const xmlChar *str;
+     const xmlChar *cur;
+     xmlChar *ret = NULL;
+     xmlChar *expr = NULL;
+     xmlXPathCompExprPtr comp = NULL;
+-    xsltAttrVTPtr avt;
++    xsltAttrVTPtr avt, tmp;
+     int i = 0, lastavt = 0;
+ 
+     if ((style == NULL) || (attr == NULL) || (attr->children == NULL))
+         return;
+     if ((attr->children->type != XML_TEXT_NODE) ||
+         (attr->children->next != NULL)) {
+         xsltTransformError(NULL, style, attr->parent,
+ 	    "Attribute '%s': The content is expected to be a single text "
+ 	    "node when compiling an AVT.\n", attr->name);
+ 	style->errors++;
+ 	return;
+     }
+     str = attr->children->content;
+     if ((xmlStrchr(str, '{') == NULL) &&
+         (xmlStrchr(str, '}') == NULL)) return;
+ 
+ #ifdef WITH_XSLT_DEBUG_AVT
+     xsltGenericDebug(xsltGenericDebugContext,
+ 		    "Found AVT %s: %s\n", attr->name, str);
+ #endif
+     if (attr->psvi != NULL) {
+ #ifdef WITH_XSLT_DEBUG_AVT
+ 	xsltGenericDebug(xsltGenericDebugContext,
+ 			"AVT %s: already compiled\n", attr->name);
+ #endif
+         return;
+     }
+     /*
+     * Create a new AVT object.
+     */
+     avt = xsltNewAttrVT(style);
+     if (avt == NULL)
+ 	return;
+     attr->psvi = avt;
+ 
+     avt->nsList = xmlGetNsList(attr->doc, attr->parent);
+     if (avt->nsList != NULL) {
+ 	while (avt->nsList[i] != NULL)
+ 	    i++;
+     }
+     avt->nsNr = i;
+ 
+     cur = str;
+     while (*cur != 0) {
+ 	if (*cur == '{') {
+ 	    if (*(cur+1) == '{') {	/* escaped '{' */
+ 	        cur++;
+ 		ret = xmlStrncat(ret, str, cur - str);
+ 		cur++;
+ 		str = cur;
+ 		continue;
+ 	    }
+ 	    if (*(cur+1) == '}') {	/* skip empty AVT */
+ 		ret = xmlStrncat(ret, str, cur - str);
+ 	        cur += 2;
+ 		str = cur;
+ 		continue;
+ 	    }
+ 	    if ((ret != NULL) || (cur - str > 0)) {
+ 		ret = xmlStrncat(ret, str, cur - str);
+ 		str = cur;
+ 		if (avt->nb_seg == 0)
+ 		    avt->strstart = 1;
+-		if ((avt = xsltSetAttrVTsegment(avt, (void *) ret)) == NULL)
++		if ((tmp = xsltSetAttrVTsegment(avt, (void *) ret)) == NULL)
+ 		    goto error;
++                avt = tmp;
+ 		ret = NULL;
+ 		lastavt = 0;
+ 	    }
+ 
+ 	    cur++;
+ 	    while ((*cur != 0) && (*cur != '}')) {
+ 		/* Need to check for literal (bug539741) */
+ 		if ((*cur == '\'') || (*cur == '"')) {
+ 		    char delim = *(cur++);
+ 		    while ((*cur != 0) && (*cur != delim))
+ 			cur++;
+ 		    if (*cur != 0)
+ 			cur++;	/* skip the ending delimiter */
+ 		} else
+ 		    cur++;
+ 	    }
+ 	    if (*cur == 0) {
+ 	        xsltTransformError(NULL, style, attr->parent,
+ 		     "Attribute '%s': The AVT has an unmatched '{'.\n",
+ 		     attr->name);
+ 		style->errors++;
+ 		goto error;
+ 	    }
+ 	    str++;
+ 	    expr = xmlStrndup(str, cur - str);
+ 	    if (expr == NULL) {
+ 		/*
+ 		* TODO: What needs to be done here?
+ 		*/
+ 	        XSLT_TODO
+ 		goto error;
+ 	    } else {
+ 		comp = xsltXPathCompile(style, expr);
+ 		if (comp == NULL) {
+ 		    xsltTransformError(NULL, style, attr->parent,
+ 			 "Attribute '%s': Failed to compile the expression "
+ 			 "'%s' in the AVT.\n", attr->name, expr);
+ 		    style->errors++;
+ 		    goto error;
+ 		}
+ 		if (avt->nb_seg == 0)
+ 		    avt->strstart = 0;
+ 		if (lastavt == 1) {
+-		    if ((avt = xsltSetAttrVTsegment(avt, NULL)) == NULL) {
++		    if ((tmp = xsltSetAttrVTsegment(avt, NULL)) == NULL) {
+                         xsltTransformError(NULL, style, attr->parent,
+                                            "out of memory\n");
+ 		        goto error;
+                     }
++                    avt = tmp;
+ 		}
+-		if ((avt = xsltSetAttrVTsegment(avt, (void *) comp)) == NULL) {
++		if ((tmp = xsltSetAttrVTsegment(avt, (void *) comp)) == NULL) {
+                     xsltTransformError(NULL, style, attr->parent,
+                                        "out of memory\n");
+ 		    goto error;
+                 }
++                avt = tmp;
+ 		lastavt = 1;
+ 		xmlFree(expr);
+ 		expr = NULL;
+                 comp = NULL;
+ 	    }
+ 	    cur++;
+ 	    str = cur;
+ 	} else if (*cur == '}') {
+ 	    cur++;
+ 	    if (*cur == '}') {	/* escaped '}' */
+ 		ret = xmlStrncat(ret, str, cur - str);
+ 		cur++;
+ 		str = cur;
+ 		continue;
+ 	    } else {
+ 	        xsltTransformError(NULL, style, attr->parent,
+ 		     "Attribute '%s': The AVT has an unmatched '}'.\n",
+ 		     attr->name);
+ 		goto error;
+ 	    }
+ 	} else
+ 	    cur++;
+     }
+     if ((ret != NULL) || (cur - str > 0)) {
+ 	ret = xmlStrncat(ret, str, cur - str);
+ 	str = cur;
+ 	if (avt->nb_seg == 0)
+ 	    avt->strstart = 1;
+-	if ((avt = xsltSetAttrVTsegment(avt, (void *) ret)) == NULL)
++	if ((tmp = xsltSetAttrVTsegment(avt, (void *) ret)) == NULL)
+ 	    goto error;
++        avt = tmp;
+ 	ret = NULL;
+     }
+ 

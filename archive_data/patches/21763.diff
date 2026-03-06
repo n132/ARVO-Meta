@@ -1,0 +1,165 @@
+commit c9a57b9a81868188470c611e09accc189383e4ad
+Author: Victor Zverovich <viz@fb.com>
+Date:   Sat Apr 18 06:50:02 2020 -0700
+
+    Fix incorrect assumptions about nul termination
+
+diff --git a/include/fmt/core.h b/include/fmt/core.h
+index 47a280a1..6c07f04e 100644
+--- a/include/fmt/core.h
++++ b/include/fmt/core.h
+@@ -805,7 +805,7 @@ template <typename Char, typename T, typename... Tail>
+ void init_named_args(named_arg_info<Char>* named_args, int arg_count,
+                      int named_arg_count, const named_arg<T, Char>& arg,
+                      const Tail&... args) {
+-  named_args[named_arg_count++] = {arg.name.data(), arg_count};
++  named_args[named_arg_count++] = {arg.name, arg_count};
+   init_named_args(named_args, arg_count + 1, named_arg_count, args...);
+ }
+ 
+@@ -1663,16 +1663,16 @@ struct is_contiguous_back_insert_iterator<std::back_insert_iterator<Container>>
+     : is_contiguous<Container> {};
+ 
+ template <typename Char> struct named_arg_base {
+-  basic_string_view<Char> name;
++  const Char* name;
+ 
+   // Serialized value<context>.
+   mutable char data[sizeof(basic_format_arg<buffer_context<Char>>)];
+ 
+-  named_arg_base(basic_string_view<Char> nm) : name(nm) {}
++  named_arg_base(const Char* nm) : name(nm) {}
+ 
+   template <typename Context> basic_format_arg<Context> deserialize() const {
+     basic_format_arg<Context> arg;
+     std::memcpy(&arg, data, sizeof(basic_format_arg<Context>));
+     return arg;
+   }
+ };
+@@ -1683,7 +1683,7 @@ template <typename T, typename Char>
+ struct named_arg : view, named_arg_base<Char> {
+   const T& value;
+ 
+-  named_arg(basic_string_view<Char> name, const T& val)
++  named_arg(const Char* name, const T& val)
+       : named_arg_base<Char>(name), value(val) {}
+ };
+ 
+@@ -1745,12 +1745,12 @@ inline void vprint_mojibake(std::FILE*, string_view, format_args) {}
+     fmt::print("Elapsed time: {s:.2f} seconds", fmt::arg("s", 1.23));
+   \endrst
+  */
+-template <typename S, typename T, typename Char = char_t<S>>
+-inline internal::named_arg<T, Char> arg(const S& name, const T& arg) {
+-  static_assert(internal::is_string<S>() && !internal::is_named_arg<T>(), "");
++template <typename Char, typename T>
++inline internal::named_arg<T, Char> arg(const Char* name, const T& arg) {
++  static_assert(!internal::is_named_arg<T>(), "");
+   return {name, arg};
+ }
+ 
+ /** Formats a string and writes the output to ``out``. */
+ // GCC 8 and earlier cannot handle std::back_insert_iterator<Container> with
+ // vformat_to<ArgFormatter>(...) overload, so SFINAE on iterator type instead.
+@@ -1838,9 +1838,9 @@ template <typename S, typename... Args, typename Char = char_t<S>>
+ inline void print(const S& format_str, Args&&... args) {
+   const auto& vargs = internal::make_args_checked<Args...>(format_str, args...);
+   return internal::is_unicode<Char>()
+              ? vprint(to_string_view(format_str), vargs)
+-             : internal::vprint_mojibake(
+-                   stdout, to_string_view(format_str), vargs);
++             : internal::vprint_mojibake(stdout, to_string_view(format_str),
++                                         vargs);
+ }
+ FMT_END_NAMESPACE
+ 
+diff --git a/include/fmt/format.h b/include/fmt/format.h
+index 96f75cd7..18db6758 100644
+--- a/include/fmt/format.h
++++ b/include/fmt/format.h
+@@ -3507,11 +3507,11 @@ template <typename Char> struct udl_formatter {
+ #  endif  // FMT_USE_UDL_TEMPLATE
+ 
+ template <typename Char> struct udl_arg {
+-  basic_string_view<Char> str;
++  const Char* str;
+ 
+   template <typename T> named_arg<T, Char> operator=(T&& value) const {
+     return {str, std::forward<T>(value)};
+   }
+ };
+ 
+ // Converts string literals to basic_string_view.
+@@ -3574,14 +3574,14 @@ FMT_CONSTEXPR internal::udl_formatter<wchar_t> operator"" _format(
+     using namespace fmt::literals;
+     fmt::print("Elapsed time: {s:.2f} seconds", "s"_a=1.23);
+   \endrst
+  */
+ FMT_CONSTEXPR internal::udl_arg<char> operator"" _a(const char* s,
+-                                                    std::size_t n) {
+-  return {{s, n}};
++                                                    std::size_t) {
++  return {s};
+ }
+ FMT_CONSTEXPR internal::udl_arg<wchar_t> operator"" _a(const wchar_t* s,
+-                                                       std::size_t n) {
+-  return {{s, n}};
++                                                       std::size_t) {
++  return {s};
+ }
+ }  // namespace literals
+ #endif  // FMT_USE_USER_DEFINED_LITERALS
+diff --git a/test/fuzzing/named_arg.cpp b/test/fuzzing/named_arg.cpp
+index 0f9a451b..8f8f9982 100644
+--- a/test/fuzzing/named_arg.cpp
++++ b/test/fuzzing/named_arg.cpp
+@@ -13,46 +13,46 @@ template <typename Item1>
+ void invoke_fmt(const uint8_t* Data, std::size_t Size, unsigned int argsize) {
+   constexpr auto N1 = sizeof(Item1);
+   static_assert(N1 <= fmt_fuzzer::Nfixed, "Nfixed too small");
+   if (Size <= fmt_fuzzer::Nfixed) {
+     return;
+   }
+   const Item1 item1 = fmt_fuzzer::assignFromBuf<Item1>(Data);
+ 
+   Data += fmt_fuzzer::Nfixed;
+   Size -= fmt_fuzzer::Nfixed;
+ 
+   // how many chars should be used for the argument name?
+   if (argsize <= 0 || argsize >= Size) {
+     return;
+   }
+ 
+   // allocating buffers separately is slower, but increases chances
+   // of detecting memory errors
+ #if FMT_FUZZ_SEPARATE_ALLOCATION
+-  std::vector<char> argnamebuffer(argsize);
++  std::vector<char> argnamebuffer(argsize + 1);
+   std::memcpy(argnamebuffer.data(), Data, argsize);
+-  auto argname = fmt::string_view(argnamebuffer.data(), argsize);
++  auto argname = argnamebuffer.data();
+ #else
+-  auto argname = fmt::string_view(fmt_fuzzer::as_chars(Data), argsize);
++  auto argname = fmt_fuzzer::as_chars(Data);
+ #endif
+   Data += argsize;
+   Size -= argsize;
+ 
+ #if FMT_FUZZ_SEPARATE_ALLOCATION
+   // allocates as tight as possible, making it easier to catch buffer overruns.
+   std::vector<char> fmtstringbuffer(Size);
+   std::memcpy(fmtstringbuffer.data(), Data, Size);
+   auto fmtstring = fmt::string_view(fmtstringbuffer.data(), Size);
+ #else
+   auto fmtstring = fmt::string_view(fmt_fuzzer::as_chars(Data), Size);
+ #endif
+ 
+ #if FMT_FUZZ_FORMAT_TO_STRING
+   std::string message = fmt::format(fmtstring, fmt::arg(argname, item1));
+ #else
+   fmt::memory_buffer outbuf;
+   fmt::format_to(outbuf, fmtstring, fmt::arg(argname, item1));
+ #endif
+ }
+ 
+ // for dynamic dispatching to an explicit instantiation

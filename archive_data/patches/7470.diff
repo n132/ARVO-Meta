@@ -1,0 +1,234 @@
+commit 6009094a8cb41ce82f634708dd846ab867d9483a
+Author: Nikos Mavrogiannopoulos <nmav@gnutls.org>
+Date:   Sat Apr 7 21:42:57 2018 +0200
+
+    ext/pre_shared_key: cleanups in error handling
+    
+    This addresses a memory leak found via oss-fuzz. It also
+    sets the right index on the selected PSK, and returns the
+    right server error code on incorrect key file.
+    
+    Addresses:
+      https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=7465
+    
+    Signed-off-by: Nikos Mavrogiannopoulos <nmav@gnutls.org>
+
+diff --git a/lib/ext/pre_shared_key.c b/lib/ext/pre_shared_key.c
+index d4ea982cb..f1cf4784a 100644
+--- a/lib/ext/pre_shared_key.c
++++ b/lib/ext/pre_shared_key.c
+@@ -250,129 +250,151 @@ server_send_params(gnutls_session_t session, gnutls_buffer_t extdata)
+ static int server_recv_params(gnutls_session_t session,
+ 			      const unsigned char *data, size_t len,
+ 			      const gnutls_psk_server_credentials_t pskcred)
+ {
+ 	int ret;
+ 	const mac_entry_st *prf;
+ 	gnutls_datum_t full_client_hello;
+ 	uint8_t binder_value[MAX_HASH_SIZE];
+ 	int psk_index = -1;
+ 	gnutls_datum_t binder_recvd = { NULL, 0 };
+-	gnutls_datum_t key;
+-	unsigned hash_size;
++	gnutls_datum_t key = {NULL, 0};
++	unsigned hash_size, cand_index;
+ 	psk_ext_parser_st psk_parser;
+ 	struct psk_st psk;
+ 	psk_auth_info_t info;
+ 
+ 	ret = _gnutls13_psk_ext_parser_init(&psk_parser, data, len);
+ 	if (ret < 0) {
+ 		if (ret == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) /* No PSKs advertised by client */
+ 			return 0;
+ 		return gnutls_assert_val(ret);
+ 	}
+ 
+ 	while ((ret = _gnutls13_psk_ext_parser_next_psk(&psk_parser, &psk)) >= 0) {
+ 		if (psk.ob_ticket_age == 0) {
++			cand_index = ret;
++
+ 			/* _gnutls_psk_pwd_find_entry() expects 0-terminated identities */
+ 			if (psk.identity.size > 0 && psk.identity.size <= MAX_USERNAME_SIZE) {
+ 				char identity_str[psk.identity.size + 1];
+ 
+ 				memcpy(identity_str, psk.identity.data, psk.identity.size);
+ 				identity_str[psk.identity.size] = 0;
+ 
+ 				ret = _gnutls_psk_pwd_find_entry(session, identity_str, &key);
+-				if (ret == 0)
+-					psk_index = ret;
++				if (ret < 0)
++					return gnutls_assert_val(ret);
++
++				psk_index = cand_index;
++				break;
+ 			}
+ 		}
+ 	}
+ 
+ 	if (psk_index < 0)
+ 		return 0;
+ 
+ 	ret = _gnutls13_psk_ext_parser_find_binder(&psk_parser, psk_index,
+ 						   &binder_recvd);
+-	if (ret < 0)
+-		return gnutls_assert_val(ret);
++	if (ret < 0) {
++		gnutls_assert();
++		goto fail;
++	}
+ 
+ 	/* Get full ClientHello */
+-	if (!_gnutls_ext_get_full_client_hello(session, &full_client_hello))
+-		return 0;
++	if (!_gnutls_ext_get_full_client_hello(session, &full_client_hello)) {
++		ret = GNUTLS_E_INTERNAL_ERROR;
++		gnutls_assert();
++		goto fail;
++	}
+ 
+ 	/* Compute the binder value for this PSK */
+ 	prf = pskcred->binder_algo;
+ 	hash_size = prf->output_size;
+ 	ret = compute_psk_binder(GNUTLS_SERVER, prf, hash_size, hash_size, 0, 0,
+ 				 &key, &full_client_hello,
+ 				 binder_value);
+-	if (ret < 0)
+-		return gnutls_assert_val(ret);
++	if (ret < 0) {
++		gnutls_assert();
++		goto fail;
++	}
+ 
+ 	if (_gnutls_mac_get_algo_len(prf) != binder_recvd.size ||
+ 	    safe_memcmp(binder_value, binder_recvd.data, binder_recvd.size)) {
+-		gnutls_free(key.data);
+-		return gnutls_assert_val(GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER);
++		gnutls_assert();
++		ret = GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER;
++		goto fail;
+ 	}
+ 
+ 	if (session->internals.hsk_flags & HSK_PSK_KE_MODE_DHE_PSK)
+ 		_gnutls_handshake_log("EXT[%p]: Selected DHE-PSK mode\n", session);
+ 	else {
+ 		reset_cand_groups(session);
+ 		_gnutls_handshake_log("EXT[%p]: Selected PSK mode\n", session);
+ 	}
+ 
+ 	/* save the username in psk_auth_info to make it available
+ 	 * using gnutls_psk_server_get_username() */
+ 	if (psk.ob_ticket_age == 0) {
+-		if (psk.identity.size >= sizeof(info->username))
+-			return gnutls_assert_val(GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER);
++		if (psk.identity.size >= sizeof(info->username)) {
++			gnutls_assert();
++			ret = GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER;
++			goto fail;
++		}
+ 
+ 		ret = _gnutls_auth_info_set(session, GNUTLS_CRD_PSK, sizeof(psk_auth_info_st), 1);
+-		if (ret < 0)
+-			return gnutls_assert_val(ret);
++		if (ret < 0) {
++			gnutls_assert();
++			goto fail;
++		}
+ 
+ 		info = _gnutls_get_auth_info(session, GNUTLS_CRD_PSK);
+ 		assert(info != NULL);
+ 
+ 		memcpy(info->username, psk.identity.data, psk.identity.size);
+ 		info->username[psk.identity.size] = 0;
+ 	}
+ 
+ 	session->internals.hsk_flags |= HSK_PSK_SELECTED;
+ 
+ 	/* Reference the selected pre-shared key */
+ 	session->key.psk.data = key.data;
+ 	session->key.psk.size = key.size;
+ 	session->key.psk_needs_free = 1;
+ 
+ 	session->key.proto.tls13.psk_index = psk_index;
+ 	session->key.proto.tls13.binder_prf = prf;
+ 
+ 	return 0;
++
++ fail:
++	gnutls_free(key.data);
++	return ret;
+ }
+ 
+ /*
+  * Return values for this function:
+  *  -  0 : Not applicable.
+  *  - >0 : Ok. Return size of extension data.
+  *  - GNUTLS_E_INT_RET_0 : Size of extension data is zero.
+  *  - <0 : There's been an error.
+  *
+  * In the client, generates the PskIdentity and PskBinderEntry messages.
+  *
+  *      PskIdentity identities<7..2^16-1>;
+  *      PskBinderEntry binders<33..2^16-1>;
+  *
+  *      struct {
+  *          opaque identity<1..2^16-1>;
+  *          uint32 obfuscated_ticket_age;
+  *      } PskIdentity;
+  *
+  *      opaque PskBinderEntry<32..255>;
+  *
+  * The server sends the selected identity, which is a zero-based index
+  * of the PSKs offered by the client:
+  *
+  *      struct {
+  *          uint16 selected_identity;
+  *      } PreSharedKeyExtension;
+  */
+diff --git a/tests/psk-file.c b/tests/psk-file.c
+index a6df3f046..a73031193 100644
+--- a/tests/psk-file.c
++++ b/tests/psk-file.c
+@@ -357,41 +357,41 @@ void run_dhtest_ok(const char *prio, const char *user, const gnutls_datum_t *key
+ void doit(void)
+ {
+ 	const gnutls_datum_t key = { (void *) "9e32cf7786321a828ef7668f09fb35db", 32 };
+ 	const gnutls_datum_t wrong_key = { (void *) "9e31cf7786321a828ef7668f09fb35db", 32 };
+ 
+ 	run_test_ok("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK", "jas", &key, 1, 0);
+ 	run_dhtest_ok("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+DHE-PSK", "jas", &key, 1, 0);
+ 	run_ectest_ok("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+ECDHE-PSK", "jas", &key, 1, 0);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK", NULL, "unknown", &key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_DECRYPTION_FAILED);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK", NULL, "jas", &wrong_key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_DECRYPTION_FAILED);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.2:-KX-ALL:+PSK", NULL, "non-hex", &key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_KEYFILE_ERROR);
+ 
+ 	run_test_ok("NORMAL:-KX-ALL:+PSK", "jas", &key, 1, 0);
+ 	run_test2("NORMAL:+PSK", NULL, "unknown", &key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_DECRYPTION_FAILED);
+ 	run_test2("NORMAL:+PSK", NULL, "jas", &wrong_key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_DECRYPTION_FAILED);
+ 	run_test2("NORMAL:-KX-ALL:+PSK", NULL, "non-hex", &key, 1, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_KEYFILE_ERROR);
+ 
+ 	run_dhtest_ok("NORMAL:-VERS-ALL:+VERS-TLS1.3:+DHE-PSK:-GROUP-EC-ALL", "jas", &key, 0, 0);
+ 	run_test_ok("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK", "jas", &key, 0, 0);
+ 
+ 	/* test priorities of DHE-PSK and PSK */
+ 	run_ectest_ok("NORMAL:-VERS-ALL:+VERS-TLS1.3:-CIPHER-ALL:+AES-128-GCM:+DHE-PSK:+PSK:-GROUP-DH-ALL", "jas", &key, 0, 0);
+ 	run_test_ok("NORMAL:-VERS-ALL:+VERS-TLS1.3:-CIPHER-ALL:+AES-128-GCM:+PSK:+DHE-PSK:-GROUP-DH-ALL", "jas", &key, 0, 0);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:-CIPHER-ALL:+AES-128-GCM:+DHE-PSK:+PSK:-GROUP-DH-ALL", 
+ 		  "NORMAL:-VERS-ALL:+VERS-TLS1.3:-CIPHER-ALL:+AES-128-GCM:+PSK:+DHE-PSK:%SERVER_PRECEDENCE:-GROUP-DH-ALL",
+ 		  "jas", &key, 0, GNUTLS_KX_PSK, 0, 0);
+ 	/* try with PRF that doesn't match binder (SHA256) */
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:-CIPHER-ALL:+AES-256-GCM:+PSK:+DHE-PSK", NULL, "jas", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_INSUFFICIENT_SECURITY);
+ 	/* try with no groups and PSK */
+ 	run_test_ok("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:-GROUP-ALL", "jas", &key, 0, 0);
+ 	/* try without any groups but DHE-PSK */
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+DHE-PSK:-GROUP-ALL", "NORMAL:-VERS-ALL:+VERS-TLS1.3:+DHE-PSK:+PSK", "jas", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_NO_COMMON_KEY_SHARE);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+DHE-PSK:-GROUP-ALL", "NORMAL:-VERS-ALL:+VERS-TLS1.3:+DHE-PSK:+PSK:-GROUP-ALL", "jas", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_NO_COMMON_KEY_SHARE);
+ 
+ 	/* if user invalid we continue without PSK */
+-	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:+DHE-PSK", NULL, "non-hex", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_INSUFFICIENT_CREDENTIALS);
++	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:+DHE-PSK", NULL, "non-hex", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_KEYFILE_ERROR);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:+DHE-PSK", NULL, "unknown", &key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER);
+ 	run_test2("NORMAL:-VERS-ALL:+VERS-TLS1.3:+PSK:+DHE-PSK", NULL, "jas", &wrong_key, 0, 0, GNUTLS_E_FATAL_ALERT_RECEIVED, GNUTLS_E_RECEIVED_ILLEGAL_PARAMETER);
+ }
+ 
+ #endif				/* _WIN32 */

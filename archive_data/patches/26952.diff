@@ -1,0 +1,282 @@
+commit 29f2177222f8a7c1a527dbf599cf47c7225f1783
+Author: Dario Lombardo <lomato@gmail.com>
+Date:   Sun Nov 15 21:57:09 2020 +0100
+
+    rtps: don't free wmem addresses with g_free.
+    
+    The dissector puts wmem_allocated memory into pinfo->private_table.
+    This table gets created with free functions (g_free) that collide
+    with wmem allocations. No need to have free functions.
+
+diff --git a/epan/dissectors/packet-rtps.c b/epan/dissectors/packet-rtps.c
+index 5c2d1c15fc..2067f034c9 100644
+--- a/epan/dissectors/packet-rtps.c
++++ b/epan/dissectors/packet-rtps.c
+@@ -10473,266 +10473,265 @@ static gboolean dissect_rtps_submessage_v1(tvbuff_t *tvb, packet_info *pinfo, gi
+ /***************************************************************************/
+ /* The main packet dissector function
+  */
+ static gboolean dissect_rtps(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, gint offset)
+ {
+   proto_item   *ti;
+   proto_tree   *rtps_tree, *rtps_submessage_tree;
+   guint8       submessageId, flags, majorRev;
+   guint16      version, vendor_id;
+   gboolean     is_ping;
+   guint        encoding;
+   gint         next_submsg, octets_to_next_header;
+   int          sub_hf;
+   const value_string *sub_vals;
+   endpoint_guid guid;
+   endpoint_guid dst_guid;
+   guint32 magic_number;
+   gchar domain_id_str[RTPS_UNKNOWN_DOMAIN_ID_STR_LEN] = RTPS_UNKNOWN_DOMAIN_ID_STR;
+   /* Check 'RTPS' signature:
+    * A header is invalid if it has less than 16 octets
+    */
+   if (tvb_reported_length_remaining(tvb, offset) < 16)
+     return FALSE;
+ 
+   magic_number = tvb_get_ntohl(tvb, offset);
+   if (magic_number != RTPX_MAGIC_NUMBER &&
+       magic_number != RTPS_MAGIC_NUMBER) {
+       return FALSE;
+   }
+   /* Distinguish between RTPS 1.x and 2.x here */
+   majorRev = tvb_get_guint8(tvb,offset+4);
+   if ((majorRev != 1) && (majorRev != 2))
+     return FALSE;
+ 
+   /* No fields have been set in either GUID yet. */
+   guid.fields_present = 0;
+   dst_guid.fields_present = 0;
+ 
+   col_set_str(pinfo->cinfo, COL_PROTOCOL, "RTPS");
+   col_clear(pinfo->cinfo, COL_INFO);
+ 
+   /* create display subtree for the protocol */
+   ti = proto_tree_add_item(tree, proto_rtps, tvb, 0, -1, ENC_NA);
+   rtps_tree = proto_item_add_subtree(ti, ett_rtps);
+ 
+   /* magic */
+   proto_tree_add_item(rtps_tree, hf_rtps_magic, tvb, 0, 4, ENC_NA | ENC_ASCII);
+ 
+   /*  Protocol Version */
+   version = rtps_util_add_protocol_version(rtps_tree, tvb, offset+4);
+ 
+   /*  Vendor Id  */
+   vendor_id = rtps_util_add_vendor_id(rtps_tree, tvb, offset+6);
+ 
+   is_ping = rtps_is_ping(tvb, pinfo, offset+8);
+ 
+   if (!is_ping) {
+     if (version < 0x0200)
+       rtps_util_add_guid_prefix_v1(rtps_tree, tvb, offset+8,
+                         hf_rtps_guid_prefix_v1, hf_rtps_host_id, hf_rtps_app_id,
+                         hf_rtps_app_id_instance_id, hf_rtps_app_id_app_kind, NULL);
+     else
+       rtps_util_add_guid_prefix_v2(rtps_tree, tvb, offset+8, hf_rtps_guid_prefix_src,
+           hf_rtps_host_id, hf_rtps_app_id, hf_rtps_sm_instance_id, hf_rtps_guid_prefix);
+ 
+     guid.host_id = tvb_get_ntohl(tvb, offset+8);
+     guid.app_id = tvb_get_ntohl(tvb, offset+12);
+     guid.instance_id = tvb_get_ntohl(tvb, offset+16);
+     guid.fields_present |= GUID_HAS_HOST_ID|GUID_HAS_APP_ID|GUID_HAS_INSTANCE_ID;
+     /* If the packet uses TCP we need top store the participant GUID to get the domainId later
+      * For that operation the member fields_present is not required and is not affected by
+      * its changes.
+      */
+     if (pinfo->private_table == NULL && pinfo->ptype == PT_TCP) {
+-      pinfo->private_table = g_hash_table_new_full(g_str_hash, g_str_equal,
+-        g_free, g_free);
++      pinfo->private_table = g_hash_table_new(g_str_hash, g_str_equal);
+     }
+     if (pinfo->private_table != NULL) {
+       gchar* key = wmem_strdup(wmem_packet_scope() , RTPS_TCPMAP_DOMAIN_ID_KEY_STR);
+       endpoint_guid *guid_copy = (endpoint_guid*)wmem_memdup(wmem_packet_scope(),
+         (const void*)&guid, sizeof(endpoint_guid));
+       g_hash_table_insert(pinfo->private_table, (gpointer)key, (gpointer)guid_copy);
+     }
+ #ifdef RTI_BUILD
+     pinfo->guid_prefix_host = tvb_get_ntohl(tvb, offset + 8);
+     pinfo->guid_prefix_app  = tvb_get_ntohl(tvb, offset + 12);
+     pinfo->guid_prefix_count = tvb_get_ntohl(tvb, offset + 16);
+     pinfo->guid_rtps2 = 1;
+ #endif
+   }
+   /* Extract the domain id and participant index */
+   {
+     int domain_id, doffset, participant_idx = 0, nature;
+     proto_tree *mapping_tree;
+     /* For a complete description of these rules, see RTPS documentation
+ 
+        RTPS 1.2 mapping:
+         domain_id = ((pinfo->destport - PORT_BASE)/10) % 100;
+         participant_idx = (pinfo->destport - PORT_BASE) / 1000;
+         nature    = (pinfo->destport % 10);
+ 
+        For Unicast, the port mapping formula is:
+          metatraffic_unicast_port = port_base +
+                                     (domain_id_gain * domain_id) +
+                                     (participant_id_gain * participant_id) +
+                                     builtin_unicast_port_offset
+        For Multicast, the port mapping is:
+          metatraffic_multicast_port = port_base +
+                                     (domain_id_gain * domain_id) +
+                                      builtin_multicast_port_offset
+ 
+        Where the constants are:
+             port_base = 7400
+             domain_id_gain = 250
+             participant_id_gain = 2
+             builtin_multicast_port_offset = 0
+             builtin_unicast_port_offset = 10
+             user_multicast_port_offset = 1
+             user_unicast_port_offset = 11
+ 
+ 
+        To obtain the individual components from the port number, the reverse formulas are:
+             domain_id = (port - port_base) / 250        (valid both multicast / unicast)
+             Doffset = (port - port_Base - (domain_id * 250));
+             participant_idx = (Doffset - 10) / 2;
+ 
+     */
+     if (version < 0x0200) {
+       /* If using TCP domainId cannot deduced from the port. It must be taken from the participant
+        * discovery packets or Unknown.
+        */
+       domain_id = (pinfo->ptype == PT_TCP) ?
+         get_domain_id_from_tcp_discovered_participants(discovered_tcp_participants, &guid) :
+         ((pinfo->destport - PORT_BASE)/10) % 100;
+       participant_idx = (pinfo->destport - PORT_BASE) / 1000;
+       nature    = (pinfo->destport % 10);
+     } else {
+       domain_id = (pinfo->ptype == PT_TCP) ?
+         get_domain_id_from_tcp_discovered_participants(discovered_tcp_participants, &guid) :
+         (pinfo->destport - PORT_BASE) / 250;
+       doffset = (pinfo->destport - PORT_BASE - domain_id * 250);
+       if (doffset == 0) {
+         nature = PORT_METATRAFFIC_MULTICAST;
+       } else if (doffset == 1) {
+         nature = PORT_USERTRAFFIC_MULTICAST;
+       } else {
+         participant_idx = (doffset - 10) / 2;
+         if ( (doffset - 10) % 2 == 0) {
+           nature = PORT_METATRAFFIC_UNICAST;
+         } else {
+           nature = PORT_USERTRAFFIC_UNICAST;
+         }
+       }
+     }
+     /* Used string for the domain participant to show Unknown if the domainId is not known when using TCP*/
+     if (domain_id != RTPS_UNKNOWN_DOMAIN_ID_VAL) {
+       g_snprintf(domain_id_str, RTPS_UNKNOWN_DOMAIN_ID_STR_LEN,
+         "%"G_GINT32_FORMAT, domain_id);
+     }
+     if ((nature == PORT_METATRAFFIC_UNICAST) || (nature == PORT_USERTRAFFIC_UNICAST) ||
+         (version < 0x0200)) {
+       mapping_tree = proto_tree_add_subtree_format(rtps_tree, tvb, 0, 0,
+                         ett_rtps_default_mapping, NULL, "Default port mapping: domainId=%s, "
+                         "participantIdx=%d, nature=%s",
+                         domain_id_str,
+                         participant_idx,
+                         val_to_str(nature, nature_type_vals, "%02x"));
+     } else {
+       mapping_tree = proto_tree_add_subtree_format(rtps_tree, tvb, 0, 0,
+                         ett_rtps_default_mapping, NULL, "Default port mapping: %s, domainId=%s",
+                         val_to_str(nature, nature_type_vals, "%02x"),
+                         domain_id_str);
+     }
+ 
+     ti = proto_tree_add_uint(mapping_tree, hf_rtps_domain_id, tvb, 0, 0, domain_id);
+     proto_item_set_generated(ti);
+     if ((nature == PORT_METATRAFFIC_UNICAST) || (nature == PORT_USERTRAFFIC_UNICAST) ||
+         (version < 0x0200)) {
+       ti = proto_tree_add_uint(mapping_tree, hf_rtps_participant_idx, tvb, 0, 0, participant_idx);
+       proto_item_set_generated(ti);
+     }
+     ti = proto_tree_add_uint(mapping_tree, hf_rtps_nature_type, tvb, 0, 0, nature);
+     proto_item_set_generated(ti);
+   }
+ 
+   /* offset behind RTPS's Header (need to be set in case tree=NULL)*/
+   offset += ((version < 0x0200) ? 16 : 20);
+ 
+   while (tvb_reported_length_remaining(tvb, offset) > 0) {
+     submessageId = tvb_get_guint8(tvb, offset);
+ 
+     if (version < 0x0200) {
+       sub_hf = hf_rtps_sm_id;
+       sub_vals = submessage_id_vals;
+     } else {
+       if ((submessageId & 0x80) && (vendor_id == RTPS_VENDOR_RTI_DDS)) {
+         sub_hf = hf_rtps_sm_idv2;
+         sub_vals = submessage_id_rti;
+       } else {
+         sub_hf = hf_rtps_sm_idv2;
+         sub_vals = submessage_id_valsv2;
+       }
+     }
+ 
+     col_append_sep_str(pinfo->cinfo, COL_INFO, ", ", val_to_str(submessageId, sub_vals, "Unknown[%02x]"));
+ 
+     /* Creates the subtree 'Submessage: XXXX' */
+     if (submessageId & 0x80) {
+       if (vendor_id == RTPS_VENDOR_RTI_DDS) {
+         ti = proto_tree_add_uint_format_value(rtps_tree, sub_hf, tvb, offset, 1, submessageId, "%s",
+                 val_to_str(submessageId, submessage_id_rti, "Vendor-specific (0x%02x)"));
+       } else {
+         ti = proto_tree_add_uint_format_value(rtps_tree, sub_hf, tvb, offset, 1,
+                 submessageId, "Vendor-specific (0x%02x)", submessageId);
+       }
+     } else {
+       ti = proto_tree_add_uint(rtps_tree, sub_hf, tvb, offset, 1, submessageId);
+     }
+ 
+     rtps_submessage_tree = proto_item_add_subtree(ti, ett_rtps_submessage);
+ 
+     /* Gets the flags */
+     flags = tvb_get_guint8(tvb, offset + 1);
+ 
+     /* Gets the E (Little endian) flag */
+     encoding = ((flags & FLAG_E) != 0) ? ENC_LITTLE_ENDIAN : ENC_BIG_ENDIAN;
+ 
+     /* Octets-to-next-header */
+     octets_to_next_header = tvb_get_guint16(tvb, offset + 2, encoding);
+     if ((octets_to_next_header == 0) && (version >= 0x0200) && (submessageId != SUBMESSAGE_PAD) && (submessageId != SUBMESSAGE_INFO_TS)) {
+       octets_to_next_header = tvb_reported_length_remaining(tvb, offset + 4);
+     }
+     next_submsg = offset + octets_to_next_header + 4;
+ 
+     /* Set length of this item */
+     proto_item_set_len(ti, octets_to_next_header + 4);
+ 
+     /* Now decode each single submessage
+      * The offset passed to the dissectors points to the start of the
+      * submessage (at the ID byte).
+      */
+     if (!dissect_rtps_submessage_v1(tvb, pinfo, offset, flags, encoding,
+                                     submessageId, version, vendor_id,
+                                     octets_to_next_header, rtps_submessage_tree,
+                                     ti, &guid, &dst_guid)) {
+       if ((version < 0x0200) ||
+           !dissect_rtps_submessage_v2(tvb, pinfo, offset, flags, encoding, submessageId,
+                                       vendor_id, octets_to_next_header, rtps_submessage_tree,
+                                       ti, &guid, &dst_guid)) {
+         proto_tree_add_uint(rtps_submessage_tree, hf_rtps_sm_flags,
+                               tvb, offset + 1, 1, flags);
+         proto_tree_add_uint(rtps_submessage_tree,
+                                 hf_rtps_sm_octets_to_next_header,
+                                 tvb, offset + 2, 2, octets_to_next_header);
+       }
+     }
+ 
+      /* next submessage's offset */
+      offset = next_submsg;
+   }
+ 
+   /* If TCP there's an extra OOB byte at the end of the message */
+   /* TODO: What to do with it? */
+   return TRUE;
+ 
+ }  /* dissect_rtps(...) */

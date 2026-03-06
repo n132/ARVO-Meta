@@ -1,0 +1,1191 @@
+commit 1a18793a02e1dab7676d594366b93847fde6fe44
+Author: Michael Vrhel <michael.vrhel@artifex.com>
+Date:   Wed Apr 13 16:37:07 2022 -0700
+
+    Bug 705197  OSS 46307
+    
+    In the example of Bug 705197 the PDF interpreter
+    reuses a pattern during a circular reference causing an aliasing
+    of two nested patterns, one of which has a softmask. The change in
+    the buffer size of the inner one blows away the color information of the
+    outer one leading to a mismatch of color spaces. Added a check
+    in the pdf14 group composition to catch the case when the color space sizes
+    are wrong and avoid buffer over-runs that would occur when we try
+    to do the group composition.  I return a Fatal error to the interpreter
+    thinking it would stop but it seems to swallow this and continue on its way.
+    Clearly being in this situation indicates something very bad has
+    happened I would expect to see GS error out when this occurs.
+
+diff --git a/base/gdevp14.c b/base/gdevp14.c
+index af594ff1f..d0fa9d881 100644
+--- a/base/gdevp14.c
++++ b/base/gdevp14.c
+@@ -1573,181 +1573,198 @@ static	int
+ pdf14_pop_transparency_group(gs_gstate *pgs, pdf14_ctx *ctx,
+     const pdf14_nonseparable_blending_procs_t * pblend_procs,
+     int tos_num_color_comp, cmm_profile_t *curr_icc_profile, gx_device *dev)
+ {
+     pdf14_buf *tos = ctx->stack;
+     pdf14_buf *nos = tos->saved;
+     pdf14_mask_t *mask_stack = tos->mask_stack;
+     pdf14_buf *maskbuf;
+     int x0, x1, y0, y1;
+     int nos_num_color_comp;
+     bool no_icc_match;
+     pdf14_device *pdev = (pdf14_device *)dev;
+     bool overprint = pdev->overprint;
+     gx_color_index drawn_comps = pdev->drawn_comps_stroke | pdev->drawn_comps_fill;
+     bool has_matte = false;
+     int code = 0;
+ 
+ #ifdef DEBUG
+     pdf14_debug_mask_stack_state(ctx);
+ #endif
+     if (mask_stack == NULL) {
+         maskbuf = NULL;
+     }
+     else {
+         maskbuf = mask_stack->rc_mask->mask_buf;
+     }
+ 
+     if (maskbuf != NULL && maskbuf->matte != NULL)
+         has_matte = true;
+ 
+     /* Check if this is our last buffer, if yes, there is nothing to
+        compose to.  Keep this buffer until we have the put image.
+        If we have another group push, this group must be destroyed.
+        This only occurs sometimes when at clist creation time
+        push_shfill_group occured and nothing was drawn in this group.
+        There is also the complication if we have a softmask.  There
+        are two approaches to this problem.  Apply the softmask during
+        the put image or handle it now.  I choose the later as the
+        put_image code is already way to complicated. */
+     if (nos == NULL && maskbuf == NULL) {
+         tos->group_popped = true;
+         return 0;
+     }
+ 
++    /* Before we get started, lets see if we have somehow gotten into
++       what should be an impossible situation where the group color
++       information does not match the buffer color information. This
++       can occur is there were memory issues that have perhaps blown
++       away information, or in the example of Bug 705197 the PDF interpreter
++       reuses a pattern during a circular reference causing an aliasing
++       of two nested patterns, one of which has a softmask. The change in
++       the buffer size of the inner one blows away the buffer of the
++       outer one leading to a mismatch of color spaces.  This is clearly
++       a problem, and one that should be solved by the interpreter. Here
++       we can at least catch the case when the color space sizes have
++       changed and avoid buffer over-runs that would occur when we try
++       to do the group composition */
++    if (nos->n_chan - 1 != nos->group_color_info->num_components ||
++        tos->n_chan - 1 != tos_num_color_comp)
++        return_error(gs_error_Fatal);
++
+     /* Here is the case with the soft mask.  Go ahead and create a new
+        target buffer (nos) with the same color information etc, but blank
+        and go ahead and do the blend with the softmask so that it gets applied. */
+     if (nos == NULL && maskbuf != NULL) {
+         nos = pdf14_buf_new(&(tos->rect), ctx->has_tags, !tos->isolated, tos->has_shape,
+             tos->idle, tos->n_chan, tos->num_spots, ctx->memory, ctx->deep);
+         if (nos == NULL) {
+             code = gs_error_VMerror;
+             goto exit;
+         }
+ 
+         if_debug4m('v', ctx->memory,
+             "[v] special buffer for softmask application: %d x %d, %d color channels, %d planes\n",
+             nos->rect.q.x, nos->rect.q.y, nos->n_chan, nos->n_planes);
+ 
+         nos->dirty = tos->dirty;
+         nos->isolated = tos->isolated;
+         nos->knockout = tos->knockout;
+         nos->alpha = 65535;
+         nos->shape = 65535;
+         nos->opacity = 65535;
+         nos->blend_mode = tos->blend_mode;
+         nos->mask_id = tos->mask_id;
+         nos->group_color_info = pdf14_clone_group_color_info(dev, tos->group_color_info);
+ 
+         if (nos->data != NULL)
+             memset(nos->data, 0,
+                    (size_t)nos->planestride *
+                                           (nos->n_chan +
+                                            (nos->has_shape ? 1 : 0) +
+                                            (nos->has_alpha_g ? 1 : 0)));
+     }
+ 
+     nos_num_color_comp = nos->group_color_info->num_components - tos->num_spots;
+     tos_num_color_comp = tos_num_color_comp - tos->num_spots;
+ 
+     /* Sanitise the dirty rectangles, in case some of the drawing routines
+      * have made them overly large. */
+     rect_intersect(tos->dirty, tos->rect);
+     rect_intersect(nos->dirty, nos->rect);
+     /* dirty = the marked bbox. rect = the entire bounds of the buffer. */
+     /* Everything marked on tos that fits onto nos needs to be merged down. */
+     y0 = max(tos->dirty.p.y, nos->rect.p.y);
+     y1 = min(tos->dirty.q.y, nos->rect.q.y);
+     x0 = max(tos->dirty.p.x, nos->rect.p.x);
+     x1 = min(tos->dirty.q.x, nos->rect.q.x);
+     if (ctx->mask_stack) {
+         /* This can occur when we have a situation where we are ending out of
+            a group that has internal to it a soft mask and another group.
+            The soft mask left over from the previous trans group pop is put
+            into ctx->masbuf, since it is still active if another trans group
+            push occurs to use it.  If one does not occur, but instead we find
+            ourselves popping from a parent group, then this softmask is no
+            longer needed.  We will rc_decrement and set it to NULL. */
+         rc_decrement(ctx->mask_stack->rc_mask, "pdf14_pop_transparency_group");
+         if (ctx->mask_stack->rc_mask == NULL ){
+             gs_free_object(ctx->memory, ctx->mask_stack, "pdf14_pop_transparency_group");
+         }
+         ctx->mask_stack = NULL;
+     }
+     ctx->mask_stack = mask_stack;  /* Restore the mask saved by pdf14_push_transparency_group. */
+     tos->mask_stack = NULL;        /* Clean the pointer sinse the mask ownership is now passed to ctx. */
+     if (tos->idle)
+         goto exit;
+     if (maskbuf != NULL && maskbuf->data == NULL && maskbuf->alpha == 255)
+         goto exit;
+ 
+ #if RAW_DUMP
+     /* Dump the current buffer to see what we have. */
+     dump_raw_buffer(ctx->memory,
+                     ctx->stack->rect.q.y-ctx->stack->rect.p.y,
+                     ctx->stack->rowstride>>ctx->stack->deep, ctx->stack->n_planes,
+                     ctx->stack->planestride, ctx->stack->rowstride,
+                     "aaTrans_Group_Pop", ctx->stack->data, ctx->stack->deep);
+     global_index++;
+ #endif
+ /* Note currently if a pattern space has transparency, the ICC profile is not used
+    for blending purposes.  Instead we rely upon the gray, rgb, or cmyk parent space.
+    This is partially due to the fact that pdf14_pop_transparency_group and
+    pdf14_push_transparnecy_group have no real ICC interaction and those are the
+    operations called in the tile transparency code.  Instead we may want to
+    look at pdf14_begin_transparency_group and pdf14_end_transparency group which
+    is where all the ICC information is handled.  We will return to look at that later */
+     if (nos->group_color_info->icc_profile != NULL) {
+         no_icc_match = !gsicc_profiles_equal(nos->group_color_info->icc_profile, curr_icc_profile);
+     } else {
+         /* Let the other tests make the decision if we need to transform */
+         no_icc_match = false;
+     }
+     /* If the color spaces are different and we actually did do a swap of
+        the procs for color */
+     if ((nos->group_color_info->group_color_mapping_procs != NULL &&
+         nos_num_color_comp != tos_num_color_comp) || no_icc_match) {
+         if (x0 < x1 && y0 < y1) {
+             pdf14_buf *result;
+             bool did_alloc; /* We don't care here */
+ 
+             if (has_matte) {
+                 result = pdf14_transform_color_buffer_with_matte(pgs, ctx, dev,
+                     tos, tos->data, curr_icc_profile, nos->group_color_info->icc_profile,
+                     tos->rect.p.x, tos->rect.p.y, tos->rect.q.x - tos->rect.p.x,
+                     tos->rect.q.y - tos->rect.p.y, &did_alloc, tos->deep, false);
+                 has_matte = false;
+             } else {
+                 result = pdf14_transform_color_buffer_no_matte(pgs, ctx, dev,
+                     tos, tos->data, curr_icc_profile, nos->group_color_info->icc_profile,
+                     tos->rect.p.x, tos->rect.p.y, tos->rect.q.x - tos->rect.p.x,
+                     tos->rect.q.y - tos->rect.p.y, &did_alloc, tos->deep, false);
+             }
+             if (result == NULL) {
+                 /* Clean up and return error code */
+                 code = gs_error_unknownerror;
+                 goto exit;
+             }
+ 
+ #if RAW_DUMP
+             /* Dump the current buffer to see what we have. */
+             dump_raw_buffer(ctx->memory,
+                             ctx->stack->rect.q.y-ctx->stack->rect.p.y,
+                             ctx->stack->rowstride>>ctx->stack->deep, ctx->stack->n_chan,
+                             ctx->stack->planestride, ctx->stack->rowstride,
+                             "aCMTrans_Group_ColorConv", ctx->stack->data,
+                             ctx->stack->deep);
+ #endif
+              /* compose. never do overprint in this case */
+             pdf14_compose_group(tos, nos, maskbuf, x0, x1, y0, y1, nos->n_chan,
+                  nos->group_color_info->isadditive,
+                  nos->group_color_info->blend_procs,
+                  has_matte, false, drawn_comps, ctx->memory, dev);
+         }
+     } else {
+         /* Group color spaces are the same.  No color conversions needed */
+         if (x0 < x1 && y0 < y1)
+             pdf14_compose_group(tos, nos, maskbuf, x0, x1, y0, y1, nos->n_chan,
+                                 ctx->additive, pblend_procs, has_matte, overprint,
+                                 drawn_comps, ctx->memory, dev);
+     }
+@@ -5036,220 +5053,220 @@ static	int
+ pdf14_tile_pattern_fill(gx_device * pdev, const gs_gstate * pgs,
+                         gx_path * ppath, const gx_fill_params * params,
+                         const gx_device_color * pdevc,
+                         const gx_clip_path * pcpath)
+ {
+     int code;
+     gs_gstate *pgs_noconst = (gs_gstate *)pgs; /* Break const. */
+     gs_fixed_rect clip_box;
+     gs_fixed_rect outer_box;
+     pdf14_device * p14dev = (pdf14_device *)pdev;
+     gs_int_rect rect;
+     gx_clip_rect *curr_clip_rect;
+     gx_color_tile *ptile = NULL;
+     int k;
+     gx_pattern_trans_t *fill_trans_buffer = NULL;
+     gs_int_point phase;  /* Needed during clist rendering for band offset */
+     int n_chan_tile;
+     gx_clip_path cpath_intersection;
+     gx_path path_ttrans;
+     gs_blend_mode_t blend_mode;
+     pdf14_group_color_t *group_color_info;
+ 
+     if (ppath == NULL)
+         return_error(gs_error_unknownerror);	/* should not happen */
+     if (pcpath != NULL) {
+         code = gx_cpath_init_local_shared_nested(&cpath_intersection, pcpath, ppath->memory, 1);
+     } else {
+         (*dev_proc(pdev, get_clipping_box)) (pdev, &clip_box);
+         gx_cpath_init_local(&cpath_intersection, ppath->memory);
+         code = gx_cpath_from_rectangle(&cpath_intersection, &clip_box);
+     }
+     if (code < 0)
+         return code;
+     code = gx_cpath_intersect_with_params(&cpath_intersection, ppath,
+                                           params->rule, pgs_noconst, params);
+     if (code < 0)
+         return code;
+     /* One (common) case worth optimising for is where we have a pattern that
+      * is positioned such that only one repeat of the tile is actually
+      * visible. In this case, we can restrict the size of the blending group
+      * we need to produce to be that of the actual area of the tile that is
+      * used. */
+     ptile = pdevc->colors.pattern.p_tile;
+     if (ptile->ttrans != NULL)
+     {
+         if ((cpath_intersection.outer_box.p.x < 0) ||
+             (cpath_intersection.outer_box.p.y < 0) ||
+             (cpath_intersection.outer_box.q.x > int2fixed(ptile->ttrans->width)) ||
+             (cpath_intersection.outer_box.q.y > int2fixed(ptile->ttrans->height)))
+         {
+             /* More than one repeat of the tile would be visible, so we can't
+              * use the optimisation here. (Actually, this test isn't quite
+              * right - it actually tests whether more than the '0th' repeat
+              * of the tile is visible. A better test would test if just one
+              * repeat of the tile was visible, irrespective of which one.
+              * This is (hopefully) relatively rare, and would make the code
+              * below more complex too, so we're ignoring that for now. If it
+              * becomes evident that it's a case that matters we can revisit
+              * it.) */
+         } else {
+             /* Only the 0th repeat is visible. Restrict the size further to
+              * just the used area of that patch. */
+             gx_path_init_local(&path_ttrans, ppath->memory);
+             code = gx_path_add_rectangle(&path_ttrans,
+                                          int2fixed(ptile->ttrans->rect.p.x),
+                                          int2fixed(ptile->ttrans->rect.p.y),
+                                          int2fixed(ptile->ttrans->rect.q.x),
+                                          int2fixed(ptile->ttrans->rect.q.y));
+             if (code < 0)
+                 return code;
+             code = gx_cpath_intersect(&cpath_intersection, &path_ttrans,
+                                       params->rule, pgs_noconst);
+             gx_path_free(&path_ttrans, "pdf14_tile_pattern_fill(path_ttrans)");
+             if (code < 0)
+                 return code;
+         }
+     }
+     /* Now let us push a transparency group into which we are
+      * going to tile the pattern.  */
+     if (ppath != NULL) {
+         pdf14_device save_pdf14_dev;		/* save area for p14dev */
+ 
+         gx_cpath_outer_box(&cpath_intersection, &outer_box);
+         rect.p.x = fixed2int(outer_box.p.x);
+         rect.p.y = fixed2int(outer_box.p.y);
+         rect.q.x = fixed2int_ceiling(outer_box.q.x);
+         rect.q.y = fixed2int_ceiling(outer_box.q.y);
+ 
+         /* The color space of this group must be the same as that of the
+            tile.  Then when we pop the group, if there is a mismatch between
+            the tile color space and the current context we will do the proper
+            conversion.  In this way, we ensure that if the tile has any overlapping
+            occuring it will be blended in the proper manner i.e in the tile
+            underlying color space. */
+         if (ptile->cdev == NULL) {
+             if (ptile->ttrans == NULL)
+                 return_error(gs_error_unknownerror);	/* should not happen */
+             n_chan_tile = ptile->ttrans->n_chan;
+         } else {
+             n_chan_tile = ptile->cdev->common.color_info.num_components+1;
+         }
+         blend_mode = ptile->blending_mode;
+         memcpy(&save_pdf14_dev, p14dev, sizeof(pdf14_device));
+ 
+         group_color_info = pdf14_clone_group_color_info(pdev, p14dev->ctx->stack->group_color_info);
+         if (group_color_info == NULL)
+             return gs_error_VMerror;
+ 
+         code = pdf14_push_transparency_group(p14dev->ctx, &rect, 1, 0, (uint16_t)floor(65535 * p14dev->alpha + 0.5),
+                                              (uint16_t)floor(65535 * p14dev->shape + 0.5), (uint16_t)floor(65535 * p14dev->opacity + 0.5),
+                                               blend_mode, 0, 0, n_chan_tile - 1, false, false,
+                                               NULL, NULL, group_color_info, pgs_noconst, pdev);
+         if (code < 0)
+             return code;
+ 
+         /* Set the blending procs and the is_additive setting based
+            upon the number of channels */
+         if (ptile->cdev == NULL) {
+             if (n_chan_tile-1 < 4) {
+                 ptile->ttrans->blending_procs = &rgb_blending_procs;
+                 ptile->ttrans->is_additive = true;
+             } else {
+                 ptile->ttrans->blending_procs = &cmyk_blending_procs;
+                 ptile->ttrans->is_additive = false;
+             }
+         }
+         /* Now lets go through the rect list and fill with the pattern */
+         /* First get the buffer that we will be filling */
+         if (ptile->cdev == NULL) {
+             fill_trans_buffer = new_pattern_trans_buff(pgs->memory);
+             pdf14_get_buffer_information(pdev, fill_trans_buffer, NULL, false);
+             /* Based upon if the tiles overlap pick the type of rect fill that we will
+                want to use */
+             if (ptile->has_overlap) {
+                 /* This one does blending since there is tile overlap */
+                 ptile->ttrans->pat_trans_fill = &tile_rect_trans_blend;
+             } else {
+                 /* This one does no blending since there is no tile overlap */
+                 ptile->ttrans->pat_trans_fill = &tile_rect_trans_simple;
+             }
+             /* fill the rectangles */
+             phase.x = pdevc->phase.x;
+             phase.y = pdevc->phase.y;
+             if (cpath_intersection.rect_list->list.head != NULL){
+                 curr_clip_rect = cpath_intersection.rect_list->list.head->next;
+                 for( k = 0; k < cpath_intersection.rect_list->list.count && code >= 0; k++){
+                     if_debug5m('v', pgs->memory,
+-                               "[v]pdf14_tile_pattern_fill, (%d, %d), %d x %d pat_id %d \n",
++                               "[v]pdf14_tile_pattern_fill, (%d, %d), %d x %d pat_id %u \n",
+                                curr_clip_rect->xmin, curr_clip_rect->ymin,
+                                curr_clip_rect->xmax-curr_clip_rect->xmin,
+                                curr_clip_rect->ymax-curr_clip_rect->ymin, (int)ptile->id);
+                     code = gx_trans_pattern_fill_rect(curr_clip_rect->xmin, curr_clip_rect->ymin,
+                                                       curr_clip_rect->xmax, curr_clip_rect->ymax, ptile,
+                                                       fill_trans_buffer, phase, pdev, pdevc, 1);
+                     curr_clip_rect = curr_clip_rect->next;
+                 }
+             } else if (cpath_intersection.rect_list->list.count == 1) {
+                 /* The case when there is just a single rect */
+                 if_debug5m('v', pgs->memory,
+-                           "[v]pdf14_tile_pattern_fill, (%d, %d), %d x %d pat_id %d \n",
++                           "[v]pdf14_tile_pattern_fill, (%d, %d), %d x %d pat_id %u \n",
+                            cpath_intersection.rect_list->list.single.xmin,
+                            cpath_intersection.rect_list->list.single.ymin,
+                            cpath_intersection.rect_list->list.single.xmax-
+                               cpath_intersection.rect_list->list.single.xmin,
+                            cpath_intersection.rect_list->list.single.ymax-
+                               cpath_intersection.rect_list->list.single.ymin,
+                            (int)ptile->id);
+                 code = gx_trans_pattern_fill_rect(cpath_intersection.rect_list->list.single.xmin,
+                                                   cpath_intersection.rect_list->list.single.ymin,
+                                                   cpath_intersection.rect_list->list.single.xmax,
+                                                   cpath_intersection.rect_list->list.single.ymax,
+                                                   ptile, fill_trans_buffer, phase, pdev, pdevc, 1);
+             }
+         } else {
+             /* Clist pattern with transparency.  Create a clip device from our
+                cpath_intersection.  The above non-clist case could probably be
+                done this way too, which will reduce the amount of code here.
+                That is for another day though due to time constraints*/
+             gx_device *dev;
+             gx_device_clip clipdev;
+ 
+             gx_make_clip_device_on_stack(&clipdev, &cpath_intersection, pdev);
+             dev = (gx_device *)&clipdev;
+             phase.x = pdevc->phase.x;
+             phase.y = pdevc->phase.y;
+             code = gx_trans_pattern_fill_rect(rect.p.x, rect.p.y, rect.q.x, rect.q.y,
+                                               ptile, fill_trans_buffer, phase,
+                                               dev, pdevc, 1);
+ 
+         }
+         /* We're done drawing with the pattern, remove the reference to the
+          * pattern device
+          */
+         p14dev->pclist_device = NULL;
+         if (code < 0)
+             return code;
+ 
+         /* free our buffer object */
+         if (fill_trans_buffer != NULL) {
+             gs_free_object(pgs->memory, fill_trans_buffer, "pdf14_tile_pattern_fill");
+             ptile->ttrans->fill_trans_buffer = NULL;  /* Avoid GC issues */
+         }
+         /* pop our transparency group which will force the blending.
+            This was all needed for Bug 693498 */
+         code = pdf14_pop_transparency_group(pgs_noconst, p14dev->ctx,
+                                             p14dev->blend_procs,
+                                             p14dev->color_info.num_components,
+                                             p14dev->icc_struct->device_profile[GS_DEFAULT_DEVICE_PROFILE],
+                                             pdev);
+         memcpy(p14dev, &save_pdf14_dev, sizeof(pdf14_device));
+         p14dev->pclist_device = NULL;
+     }
+     gx_cpath_free(&cpath_intersection, "pdf14_tile_pattern_fill");
+     return code;
+ }
+ 
+ /* Useful function that should probably go elsewhere.
+  * Call this function to find the topmost pdf14 device in the device chain,
+  * or NULL if there is not one.
+  */
+diff --git a/base/gsptype1.c b/base/gsptype1.c
+index 75f6b9529..cea1ad3bc 100644
+--- a/base/gsptype1.c
++++ b/base/gsptype1.c
+@@ -1935,102 +1935,102 @@ int
+ gx_dc_pattern_write(
+     const gx_device_color *         pdevc,
+     const gx_device_color_saved *   psdc,
+     const gx_device *               dev,
+     int64_t                         offset,
+     byte *                          data,
+     uint *                          psize )
+ {
+     gx_color_tile *ptile = pdevc->colors.pattern.p_tile;
+     int size_b, size_c;
+     byte *dp = data;
+     int left = *psize;
+     int64_t offset1 = offset;
+     int code, l;
+ 
+     if (ptile == NULL)
+         return 0;
+     if (psdc->type == pdevc->type) {
+         if (psdc->colors.pattern.id == ptile->id) {
+             /* fixme : Do we need to check phase ? How ? */
+             return 1; /* Same as saved one, don't write. */
+         }
+     }
+     if (offset1 == 0 && left == sizeof(gs_id)) {
+         /* A special case for writing a known pattern :
+            Just write the tile id. */
+         gs_id id = ptile->id; /* Ensure sizeof(gs_id). */
+         if_debug2m('v', dev->memory,
+-                   "[v*] Writing trans tile ID into clist, uid = %ld id = %ld \n",
++                   "[v*] Writing trans tile ID into clist, uid = %ld id = %u \n",
+                    ptile->uid.id, ptile->id);
+         memcpy(dp, &ptile->id, sizeof(id));
+         *psize = sizeof(gs_id);
+         return 0;
+     }
+ 
+     /* Check if pattern has transparency object
+        If so then that is what we will stuff in
+        the clist */
+         if (ptile->ttrans != NULL) {
+             if_debug2m('v', dev->memory,
+-                       "[v*] Writing trans tile into clist, uid = %ld id = %ld \n",
++                       "[v*] Writing trans tile into clist, uid = %ld id = %u \n",
+                        ptile->uid.id, ptile->id);
+             return gx_dc_pattern_trans_write_raster(ptile, offset, data, psize);
+         }
+ 
+     if (ptile->cdev == NULL)
+         return gx_dc_pattern_write_raster(ptile, offset, data, psize, dev);
+     /* Here is where we write pattern-clist data */
+     size_b = clist_data_size(ptile->cdev, 0);
+     if (size_b < 0)
+         return_error(gs_error_unregistered);
+     size_c = clist_data_size(ptile->cdev, 1);
+     if (size_c < 0)
+         return_error(gs_error_unregistered);
+     if (data == NULL) {
+         *psize = sizeof(gx_dc_serialized_pattern_tile_t) + size_b + size_c;
+         return 0;
+     }
+     if (offset1 == 0) { /* Serialize tile parameters: */
+         gx_dc_serialized_pattern_tile_t buf;
+ 
+         buf.id = ptile->id;
+         buf.size.x = ptile->cdev->common.width;
+         buf.size.y = ptile->cdev->common.height;
+         buf.size_b = size_b;
+         buf.size_c = size_c;
+         buf.step_matrix = ptile->step_matrix;
+         buf.bbox = ptile->bbox;
+         buf.flags = ptile->depth
+                   | TILE_IS_CLIST
+                   | (ptile->tiling_type<<TILE_TYPE_SHIFT)
+                   | (ptile->is_simple ? TILE_IS_SIMPLE : 0)
+                   | (ptile->has_overlap ? TILE_HAS_OVERLAP : 0)
+                   | (ptile->is_locked ? TILE_IS_LOCKED : 0)
+                   | (ptile->cdev->common.page_uses_transparency ? TILE_USES_TRANSP : 0);
+         buf.blending_mode = ptile->blending_mode;    /* in case tile has transparency */
+         if (sizeof(buf) > left) {
+             /* For a while we require the client to provide enough buffer size. */
+             return_error(gs_error_unregistered); /* Must not happen. */
+         }
+         memcpy(dp, &buf, sizeof(gx_dc_serialized_pattern_tile_t));
+         left -= sizeof(buf);
+         dp += sizeof(buf);
+         offset1 += sizeof(buf);
+     }
+     if (offset1 < sizeof(gx_dc_serialized_pattern_tile_t) + size_b) {
+         l = min(left, size_b - (offset1 - sizeof(gx_dc_serialized_pattern_tile_t)));
+         code = clist_get_data(ptile->cdev, 0, offset1 - sizeof(gx_dc_serialized_pattern_tile_t), dp, l);
+         if (code < 0)
+             return code;
+         left -= l;
+         offset1 += l;
+         dp += l;
+     }
+     if (left > 0) {
+         l = min(left, size_c - (offset1 - sizeof(gx_dc_serialized_pattern_tile_t) - size_b));
+         code = clist_get_data(ptile->cdev, 1, offset1 - sizeof(gx_dc_serialized_pattern_tile_t) - size_b, dp, l);
+         if (code < 0)
+             return code;
+     }
+     return 0;
+ }
+@@ -2148,219 +2148,219 @@ int
+ gx_dc_pattern_read(
+     gx_device_color *       pdevc,
+     const gs_gstate * pgs,
+     const gx_device_color * prior_devc,
+     const gx_device *       dev,
+     int64_t                    offset,
+     const byte *            data,
+     uint                    size,
+     gs_memory_t *           mem,
+     int                     x0,
+     int                     y0)
+ {
+     gx_dc_serialized_pattern_tile_t buf;
+     int size_b, size_c = -1;
+     const byte *dp = data;
+     int left = size;
+     int64_t offset1 = offset;
+     gx_color_tile *ptile;
+     int code, l;
+     tile_trans_clist_info_t trans_info = { { { 0 } } };
+     int cache_space_needed;
+     bool deep = device_is_deep(dev);
+     size_t buf_read;
+ 
+     if (offset == 0) {
+         pdevc->mask.id = gx_no_bitmap_id;
+         pdevc->mask.m_tile = NULL;
+         if (size == 0) {
+             /* Null pattern. */
+             pdevc->type = &gx_dc_pattern;
+             pdevc->colors.pattern.p_tile = NULL;
+             pdevc->mask.id = gs_no_id;
+             return 0;
+         }
+         if (size == sizeof(gs_id)) {
+             /* A special case for restoring a known (cached) pattern :
+                read the tile id only. */
+             gs_id id; /* Ensure data size == sizeof(gs_id). */
+ 
+             memcpy(&id, dp, sizeof(id));
+             pdevc->type = &gx_dc_pattern;
+             pdevc->mask.id = id; /* See gx_dc_pattern_load, gx_pattern_cache_lookup. */
+             return size;
+         }
+         if (sizeof(buf) > size) {
+             /* For a while we require the client to provide enough buffer size. */
+             return_error(gs_error_unregistered); /* Must not happen. */
+         }
+         memcpy(&buf, dp, sizeof(gx_dc_serialized_tile_t));
+         dp += sizeof(gx_dc_serialized_tile_t);
+         buf_read = sizeof(gx_dc_serialized_tile_t);
+         if (buf.flags & TILE_USES_TRANSP) {
+             memcpy(((char *)&buf)+sizeof(gx_dc_serialized_tile_t), dp, sizeof(gx_dc_serialized_trans_tile_t) - sizeof(gx_dc_serialized_tile_t));
+             dp += sizeof(gx_dc_serialized_trans_tile_t) - sizeof(gx_dc_serialized_tile_t);
+             buf_read = sizeof(gx_dc_serialized_trans_tile_t);
+         }
+         if (buf.flags & TILE_IS_CLIST) {
+             memcpy(((char *)&buf) + sizeof(gx_dc_serialized_trans_tile_t), dp, sizeof(gx_dc_serialized_pattern_tile_t) - sizeof(gx_dc_serialized_trans_tile_t));
+             dp += sizeof(gx_dc_serialized_pattern_tile_t) - sizeof(gx_dc_serialized_trans_tile_t);
+             buf_read = sizeof(gx_dc_serialized_pattern_tile_t);
+         }
+         left -= buf_read;
+         offset1 += buf_read;
+ 
+         if ((buf.flags & TILE_USES_TRANSP) && !(buf.flags & TILE_IS_CLIST)){
+ 
+             if (buf_read + sizeof(tile_trans_clist_info_t) > size) {
+                 return_error(gs_error_unregistered); /* Must not happen. */
+             }
+ 
+             memcpy(&trans_info, dp, sizeof(trans_info));
+             dp += sizeof(trans_info);
+             left -= sizeof(trans_info);
+             offset1 += sizeof(trans_info);
+ 
+                 /* limit our upper bound to avoid int overflow */
+             cache_space_needed = trans_info.planestride > (0x7fffffff / 6) ? 0x7fff0000 :
+                         trans_info.planestride * trans_info.n_chan;
+         } else {
+             /* the following works for raster or clist patterns */
+             cache_space_needed = buf.size_b + buf.size_c;
+         }
+ 
+         /* Free up any unlocked patterns if needed */
+         gx_pattern_cache_ensure_space((gs_gstate *)pgs, cache_space_needed);
+ 
+         /* If the pattern tile is already in the cache, make sure it isn't locked */
+         /* The lock will be reset below, but the read logic needs to finish loading the pattern. */
+         ptile = &(pgs->pattern_cache->tiles[buf.id % pgs->pattern_cache->num_tiles]);
+         if (ptile->id != gs_no_id && ptile->is_locked) {
+             /* we shouldn't have miltiple tiles locked, but check if OK before unlocking */
+             if (ptile->id != buf.id)
+                 return_error(gs_error_unregistered);	/* can't unlock some other tile in this slot */
+             code = gx_pattern_cache_entry_set_lock((gs_gstate *)pgs, buf.id, false);        /* make sure not locked */
+             if (code < 0)
+                 return code;	/* can't happen since we call ensure_space above, but Coverity doesn't know that */
+         }
+         /* get_entry will free the tile in the cache slot if it isn't empty */
+         code = gx_pattern_cache_get_entry((gs_gstate *)pgs, /* Break 'const'. */
+                         buf.id, &ptile);
+         if (code < 0)
+             return code;
+         gx_pattern_cache_update_used((gs_gstate *)pgs, cache_space_needed);
+         ptile->bits_used = cache_space_needed;
+         pdevc->type = &gx_dc_pattern;
+         pdevc->colors.pattern.p_tile = ptile;
+         ptile->id = buf.id;
+         pdevc->mask.id = buf.id;
+         ptile->step_matrix = buf.step_matrix;
+         ptile->bbox = buf.bbox;
+         ptile->depth = buf.flags & TILE_DEPTH_MASK;
+         ptile->tiling_type = (buf.flags & TILE_TYPE_MASK)>>TILE_TYPE_SHIFT;
+         ptile->is_simple = !!(buf.flags & TILE_IS_SIMPLE);
+         ptile->has_overlap = !!(buf.flags & TILE_HAS_OVERLAP);
+         ptile->is_locked = !!(buf.flags & TILE_IS_LOCKED);
+         ptile->blending_mode = buf.blending_mode;
+         ptile->is_dummy = false;
+ 
+         if (!(buf.flags & TILE_IS_CLIST)) {
+ 
+             if (buf.flags & TILE_USES_TRANSP){
+ 
+                 /* Make a new ttrans object */
+ 
+                 ptile->ttrans = new_pattern_trans_buff(mem);
+                 /* trans_info was loaded above */
+ 
+                 ptile->ttrans->height = trans_info.height;
+                 ptile->ttrans->n_chan = trans_info.n_chan;
+                 ptile->ttrans->has_tags = trans_info.has_tags;
+                 ptile->ttrans->pdev14 = NULL;
+                 ptile->ttrans->planestride = trans_info.planestride;
+                 ptile->ttrans->rect.p.x = trans_info.rect.p.x;
+                 ptile->ttrans->rect.p.y = trans_info.rect.p.y;
+                 ptile->ttrans->rect.q.x = trans_info.rect.q.x;
+                 ptile->ttrans->rect.q.y = trans_info.rect.q.y;
+                 ptile->ttrans->rowstride = trans_info.rowstride;
+                 ptile->ttrans->width = trans_info.width;
+                 ptile->ttrans->deep = deep;
+                 pdevc->type = &gx_dc_pattern_trans;
+                 if_debug2m('v', pgs->memory,
+-                           "[v*] Reading trans tile from clist into cache, uid = %ld id = %ld \n",
++                           "[v*] Reading trans tile from clist into cache, uid = %ld id = %u \n",
+                            ptile->uid.id, ptile->id);
+ 
+                 code = gx_dc_pattern_read_trans_buff(ptile, offset1, dp, left, mem);
+                 if (code < 0)
+                     return code;
+                 return code + buf_read + sizeof(trans_info);
+ 
+             } else {
+                 code = gx_dc_pattern_read_raster(ptile, (gx_dc_serialized_tile_t *)&buf, offset1, dp, left, mem);
+                 if (code < 0)
+                     return code;
+                 return code + buf_read;
+             }
+ 
+         }
+ 
+         /* Here is where we read back from the clist */
+         size_b = buf.size_b;
+         size_c = buf.size_c;
+         ptile->tbits.size.x = size_b; /* HACK: Use unrelated field for saving size_b between calls. */
+         ptile->tbits.size.y = size_c; /* HACK: Use unrelated field for saving size_c between calls. */
+         {
+             gs_gstate state;
+             gs_pattern1_instance_t inst;
+ 
+             memset(&state, 0, sizeof(state));
+             memset(&inst, 0, sizeof(inst));
+             /* NB: Currently PaintType 2 can't pass here. */
+             state.device = (gx_device *)dev; /* Break 'const'. */
+             inst.templat.PaintType = 1;
+             inst.size.x = buf.size.x;
+             inst.size.y = buf.size.y;
+             inst.saved = &state;
+             inst.is_clist = !!(buf.flags & TILE_IS_CLIST);	/* tell gx_pattern_accum_alloc to use clist */
+             ptile->cdev = (gx_device_clist *)gx_pattern_accum_alloc(mem, mem,
+                                &inst, "gx_dc_pattern_read");
+             if (ptile->cdev == NULL)
+                 return_error(gs_error_VMerror);
+             ptile->cdev->common.page_uses_transparency = !!(buf.flags & TILE_USES_TRANSP);
+             code = dev_proc(&ptile->cdev->writer, open_device)((gx_device *)&ptile->cdev->writer);
+             if (code < 0)
+                 return code;
+         }
+     } else {
+         ptile = pdevc->colors.pattern.p_tile;
+ 
+         if (ptile->ttrans != NULL)
+             return gx_dc_pattern_read_trans_buff(ptile, offset1, dp, left, mem);
+ 
+         if (ptile->cdev == NULL)
+             return gx_dc_pattern_read_raster(ptile, NULL, offset1, dp, left, mem);
+ 
+         size_b = ptile->tbits.size.x;
+     }
+     if (offset1 < sizeof(buf) + size_b) {
+         l = min(left, size_b - (offset1 - sizeof(buf)));
+         code = clist_put_data(ptile->cdev, 0, offset1 - sizeof(buf), dp, l);
+         if (code < 0)
+             return code;
+         l = code;
+         left -= l;
+         offset1 += l;
+         dp += l;
+         ptile->cdev->common.page_bfile_end_pos = offset1 - sizeof(buf);
+     }
+     if (left > 0) {
+         l = left;
+         code = clist_put_data(ptile->cdev, 1, offset1 - sizeof(buf) - size_b, dp, l);
+         if (code < 0)
+             return code;
+         l = code;
+         left -= l;
+     }
+     return size - left;
+ }
+ 
+ /* Set the transparency pattern procs for filling rects.  */
+diff --git a/base/gxpcmap.c b/base/gxpcmap.c
+index 43682e03f..9f2683a67 100644
+--- a/base/gxpcmap.c
++++ b/base/gxpcmap.c
+@@ -908,95 +908,95 @@ static void
+ gx_pattern_cache_free_entry(gx_pattern_cache * pcache, gx_color_tile * ctile)
+ {
+     gx_device *temp_device;
+ 
+     if ((ctile->id != gx_no_bitmap_id) && !ctile->is_dummy && !ctile->is_locked) {
+         gs_memory_t *mem = pcache->memory;
+ 
+         /*
+          * We must initialize the memory device properly, even though
+          * we aren't using it for drawing.
+          */
+         if (ctile->tmask.data != 0) {
+             gs_free_object(mem, ctile->tmask.data,
+                            "free_pattern_cache_entry(mask data)");
+             ctile->tmask.data = 0;      /* for GC */
+         }
+         if (ctile->tbits.data != 0) {
+             gs_free_object(mem, ctile->tbits.data,
+                            "free_pattern_cache_entry(bits data)");
+             ctile->tbits.data = 0;      /* for GC */
+         }
+         if (ctile->cdev != NULL) {
+             ctile->cdev->common.do_not_open_or_close_bandfiles = false;  /* make sure memfile gets freed/closed */
+             dev_proc(&ctile->cdev->common, close_device)((gx_device *)&ctile->cdev->common);
+             /* Free up the icc based stuff in the clist device.  I am puzzled
+                why the other objects are not released */
+             clist_free_icc_table(ctile->cdev->common.icc_table,
+                             ctile->cdev->common.memory);
+             ctile->cdev->common.icc_table = NULL;
+             rc_decrement(ctile->cdev->common.icc_cache_cl,
+                             "gx_pattern_cache_free_entry");
+             ctile->cdev->common.icc_cache_cl = NULL;
+             ctile->cdev->writer.pinst = NULL;
+             gs_free_object(ctile->cdev->common.memory->non_gc_memory, ctile->cdev->common.cache_chunk, "free tile cache for clist");
+             ctile->cdev->common.cache_chunk = 0;
+             temp_device = (gx_device *)ctile->cdev;
+             gx_device_retain(temp_device, false);
+             ctile->cdev = NULL;
+         }
+ 
+         if (ctile->ttrans != NULL) {
+             if_debug2m('v', mem,
+-                       "[v*] Freeing trans pattern from cache, uid = %ld id = %ld\n",
++                       "[v*] Freeing trans pattern from cache, uid = %ld id = %u\n",
+                        ctile->uid.id, ctile->id);
+             if ( ctile->ttrans->pdev14 == NULL) {
+                 /* This can happen if we came from the clist */
+                 if (ctile->ttrans->mem != NULL)
+                     gs_free_object(ctile->ttrans->mem ,ctile->ttrans->transbytes,
+                                    "free_pattern_cache_entry(transbytes)");
+                 gs_free_object(mem,ctile->ttrans->fill_trans_buffer,
+                                 "free_pattern_cache_entry(fill_trans_buffer)");
+                 ctile->ttrans->transbytes = NULL;
+                 ctile->ttrans->fill_trans_buffer = NULL;
+             } else {
+                 dev_proc(ctile->ttrans->pdev14, close_device)((gx_device *)ctile->ttrans->pdev14);
+                 temp_device = (gx_device *)(ctile->ttrans->pdev14);
+                 gx_device_retain(temp_device, false);
+                 rc_decrement(temp_device,"gx_pattern_cache_free_entry");
+                 ctile->ttrans->pdev14 = NULL;
+                 ctile->ttrans->transbytes = NULL;  /* should be ok due to pdf14_close */
+                 ctile->ttrans->fill_trans_buffer = NULL; /* This is always freed */
+             }
+ 
+             gs_free_object(mem, ctile->ttrans,
+                            "free_pattern_cache_entry(ttrans)");
+             ctile->ttrans = NULL;
+ 
+         }
+ 
+         pcache->tiles_used--;
+         pcache->bits_used -= ctile->bits_used;
+         ctile->id = gx_no_bitmap_id;
+     }
+ }
+ 
+ /*
+     Historically, the pattern cache has used a very simple hashing
+     scheme whereby pattern A goes into slot idx = (A.id % num_tiles).
+     Unfortunately, now we allow tiles to be 'locked' into the
+     pattern cache, we might run into the case where we want both
+     tiles A and B to be in the cache at once where:
+       (A.id % num_tiles) == (B.id % num_tiles).
+ 
+     We have a maximum of 2 locked tiles, and one of those can be
+     placed while the other one is locked. So we only need to cope
+     with a single 'collision'.
+ 
+     We therefore allow tiles to either go in at idx or at
+     (idx + 1) % num_tiles. This means we need to be prepared to
+     search a bit further for them, hence we now have 2 helper
+     functions to do this.
+ */
+ 
+ /* We can have at most 1 locked tile while looking for a place to
+  * put another tile. */
+@@ -1066,163 +1066,163 @@ int
+ gx_pattern_cache_add_entry(gs_gstate * pgs,
+                    gx_device_forward * fdev, gx_color_tile ** pctile, gs_gstate* saved)
+ {
+     gx_pattern_cache *pcache;
+     const gs_pattern1_instance_t *pinst;
+     ulong used = 0, mask_used = 0, trans_used = 0;
+     gx_bitmap_id id;
+     gx_color_tile *ctile;
+     int code = ensure_pattern_cache(pgs);
+     gx_device_memory *mmask = NULL;
+     gx_device_memory *mbits = NULL;
+     gx_pattern_trans_t *trans = NULL;
+     int size_b, size_c;
+ 
+     if (code < 0)
+         return code;
+     pcache = pgs->pattern_cache;
+ 
+     if (dev_proc(fdev, open_device) != pattern_clist_open_device) {
+         gx_device_pattern_accum *padev = (gx_device_pattern_accum *)fdev;
+ 
+         mbits = padev->bits;
+         mmask = padev->mask;
+         pinst = padev->instance;
+         trans = padev->transbuff;
+ 
+         /*
+          * Check whether the pattern completely fills its box.
+          * If so, we can avoid the expensive masking operations
+          * when using the pattern.
+          */
+         /* Bug 700624: In cases where the mask is completely full,
+          * but the pattern cells are separated from one another,
+          * we need to leave gaps between the cells when rendering
+          * them. Sadly, the graphics library can't cope with this
+          * in the no-mask case. Therefore, only do the optimisation
+          * of not sending the mask if the step matrix is suitable.
+          *
+          * To do this, we compare the step matrix to the size. My
+          * belief is that the mask will only ever be full if it's
+          * orthogonal, cos otherwise the edges will be clipped,
+          * hence we lose no generality by checking for .xy and .yx
+          * being 0.
+          */
+         if (mmask != 0 &&
+             fabsf(pinst->step_matrix.xx) <= pinst->size.x &&
+             fabsf(pinst->step_matrix.yy) <= pinst->size.y &&
+             pinst->step_matrix.xy == 0 &&
+             pinst->step_matrix.yx == 0) {
+             int y;
+             int w_less_8 = mmask->width-8;
+ 
+             for (y = 0; y < mmask->height; y++) {
+                 const byte *row = scan_line_base(mmask, y);
+                 int w;
+ 
+                 for (w = w_less_8; w > 0; w -= 8)
+                     if (*row++ != 0xff)
+                         goto keep;
+                 w += 8;
+                 if ((*row | (0xff >> w)) != 0xff)
+                     goto keep;
+             }
+             /* We don't need a mask. */
+             mmask = 0;
+           keep:;
+         }
+         /* Need to get size of buffers that are being added to the cache */
+         if (mbits != 0)
+             gdev_mem_bitmap_size(mbits, &used);
+         if (mmask != 0) {
+             gdev_mem_bitmap_size(mmask, &mask_used);
+             used += mask_used;
+         }
+         if (trans != 0) {
+             trans_used = (size_t)trans->planestride*trans->n_chan;
+             used += trans_used;
+         }
+     } else {
+         gx_device_clist *cdev = (gx_device_clist *)fdev;
+         gx_device_clist_writer * cldev = (gx_device_clist_writer *)cdev;
+ 
+         code = clist_end_page(cldev);
+         if (code < 0)
+             return code;
+         pinst = cdev->writer.pinst;
+         size_b = clist_data_size(cdev, 0);
+         if (size_b < 0)
+             return_error(gs_error_unregistered);
+         size_c = clist_data_size(cdev, 1);
+         if (size_c < 0)
+             return_error(gs_error_unregistered);
+         /* The memfile size is the size, not the size determined by the depth*width*height */
+         used = size_b + size_c;
+     }
+     id = pinst->id;
+     ctile = gx_pattern_cache_find_tile_for_id(pcache, id);
+     gx_pattern_cache_free_entry(pcache, ctile);         /* ensure that this cache slot is empty */
+     ctile->id = id;
+     ctile->is_planar = pinst->is_planar;
+     ctile->depth = fdev->color_info.depth;
+     ctile->uid = pinst->templat.uid;
+     ctile->tiling_type = pinst->templat.TilingType;
+     ctile->step_matrix = pinst->step_matrix;
+     ctile->bbox = pinst->bbox;
+     ctile->is_simple = pinst->is_simple;
+     ctile->has_overlap = pinst->has_overlap;
+     ctile->is_dummy = false;
+     ctile->is_locked = false;
+     if (pinst->templat.uses_transparency) {
+         /* to work with pdfi get the blend mode out of the saved pgs device */
+         ctile->blending_mode = ((pdf14_device*)(saved->device))->blend_mode;
+     }
+     else
+         ctile->blending_mode = 0;
+     ctile->trans_group_popped = false;
+     if (dev_proc(fdev, open_device) != pattern_clist_open_device) {
+         if (mbits != 0) {
+             make_bitmap(&ctile->tbits, mbits, gs_next_ids(pgs->memory, 1), pgs->memory);
+             mbits->bitmap_memory = 0;   /* don't free the bits */
+         } else
+             ctile->tbits.data = 0;
+         if (mmask != 0) {
+             make_bitmap(&ctile->tmask, mmask, id, pgs->memory);
+             mmask->bitmap_memory = 0;   /* don't free the bits */
+         } else
+             ctile->tmask.data = 0;
+         if (trans != 0) {
+             if_debug2m('v', pgs->memory,
+-                       "[v*] Adding trans pattern to cache, uid = %ld id = %ld\n",
++                       "[v*] Adding trans pattern to cache, uid = %ld id = %u\n",
+                        ctile->uid.id, ctile->id);
+             ctile->ttrans = trans;
+         }
+ 
+         ctile->cdev = NULL;
+     } else {
+         gx_device_clist *cdev = (gx_device_clist *)fdev;
+         gx_device_clist_writer *cwdev = (gx_device_clist_writer *)fdev;
+ 
+         ctile->tbits.data = 0;
+         ctile->tbits.size.x = 0;
+         ctile->tbits.size.y = 0;
+         ctile->tmask.data = 0;
+         ctile->tmask.size.x = 0;
+         ctile->tmask.size.y = 0;
+         ctile->cdev = cdev;
+         /* Prevent freeing files on pattern_paint_cleanup : */
+         cwdev->do_not_open_or_close_bandfiles = true;
+     }
+     /* In the clist case, used is accurate. In the non-clist case, it may
+      * not be. The important thing is that we account the same for tiles
+      * going in and coming out of the cache. Therefore we store the used
+      * figure in the tile so we always remove the same amount. */
+     ctile->bits_used = used;
+     gx_pattern_cache_update_used(pgs, used);
+ 
+     *pctile = ctile;
+     return 0;
+ }
+ 
+ /* set or clear the 'is_locked' flag for a tile in the cache. Used by	*/
+ /* fill_stroke_path to make sure a large stroke pattern stays in the	*/
+ /* cache even if the fill is also a pattern.				*/
+@@ -1482,149 +1482,149 @@ int
+ gx_pattern_load(gx_device_color * pdc, const gs_gstate * pgs,
+                 gx_device * dev, gs_color_select_t select)
+ {
+     gx_device_forward *adev = NULL;
+     gs_pattern1_instance_t *pinst =
+         (gs_pattern1_instance_t *)pdc->ccolor.pattern;
+     gs_gstate *saved;
+     gx_color_tile *ctile;
+     gs_memory_t *mem = pgs->memory;
+     bool has_tags = device_encodes_tags(dev);
+     int code;
+ 
+     if (pgs->pattern_cache == NULL)
+         if ((code = ensure_pattern_cache((gs_gstate *) pgs))< 0)      /* break const for call */
+             return code;
+ 
+     if (gx_pattern_cache_lookup(pdc, pgs, dev, select))
+         return 0;
+ 
+     /* Get enough space in the cache for this pattern (estimated if it is a clist) */
+     gx_pattern_cache_ensure_space((gs_gstate *)pgs, gx_pattern_size_estimate(pinst, has_tags));
+     /*
+      * Note that adev is an internal device, so it will be freed when the
+      * last reference to it from a graphics state is deleted.
+      */
+     adev = gx_pattern_accum_alloc(mem, pgs->pattern_cache->memory, pinst, "gx_pattern_load");
+     if (adev == 0)
+         return_error(gs_error_VMerror);
+     gx_device_set_target((gx_device_forward *)adev, dev);
+     code = dev_proc(adev, open_device)((gx_device *)adev);
+     if (code < 0) {
+         gs_free_object(mem, adev, "gx_pattern_load");
+         return code;
+     }
+     saved = gs_gstate_copy(pinst->saved, pinst->saved->memory);
+     if (saved == 0) {
+         code = gs_note_error(gs_error_VMerror);
+         goto fail;
+     }
+     if (saved->pattern_cache == 0)
+         saved->pattern_cache = pgs->pattern_cache;
+     code = gs_setdevice_no_init(saved, (gx_device *)adev);
+     if (code < 0)
+         goto fail;
+     if (pinst->templat.uses_transparency) {
+-        if_debug0m('v', mem, "gx_pattern_load: pushing the pdf14 compositor device into this graphics state\n");
++        if_debug1m('v', mem, "gx_pattern_load: pushing the pdf14 compositor device into this graphics state pat_id = %u\n", pinst->id);
+         if ((code = gs_push_pdf14trans_device(saved, true, false, 0, 0)) < 0)   /* spot_color_count taken from pdf14 target values */
+             return code;
+         saved->device->is_open = true;
+     } else {
+         /* For colored patterns we clear the pattern device's
+            background.  This is necessary for the anti aliasing code
+            and (unfortunately) it masks a difficult to fix UMR
+            affecting pcl patterns, see bug #690487.  Note we have to
+            make a similar change in zpcolor.c where much of this
+            pattern code is duplicated to support high level stream
+            patterns. */
+         if (pinst->templat.PaintType == 1 && !(pinst->is_clist)
+             && dev_proc(pinst->saved->device, dev_spec_op)(pinst->saved->device, gxdso_pattern_can_accum, NULL, 0) == 0)
+             if ((code = gx_erase_colored_pattern(saved)) < 0)
+                 goto fail;
+     }
+ 
+     code = (*pinst->templat.PaintProc)(&pdc->ccolor, saved);
+     if (code < 0) {
+         if (dev_proc(adev, open_device) == pattern_accum_open) {
+             // free pattern cache data that never got added to the dictionary
+             gx_device_pattern_accum *padev = (gx_device_pattern_accum *) adev;
+             if ((padev->bits != NULL) && (padev->bits->base != NULL)) {
+                 gs_free_object(padev->bits->memory, padev->bits->base, "mem_open");
+             }
+         }
+         /* RJW: At this point, in the non transparency case,
+          * saved->device == adev. So unretain it, close it, and the
+          * gs_gstate_free(saved) will remove it. In the transparency case,
+          * saved->device = the pdf14 device. So we need to unretain it,
+          * close adev, and finally close saved->device.
+          */
+         gx_device_retain(saved->device, false);         /* device no longer retained */
+         if (pinst->templat.uses_transparency) {
+             if (pinst->is_clist == 0) {
+                 gs_free_object(((gx_device_pattern_accum *)adev)->bitmap_memory,
+                                ((gx_device_pattern_accum *)adev)->transbuff,
+                                "gx_pattern_load");
+                 ((gx_device_pattern_accum *)adev)->transbuff = NULL;
+             }
+             dev_proc(adev, close_device)((gx_device *)adev);
+             /* adev was the target of the pdf14 device, so also is no longer retained */
+             gx_device_retain((gx_device *)adev, false);         /* device no longer retained */
+         }
+         dev_proc(saved->device, close_device)((gx_device *)saved->device);
+         /* Freeing the state should now free the device which may be the pdf14 compositor. */
+         gs_gstate_free_chain(saved);
+         if (code == gs_error_handled)
+             code = 0;
+         return code;
+     }
+     if (pinst->templat.uses_transparency) {
+         /* if_debug0m('v', saved->memory, "gx_pattern_load: popping the pdf14 compositor device from this graphics state\n");
+         if ((code = gs_pop_pdf14trans_device(saved, true)) < 0)
+             return code; */
+             if (pinst->is_clist) {
+                 /* Send the compositor command to close the PDF14 device */
+                 code = gs_pop_pdf14trans_device(saved, true);
+                 if (code < 0)
+                     return code;
+             } else {
+                 /* Not a clist, get PDF14 buffer information */
+                 code =
+                     pdf14_get_buffer_information(saved->device,
+                                                 ((gx_device_pattern_accum*)adev)->transbuff,
+                                                  saved->memory,
+                                                  true);
+                 /* PDF14 device (and buffer) is destroyed when pattern cache
+                    entry is removed */
+                 if (code < 0)
+                     return code;
+             }
+     }
+     /* We REALLY don't like the following cast.... */
+     code = gx_pattern_cache_add_entry((gs_gstate *)pgs,
+                 adev, &ctile, saved);
+     if (code >= 0) {
+         if (!gx_pattern_cache_lookup(pdc, pgs, dev, select)) {
+             mlprintf(mem, "Pattern cache lookup failed after insertion!\n");
+             code = gs_note_error(gs_error_Fatal);
+         }
+     }
+ #ifdef DEBUG
+     if (gs_debug_c('B') && dev_proc(adev, open_device) == pattern_accum_open) {
+         gx_device_pattern_accum *pdev = (gx_device_pattern_accum *)adev;
+ 
+         if (pdev->mask)
+             debug_dump_bitmap(pdev->memory,
+                               pdev->mask->base, pdev->mask->raster,
+                               pdev->mask->height, "[B]Pattern mask");
+         if (pdev->bits)
+             debug_dump_bitmap(pdev->memory,
+                               ((gx_device_memory *) pdev->target)->base,
+                               ((gx_device_memory *) pdev->target)->raster,
+                               pdev->target->height, "[B]Pattern bits");
+     }
+ #endif
+     /* Free the bookkeeping structures, except for the bits and mask */
+     /* data iff they are still needed. */
+     dev_proc(adev, close_device)((gx_device *)adev);
+     /* Free the chain of gstates. Freeing the state will free the device. */
+     gs_gstate_free_chain(saved);
+     return code;

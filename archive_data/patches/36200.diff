@@ -1,0 +1,982 @@
+commit 456ac566938a1da774db06126a2fa6c0cba514b3
+Author: Doug Engert <deengert@gmail.com>
+Date:   Wed Jul 14 11:15:10 2021 -0500
+
+    PIV Improved parsing of data from the card
+    
+    Based on Fuzz testing, many of the calls to sc_asn1_find_tag were replaced
+    with sc_asn1_read_tag. The input is also tested that the
+    expected tag is  the first byte. Additional tests are also add.
+    
+    sc_asn1_find_tag will skip 0X00 or 0Xff if found. NIST sp800-73-x specs
+    do not allow these extra bytes.
+    
+     On branch PIV-improved-parsing
+     Changes to be committed:
+            modified:   card-piv.c
+
+diff --git a/src/libopensc/card-piv.c b/src/libopensc/card-piv.c
+index f144b2cc..77e4864f 100644
+--- a/src/libopensc/card-piv.c
++++ b/src/libopensc/card-piv.c
+@@ -551,108 +551,106 @@ err:
+ static int piv_generate_key(sc_card_t *card,
+ 		sc_cardctl_piv_genkey_info_t *keydata)
+ {
+ 	int r;
+ 	u8 rbuf[4096];
+ 	u8 *p;
+ 	const u8 *tag;
+ 	u8 tagbuf[16];
+ 	u8 outdata[3]; /* we could also add tag 81 for exponent */
+ 	size_t taglen, i;
+ 	size_t out_len;
+ 	size_t in_len;
+ 	unsigned int cla_out, tag_out;
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 
+ 	keydata->exponent = 0;
+ 	keydata->pubkey = NULL;
+ 	keydata->pubkey_len = 0;
+ 	keydata->ecparam = NULL; /* will show size as we only support 2 curves */
+ 	keydata->ecparam_len = 0;
+ 	keydata->ecpoint = NULL;
+ 	keydata->ecpoint_len = 0;
+ 
+ 	out_len = 3;
+ 	outdata[0] = 0x80;
+ 	outdata[1] = 0x01;
+ 	outdata[2] = keydata->key_algid;
+ 	switch (keydata->key_algid) {
+ 		case 0x05: keydata->key_bits = 3072; break;
+ 		case 0x06: keydata->key_bits = 1024; break;
+ 		case 0x07: keydata->key_bits = 2048; break;
+ 		/* TODO: - DEE For EC, also set the curve parameter as the OID */
+ 		case 0x11: keydata->key_bits = 0;
+ 			keydata->ecparam =0; /* we only support prime256v1 for 11 */
+ 			keydata->ecparam_len =0;
+ 			break;
+ 		case 0x14: keydata->key_bits = 0;
+ 			keydata->ecparam = 0; /* we only support secp384r1 */
+ 			keydata->ecparam_len = 0;
+ 			break;
+ 		default:
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+ 	}
+ 
+ 	p = tagbuf;
+ 
+ 	r = sc_asn1_put_tag(0xAC, outdata, out_len, tagbuf, sizeof(tagbuf), &p);
+ 	if (r != SC_SUCCESS) {
+ 		sc_log(card->ctx, "Failed to encode ASN1 tag");
+ 		goto err;
+ 	}
+ 
+ 	r = piv_general_io(card, 0x47, 0x00, keydata->key_num,
+ 			tagbuf, p - tagbuf, rbuf, sizeof rbuf);
+ 
+ 	if (r >= 0) {
+ 		const u8 *cp;
+ 		keydata->exponent = 0;
+ 
+-		/* expected tag is 7f49.  */
+-		/* we will whatever tag is present */
+-
+ 		cp = rbuf;
+ 		in_len = r;
+ 
++		/* expected tag is 0x7f49,returned as cla_out == 0x60 and tag_out = 0x1F49 */
+ 		r = sc_asn1_read_tag(&cp, in_len, &cla_out, &tag_out, &in_len);
+-		if (cp == NULL) {
++		if (cp == NULL || in_len == 0 || cla_out != 0x60 || tag_out != 0x1f49) {
+ 			r = SC_ERROR_ASN1_OBJECT_NOT_FOUND;
+ 		}
+ 		if (r != SC_SUCCESS) {
+ 			sc_log(card->ctx, "Tag buffer not found");
+ 			goto err;
+ 		}
+ 
+ 		/* if RSA vs EC */
+ 		if (keydata->key_bits > 0 ) {
+ 			tag = sc_asn1_find_tag(card->ctx, cp, in_len, 0x82, &taglen);
+ 			if (tag != NULL && taglen <= 4) {
+ 				keydata->exponent = 0;
+ 				for (i = 0; i < taglen;i++)
+ 					keydata->exponent = (keydata->exponent<<8) + tag[i];
+ 			}
+ 
+ 			tag = sc_asn1_find_tag(card->ctx, cp, in_len, 0x81, &taglen);
+ 			if (tag != NULL && taglen > 0) {
+ 				keydata->pubkey = malloc(taglen);
+ 				if (keydata->pubkey == NULL)
+ 					LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+ 				keydata->pubkey_len = taglen;
+ 				memcpy (keydata->pubkey, tag, taglen);
+ 			}
+ 		}
+ 		else { /* must be EC */
+ 			tag = sc_asn1_find_tag(card->ctx, cp, in_len, 0x86, &taglen);
+ 			if (tag != NULL && taglen > 0) {
+ 				keydata->ecpoint = malloc(taglen);
+ 				if (keydata->ecpoint == NULL)
+ 					LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+ 				keydata->ecpoint_len = taglen;
+ 				memcpy (keydata->ecpoint, tag, taglen);
+ 			}
+ 		}
+ 
+ 		/* TODO: -DEE Could add key to cache so could use engine to generate key,
+ 		 * and sign req in single operation */
+ 		r = 0;
+ 	}
+@@ -1011,101 +1009,101 @@ static int
+ piv_cache_internal_data(sc_card_t *card, int enumtag)
+ {
+ 	piv_private_data_t * priv = PIV_DATA(card);
+ 	const u8* tag;
+ 	const u8* body;
+ 	size_t taglen;
+ 	size_t bodylen;
+ 	int compressed = 0;
+ 
+ 	/* if already cached */
+ 	if (priv->obj_cache[enumtag].internal_obj_data && priv->obj_cache[enumtag].internal_obj_len) {
+ 		sc_log(card->ctx,
+ 		       "#%d found internal %p:%"SC_FORMAT_LEN_SIZE_T"u",
+ 		       enumtag,
+ 		       priv->obj_cache[enumtag].internal_obj_data,
+ 		       priv->obj_cache[enumtag].internal_obj_len);
+ 		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+ 	}
+ 
+ 	body = sc_asn1_find_tag(card->ctx,
+ 			priv->obj_cache[enumtag].obj_data,
+ 			priv->obj_cache[enumtag].obj_len,
+ 			0x53, &bodylen);
+ 
+-	if (body == NULL)
++	if (body == NULL || priv->obj_cache[enumtag].obj_data[0] != 0x53)
+ 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_OBJECT_NOT_VALID);
+ 
+ 	/* get the certificate out */
+ 	 if (piv_objects[enumtag].flags & PIV_OBJECT_TYPE_CERT) {
+ 
+ 		tag = sc_asn1_find_tag(card->ctx, body, bodylen, 0x71, &taglen);
+ 		/* 800-72-1 not clear if this is 80 or 01 Sent comment to NIST for 800-72-2 */
+ 		/* 800-73-3 says it is 01, keep dual test so old cards still work */
+ 		if (tag && taglen > 0 && (((*tag) & 0x80) || ((*tag) & 0x01)))
+ 			compressed = 1;
+ 
+ 		tag = sc_asn1_find_tag(card->ctx, body, bodylen, 0x70, &taglen);
+ 		if (tag == NULL)
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_OBJECT_NOT_VALID);
+ 
+ 		if (taglen == 0)
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_FILE_NOT_FOUND);
+ 
+ 		if(compressed) {
+ #ifdef ENABLE_ZLIB
+ 			size_t len;
+ 			u8* newBuf = NULL;
+ 
+ 			if(SC_SUCCESS != sc_decompress_alloc(&newBuf, &len, tag, taglen, COMPRESSION_AUTO))
+ 				LOG_FUNC_RETURN(card->ctx, SC_ERROR_OBJECT_NOT_VALID);
+ 
+ 			priv->obj_cache[enumtag].internal_obj_data = newBuf;
+ 			priv->obj_cache[enumtag].internal_obj_len = len;
+ #else
+ 			sc_log(card->ctx, "PIV compression not supported, no zlib");
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+ #endif
+ 		}
+ 		else {
+ 			if (!(priv->obj_cache[enumtag].internal_obj_data = malloc(taglen)))
+ 				LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+ 
+ 			memcpy(priv->obj_cache[enumtag].internal_obj_data, tag, taglen);
+ 			priv->obj_cache[enumtag].internal_obj_len = taglen;
+ 		}
+ 
+ 	/* convert pub key to internal */
+ /* TODO: -DEE need to fix ...  would only be used if we cache the pub key, but we don't today */
+ 	}
+ 	else if (piv_objects[enumtag].flags & PIV_OBJECT_TYPE_PUBKEY) {
+ 		tag = sc_asn1_find_tag(card->ctx, body, bodylen, *body, &taglen);
+ 		if (tag == NULL)
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_OBJECT_NOT_VALID);
+ 
+ 		if (taglen == 0)
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_FILE_NOT_FOUND);
+ 
+ 		if (!(priv->obj_cache[enumtag].internal_obj_data = malloc(taglen)))
+ 			LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+ 
+ 		memcpy(priv->obj_cache[enumtag].internal_obj_data, tag, taglen);
+ 		priv->obj_cache[enumtag].internal_obj_len = taglen;
+ 	}
+ 	else {
+ 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INTERNAL);
+ 	}
+ 
+ 	sc_log(card->ctx, "added #%d internal %p:%"SC_FORMAT_LEN_SIZE_T"u",
+ 	       enumtag,
+ 	       priv->obj_cache[enumtag].internal_obj_data,
+ 	       priv->obj_cache[enumtag].internal_obj_len);
+ 
+ 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+ }
+ 
+ 
+ /*
+  * Callers of this may be expecting a certificate,
+  * select file will have saved the object type for us
+  * as well as set that we want the cert from the object.
+  */
+@@ -1540,274 +1538,274 @@ err:
+ static int piv_general_mutual_authenticate(sc_card_t *card,
+ 	unsigned int key_ref, unsigned int alg_id)
+ {
+ 	int r;
+ #ifdef ENABLE_OPENSSL
+ 	int N;
+ 	int locked = 0;
+ 	u8 rbuf[4096];
+ 	u8 *nonce = NULL;
+ 	size_t nonce_len;
+ 	u8 *p;
+ 	u8 *key = NULL;
+ 	size_t keylen;
+ 	u8 *plain_text = NULL;
+ 	size_t plain_text_len = 0;
+ 	u8 *tmp;
+ 	size_t tmplen, tmplen2;
+ 	u8 *built = NULL;
+ 	size_t built_len;
+ 	const u8 *body = NULL;
+ 	size_t body_len;
+ 	const u8 *witness_data = NULL;
+ 	size_t witness_len;
+ 	const u8 *challenge_response = NULL;
+ 	size_t challenge_response_len;
+ 	u8 *decrypted_reponse = NULL;
+ 	size_t decrypted_reponse_len;
+ 	EVP_CIPHER_CTX * ctx = NULL;
+ 
+ 	u8 sbuf[255];
+ 	const EVP_CIPHER *cipher;
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 
+ 	ctx = EVP_CIPHER_CTX_new();
+ 	if (ctx == NULL) {
+ 		r = SC_ERROR_OUT_OF_MEMORY;
+ 		goto err;
+ 	}
+ 
+ 	cipher = get_cipher_for_algo(alg_id);
+ 	if(!cipher) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid cipher selector, none found for:  %02x\n", alg_id);
+ 		r = SC_ERROR_INVALID_ARGUMENTS;
+ 		goto err;
+ 	}
+ 
+ 	r = piv_get_key(card, alg_id, &key, &keylen);
+ 	if (r) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Error getting General Auth key\n");
+ 		goto err;
+ 	}
+ 
+ 	r = sc_lock(card);
+ 	if (r != SC_SUCCESS) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "sc_lock failed\n");
+ 		goto err; /* cleanup */
+ 	}
+ 	locked = 1;
+ 
+ 	p = sbuf;
+ 	*p++ = 0x7C;
+ 	*p++ = 0x02;
+ 	*p++ = 0x80;
+ 	*p++ = 0x00;
+ 
+ 	/* get the encrypted nonce */
+ 	r = piv_general_io(card, 0x87, alg_id, key_ref, sbuf, p - sbuf, rbuf, sizeof rbuf);
+ 
+ 	if (r < 0) goto err;
+ 
+ 	/* Remove the encompassing outer TLV of 0x7C and get the data */
+ 	body = sc_asn1_find_tag(card->ctx, rbuf,
+ 		r, 0x7C, &body_len);
+-	if (!body) {
++	if (!body || rbuf[0] != 0x7C) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid Witness Data response of NULL\n");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	/* Get the witness data indicated by the TAG 0x80 */
+ 	witness_data = sc_asn1_find_tag(card->ctx, body,
+ 		body_len, 0x80, &witness_len);
+ 	if (!witness_len) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid Challenge Data none found in TLV\n");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	/* Allocate an output buffer for openssl */
+ 	plain_text = malloc(witness_len);
+ 	if (!plain_text) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Could not allocate buffer for plain text\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	/* decrypt the data from the card */
+ 	if (!EVP_DecryptInit(ctx, cipher, key, NULL)) {
+ 		/* may fail if des parity of key is wrong. depends on OpenSSL options */
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	EVP_CIPHER_CTX_set_padding(ctx,0);
+ 
+ 	p = plain_text;
+ 	if (!EVP_DecryptUpdate(ctx, p, &N, witness_data, witness_len)) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	plain_text_len = tmplen = N;
+ 	p += tmplen;
+ 
+ 	if(!EVP_DecryptFinal(ctx, p, &N)) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	tmplen = N;
+ 	plain_text_len += tmplen;
+ 
+ 	if (plain_text_len != witness_len) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE,
+ 			 "Encrypted and decrypted lengths do not match: %"SC_FORMAT_LEN_SIZE_T"u:%"SC_FORMAT_LEN_SIZE_T"u\n",
+ 			 witness_len, plain_text_len);
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	/* Build a response to the card of:
+ 	 * [GEN AUTH][ 80<decrypted witness>81 <challenge> ]
+ 	 * Start by computing the nonce for <challenge> the
+ 	 * nonce length should match the witness length of
+ 	 * the card.
+ 	 */
+ 	nonce = malloc(witness_len);
+ 	if(!nonce) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE,
+ 			 "OOM allocating nonce (%"SC_FORMAT_LEN_SIZE_T"u : %"SC_FORMAT_LEN_SIZE_T"u)\n",
+ 			 witness_len, plain_text_len);
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	nonce_len = witness_len;
+ 
+ 	r = RAND_bytes(nonce, witness_len);
+ 	if(!r) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE,
+ 			 "Generating random for nonce (%"SC_FORMAT_LEN_SIZE_T"u : %"SC_FORMAT_LEN_SIZE_T"u)\n",
+ 			 witness_len, plain_text_len);
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	/* nonce for challenge */
+ 	r = sc_asn1_put_tag(0x81, NULL, witness_len, NULL, 0, NULL);
+ 	if (r <= 0) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	tmplen = r;
+ 
+ 	/* plain text witness keep a length separate for the 0x7C tag */
+ 	r = sc_asn1_put_tag(0x80, NULL, witness_len, NULL, 0, NULL);
+ 	if (r <= 0) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	tmplen += r;
+ 	tmplen2 = tmplen;
+ 
+ 	/* outside 7C tag with 81:80 as innards */
+ 	r = sc_asn1_put_tag(0x7C, NULL, tmplen, NULL, 0, NULL);
+ 	if (r <= 0) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	built_len = r;
+ 
+ 	/* Build the response buffer */
+ 	p = built = malloc(built_len);
+ 	if(!built) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "OOM Building witness response and challenge\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	p = built;
+ 
+ 	/* Start with the 7C Tag */
+ 	r = sc_asn1_put_tag(0x7C, NULL, tmplen2, p, built_len, &p);
+ 	if (r != SC_SUCCESS) {
+ 		goto err;
+ 	}
+ 
+ 	/* Add the DECRYPTED witness, tag 0x80 */
+ 	r = sc_asn1_put_tag(0x80, plain_text, witness_len, p, built_len - (p - built), &p);
+ 	if (r != SC_SUCCESS) {
+ 		goto err;
+ 	}
+ 
+ 	/* Add the challenge, tag 0x81 */
+ 	r = sc_asn1_put_tag(0x81, nonce, witness_len, p, built_len - (p - built), &p);
+ 	if (r != SC_SUCCESS) {
+ 		goto err;
+ 	}
+ 
+ 	/* Send constructed data */
+ 	r = piv_general_io(card, 0x87, alg_id, key_ref, built, built_len, rbuf, sizeof rbuf);
+ 	if (r < 0) {
+ 		goto err;
+ 	}
+ 
+ 	/* Remove the encompassing outer TLV of 0x7C and get the data */
+ 	body = sc_asn1_find_tag(card->ctx, rbuf,
+ 		r, 0x7C, &body_len);
+-	if(!body) {
++	if(!body || rbuf[0] != 0x7C) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Could not find outer tag 0x7C in response");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	/* SP800-73 not clear if  80 or 82 */
+ 	challenge_response = sc_asn1_find_tag(card->ctx, body,
+ 		body_len, 0x82, &challenge_response_len);
+ 	if(!challenge_response) {
+ 		challenge_response = sc_asn1_find_tag(card->ctx, body,
+ 				body_len, 0x80, &challenge_response_len);
+ 		if(!challenge_response) {
+ 			sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Could not find tag 0x82 or 0x80 in response");
+ 			r =  SC_ERROR_INVALID_DATA;
+ 			goto err;
+ 		}
+ 	}
+ 
+ 	/* Decrypt challenge and check against nonce */
+ 	decrypted_reponse = malloc(challenge_response_len);
+ 	if(!decrypted_reponse) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "OOM Allocating decryption buffer");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	EVP_CIPHER_CTX_cleanup(ctx);
+ 
+ 	if (!EVP_DecryptInit(ctx, cipher, key, NULL)) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	EVP_CIPHER_CTX_set_padding(ctx,0);
+ 
+ 	tmp = decrypted_reponse;
+ 	if (!EVP_DecryptUpdate(ctx, tmp, &N, challenge_response, challenge_response_len)) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	decrypted_reponse_len = tmplen = N;
+ 	tmp += tmplen;
+ 
+ 	if(!EVP_DecryptFinal(ctx, tmp, &N)) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	tmplen = N;
+ 	decrypted_reponse_len += tmplen;
+ 
+ 	if (decrypted_reponse_len != nonce_len || memcmp(nonce, decrypted_reponse, nonce_len) != 0) {
+ 		sc_log(card->ctx,
+ 		       "mutual authentication failed, card returned wrong value %"SC_FORMAT_LEN_SIZE_T"u:%"SC_FORMAT_LEN_SIZE_T"u",
+ 		       decrypted_reponse_len, nonce_len);
+ 		r = SC_ERROR_DECRYPT_FAILED;
+ 		goto err;
+ 	}
+ 	r = SC_SUCCESS;
+@@ -1840,184 +1838,184 @@ err:
+ /* Currently only used for card administration */
+ static int piv_general_external_authenticate(sc_card_t *card,
+ 		unsigned int key_ref, unsigned int alg_id)
+ {
+ 	int r;
+ #ifdef ENABLE_OPENSSL
+ 	int tmplen;
+ 	int outlen;
+ 	int locked = 0;
+ 	u8 *p;
+ 	u8 rbuf[4096];
+ 	u8 *key = NULL;
+ 	u8 *cypher_text = NULL;
+ 	u8 *output_buf = NULL;
+ 	const u8 *body = NULL;
+ 	const u8 *challenge_data = NULL;
+ 	size_t body_len;
+ 	size_t output_len;
+ 	size_t challenge_len;
+ 	size_t keylen = 0;
+ 	size_t cypher_text_len = 0;
+ 	u8 sbuf[255];
+ 	EVP_CIPHER_CTX * ctx = NULL;
+ 	const EVP_CIPHER *cipher;
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 
+ 	ctx = EVP_CIPHER_CTX_new();
+ 	if (ctx == NULL) {
+ 	    r = SC_ERROR_OUT_OF_MEMORY;
+ 	    goto err;
+ 	}
+ 
+ 	sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Selected cipher for algorithm id: %02x\n", alg_id);
+ 
+ 	cipher = get_cipher_for_algo(alg_id);
+ 	if(!cipher) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid cipher selector, none found for:  %02x\n", alg_id);
+ 		r = SC_ERROR_INVALID_ARGUMENTS;
+ 		goto err;
+ 	}
+ 
+ 	r = piv_get_key(card, alg_id, &key, &keylen);
+ 	if (r) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Error getting General Auth key\n");
+ 		goto err;
+ 	}
+ 
+ 	r = sc_lock(card);
+ 	if (r != SC_SUCCESS) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "sc_lock failed\n");
+ 		goto err; /* cleanup */
+ 	}
+ 	locked = 1;
+ 
+ 	p = sbuf;
+ 	*p++ = 0x7C;
+ 	*p++ = 0x02;
+ 	*p++ = 0x81;
+ 	*p++ = 0x00;
+ 
+ 	/* get a challenge */
+ 	r = piv_general_io(card, 0x87, alg_id, key_ref, sbuf, p - sbuf, rbuf, sizeof rbuf);
+ 	if (r < 0) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Error getting Challenge\n");
+ 		goto err;
+ 	}
+ 
+ 	/*
+ 	 * the value here corresponds with the response size, so we use this
+ 	 * to alloc the response buffer, rather than re-computing it.
+ 	 */
+ 	output_len = r;
+ 
+ 	/* Remove the encompassing outer TLV of 0x7C and get the data */
+ 	body = sc_asn1_find_tag(card->ctx, rbuf,
+ 		r, 0x7C, &body_len);
+-	if (!body) {
++	if (!body || rbuf[0] != 0x7C) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid Challenge Data response of NULL\n");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	/* Get the challenge data indicated by the TAG 0x81 */
+ 	challenge_data = sc_asn1_find_tag(card->ctx, body,
+ 		body_len, 0x81, &challenge_len);
+ 	if (!challenge_data) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Invalid Challenge Data none found in TLV\n");
+ 		r =  SC_ERROR_INVALID_DATA;
+ 		goto err;
+ 	}
+ 
+ 	/* Store this to sanity check that plaintext length and cyphertext lengths match */
+ 	/* TODO is this required */
+ 	tmplen = challenge_len;
+ 
+ 	/* Encrypt the challenge with the secret */
+ 	if (!EVP_EncryptInit(ctx, cipher, key, NULL)) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Encrypt fail\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	cypher_text = malloc(challenge_len);
+ 	if (!cypher_text) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Could not allocate buffer for cipher text\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	EVP_CIPHER_CTX_set_padding(ctx,0);
+ 	if (!EVP_EncryptUpdate(ctx, cypher_text, &outlen, challenge_data, challenge_len)) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Encrypt update fail\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	cypher_text_len += outlen;
+ 
+ 	if (!EVP_EncryptFinal(ctx, cypher_text + cypher_text_len, &outlen)) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Final fail\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 	cypher_text_len += outlen;
+ 
+ 	/*
+ 	 * Actually perform the sanity check on lengths plaintext length vs
+ 	 * encrypted length
+ 	 */
+ 	if (cypher_text_len != (size_t)tmplen) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Length test fail\n");
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	output_buf = malloc(output_len);
+ 	if(!output_buf) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Could not allocate output buffer: %s\n",
+ 				strerror(errno));
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	p = output_buf;
+ 
+ 	/*
+ 	 * Build: 7C<len>[82<len><challenge>]
+ 	 * Start off by capturing the data of the response:
+ 	 *     - 82<len><encrypted challenege response>
+ 	 * Build the outside TLV (7C)
+ 	 * Advance past that tag + len
+ 	 * Build the body (82)
+ 	 * memcopy the body past the 7C<len> portion
+ 	 * Transmit
+ 	 */
+ 	tmplen = sc_asn1_put_tag(0x82, NULL, cypher_text_len, NULL, 0, NULL);
+ 	if (tmplen <= 0) {
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	r = sc_asn1_put_tag(0x7C, NULL, tmplen, p, output_len, &p);
+ 	if (r != SC_SUCCESS) {
+ 		goto err;
+ 	}
+ 
+ 	/* Build the 0x82 TLV and append to the 7C<len> tag */
+ 	r = sc_asn1_put_tag(0x82, cypher_text, cypher_text_len, p, output_len - (p - output_buf), &p);
+ 	if (r != SC_SUCCESS) {
+ 		goto err;
+ 	}
+ 
+ 	/* Sanity check the lengths again */
+ 	tmplen = sc_asn1_put_tag(0x7C, NULL, tmplen, NULL, 0, NULL)
+ 		+ sc_asn1_put_tag(0x82, NULL, cypher_text_len, NULL, 0, NULL);
+ 	if (output_len != (size_t)tmplen) {
+ 		sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Allocated and computed lengths do not match! "
+ 			 "Expected %"SC_FORMAT_LEN_SIZE_T"d, found: %d\n", output_len, tmplen);
+ 		r = SC_ERROR_INTERNAL;
+ 		goto err;
+ 	}
+ 
+ 	r = piv_general_io(card, 0x87, alg_id, key_ref, output_buf, output_len, NULL, 0);
+ 	sc_debug(card->ctx, SC_LOG_DEBUG_VERBOSE, "Got response  challenge\n");
+@@ -2052,78 +2050,78 @@ static int
+ piv_get_serial_nr_from_CHUI(sc_card_t* card, sc_serial_number_t* serial)
+ {
+ 	int r;
+ 	int i;
+ 	u8 gbits;
+ 	u8 *rbuf = NULL;
+ 	const u8 *body;
+ 	const u8 *fascn;
+ 	const u8 *guid;
+ 	size_t rbuflen = 0, bodylen, fascnlen, guidlen;
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 	if (card->serialnr.len)   {
+ 		*serial = card->serialnr;
+ 		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+ 	}
+ 
+ 	/*
+ 	 * 800-73-3 Part 1 and CIO Council docs say for PIV Compatible cards
+ 	 * the FASC-N Agency code should be 9999 and there should be a GUID
+ 	 * based on RFC 4122. If GUID present and not zero
+ 	 * we will use the GUID as the serial number.
+ 	 */
+ 
+ 	r = piv_get_cached_data(card, PIV_OBJ_CHUI, &rbuf, &rbuflen);
+ 	LOG_TEST_RET(card->ctx, r, "Failure retrieving CHUI");
+ 
+ 	r = SC_ERROR_INTERNAL;
+ 	if (rbuflen != 0) {
+ 		body = sc_asn1_find_tag(card->ctx, rbuf, rbuflen, 0x53, &bodylen); /* Pass the outer wrapper asn1 */
+-		if (body != NULL && bodylen != 0) {
++		if (body != NULL && bodylen != 0 && rbuf[0] == 0x53) {
+ 			fascn = sc_asn1_find_tag(card->ctx, body, bodylen, 0x30, &fascnlen); /* Find the FASC-N data */
+ 			guid = sc_asn1_find_tag(card->ctx, body, bodylen, 0x34, &guidlen);
+ 
+ 			gbits = 0; /* if guid is valid, gbits will not be zero */
+ 			if (guid && guidlen == 16) {
+ 				for (i = 0; i < 16; i++) {
+ 					gbits = gbits | guid[i]; /* if all are zero, gbits will be zero */
+ 				}
+ 			}
+ 			sc_log(card->ctx,
+ 			       "fascn=%p,fascnlen=%"SC_FORMAT_LEN_SIZE_T"u,guid=%p,guidlen=%"SC_FORMAT_LEN_SIZE_T"u,gbits=%2.2x",
+ 			       fascn, fascnlen, guid, guidlen, gbits);
+ 
+ 			if (fascn && fascnlen == 25) {
+ 				/* test if guid and the fascn starts with ;9999 (in ISO 4bit + parity code) */
+ 				if (!(gbits && fascn[0] == 0xD4 && fascn[1] == 0xE7
+ 						    && fascn[2] == 0x39 && (fascn[3] | 0x7F) == 0xFF)) {
+ 					/* fascnlen is 25 */
+ 					serial->len = fascnlen;
+ 					memcpy (serial->value, fascn, serial->len);
+ 					r = SC_SUCCESS;
+ 					gbits = 0; /* set to skip using guid below */
+ 				}
+ 			}
+ 			if (guid && gbits) {
+ 				/* guidlen is 16 */
+ 				serial->len = guidlen;
+ 				memcpy (serial->value, guid, serial->len);
+ 				r = SC_SUCCESS;
+ 			}
+ 		}
+ 	}
+ 
+ 	card->serialnr = *serial;
+ 	LOG_FUNC_RETURN(card->ctx, r);
+ }
+ 
+ /*
+  * If the object can not be present on the card, because the History
+  * object is not present or the History object says its not present,
+  * return 1. If object may be present return 0.
+  * Cuts down on overhead, by not showing non existent objects to pkcs11
+  * The path for the object is passed in and the first 2 bytes are used.
+  * Note: If the History or Discovery object is not found the
+  * PIV_OBJ_CACHE_NOT_PRESENT is set, as older cards do not have these.
+  * pkcs15-piv.c calls this via cardctl.
+  */
+@@ -2307,80 +2305,88 @@ static int piv_restore_security_env(sc_card_t *card, int se_num)
+ static int piv_validate_general_authentication(sc_card_t *card,
+ 					const u8 * data, size_t datalen,
+ 					u8 * out, size_t outlen)
+ {
+ 	piv_private_data_t * priv = PIV_DATA(card);
+ 	int r, tmplen, tmplen2;
+ 	u8 *p;
+-	const u8 *tag;
++	const unsigned char *p2;
+ 	size_t taglen;
+-	const u8 *body;
+ 	size_t bodylen;
++	unsigned int cla, tag;
+ 	unsigned int real_alg_id, op_tag;
+ 
+ 	u8 sbuf[4096]; /* needs work. for 3072 keys, needs 384+10 or so */
+ 	size_t sbuflen = sizeof(sbuf);
+ 	u8 rbuf[4096];
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 
+ 	/* should assume large send data */
+ 	p = sbuf;
+ 	tmplen = sc_asn1_put_tag(0xff, NULL, datalen, NULL, 0, NULL);
+ 	tmplen2 = sc_asn1_put_tag(0x82, NULL, 0, NULL, 0, NULL);
+ 	if (tmplen <= 0 || tmplen2 <= 0) {
+ 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INTERNAL);
+ 	}
+ 	tmplen += tmplen2;
+ 	if ((r = sc_asn1_put_tag(0x7c, NULL, tmplen, p, sbuflen, &p)) != SC_SUCCESS ||
+ 	    (r = sc_asn1_put_tag(0x82, NULL, 0, p, sbuflen - (p - sbuf), &p)) != SC_SUCCESS) {
+ 		LOG_FUNC_RETURN(card->ctx, r);
+ 	}
+ 	if (priv->operation == SC_SEC_OPERATION_DERIVE
+ 			&& priv->algorithm == SC_ALGORITHM_EC) {
+ 		op_tag = 0x85;
+ 	} else {
+ 		op_tag = 0x81;
+ 	}
+ 	r = sc_asn1_put_tag(op_tag, data, datalen, p, sbuflen - (p - sbuf), &p);
+ 	if (r != SC_SUCCESS) {
+ 		LOG_FUNC_RETURN(card->ctx, r);
+ 	}
+ 
+ 	/*
+ 	 * alg_id=06 is a place holder for all RSA keys.
+ 	 * Derive the real alg_id based on the size of the
+ 	 * the data, as we are always using raw mode.
+ 	 * Non RSA keys needs some work in this area.
+ 	 */
+ 
+ 	real_alg_id = priv->alg_id;
+ 	if (priv->alg_id == 0x06) {
+ 		switch  (datalen) {
+ 			case 128: real_alg_id = 0x06; break;
+ 			case 256: real_alg_id = 0x07; break;
+ 			case 384: real_alg_id = 0x05; break;
+ 			default:
+ 				SC_FUNC_RETURN(card->ctx, SC_LOG_DEBUG_VERBOSE, SC_ERROR_NO_CARD_SUPPORT);
+ 		}
+ 	}
+ 	/* EC alg_id was already set */
+ 
+ 	r = piv_general_io(card, 0x87, real_alg_id, priv->key_ref,
+ 			sbuf, p - sbuf, rbuf, sizeof rbuf);
++	if (r < 0)
++		goto err;
+ 
+-	if (r >= 0) {
+-		body = sc_asn1_find_tag(card->ctx, rbuf, r, 0x7c, &bodylen);
+-		if (body) {
+-			tag = sc_asn1_find_tag(card->ctx, body,  bodylen, 0x82, &taglen);
+-			if (tag) {
+-				memcpy(out, tag, taglen);
+-				r = taglen;
+-			} else
+-				r = SC_ERROR_INVALID_DATA;
+-		} else
+-			r = SC_ERROR_INVALID_DATA;
++	p2 = rbuf;
++	r = sc_asn1_read_tag(&p2, r, &cla, &tag, &bodylen);
++	if (p2 == NULL || r < 0 || bodylen == 0 || (cla|tag) != 0x7C) {
++		LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA, "Can't find 0x7C");
++        }
++
++	r = sc_asn1_read_tag(&p2, bodylen, &cla, &tag, &taglen);
++	if (p2 == NULL || r < 0 || taglen == 0 || (cla|tag) != 0x82) {
++		LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA, "Can't find 0x82");
+ 	}
+ 
++	if (taglen > outlen) {
++		LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA, "data read longer then buffer");
++	}
++
++	memcpy(out, p2, taglen);
++	r = taglen;
++
++err:
+ 	LOG_FUNC_RETURN(card->ctx, r);
+ }
+ 
+@@ -2389,69 +2395,71 @@ static int
+ piv_compute_signature(sc_card_t *card, const u8 * data, size_t datalen,
+ 		u8 * out, size_t outlen)
+ {
+ 	piv_private_data_t * priv = PIV_DATA(card);
+ 	int r;
+ 	int i;
+ 	size_t nLen;
+ 	u8 rbuf[128]; /* For EC conversions  384 will fit */
+-	const u8 * body;
+-	size_t bodylen;
+-	const u8 * tag;
+-	size_t taglen;
++	const unsigned char *pseq, *pint, *ptemp, *pend;
++	unsigned int cla, tag;
++	size_t seqlen;
++	size_t intlen;
++	size_t templen;
+ 
+ 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+ 
+ 	/* The PIV returns a DER SEQUENCE{INTEGER, INTEGER}
+-	 * Which may have leading 00 to force positive
+-	 * TODO: -DEE should check if PKCS15 want the same
+-	 * But PKCS11 just wants 2* filed_length in bytes
++	 * Which may have leading 00 to force a positive integer
++	 * But PKCS11 just wants 2* field_length in bytes
+ 	 * So we have to strip out the integers
+-	 * if present and pad on left if too short.
++	 * and pad on left if too short.
+ 	 */
+ 
+ 	if (priv->alg_id == 0x11 || priv->alg_id == 0x14 ) {
+ 		nLen = (priv->key_size + 7) / 8;
+ 		if (outlen < 2*nLen) {
+ 			sc_log(card->ctx,
+ 			       " output too small for EC signature %"SC_FORMAT_LEN_SIZE_T"u < %"SC_FORMAT_LEN_SIZE_T"u",
+ 			       outlen, 2 * nLen);
+ 			r = SC_ERROR_INVALID_DATA;
+ 			goto err;
+ 		}
+ 		memset(out, 0, outlen);
+ 
+ 		r = piv_validate_general_authentication(card, data, datalen, rbuf, sizeof rbuf);
+ 		if (r < 0)
+ 			goto err;
+ 
+-		body = sc_asn1_find_tag(card->ctx, rbuf, r, 0x30, &bodylen);
+-
+-		for (i = 0; i<2; i++) {
+-			if (body) {
+-				tag = sc_asn1_find_tag(card->ctx, body,  bodylen, 0x02, &taglen);
+-				if (tag) {
+-					bodylen -= taglen - (tag - body);
+-					body = tag + taglen;
+-
+-					if (taglen > nLen) { /* drop leading 00 if present */
+-						if (*tag != 0x00) {
+-							r = SC_ERROR_INVALID_DATA;
+-							goto err;
+-						}
+-						tag++;
+-						taglen--;
+-					}
+-					memcpy(out + nLen*i + nLen - taglen , tag, taglen);
+-				} else {
++		pseq = rbuf;
++		r = sc_asn1_read_tag(&pseq, r, &cla, &tag, &seqlen);
++		if (pseq == NULL || r < 0 || seqlen == 0 || (cla|tag) != 0x30)
++			LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA, "Can't find 0x30");
++
++		pint = pseq;
++		pend = pseq + seqlen;
++		for (i = 0; i < 2; i++) {
++			r = sc_asn1_read_tag(&pint, (pend - pint), &cla, &tag, &intlen);
++			if (pint == NULL || r < 0 || intlen == 0 || (cla|tag) != 0x02)
++				LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA, "Can't find 0x02");
++			if (intlen > nLen + 1)
++				LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA,"Signature too long");
++
++			ptemp = pint;
++			templen = intlen;
++			if (intlen > nLen) { /* drop leading 00 if present */
++				if (*ptemp != 0x00) {
++					LOG_TEST_GOTO_ERR(card->ctx, SC_ERROR_INVALID_DATA,"Signature too long");
+ 					r = SC_ERROR_INVALID_DATA;
+ 					goto err;
+ 				}
+-			} else  {
+-				r = SC_ERROR_INVALID_DATA;
+-				goto err;
++				ptemp++;
++				templen--;
+ 			}
++			memcpy(out + nLen*i + nLen - templen , ptemp, templen);
++			pint += intlen; /* next integer */
++			
+ 		}
+ 		r = 2 * nLen;
+ 	} else { /* RSA is all set */
+ 		r = piv_validate_general_authentication(card, data, datalen, out, outlen);
+ 	}

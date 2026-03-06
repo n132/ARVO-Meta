@@ -1,0 +1,297 @@
+commit 587f5a9a309feebee7bf069f762f5702baf4699e
+Author: Florin Malita <fmalita@chromium.org>
+Date:   Fri Jun 15 09:21:36 2018 -0400
+
+    [skjson] Catch end-of-stream for unbalanced scopes
+    
+    The input is not guaranteed to contain well-formed scopes, so it's not
+    sufficient to check for end-of-stream only when popping the top-level
+    scope -- we have to check on every scope pop.
+    
+    Bug: oss-fuzz:8898
+    Change-Id: I7399a8872187ec6714672cac2ff8fc7fbf3c2dfe
+    Reviewed-on: https://skia-review.googlesource.com/135059
+    Reviewed-by: Kevin Lubick <kjlubick@google.com>
+    Reviewed-by: Mike Klein <mtklein@google.com>
+    Commit-Queue: Florin Malita <fmalita@chromium.org>
+
+diff --git a/modules/skjson/src/SkJSON.cpp b/modules/skjson/src/SkJSON.cpp
+index 7f082d7294..d423715947 100644
+--- a/modules/skjson/src/SkJSON.cpp
++++ b/modules/skjson/src/SkJSON.cpp
+@@ -222,167 +222,171 @@ class DOMParser {
+ public:
+     explicit DOMParser(SkArenaAlloc& alloc)
+         : fAlloc(alloc) {
+ 
+         fValueStack.reserve(kValueStackReserve);
+         fScopeStack.reserve(kScopeStackReserve);
+     }
+ 
+     const Value parse(const char* p, size_t size) {
+         if (!size) {
+             return this->error(NullValue(), p, "invalid empty input");
+         }
+ 
+         const char* p_stop = p + size - 1;
+ 
+         // We're only checking for end-of-stream on object/array close('}',']'),
+         // so we must trim any whitespace from the buffer tail.
+         while (p_stop > p && is_ws(*p_stop)) --p_stop;
+ 
+         SkASSERT(p_stop >= p && p_stop < p + size);
+         if (*p_stop != '}' && *p_stop != ']') {
+             return this->error(NullValue(), p_stop, "invalid top-level value");
+         }
+ 
+         p = skip_ws(p);
+ 
+         switch (*p) {
+         case '{':
+             goto match_object;
+         case '[':
+             goto match_array;
+         default:
+             return this->error(NullValue(), p, "invalid top-level value");
+         }
+ 
+     match_object:
+         SkASSERT(*p == '{');
+         p = skip_ws(p + 1);
+ 
+         this->pushObjectScope();
+ 
+         if (*p == '}') goto pop_object;
+ 
+         // goto match_object_key;
+     match_object_key:
+         p = skip_ws(p);
+         if (*p != '"') return this->error(NullValue(), p, "expected object key");
+ 
+         p = this->matchString(p, [this](const char* key, size_t size) {
+             this->pushObjectKey(key, size);
+         });
+         if (!p) return NullValue();
+ 
+         p = skip_ws(p);
+         if (*p != ':') return this->error(NullValue(), p, "expected ':' separator");
+ 
+         ++p;
+ 
+         // goto match_value;
+     match_value:
+         p = skip_ws(p);
+ 
+         switch (*p) {
+         case '\0':
+             return this->error(NullValue(), p, "unexpected input end");
+         case '"':
+             p = this->matchString(p, [this](const char* str, size_t size) {
+                 this->pushString(str, size);
+             });
+             break;
+         case '[':
+             goto match_array;
+         case 'f':
+             p = this->matchFalse(p);
+             break;
+         case 'n':
+             p = this->matchNull(p);
+             break;
+         case 't':
+             p = this->matchTrue(p);
+             break;
+         case '{':
+             goto match_object;
+         default:
+             p = this->matchNumber(p);
+             break;
+         }
+ 
+         if (!p) return NullValue();
+ 
+         // goto match_post_value;
+     match_post_value:
+         SkASSERT(!fScopeStack.empty());
+ 
+         p = skip_ws(p);
+         switch (*p) {
+         case ',':
+             ++p;
+             if (fScopeStack.back() >= 0) {
+                 goto match_object_key;
+             } else {
+                 goto match_value;
+             }
+         case ']':
+             goto pop_array;
+         case '}':
+             goto pop_object;
+         default:
+             return this->error(NullValue(), p - 1, "unexpected value-trailing token");
+         }
+ 
+         // unreachable
+         SkASSERT(false);
+ 
+     pop_object:
+         SkASSERT(*p == '}');
+ 
+         if (fScopeStack.back() < 0) {
+             return this->error(NullValue(), p, "unexpected object terminator");
+         }
+ 
+         this->popObjectScope();
+ 
+         // goto pop_common
+     pop_common:
+         SkASSERT(*p == '}' || *p == ']');
+ 
+         if (fScopeStack.empty()) {
+             SkASSERT(fValueStack.size() == 1);
+ 
+             // Success condition: parsed the top level element and reached the stop token.
+             return p == p_stop
+                 ? fValueStack.front()
+                 : this->error(NullValue(), p + 1, "trailing root garbage");
+         }
+ 
++        if (p == p_stop) {
++            return this->error(NullValue(), p, "unexpected end-of-input");
++        }
++
+         ++p;
+ 
+         goto match_post_value;
+ 
+     match_array:
+         SkASSERT(*p == '[');
+         p = skip_ws(p + 1);
+ 
+         this->pushArrayScope();
+ 
+         if (*p != ']') goto match_value;
+ 
+         // goto pop_array;
+     pop_array:
+         SkASSERT(*p == ']');
+ 
+         if (fScopeStack.back() >= 0) {
+             return this->error(NullValue(), p, "unexpected array terminator");
+         }
+ 
+         this->popArrayScope();
+ 
+         goto pop_common;
+ 
+         SkASSERT(false);
+         return NullValue();
+     }
+ 
+     std::tuple<const char*, const SkString> getError() const {
+         return std::make_tuple(fErrorToken, fErrorMessage);
+     }
+diff --git a/modules/skjson/src/SkJSONTest.cpp b/modules/skjson/src/SkJSONTest.cpp
+index 91ae497cf0..1aaa278fb8 100644
+--- a/modules/skjson/src/SkJSONTest.cpp
++++ b/modules/skjson/src/SkJSONTest.cpp
+@@ -17,98 +17,99 @@ using namespace skjson;
+ DEF_TEST(SkJSON_Parse, reporter) {
+     static constexpr struct {
+         const char* in;
+         const char* out;
+     } g_tests[] = {
+         { ""     , nullptr },
+         { "["    , nullptr },
+         { "]"    , nullptr },
+         { "[[]"  , nullptr },
+         { "[]]"  , nullptr },
+         { "[]f"  , nullptr },
+         { "{"    , nullptr },
+         { "}"    , nullptr },
+         { "{{}"  , nullptr },
+         { "{}}"  , nullptr },
+         { "{}f"  , nullptr },
+         { "{]"   , nullptr },
+         { "[}"   , nullptr },
+         { "1"    , nullptr },
+         { "true" , nullptr },
+         { "false", nullptr },
+         { "null" , nullptr },
+ 
+         { "[nulll]" , nullptr },
+         { "[false2]", nullptr },
+         { "[true:]" , nullptr },
+ 
+         { "[1 2]"   , nullptr },
+         { "[1,,2]"  , nullptr },
+         { "[1,2,]"  , nullptr },
+         { "[,1,2]"  , nullptr },
+ 
+         { "[ \"foo"       , nullptr },
+         { "[ \"fo\0o\" ]" , nullptr },
+ 
++        { "{\"\":{}"                  , nullptr },
+         { "{ null }"                  , nullptr },
+         { "{ \"k\" : }"               , nullptr },
+         { "{ : null }"                , nullptr },
+         { "{ \"k\" : : null }"        , nullptr },
+         { "{ \"k\" : null , }"        , nullptr },
+         { "{ \"k\" : null \"k\" : 1 }", nullptr },
+ 
+ 
+         { "[]"                           , "[]" },
+         { " \n\r\t [ \n\r\t ] \n\r\t "   , "[]" },
+         { "[[]]"                         , "[[]]" },
+         { "[ null ]"                     , "[null]" },
+         { "[ true ]"                     , "[true]" },
+         { "[ false ]"                    , "[false]" },
+         { "[ 0 ]"                        , "[0]" },
+         { "[ 1 ]"                        , "[1]" },
+         { "[ 1.248 ]"                    , "[1.248]" },
+         { "[ \"\" ]"                     , "[\"\"]" },
+         { "[ \" f o o \" ]"              , "[\" f o o \"]" },
+         { "[ \"123456\" ]"               , "[\"123456\"]" },
+         { "[ \"1234567\" ]"              , "[\"1234567\"]" },
+         { "[ \"12345678\" ]"             , "[\"12345678\"]" },
+         { "[ \"123456789\" ]"            , "[\"123456789\"]" },
+         { "[ null , true, false,0,12.8 ]", "[null,true,false,0,12.8]" },
+ 
+         { "{}"                          , "{}" },
+         { " \n\r\t { \n\r\t } \n\r\t "  , "{}" },
+         { "{ \"k\" : null }"            , "{\"k\":null}" },
+         { "{ \"k1\" : null, \"k2 \":0 }", "{\"k1\":null,\"k2 \":0}" },
+         { "{ \"k1\" : null, \"k1\":0 }" , "{\"k1\":null,\"k1\":0}" },
+ 
+         { "{ \"k1\" : null,                   \n\
+              \"k2\" : 0,                      \n\
+              \"k3\" : [                       \n\
+                         true,                 \r\n\
+                         { \"kk1\" : \"foo\" , \n\
+                           \"kk2\" : \"bar\" , \n\
+                           \"kk3\" : 1.28 ,    \n\
+                           \"kk4\" : [ 42 ]    \n\
+                         } ,                   \n\
+                         \"boo\" ,             \n\
+                         null                  \n\
+                       ]                       \n\
+            }",
+           "{\"k1\":null,\"k2\":0,\"k3\":[true,"
+               "{\"kk1\":\"foo\",\"kk2\":\"bar\",\"kk3\":1.28,\"kk4\":[42]},\"boo\",null]}" },
+     };
+ 
+     for (const auto& tst : g_tests) {
+         DOM dom(tst.in, strlen(tst.in));
+         const auto success = !dom.root().is<NullValue>();
+         REPORTER_ASSERT(reporter, success == (tst.out != nullptr));
+         if (!success) continue;
+ 
+         SkDynamicMemoryWStream str;
+         dom.write(&str);
+         str.write8('\0');
+ 
+         auto data = str.detachAsData();
+         REPORTER_ASSERT(reporter, !strcmp(tst.out, static_cast<const char*>(data->data())));
+     }
+ 
+ }

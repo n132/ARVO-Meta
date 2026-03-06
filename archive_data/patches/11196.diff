@@ -1,0 +1,336 @@
+commit 4bc5892128a042780f167ac35aa72f63c426f3b7
+Merge: c3d742c9 72f40fab
+Author: Martin Matuška <martin@matuska.org>
+Date:   Thu Jan 31 00:27:41 2019 +0100
+
+    Merge pull request #1125 from antekone/bug/GH-1119
+    
+    RAR5 reader: fix an invalid read and a memory leak
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index 99d81768..b5f94e0c 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -1288,199 +1288,199 @@ static int process_head_file_extra(struct archive_read* a,
+ static int process_head_file(struct archive_read* a, struct rar5* rar,
+         struct archive_entry* entry, size_t block_flags)
+ {
+     ssize_t extra_data_size = 0;
+     size_t data_size = 0;
+     size_t file_flags = 0;
+     size_t file_attr = 0;
+     size_t compression_info = 0;
+     size_t host_os = 0;
+     size_t name_size = 0;
+     uint64_t unpacked_size;
+     uint32_t mtime = 0, crc = 0;
+     int c_method = 0, c_version = 0, is_dir;
+     char name_utf8_buf[2048 * 4];
+     const uint8_t* p;
+ 
+-    memset(entry, 0, sizeof(struct archive_entry));
++    archive_entry_clear(entry);
+ 
+     /* Do not reset file context if we're switching archives. */
+     if(!rar->cstate.switch_multivolume) {
+         reset_file_context(rar);
+     }
+ 
+     if(block_flags & HFL_EXTRA_DATA) {
+         size_t edata_size = 0;
+         if(!read_var_sized(a, &edata_size, NULL))
+             return ARCHIVE_EOF;
+ 
+         /* Intentional type cast from unsigned to signed. */
+         extra_data_size = (ssize_t) edata_size;
+     }
+ 
+     if(block_flags & HFL_DATA) {
+         if(!read_var_sized(a, &data_size, NULL))
+             return ARCHIVE_EOF;
+ 
+         rar->file.bytes_remaining = data_size;
+     } else {
+         rar->file.bytes_remaining = 0;
+ 
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                 "no data found in file/service block");
+         return ARCHIVE_FATAL;
+     }
+ 
+     enum FILE_FLAGS {
+         DIRECTORY = 0x0001, UTIME = 0x0002, CRC32 = 0x0004,
+         UNKNOWN_UNPACKED_SIZE = 0x0008,
+     };
+ 
+     enum COMP_INFO_FLAGS {
+         SOLID = 0x0040,
+     };
+ 
+     if(!read_var_sized(a, &file_flags, NULL))
+         return ARCHIVE_EOF;
+ 
+     if(!read_var(a, &unpacked_size, NULL))
+         return ARCHIVE_EOF;
+ 
+     if(file_flags & UNKNOWN_UNPACKED_SIZE) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                 "Files with unknown unpacked size are not supported");
+         return ARCHIVE_FATAL;
+     }
+ 
+     is_dir = (int) (file_flags & DIRECTORY);
+ 
+     if(!read_var_sized(a, &file_attr, NULL))
+         return ARCHIVE_EOF;
+ 
+     if(file_flags & UTIME) {
+         if(!read_u32(a, &mtime))
+             return ARCHIVE_EOF;
+     }
+ 
+     if(file_flags & CRC32) {
+         if(!read_u32(a, &crc))
+             return ARCHIVE_EOF;
+     }
+ 
+     if(!read_var_sized(a, &compression_info, NULL))
+         return ARCHIVE_EOF;
+ 
+     c_method = (int) (compression_info >> 7) & 0x7;
+     c_version = (int) (compression_info & 0x3f);
+ 
+     rar->cstate.window_size = is_dir ?
+         0 :
+         g_unpack_window_size << ((compression_info >> 10) & 15);
+     rar->cstate.method = c_method;
+     rar->cstate.version = c_version + 50;
+ 
+     rar->file.solid = (compression_info & SOLID) > 0;
+     rar->file.service = 0;
+ 
+     if(!read_var_sized(a, &host_os, NULL))
+         return ARCHIVE_EOF;
+ 
+     enum HOST_OS {
+         HOST_WINDOWS = 0,
+         HOST_UNIX = 1,
+     };
+ 
+     if(host_os == HOST_WINDOWS) {
+         /* Host OS is Windows */
+ 
+         unsigned short mode = 0660;
+ 
+         if(is_dir)
+             mode |= AE_IFDIR;
+         else
+             mode |= AE_IFREG;
+ 
+         archive_entry_set_mode(entry, mode);
+     } else if(host_os == HOST_UNIX) {
+         /* Host OS is Unix */
+         archive_entry_set_mode(entry, (unsigned short) file_attr);
+     } else {
+         /* Unknown host OS */
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                 "Unsupported Host OS: 0x%02x", (int) host_os);
+ 
+         return ARCHIVE_FATAL;
+     }
+ 
+     if(!read_var_sized(a, &name_size, NULL))
+         return ARCHIVE_EOF;
+ 
+     if(!read_ahead(a, name_size, &p))
+         return ARCHIVE_EOF;
+ 
+     if(name_size > 2047) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                 "Filename is too long");
+ 
+         return ARCHIVE_FATAL;
+     }
+ 
+     if(name_size == 0) {
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                 "No filename specified");
+ 
+         return ARCHIVE_FATAL;
+     }
+ 
+     memcpy(name_utf8_buf, p, name_size);
+     name_utf8_buf[name_size] = 0;
+     if(ARCHIVE_OK != consume(a, name_size)) {
+         return ARCHIVE_EOF;
+     }
+ 
+     if(extra_data_size > 0) {
+         int ret = process_head_file_extra(a, entry, rar, extra_data_size);
+ 
+         /* Sanity check. */
+         if(extra_data_size < 0) {
+             archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                     "File extra data size is not zero");
+             return ARCHIVE_FATAL;
+         }
+ 
+         if(ret != ARCHIVE_OK)
+             return ret;
+     }
+ 
+     if((file_flags & UNKNOWN_UNPACKED_SIZE) == 0) {
+         rar->file.unpacked_size = (ssize_t) unpacked_size;
+         archive_entry_set_size(entry, unpacked_size);
+     }
+ 
+     if(file_flags & UTIME) {
+         archive_entry_set_mtime(entry, (time_t) mtime, 0);
+     }
+ 
+     if(file_flags & CRC32) {
+         rar->file.stored_crc32 = crc;
+     }
+ 
+     archive_entry_update_pathname_utf8(entry, name_utf8_buf);
+ 
+     if(!rar->cstate.switch_multivolume) {
+         /* Do not reinitialize unpacking state if we're switching archives. */
+         rar->cstate.block_parsing_finished = 1;
+         rar->cstate.all_filters_applied = 1;
+         rar->cstate.initialized = 0;
+     }
+ 
+     if(rar->generic.split_before > 0) {
+         /* If now we're standing on a header that has a 'split before' mark,
+          * it means we're standing on a 'continuation' file header. Signal
+          * the caller that if it wants to move to another file, it must call
+          * rar5_read_header() function again. */
+ 
+         return ARCHIVE_RETRY;
+     } else {
+         return ARCHIVE_OK;
+     }
+ }
+@@ -1794,15 +1794,21 @@ static int process_base_block(struct archive_read* a,
+ static int skip_base_block(struct archive_read* a) {
+     int ret;
+     struct rar5* rar = get_context(a);
+ 
+-    struct archive_entry entry;
+-    ret = process_base_block(a, &entry);
++    /* Create a new local archive_entry structure that will be operated on
++     * by header reader; operations on this archive_entry will be discarded.
++     */
++    struct archive_entry* entry = archive_entry_new();
++    ret = process_base_block(a, entry);
++
++    /* Discard operations on this archive_entry structure. */
++    archive_entry_free(entry);
+ 
+     if(rar->generic.last_header_id == 2 && rar->generic.split_before > 0)
+         return ARCHIVE_OK;
+ 
+     if(ret == ARCHIVE_OK)
+         return ARCHIVE_RETRY;
+     else
+         return ret;
+ }
+@@ -2663,88 +2669,96 @@ static int advance_multivolume(struct archive_read* a) {
+ /* Merges the partial block from the first multivolume archive file, and
+  * partial block from the second multivolume archive file. The result is
+  * a chunk of memory containing the whole block, and the stream pointer
+  * is advanced to the next block in the second multivolume archive file. */
+ static int merge_block(struct archive_read* a, ssize_t block_size,
+         const uint8_t** p)
+ {
+     struct rar5* rar = get_context(a);
+     ssize_t cur_block_size, partial_offset = 0;
+     const uint8_t* lp;
+     int ret;
+ 
+     /* Set a flag that we're in the switching mode. */
+     rar->cstate.switch_multivolume = 1;
+ 
+     /* Reallocate the memory which will hold the whole block. */
+     if(rar->vol.push_buf)
+         free((void*) rar->vol.push_buf);
+ 
+-    rar->vol.push_buf = malloc(block_size);
++    /* Increasing the allocation block by 8 is due to bit reading functions,
++     * which are using additional 2 or 4 bytes. Allocating the block size
++     * by exact value would make bit reader perform reads from invalid memory
++     * block when reading the last byte from the buffer. */
++    rar->vol.push_buf = malloc(block_size + 8);
+     if(!rar->vol.push_buf) {
+         archive_set_error(&a->archive, ENOMEM, "Can't allocate memory for a "
+                 "merge block buffer.");
+         return ARCHIVE_FATAL;
+     }
+ 
++    /* Valgrind complains if the extension block for bit reader is not
++     * initialized, so initialize it. */
++    memset(&rar->vol.push_buf[block_size], 0, 8);
++
+     /* A single block can span across multiple multivolume archive files,
+      * so we use a loop here. This loop will consume enough multivolume
+      * archive files until the whole block is read. */
+ 
+     while(1) {
+         /* Get the size of current block chunk in this multivolume archive
+          * file and read it. */
+         cur_block_size =
+             rar5_min(rar->file.bytes_remaining, block_size - partial_offset);
+ 
+         if(cur_block_size == 0) {
+             archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                     "Encountered block size == 0 during block merge");
+             return ARCHIVE_FATAL;
+         }
+ 
+         if(!read_ahead(a, cur_block_size, &lp))
+             return ARCHIVE_EOF;
+ 
+         /* Sanity check; there should never be a situation where this function
+          * reads more data than the block's size. */
+         if(partial_offset + cur_block_size > block_size) {
+             archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                 "Consumed too much data when merging blocks.");
+             return ARCHIVE_FATAL;
+         }
+ 
+         /* Merge previous block chunk with current block chunk, or create
+          * first block chunk if this is our first iteration. */
+         memcpy(&rar->vol.push_buf[partial_offset], lp, cur_block_size);
+ 
+         /* Advance the stream read pointer by this block chunk size. */
+         if(ARCHIVE_OK != consume(a, cur_block_size))
+             return ARCHIVE_EOF;
+ 
+         /* Update the pointers. `partial_offset` contains information about
+          * the sum of merged block chunks. */
+         partial_offset += cur_block_size;
+         rar->file.bytes_remaining -= cur_block_size;
+ 
+         /* If `partial_offset` is the same as `block_size`, this means we've
+          * merged all block chunks and we have a valid full block. */
+         if(partial_offset == block_size) {
+             break;
+         }
+ 
+         /* If we don't have any bytes to read, this means we should switch
+          * to another multivolume archive file. */
+         if(rar->file.bytes_remaining == 0) {
+             ret = advance_multivolume(a);
+             if(ret != ARCHIVE_OK)
+                 return ret;
+         }
+     }
+ 
+     *p = rar->vol.push_buf;
+ 
+     /* If we're here, we can resume unpacking by processing the block pointed
+      * to by the `*p` memory pointer. */
+ 
+     return ARCHIVE_OK;
+ }

@@ -1,0 +1,234 @@
+commit 2afcaa044d7f58c8409f3d7b15a150fc1bb3c9a6
+Merge: 4518aa4e2 a650e0fe6
+Author: eugene7646 <elivis@basistech.com>
+Date:   Wed Aug 17 14:13:01 2022 -0400
+
+    Merge pull request #2728 from sashashura/patch-4
+    
+    Fixes Crash Unknown Read in std::__1::enable_if<true, memory_view>::type
+
+diff --git a/tsk/fs/tsk_apfs.hpp b/tsk/fs/tsk_apfs.hpp
+index db3ddf627..839ee0066 100755
+--- a/tsk/fs/tsk_apfs.hpp
++++ b/tsk/fs/tsk_apfs.hpp
+@@ -356,211 +356,220 @@ template <typename Key = memory_view, typename Value = memory_view>
+ class APFSBtreeNode : public APFSObject, public APFSOmap::node_tag {
+   using is_variable_kv_node = std::is_same<APFSBtreeNode, APFSBtreeNode<>>;
+   using is_fixed_kv_node =
+       std::integral_constant<bool, !is_variable_kv_node::value>;
+ 
+   using key_type =
+       std::conditional_t<is_variable_kv_node::value, Key, const Key *>;
+   using value_type =
+       std::conditional_t<is_variable_kv_node::value, Value, const Value *>;
+   ;
+ 
+  protected:
+   struct {
+     union {
+       void *v;
+       apfs_btentry_fixed *fixed;
+       apfs_btentry_variable *variable;
+     } toc;
+     char *voff;
+     char *koff;
+   } _table_data;
+ 
+   const uint8_t *_decryption_key{};
+ 
+   inline const apfs_btree_node *bn() const noexcept {
+     return reinterpret_cast<const apfs_btree_node *>(_storage.data());
+   }
+ 
+   inline ptrdiff_t toffset() const noexcept {
+     // The table space offset is relative to the end of the header
+     return sizeof(apfs_btree_node) + bn()->table_space_offset;
+   }
+ 
+   inline ptrdiff_t koffset() const noexcept {
+     // The keys table is immediately after the table space.
+     return toffset() + bn()->table_space_length;
+   }
+ 
+   inline ptrdiff_t voffset() const noexcept {
+     // The value table is a negative index relative to the end of the block
+     // unless the node is a root node then it's relative to the footer
+     ptrdiff_t off = _pool.block_size();
+ 
+     if (is_root()) {
+       off -= sizeof(apfs_btree_info);
+     }
+ 
+     return off;
+   }
+ 
+   template <typename KeyType = key_type>
+   inline auto key(uint32_t index) const
+       -> std::enable_if_t<is_variable_kv_node::value, KeyType> {
+     const auto &t = _table_data.toc.variable[index];
+     const auto key_data = _table_data.koff + t.key_offset;
+ 
+     return {key_data, t.key_length};
+   }
+ 
+   template <typename KeyType = key_type>
+   inline auto key(uint32_t index) const
+       -> std::enable_if_t<is_fixed_kv_node::value, KeyType> {
+     const auto &t = _table_data.toc.fixed[index];
+     const auto key_data = _table_data.koff + t.key_offset;
+ 
+     return reinterpret_cast<KeyType>(key_data);
+   }
+ 
+   template <typename Compare>
+   inline uint32_t contains_key(const key_type &key, Compare comp) const {
+     for (auto i = 0U; i < key_count(); i++) {
+       const auto k = this->key(i);
+       if (comp(k, key) > 0) {
+         if (i == 0) {
+           break;
+         }
+ 
+         return i - 1;
+       }
+     }
+ 
+     return key_count();
+   }
+ 
+  public:
+   APFSBtreeNode(const APFSPool &pool, const apfs_block_num block_num,
+                 const uint8_t *key = nullptr)
+       : APFSObject(pool, block_num), _decryption_key{key} {
+     // Decrypt node if needed
+     if (key != nullptr) {
+       decrypt(key);
+     }
+ 
+     if (obj_type() != APFS_OBJ_TYPE_BTREE_NODE &&
+         obj_type() != APFS_OBJ_TYPE_BTREE_ROOTNODE) {
+       throw std::runtime_error("APFSBtreeNode: invalid object type");
+     }
+ 
+     _table_data.toc = {_storage.data() + toffset()};
++    if ((uintptr_t)_table_data.toc.v - (uintptr_t)_storage.data() > _storage.size()) {
++      throw std::runtime_error("APFSBtreeNode: invalid toffset");
++    }
+     _table_data.voff = _storage.data() + voffset();
++    if (_table_data.voff - _storage.data() > _storage.size()) {
++      throw std::runtime_error("APFSBtreeNode: invalid voffset");
++    }
+     _table_data.koff = _storage.data() + koffset();
++    if (_table_data.koff - _storage.data() > _storage.size()) {
++      throw std::runtime_error("APFSBtreeNode: invalid koffset");
++    }
+   }
+ 
+   inline bool is_root() const noexcept {
+     return bit_is_set(bn()->flags, APFS_BTNODE_ROOT);
+   }
+ 
+   inline bool is_leaf() const noexcept {
+     return bit_is_set(bn()->flags, APFS_BTNODE_LEAF);
+   }
+ 
+   inline bool has_fixed_kv_size() const noexcept {
+     return bit_is_set(bn()->flags, APFS_BTNODE_FIXED_KV_SIZE);
+   }
+ 
+   inline uint16_t level() const noexcept { return bn()->level; }
+ 
+   inline uint32_t key_count() const noexcept { return bn()->key_count; }
+ 
+   inline auto entries() const {
+     const auto vec = [&] {
+       std::vector<typename iterator::value_type> v{};
+ 
+       std::for_each(begin(), end(), [&v](const auto e) { v.push_back(e); });
+ 
+       return v;
+     }();
+ 
+     return vec;
+   }
+ 
+   inline const apfs_btree_info *info() const noexcept {
+     // Only root nodes contain the info struct
+     if (!is_root()) {
+       return nullptr;
+     }
+ 
+     // The info structure is at the end of the object
+     const auto ptr =
+         _storage.data() + _storage.size() - sizeof(apfs_btree_info);
+ 
+     return reinterpret_cast<const apfs_btree_info *>(ptr);
+   }
+ 
+   // Iterators
+ 
+  public:
+   using iterator = APFSBtreeNodeIterator<APFSBtreeNode>;
+ 
+   iterator begin() const { return {this, 0, 0}; }
+   iterator end() const { return {this, key_count(), 0}; }
+ 
+   template <typename T, typename Compare>
+   iterator find(const T &value, Compare comp) const {
+     // TODO(JTS): It turns out, when a disk has snapshots, there can be more
+     // than one entry in the objects tree that corresponds to the same oid.
+     // Since we do not currently support snapshots, we're always returning the
+     // last object with the id, because that should always be the newest object.
+     // When we support snapshots, this logic likely needs to change.
+ 
+     // For leaf nodes we can just search the entries directly
+     if (is_leaf()) {
+       // Search for key that's equal to the value
+       for (auto i = key_count(); i > 0; i--) {
+         const auto &k = key(i - 1);
+ 
+         const auto res = comp(k, value);
+ 
+         if (res == 0) {
+           // We've found it!
+           return {this, i - 1, 0};
+         }
+ 
+         if (res < 0) {
+           // We've gone too far
+           break;
+         }
+       }
+ 
+       // Not found
+       return end();
+     }
+ 
+     // For non-leaf nodes we can be more efficient by skipping searches of
+     // sub-trees that don't contain the object
+ 
+     // Search for the last key that's <= the value
+     for (auto i = key_count(); i > 0; i--) {
+       const auto &k = key(i - 1);
+ 
+       if (comp(k, value) <= 0) {
+         iterator it{this, i - 1, 0};
+ 
+         auto ret = it._child_it->_node->find(value, comp);
+         if (ret == it._child_it->_node->end()) {
+           return end();
+         }
+ 
+         return {this, i - 1, std::move(ret)};
+       }
+     }
+ 
+     // Not Found
+     return end();
+   }
+ 
+   friend iterator;
+ 
+   template <typename T>
+   friend class APFSBtreeNodeIterator;
+ };

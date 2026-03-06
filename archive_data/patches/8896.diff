@@ -1,0 +1,455 @@
+changeset:   15707:978502137626
+user:        Bob Friesenhahn <bfriesen@GraphicsMagick.org>
+date:        Sat Jun 16 14:08:28 2018 -0500
+summary:     ReadTIFFImage(): Re-structure exceptions so QuantumTransferMode() exceptions for planar TIFF are handled immediately. (Credit to OSS-Fuzz)
+
+diff -r 4234dde539ee -r 978502137626 ChangeLog
+--- a/ChangeLog	Sat Jun 16 13:44:59 2018 -0500
++++ b/ChangeLog	Sat Jun 16 14:08:28 2018 -0500
+@@ -1,3 +1,12 @@
++2018-06-16  Bob Friesenhahn  <bfriesen@simple.dallas.tx.us>
++
++	* coders/tiff.c (ReadTIFFImage): Re-structure exception reporting
++	so that QuantumTransferMode() exceptions thrown for
++	PLANARCONFIG_SEPARATE images are handled immediately.  Fixes
++	oss-fuzz 8896 "graphicsmagick/coder_BIGTIFF_fuzzer:
++	Use-of-uninitialized-value in DisassociateAlphaRegion". (Credit to
++	OSS-Fuzz)
++
+ 2018-06-16  Fojtik Jaroslav  <JaFojtik@seznam.cz>
+ 
+ 	* coders/wpg.c Fix oss-fuzz 7735 "graphicsmagick/coder_WPG_fuzzer:
+diff -r 4234dde539ee -r 978502137626 coders/jpeg.c
+--- a/coders/jpeg.c	Sat Jun 16 13:44:59 2018 -0500
++++ b/coders/jpeg.c	Sat Jun 16 14:08:28 2018 -0500
+@@ -138,7 +138,7 @@
+     *buffer;
+ } DestinationManager;
+ 
+-typedef struct _ErrorManager
++typedef struct _ErrorManager /* FIXME: Can include a tally of error/warning message counts here */
+ {
+   Image
+     *image;
+@@ -203,6 +203,8 @@
+   Format a libjpeg warning or trace event.  Warnings are converted to
+   GraphicsMagick warning exceptions while traces are optionally
+   logged.
++
++  JPEG message codes range from 0 to JMSG_LASTMSGCODE
+ */
+ static unsigned int JPEGMessageHandler(j_common_ptr jpeg_info,int msg_level)
+ {
+@@ -231,10 +233,12 @@
+       if (image->logging)
+         {
+           (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+-                                "[%s] JPEG Warning: \"%s\" (code=%d, "
++                                "[%s] JPEG Warning[%ld]: \"%s\" (code=%d, "
+                                 "parms=0x%02x,0x%02x,"
+                                 "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x)",
+-                                image->filename,message,err->msg_code,
++                                image->filename,
++                                err->num_warnings,
++                                message,err->msg_code,
+                                 err->msg_parm.i[0], err->msg_parm.i[1],
+                                 err->msg_parm.i[2], err->msg_parm.i[3],
+                                 err->msg_parm.i[4], err->msg_parm.i[5],
+@@ -242,9 +246,11 @@
+         }
+       if ((err->num_warnings == 0) ||
+           (err->trace_level >= 3))
+-        ThrowBinaryException2(CorruptImageWarning,(char *) message,
+-                                    image->filename);
++        ThrowException2(&image->exception,CorruptImageWarning,message,
++                        image->filename);
++      /* JWRN_JPEG_EOF - "Premature end of JPEG file" */
+       err->num_warnings++;
++      return False;
+     }
+   else
+     {
+@@ -257,7 +263,7 @@
+                                 message);
+         }
+     }
+-  return(True);
++  return True;
+ }
+ 
+ static boolean FillInputBuffer(j_decompress_ptr cinfo)
+diff -r 4234dde539ee -r 978502137626 coders/tiff.c
+--- a/coders/tiff.c	Sat Jun 16 13:44:59 2018 -0500
++++ b/coders/tiff.c	Sat Jun 16 14:08:28 2018 -0500
+@@ -1539,6 +1539,10 @@
+         }
+     }
+ 
++  if ((image->logging) && (*quantum_samples == 0))
++    (void) LogMagickEvent(CoderEvent,GetMagickModule(),
++                          "Reporting failure");
++
+   return (*quantum_samples != 0 ? MagickPass : MagickFail);
+ }
+ 
+@@ -2380,6 +2384,22 @@
+                                     "Using scanline %s read method with %u bits per sample",
+                                     PhotometricTagToString(photometric),bits_per_sample);
+             /*
++              Prepare for separate/contiguous retrieval.
++            */
++            max_sample=1;
++            if (planar_config == PLANARCONFIG_SEPARATE)
++              {
++                if (QuantumTransferMode(image,photometric,compress_tag,
++                                        sample_format,samples_per_pixel,
++                                        PLANARCONFIG_CONTIG,0,
++                                        &quantum_type,&quantum_samples,
++                                        exception)
++                    != MagickPass)
++                  ThrowTIFFReaderException(CorruptImageError,
++                                           ImproperImageHeader,image);
++                max_sample=quantum_samples;
++              }
++            /*
+               Allocate memory for one scanline.
+             */
+             scanline_size=TIFFScanlineSize(tiff);
+@@ -2419,31 +2439,16 @@
+                                          image);
+               }
+             memset(scanline,0,(size_t) scanline_size);
+-            /*
+-              Prepare for separate/contiguous retrieval.
+-            */
+-            max_sample=1;
+-            if (planar_config == PLANARCONFIG_SEPARATE)
+-              {
+-                if (QuantumTransferMode(image,photometric,compress_tag,
+-                                        sample_format,samples_per_pixel,
+-                                        PLANARCONFIG_CONTIG,0,
+-                                        &quantum_type,&quantum_samples,
+-                                        exception)
+-                    == MagickPass)
+-                  max_sample=quantum_samples;
+-              }
+             for (sample=0; sample < max_sample; sample++)
+               {
+                 for (y=0; y < image->rows; y++)
+                   {
+                     if (sample == 0)
+-                      q=SetImagePixels(image,0,y,image->columns,1);
++                      q=SetImagePixelsEx(image,0,y,image->columns,1,exception);
+                     else
+-                      q=GetImagePixels(image,0,y,image->columns,1);
++                      q=GetImagePixelsEx(image,0,y,image->columns,1,exception);
+                     if (q == (PixelPacket *) NULL)
+                       {
+-                        CopyException(exception,&image->exception);
+                         status=MagickFail;
+                         break;
+                       }
+@@ -2470,7 +2475,6 @@
+                                             exception)
+                         == MagickFail)
+                       {
+-                        CopyException(exception,&image->exception);
+                         status=MagickFail;
+                         break;
+                       }
+@@ -2500,9 +2504,8 @@
+                     /*
+                       Save our updates.
+                     */
+-                    if (!SyncImagePixels(image))
++                    if (!SyncImagePixelsEx(image,exception))
+                       {
+-                        CopyException(exception,&image->exception);
+                         status=MagickFail;
+                         break;
+                       }
+@@ -2554,11 +2557,28 @@
+               (void) LogMagickEvent(CoderEvent,GetMagickModule(),
+                                     "Using stripped read method with %u bits per sample",
+                                     bits_per_sample);
++            /*
++              Prepare for separate/contiguous retrieval.
++            */
++            max_sample=1;
++            if (planar_config == PLANARCONFIG_SEPARATE)
++              {
++                if (QuantumTransferMode(image,photometric,compress_tag,
++                                        sample_format,
++                                        samples_per_pixel,PLANARCONFIG_CONTIG,
++                                        0,&quantum_type,&quantum_samples,
++                                        exception)
++                    != MagickPass)
++                  ThrowTIFFReaderException(CorruptImageError,
++                                           ImproperImageHeader,image);
++                max_sample=quantum_samples;
++              }
++
+             /* pixels_per_strip=rows_per_strip*image->columns; */
+             p=0;
+             strip_size=0;
+             strip_id=0;
+-            /*
++             /*
+               Allocate memory for one strip.
+             */
+             strip_size_max=TIFFStripSize(tiff);
+@@ -2589,7 +2609,7 @@
+                                          image);
+               }
+ 
+-            strip=MagickAllocateMemory(unsigned char *,(size_t) strip_size_max);
++           strip=MagickAllocateMemory(unsigned char *,(size_t) strip_size_max);
+             if (strip == (unsigned char *) NULL)
+               {
+                 ThrowTIFFReaderException(ResourceLimitError,MemoryAllocationFailed,
+@@ -2597,20 +2617,6 @@
+               }
+             memset(strip,0,(size_t) strip_size_max);
+             /*
+-              Prepare for separate/contiguous retrieval.
+-            */
+-            max_sample=1;
+-            if (planar_config == PLANARCONFIG_SEPARATE)
+-              {
+-                if (QuantumTransferMode(image,photometric,compress_tag,
+-                                        sample_format,
+-                                        samples_per_pixel,PLANARCONFIG_CONTIG,
+-                                        0,&quantum_type,&quantum_samples,
+-                                        exception)
+-                    == MagickPass)
+-                  max_sample=quantum_samples;
+-              }
+-            /*
+               Compute per-row stride.
+             */
+             stride=TIFFVStripSize(tiff,1);
+@@ -2630,7 +2636,6 @@
+                                         exception)
+                     == MagickFail)
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -2640,12 +2645,11 @@
+                       Access Magick pixels.
+                     */
+                     if (sample == 0)
+-                      q=SetImagePixels(image,0,y,image->columns,1);
++                      q=SetImagePixelsEx(image,0,y,image->columns,1,exception);
+                     else
+-                      q=GetImagePixels(image,0,y,image->columns,1);
++                      q=GetImagePixelsEx(image,0,y,image->columns,1,exception);
+                     if (q == (PixelPacket *) NULL)
+                       {
+-                        CopyException(exception,&image->exception);
+                         status=MagickFail;
+                         break;
+                       }
+@@ -2696,9 +2700,8 @@
+                     /*
+                       Save our updates.
+                     */
+-                    if (!SyncImagePixels(image))
++                    if (!SyncImagePixelsEx(image,exception))
+                       {
+-                        CopyException(exception,&image->exception);
+                         status=MagickFail;
+                         break;
+                       }
+@@ -2757,6 +2760,22 @@
+                                     "Using tiled %s read method with %u bits per sample",
+                                     PhotometricTagToString(photometric), bits_per_sample);
+             /*
++              Prepare for separate/contiguous retrieval.
++            */
++            max_sample=1;
++            if (planar_config == PLANARCONFIG_SEPARATE)
++              {
++                if (QuantumTransferMode(image,photometric,compress_tag,
++                                        sample_format,samples_per_pixel,
++                                        PLANARCONFIG_CONTIG,0,&quantum_type,
++                                        &quantum_samples,
++                                        exception)
++                    != MagickPass)
++                  ThrowTIFFReaderException(CorruptImageError,
++                                           ImproperImageHeader,image);
++                max_sample=quantum_samples;
++              }
++            /*
+               Obtain tile geometry
+             */
+             if(!(TIFFGetField(tiff,TIFFTAG_TILEWIDTH,&tile_columns) == 1) ||
+@@ -2817,20 +2836,6 @@
+               }
+             memset(tile,0,(size_t) tile_size_max);
+             /*
+-              Prepare for separate/contiguous retrieval.
+-            */
+-            max_sample=1;
+-            if (planar_config == PLANARCONFIG_SEPARATE)
+-              {
+-                if (QuantumTransferMode(image,photometric,compress_tag,
+-                                        sample_format,samples_per_pixel,
+-                                        PLANARCONFIG_CONTIG,0,&quantum_type,
+-                                        &quantum_samples,
+-                                        exception)
+-                    == MagickPass)
+-                  max_sample=quantum_samples;
+-              }
+-            /*
+               Compute per-row stride.
+             */
+             stride=TIFFTileRowSize(tiff);
+@@ -2849,7 +2854,6 @@
+                                         &quantum_samples,exception)
+                     == MagickFail)
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -2898,12 +2902,11 @@
+                               Obtain pixel region corresponding to tile row.
+                             */
+                             if (sample == 0)
+-                              q=SetImagePixels(image,x,yy,tile_set_columns,1);
++                              q=SetImagePixelsEx(image,x,yy,tile_set_columns,1,exception);
+                             else
+-                              q=GetImagePixels(image,x,yy,tile_set_columns,1);
++                              q=GetImagePixelsEx(image,x,yy,tile_set_columns,1,exception);
+                             if (q == (PixelPacket *) NULL)
+                               {
+-                                CopyException(exception,&image->exception);
+                                 status=MagickFail;
+                                 break;
+                               }
+@@ -2935,9 +2938,8 @@
+                             /*
+                               Save our updates.
+                             */
+-                            if (!SyncImagePixels(image))
++                            if (!SyncImagePixelsEx(image,exception))
+                               {
+-                                CopyException(exception,&image->exception);
+                                 status=MagickFail;
+                                 break;
+                               }
+@@ -3024,10 +3026,9 @@
+             p=0;
+             for (y=0; y < image->rows; y++)
+               {
+-                q=SetImagePixels(image,0,y,image->columns,1);
++                q=SetImagePixelsEx(image,0,y,image->columns,1,exception);
+                 if (q == (PixelPacket *) NULL)
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -3057,9 +3058,8 @@
+                 */
+                 if ((image->matte) && (alpha_type == AssociatedAlpha))
+                   DisassociateAlphaRegion(image);
+-                if (!SyncImagePixels(image))
++                if (!SyncImagePixelsEx(image,exception))
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -3168,10 +3168,9 @@
+                 /*
+                   Obtain a row of pixels
+                 */
+-                strip=SetImagePixels(image,0,y,image->columns,tile_rows_remaining);
++                strip=SetImagePixelsEx(image,0,y,image->columns,tile_rows_remaining,exception);
+                 if (strip == (PixelPacket *) NULL)
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -3237,9 +3236,8 @@
+                 */
+                 if ((image->matte) && (alpha_type == AssociatedAlpha))
+                   DisassociateAlphaRegion(image);
+-                if (!SyncImagePixels(image))
++                if (!SyncImagePixelsEx(image,exception))
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -3326,10 +3324,9 @@
+             p=pixels+number_pixels-1;
+             for (y=0; y < image->rows; y++)
+               {
+-                q=SetImagePixels(image,0,y,image->columns,1);
++                q=SetImagePixelsEx(image,0,y,image->columns,1,exception);
+                 if (q == (PixelPacket *) NULL)
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -3358,9 +3355,8 @@
+                 */
+                 if ((image->matte) && (alpha_type == AssociatedAlpha))
+                   DisassociateAlphaRegion(image);
+-                if (!SyncImagePixels(image))
++                if (!SyncImagePixelsEx(image,exception))
+                   {
+-                    CopyException(exception,&image->exception);
+                     status=MagickFail;
+                     break;
+                   }
+@@ -5508,10 +5504,6 @@
+                                     "bits per sample (%lu bytes/scanline)",
+                                     PhotometricTagToString(photometric),
+                                     bits_per_sample, (unsigned long) scanline_size);
+-
+-            scanline=MagickAllocateMemory(unsigned char *,(size_t) scanline_size);
+-            if (scanline == (unsigned char *) NULL)
+-              ThrowTIFFWriterException(ResourceLimitError,MemoryAllocationFailed,image);
+             /*
+               Prepare for separate/contiguous retrieval.
+             */
+@@ -5525,6 +5517,10 @@
+                     == MagickPass)
+                   max_sample=quantum_samples;
+               }
++
++            scanline=MagickAllocateMemory(unsigned char *,(size_t) scanline_size);
++            if (scanline == (unsigned char *) NULL)
++              ThrowTIFFWriterException(ResourceLimitError,MemoryAllocationFailed,image);
+             /*
+               For each plane
+             */
+diff -r 4234dde539ee -r 978502137626 www/Changelog.html
+--- a/www/Changelog.html	Sat Jun 16 13:44:59 2018 -0500
++++ b/www/Changelog.html	Sat Jun 16 14:08:28 2018 -0500
+@@ -35,6 +35,17 @@
+ <div class="document">
+ 
+ 
++<p>2018-06-16  Bob Friesenhahn  &lt;<a class="reference external" href="mailto:bfriesen&#37;&#52;&#48;simple&#46;dallas&#46;tx&#46;us">bfriesen<span>&#64;</span>simple<span>&#46;</span>dallas<span>&#46;</span>tx<span>&#46;</span>us</a>&gt;</p>
++<blockquote>
++<ul class="simple">
++<li>coders/tiff.c (ReadTIFFImage): Re-structure exception reporting
++so that QuantumTransferMode() exceptions thrown for
++PLANARCONFIG_SEPARATE images are handled immediately.  Fixes
++oss-fuzz 8896 &quot;graphicsmagick/coder_BIGTIFF_fuzzer:
++Use-of-uninitialized-value in DisassociateAlphaRegion&quot;. (Credit to
++OSS-Fuzz)</li>
++</ul>
++</blockquote>
+ <p>2018-06-16  Fojtik Jaroslav  &lt;<a class="reference external" href="mailto:JaFojtik&#37;&#52;&#48;seznam&#46;cz">JaFojtik<span>&#64;</span>seznam<span>&#46;</span>cz</a>&gt;</p>
+ <blockquote>
+ <ul class="simple">
+

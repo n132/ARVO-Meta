@@ -1,0 +1,321 @@
+commit df82e56d5561e05529dff3369106f08a647b8a8a
+Author: Reini Urban <rurban@cpan.org>
+Date:   Tue Mar 16 09:34:09 2021 +0100
+
+    indxf: improve fuzzer zero-termination
+    
+    don't allow \n without \0 in DXF.
+    Fail earlier when the ASCII DXF buffer has none to avoid strtol overflows.
+    Fixes oss-fuzz issue 32022
+    
+    Also clear errno before calling strtol.
+
+diff --git a/examples/llvmfuzz.c b/examples/llvmfuzz.c
+index 9a391d82..878cdcad 100644
+--- a/examples/llvmfuzz.c
++++ b/examples/llvmfuzz.c
+@@ -40,22 +40,22 @@ extern int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size);
+ // libfuzzer limitation:
+ // Enforce NULL-termination of the input buffer, to avoid bugus reports. copy it.
+ // Problematic is mostly strtol(3) which also works with \n termination.
+ static int enforce_null_termination(Bit_Chain *dat, bool enforce)
+ {
+     unsigned char *copy;
+     unsigned char c;
+     if (!dat->size)
+       return 0;
+     c = dat->chain[dat->size - 1];
+-    // Allow \n termination
+-    if (!enforce && (c == '\0' || c == '\n'))
++    // Allow \n termination without \0 in DXF? No, still crashes
++    if (!enforce && ((c == '\n' && c+1 == '\0') || c == '\0'))
+       return 0;
+ #ifdef STANDALONE
+     fprintf (stderr, "llvmfuzz_standalone: enforce libfuzzer buffer NULL termination\n");
+ #endif
+     copy = malloc (dat->size + 1);
+     memcpy (copy, dat->chain, dat->size);
+     copy[dat->size] = '\0';
+     dat->chain = copy;
+     return 1;
+ }
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index e45b82fb..66603073 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -227,45 +227,45 @@ static inline void
+ dxf_skip_ws (Bit_Chain *dat)
+ {
+   const int is_binary = dat->opts & DWG_OPTS_DXFB;
+   if (is_binary)
+     return;
+   if (dat->byte >= dat->size)
+     return;
+   // clang-format off
+   for (; (!dat->chain[dat->byte] ||
+           dat->chain[dat->byte] == ' ' ||
+           dat->chain[dat->byte] == '\t' ||
+           dat->chain[dat->byte] == '\r');
+        )
+     // clang-format on
+     {
+       dat->byte++;
+       if (dat->byte >= dat->size)
+         return;
+     }
+ }
+ 
+ #define SAFER_STRTOL(num, rettype, ret)                                       \
+   if (dat->byte + 3 >= dat->size                                              \
+       || !memchr (&dat->chain[dat->byte], '\n', dat->size - dat->byte))       \
+     {                                                                         \
+       LOG_ERROR ("Premature DXF end");                                        \
+       dat->byte = dat->size;                                                  \
+       return (rettype)ret;                                                    \
+     }                                                                         \
+-  else                                                                        \
+-    num = strtol ((char *)&dat->chain[dat->byte], &endptr, 10);               \
++  errno = 0;                                                                  \
++  num = strtol ((char *)&dat->chain[dat->byte], &endptr, 10);                 \
+   if (endptr)                                                                 \
+     {                                                                         \
+       if (endptr == (char *)&dat->chain[dat->byte])                           \
+         {                                                                     \
+           LOG_ERROR ("Expected DXF integer value");                           \
+           dat->byte = dat->size;                                              \
+           return (rettype)ret;                                                \
+         }                                                                     \
+       dat->byte += (unsigned char *)endptr - &dat->chain[dat->byte];          \
+     }                                                                         \
+   if (errno == ERANGE)                                                        \
+     return (rettype)num;                                                      \
+   if (dat->byte + 1 >= dat->size)                                             \
+   return (rettype)num
+@@ -12650,221 +12650,227 @@ EXPORT int
+ dwg_read_dxf (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+ {
+   // const int minimal = dwg->opts & DWG_OPTS_MINIMAL;
+   Dxf_Pair *pair = NULL;
+   int error = 0;
+ 
+   loglevel = dwg->opts & DWG_OPTS_LOGLEVEL;
+   if (!dat->chain && dat->fh)
+     {
+       error = dat_read_stream (dat, dat->fh);
+       if (error >= DWG_ERR_CRITICAL)
+         return error;
+       if (dat->size >= 22 &&
+           !memcmp (dat->chain, "AutoCAD Binary DXF",
+                    sizeof ("AutoCAD Binary DXF") - 1))
+         {
+           dat->opts |= DWG_OPTS_DXFB;
+           dat->byte = 22;
+         }
+     }
+   if (dat->size < 256)
+     {
+       LOG_ERROR ("DXF input too small, %lu byte.\n", dat->size);
+       return DWG_ERR_IOERROR;
+     }
+   /* Fail early on DWG */
+   if (!memcmp (dat->chain, "AC10", 4) ||
+       !memcmp (dat->chain, "AC1.", 4) ||
+       !memcmp (dat->chain, "AC2.10", 4) ||
+       !memcmp (dat->chain, "MC0.0", 4))
+     {
+       LOG_ERROR ("This is a DWG, not a DXF\n");
+       return DWG_ERR_INVALIDDWG;
+     }
++  /* Fuzzers like to skip zero-termination. And fail loudly on strtol */
++  if (!memchr (&dat->chain[dat->size], '\0', 2))
++    {
++      LOG_ERROR ("This buffer is not zero-terminated\n");
++      return DWG_ERR_INVALIDDWG;
++    }
+ 
+   dat->opts |= DWG_OPTS_INDXF;
+   dwg->opts |= DWG_OPTS_INDXF;
+   //num_dxf_objs = 0;
+   //size_dxf_objs = 1000;
+   //dxf_objs = (Dxf_Objs *)malloc (1000 * sizeof (Dxf_Objs));
+   if (!dwg->object_map)
+     dwg->object_map = hash_new (dat->size / 1000);
+   // cannot rely on ref->obj during realloc's
+   dwg->dirty_refs = 1;
+ 
+   header_hdls = new_array_hdls (16);
+   eed_hdls = new_array_hdls (16);
+   obj_hdls = new_array_hdls (16);
+ 
+   // start with the BLOCK_HEADER at objid 0
+   if (!dwg->num_objects)
+     {
+       Dwg_Object *obj;
+       Dwg_Object_BLOCK_HEADER *_obj;
+       char *dxfname = strdup ((char *)"BLOCK_HEADER");
+       NEW_OBJECT (dwg, obj);
+       ADD_OBJECT (BLOCK_HEADER);
+       // dwg->header.version probably here still unknown. <r2000: 0x17
+       // later fixed up when reading $ACADVER and the BLOCK_HEADER.name
+       _obj->name = dwg_add_u8_input (dwg, "*Model_Space");
+       _obj->is_xref_ref = 1;
+       obj->tio.object->is_xdic_missing = 1;
+       dwg_add_handle (&obj->handle, 0, 0x1F, obj);
+       obj->tio.object->ownerhandle = dwg_add_handleref (dwg, 4, 1, NULL);
+     }
+ 
+   while (dat->byte < dat->size)
+     {
+       pair = dxf_read_pair (dat);
+       DXF_BREAK_EOF;
+       pair = dxf_expect_code (dat, pair, 0);
+       DXF_BREAK_EOF;
+       if (pair->type == DWG_VT_STRING && strEQc (pair->value.s, "SECTION"))
+         {
+           dxf_free_pair (pair);
+           pair = dxf_read_pair (dat);
+           DXF_BREAK_EOF;
+           pair = dxf_expect_code (dat, pair, 2);
+           DXF_BREAK_EOF;
+           if (!pair->value.s)
+             {
+               LOG_ERROR ("Expected SECTION string code 2, got code %d",
+                          pair->code);
+               dxf_free_pair (pair);
+               pair = NULL;
+               break;
+             }
+           else if (strEQc (pair->value.s, "HEADER"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_header_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 goto error;
+               dxf_fixup_header (dwg);
+               // skip minimal DXF
+               /*
+               if (!dwg->header_vars.DIMPOST) // T in all versions
+                 {
+                   LOG_ERROR ("Unsupported minimal DXF");
+                   return DWG_ERR_INVALIDDWG;
+                 }
+               */
+             }
+           else if (strEQc (pair->value.s, "CLASSES"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_classes_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 return error;
+             }
+           else if (strEQc (pair->value.s, "TABLES"))
+             {
+               BITCODE_H hdl;
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_tables_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 goto error;
+ 
+               resolve_postponed_header_refs (dwg);
+               resolve_postponed_eed_refs (dwg);
+ 
+               // should not happen
+               if (!dwg->header_vars.LTYPE_BYLAYER
+                   && (hdl = dwg_find_tablehandle_silent (
+                           dwg, (char *)"ByLayer", "LTYPE")))
+                 dwg->header_vars.LTYPE_BYLAYER
+                     = dwg_add_handleref (dwg, 5, hdl->handleref.value, NULL);
+               // should not happen
+               if (!dwg->header_vars.LTYPE_BYBLOCK
+                   && (hdl = dwg_find_tablehandle_silent (
+                           dwg, (char *)"ByBlock", "LTYPE")))
+                 dwg->header_vars.LTYPE_BYBLOCK
+                     = dwg_add_handleref (dwg, 5, hdl->handleref.value, NULL);
+               // but this is needed
+               if (!dwg->header_vars.LTYPE_CONTINUOUS
+                   && (hdl = dwg_find_tablehandle_silent (
+                           dwg, (char *)"Continuous", "LTYPE")))
+                 dwg->header_vars.LTYPE_CONTINUOUS
+                     = dwg_add_handleref (dwg, 5, hdl->handleref.value, NULL);
+             }
+           else if (strEQc (pair->value.s, "BLOCKS"))
+             {
+               BITCODE_H hdl;
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_blocks_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 goto error;
+ 
+               // resolve_postponed_header_refs (dwg);
+               if (!dwg->header_vars.BLOCK_RECORD_PSPACE
+                   && (hdl = dwg_find_tablehandle_silent (
+                           dwg, (char *)"*Paper_Space", "BLOCK")))
+                 dwg->header_vars.BLOCK_RECORD_PSPACE
+                     = dwg_add_handleref (dwg, 5, hdl->handleref.value, NULL);
+               if (!dwg->header_vars.BLOCK_RECORD_MSPACE
+                   && (hdl = dwg_find_tablehandle_silent (
+                           dwg, (char *)"*Model_Space", "BLOCK")))
+                 dwg->header_vars.BLOCK_RECORD_MSPACE
+                     = dwg_add_handleref (dwg, 5, hdl->handleref.value, NULL);
+             }
+           else if (strEQc (pair->value.s, "ENTITIES"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_entities_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 goto error;
+             }
+           else if (strEQc (pair->value.s, "OBJECTS"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_objects_read (dat, dwg);
+               if (error > DWG_ERR_CRITICAL)
+                 goto error;
+               resolve_header_dicts (dwg);
+             }
+           else if (strEQc (pair->value.s, "THUMBNAILIMAGE"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_thumbnail_read (dat, dwg);
+             }
+           else if (strEQc (pair->value.s, "ACDSDATA"))
+             {
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_acds_read (dat, dwg);
+             }
+           else // if (strEQc (pair->value.s, ""))
+             {
+               LOG_WARN ("SECTION %s ignored for now", pair->value.s);
+               dxf_free_pair (pair);
+               pair = NULL;
+               error = dxf_unknownsection_read (dat, dwg);
+             }
+         }
+     }
+   if (pair != NULL && pair->code == 0 &&
+       pair->value.s != NULL && strEQc (pair->value.s, "EOF"))
+     ;
+   else if (dat->byte >= dat->size || (pair == NULL))
+     error |= DWG_ERR_IOERROR;
+   resolve_postponed_header_refs (dwg);
+   resolve_postponed_object_refs (dwg);
+   LOG_HANDLE ("Resolving pointers from ObjectRef vector:\n");
+   dwg_resolve_objectrefs_silent (dwg);
+   free_array_hdls (header_hdls);
+   free_array_hdls (eed_hdls);
+   free_array_hdls (obj_hdls);
+   if (dwg->header.version <= R_2000 && dwg->header.from_version > R_2000)
+     dwg_fixup_BLOCKS_entities (dwg);
+   LOG_TRACE ("import from DXF\n");
+   if (error > DWG_ERR_CRITICAL)
+     return error;
+   else
+     return dwg->num_objects ? 1 : 0;

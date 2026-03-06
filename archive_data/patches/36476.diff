@@ -1,0 +1,185 @@
+commit 034a5c02488cf7f0048e130177fc71c9e626e135
+Author: Stefan Berger <stefanb@linux.vnet.ibm.com>
+Date:   Fri Jul 23 13:29:00 2021 -0400
+
+    tpm2: NVMarshal: Handle index orderly RAM without 0-sized terminating node
+    
+    The NVRAM entries in s_indexOrderlyRam array do not need to contain a
+    0-sized terminating node. Instead, the entries may fill up this 512
+    byte array so that no NV_RAM_HEADER structure fits anymore. The fact
+    that no more NV_RAM_HEADER structure fits is also an indicator for the
+    last entry. We need to account for this in the code marshalling and
+    unmarshalling the entries so that we stop marshalling the entries
+    then and similarly stop unmarshalling.
+    
+    Signed-off-by: Stefan Berger <stefanb@linux.ibm.com>
+
+diff --git a/src/tpm2/NVMarshal.c b/src/tpm2/NVMarshal.c
+index 8e0ec0b..e3db9d6 100644
+--- a/src/tpm2/NVMarshal.c
++++ b/src/tpm2/NVMarshal.c
+@@ -4218,65 +4218,71 @@ static UINT32
+ INDEX_ORDERLY_RAM_Marshal(void *array, size_t array_size,
+                           BYTE **buffer, INT32 *size)
+ {
+     UINT16 written;
+     NV_RAM_HEADER nrh, *nrhp;
+     UINT16 offset = 0;
+     UINT16 datasize;
+     UINT32 sourceside_size = array_size;
+     BLOCK_SKIP_INIT;
+ 
+     written = NV_HEADER_Marshal(buffer, size,
+                                 INDEX_ORDERLY_RAM_VERSION,
+                                 INDEX_ORDERLY_RAM_MAGIC, 1);
+ 
+     /* the size of the array we are using here */
+     written += UINT32_Marshal(&sourceside_size, buffer, size);
+ 
+     while (TRUE) {
+         nrhp = array + offset;
+         /* nrhp may point to misaligned address (ubsan), so use 'nrh'; first access only 'size' */
+         memcpy(&nrh, nrhp, sizeof(nrh.size));
+ 
+         /* write the NVRAM header;
+            nrh->size holds the complete size including data;
+            nrh->size = 0 indicates the end */
+         written += UINT32_Marshal(&nrh.size, buffer, size);
+         if (nrh.size == 0)
+             break;
+         /* copy the entire structure now; ubsan does not allow 'nrh = *nrhp' */
+         memcpy(&nrh, nrhp, sizeof(nrh));
+ 
+         written += TPM_HANDLE_Marshal(&nrh.handle, buffer, size);
+         written += TPMA_NV_Marshal(&nrh.attributes, buffer, size);
+ 
+         if (offset + nrh.size > array_size) {
+             TPMLIB_LogTPM2Error("INDEX_ORDERLY_RAM: nrh->size corrupted: %d\n",
+                                 nrh.size);
+             break;
+         }
+         /* write data size before array */
+         if (nrh.size < sizeof(NV_RAM_HEADER)) {
+             TPMLIB_LogTPM2Error(
+                 "INDEX_ORDERLY_RAM: nrh->size < sizeof(NV_RAM_HEADER): %d < %zu\n",
+                 (int)nrh.size, sizeof(NV_RAM_HEADER));
+             break;
+         }
+         datasize = nrh.size - sizeof(NV_RAM_HEADER);
+         written += UINT16_Marshal(&datasize, buffer, size);
+         if (datasize > 0) {
+             /* append the data */
+             written += Array_Marshal(array + offset + sizeof(NV_RAM_HEADER),
+                                      datasize, buffer, size);
+         }
+         offset += nrh.size;
++        if (offset + sizeof(NV_RAM_HEADER) > array_size) {
++            /* nothing will fit anymore and there won't be a 0-sized
++             * terminating node (@1).
++             */
++            break;
++        }
+     }
+ 
+     written += BLOCK_SKIP_WRITE_PUSH(TRUE, buffer, size);
+     /* future versions append below this line */
+ 
+     BLOCK_SKIP_WRITE_POP(size);
+ 
+     BLOCK_SKIP_WRITE_CHECK;
+ 
+     return written;
+ }
+@@ -4285,82 +4291,92 @@ static TPM_RC
+ INDEX_ORDERLY_RAM_Unmarshal(void *array, size_t array_size,
+                             BYTE **buffer, INT32 *size)
+ {
+     TPM_RC rc = TPM_RC_SUCCESS;
+     NV_HEADER hdr;
+     NV_RAM_HEADER nrh, *nrhp;
+     UINT16 offset = 0;
+     UINT16 datasize = 0;
+     UINT32 sourceside_size;
+ 
+     if (rc == TPM_RC_SUCCESS) {
+         rc = NV_HEADER_Unmarshal(&hdr, buffer, size,
+                                  INDEX_ORDERLY_RAM_VERSION,
+                                  INDEX_ORDERLY_RAM_MAGIC);
+     }
+     if (rc == TPM_RC_SUCCESS) {
+         /* get the size of the array on the source side
+            we can accommodate different sizes when rebuilding
+            but if it doesn't fit we'll error out and report the sizes */
+         rc = UINT32_Unmarshal(&sourceside_size, buffer, size);
+     }
+ 
+     while (rc == TPM_RC_SUCCESS) {
+         memset(&nrh, 0, sizeof(nrh)); /* coverity */
+         /* nrhp may point to misaligned address (ubsan)
+          * we read 'into' nrh and copy to nrhp at end
+          */
+         nrhp = array + offset;
+ 
++        if (offset + sizeof(NV_RAM_HEADER) > sourceside_size) {
++            /* this case can occur with the previous entry filling up the
++             * space; in this case there will not be a 0-sized terminating
++             * node (see @1 above). We clear the rest of our space.
++             */
++            if (array_size > offset)
++                memset(nrhp, 0, array_size - offset);
++            break;
++        }
++
+         /* write the NVRAM header;
+            nrh->size holds the complete size including data;
+            nrh->size = 0 indicates the end */
+         if (offset + sizeof(nrh.size) > array_size) {
+             offset += sizeof(nrh.size);
+             goto exit_size;
+         }
+ 
+         if (rc == TPM_RC_SUCCESS) {
+             rc = UINT32_Unmarshal(&nrh.size, buffer, size);
+             if (rc == TPM_RC_SUCCESS && nrh.size == 0) {
+                 memcpy(nrhp, &nrh, sizeof(nrh.size));
+                 break;
+             }
+         }
+         if (offset + sizeof(NV_RAM_HEADER) > array_size) {
+             offset += sizeof(NV_RAM_HEADER);
+             goto exit_size;
+         }
+         if (rc == TPM_RC_SUCCESS) {
+             rc = TPM_HANDLE_Unmarshal(&nrh.handle, buffer, size);
+         }
+         if (rc == TPM_RC_SUCCESS) {
+             rc = TPMA_NV_Unmarshal(&nrh.attributes, buffer, size);
+         }
+         if (rc == TPM_RC_SUCCESS) {
+             rc = UINT16_Unmarshal(&datasize, buffer, size);
+         }
+         if (offset + sizeof(NV_RAM_HEADER) + datasize > array_size) {
+             offset += sizeof(NV_RAM_HEADER) + datasize;
+             goto exit_size;
+         }
+         if (rc == TPM_RC_SUCCESS && datasize > 0) {
+             /* append the data */
+             rc = Array_Unmarshal(array + offset + sizeof(NV_RAM_HEADER),
+                                  datasize, buffer, size);
+         }
+         if (rc == TPM_RC_SUCCESS) {
+             /* fix up size in case it is architecture-dependent */
+             nrh.size = sizeof(nrh) + datasize;
+             offset += nrh.size;
+             /* copy header into possibly misaligned address in NVRAM */
+             *nrhp = nrh;
+         }
+     }
+ 
+     /* version 2 starts having indicator for next versions that we can skip;
+        this allows us to downgrade state */
+     if (rc == TPM_RC_SUCCESS && hdr.version >= 2) {
+         BLOCK_SKIP_READ(skip_future_versions, FALSE, buffer, size,
+                         "INDEX_ORDERLY_RAM", "version 3 or later");
+         /* future versions nest-append here */
+     }

@@ -1,0 +1,434 @@
+commit 0c6a3cd13585be7d17d5ee76ac9c4404910d2b17
+Author: Alan Modra <amodra@gmail.com>
+Date:   Thu Mar 17 16:47:39 2022 +1030
+
+    asan: Buffer overflow in som_set_reloc_info
+    
+            * som.c (som_set_reloc_info): Add symcount parameter.  Don't
+            access symbols past symcount.  Don't access fixup past end_fixups.
+            (som_slurp_reloc_table): Adjust som_set_reloc_info calls.
+
+diff --git a/bfd/som.c b/bfd/som.c
+index d53a3b90b02..3c0b68a444e 100644
+--- a/bfd/som.c
++++ b/bfd/som.c
+@@ -4937,339 +4937,340 @@ static unsigned int
+ som_set_reloc_info (unsigned char *fixup,
+ 		    unsigned int end,
+ 		    arelent *internal_relocs,
+ 		    asection *section,
+ 		    asymbol **symbols,
++		    unsigned int symcount,
+ 		    bool just_count)
+ {
+   unsigned int op, varname, deallocate_contents = 0;
+   unsigned char *end_fixups = &fixup[end];
+   const struct fixup_format *fp;
+   const char *cp;
+   unsigned char *save_fixup;
+   int variables[26], stack[20], c, v, count, prev_fixup, *sp, saved_unwind_bits;
+   const int *subop;
+   arelent *rptr = internal_relocs;
+   unsigned int offset = 0;
+ 
+ #define	var(c)		variables[(c) - 'A']
+ #define	push(v)		(*sp++ = (v))
+ #define	pop()		(*--sp)
+ #define	emptystack()	(sp == stack)
+ 
+   som_initialize_reloc_queue (reloc_queue);
+   memset (variables, 0, sizeof (variables));
+   memset (stack, 0, sizeof (stack));
+   count = 0;
+   prev_fixup = 0;
+   saved_unwind_bits = 0;
+   sp = stack;
+ 
+   while (fixup < end_fixups)
+     {
+       /* Save pointer to the start of this fixup.  We'll use
+ 	 it later to determine if it is necessary to put this fixup
+ 	 on the queue.  */
+       save_fixup = fixup;
+ 
+       /* Get the fixup code and its associated format.  */
+       op = *fixup++;
+       fp = &som_fixup_formats[op];
+ 
+       /* Handle a request for a previous fixup.  */
+       if (*fp->format == 'P')
+ 	{
+ 	  /* Get pointer to the beginning of the prev fixup, move
+ 	     the repeated fixup to the head of the queue.  */
+ 	  fixup = reloc_queue[fp->D].reloc;
+ 	  som_reloc_queue_fix (reloc_queue, fp->D);
+ 	  prev_fixup = 1;
+ 
+ 	  /* Get the fixup code and its associated format.  */
+ 	  op = *fixup++;
+ 	  fp = &som_fixup_formats[op];
+ 	}
+ 
+       /* If this fixup will be passed to BFD, set some reasonable defaults.  */
+       if (! just_count
+ 	  && som_hppa_howto_table[op].type != R_NO_RELOCATION
+ 	  && som_hppa_howto_table[op].type != R_DATA_OVERRIDE)
+ 	{
+ 	  rptr->address = offset;
+ 	  rptr->howto = &som_hppa_howto_table[op];
+ 	  rptr->addend = 0;
+ 	  rptr->sym_ptr_ptr = bfd_abs_section_ptr->symbol_ptr_ptr;
+ 	}
+ 
+       /* Set default input length to 0.  Get the opcode class index
+ 	 into D.  */
+       var ('L') = 0;
+       var ('D') = fp->D;
+       var ('U') = saved_unwind_bits;
+ 
+       /* Get the opcode format.  */
+       cp = fp->format;
+ 
+       /* Process the format string.  Parsing happens in two phases,
+ 	 parse RHS, then assign to LHS.  Repeat until no more
+ 	 characters in the format string.  */
+       while (*cp)
+ 	{
+ 	  /* The variable this pass is going to compute a value for.  */
+ 	  varname = *cp++;
+ 
+ 	  /* Start processing RHS.  Continue until a NULL or '=' is found.  */
+ 	  do
+ 	    {
+ 	      c = *cp++;
+ 
+ 	      /* If this is a variable, push it on the stack.  */
+ 	      if (ISUPPER (c))
+ 		push (var (c));
+ 
+ 	      /* If this is a lower case letter, then it represents
+ 		 additional data from the fixup stream to be pushed onto
+ 		 the stack.  */
+ 	      else if (ISLOWER (c))
+ 		{
+ 		  int bits = (c - 'a') * 8;
+-		  for (v = 0; c > 'a'; --c)
++		  for (v = 0; c > 'a' && fixup < end_fixups; --c)
+ 		    v = (v << 8) | *fixup++;
+ 		  if (varname == 'V')
+ 		    v = sign_extend (v, bits);
+ 		  push (v);
+ 		}
+ 
+ 	      /* A decimal constant.  Push it on the stack.  */
+ 	      else if (ISDIGIT (c))
+ 		{
+ 		  v = c - '0';
+ 		  while (ISDIGIT (*cp))
+ 		    v = (v * 10) + (*cp++ - '0');
+ 		  push (v);
+ 		}
+ 	      else
+ 		/* An operator.  Pop two values from the stack and
+ 		   use them as operands to the given operation.  Push
+ 		   the result of the operation back on the stack.  */
+ 		switch (c)
+ 		  {
+ 		  case '+':
+ 		    v = pop ();
+ 		    v += pop ();
+ 		    push (v);
+ 		    break;
+ 		  case '*':
+ 		    v = pop ();
+ 		    v *= pop ();
+ 		    push (v);
+ 		    break;
+ 		  case '<':
+ 		    v = pop ();
+ 		    v = pop () << v;
+ 		    push (v);
+ 		    break;
+ 		  default:
+ 		    abort ();
+ 		  }
+ 	    }
+ 	  while (*cp && *cp != '=');
+ 
+ 	  /* Move over the equal operator.  */
+ 	  cp++;
+ 
+ 	  /* Pop the RHS off the stack.  */
+ 	  c = pop ();
+ 
+ 	  /* Perform the assignment.  */
+ 	  var (varname) = c;
+ 
+ 	  /* Handle side effects. and special 'O' stack cases.  */
+ 	  switch (varname)
+ 	    {
+ 	    /* Consume some bytes from the input space.  */
+ 	    case 'L':
+ 	      offset += c;
+ 	      break;
+ 	    /* A symbol to use in the relocation.  Make a note
+ 	       of this if we are not just counting.  */
+ 	    case 'S':
+-	      if (! just_count)
++	      if (! just_count && (unsigned int) c < symcount)
+ 		rptr->sym_ptr_ptr = &symbols[c];
+ 	      break;
+ 	    /* Argument relocation bits for a function call.  */
+ 	    case 'R':
+ 	      if (! just_count)
+ 		{
+ 		  unsigned int tmp = var ('R');
+ 		  rptr->addend = 0;
+ 
+ 		  if ((som_hppa_howto_table[op].type == R_PCREL_CALL
+ 		       && R_PCREL_CALL + 10 > op)
+ 		      || (som_hppa_howto_table[op].type == R_ABS_CALL
+ 			  && R_ABS_CALL + 10 > op))
+ 		    {
+ 		      /* Simple encoding.  */
+ 		      if (tmp > 4)
+ 			{
+ 			  tmp -= 5;
+ 			  rptr->addend |= 1;
+ 			}
+ 		      if (tmp == 4)
+ 			rptr->addend |= 1 << 8 | 1 << 6 | 1 << 4 | 1 << 2;
+ 		      else if (tmp == 3)
+ 			rptr->addend |= 1 << 8 | 1 << 6 | 1 << 4;
+ 		      else if (tmp == 2)
+ 			rptr->addend |= 1 << 8 | 1 << 6;
+ 		      else if (tmp == 1)
+ 			rptr->addend |= 1 << 8;
+ 		    }
+ 		  else
+ 		    {
+ 		      unsigned int tmp1, tmp2;
+ 
+ 		      /* First part is easy -- low order two bits are
+ 			 directly copied, then shifted away.  */
+ 		      rptr->addend = tmp & 0x3;
+ 		      tmp >>= 2;
+ 
+ 		      /* Diving the result by 10 gives us the second
+ 			 part.  If it is 9, then the first two words
+ 			 are a double precision paramater, else it is
+ 			 3 * the first arg bits + the 2nd arg bits.  */
+ 		      tmp1 = tmp / 10;
+ 		      tmp -= tmp1 * 10;
+ 		      if (tmp1 == 9)
+ 			rptr->addend += (0xe << 6);
+ 		      else
+ 			{
+ 			  /* Get the two pieces.  */
+ 			  tmp2 = tmp1 / 3;
+ 			  tmp1 -= tmp2 * 3;
+ 			  /* Put them in the addend.  */
+ 			  rptr->addend += (tmp2 << 8) + (tmp1 << 6);
+ 			}
+ 
+ 		      /* What's left is the third part.  It's unpacked
+ 			 just like the second.  */
+ 		      if (tmp == 9)
+ 			rptr->addend += (0xe << 2);
+ 		      else
+ 			{
+ 			  tmp2 = tmp / 3;
+ 			  tmp -= tmp2 * 3;
+ 			  rptr->addend += (tmp2 << 4) + (tmp << 2);
+ 			}
+ 		    }
+ 		  rptr->addend = HPPA_R_ADDEND (rptr->addend, 0);
+ 		}
+ 	      break;
+ 	    /* Handle the linker expression stack.  */
+ 	    case 'O':
+ 	      switch (op)
+ 		{
+ 		case R_COMP1:
+ 		  subop = comp1_opcodes;
+ 		  break;
+ 		case R_COMP2:
+ 		  subop = comp2_opcodes;
+ 		  break;
+ 		case R_COMP3:
+ 		  subop = comp3_opcodes;
+ 		  break;
+ 		default:
+ 		  abort ();
+ 		}
+ 	      while (*subop <= (unsigned char) c)
+ 		++subop;
+ 	      --subop;
+ 	      break;
+ 	    /* The lower 32unwind bits must be persistent.  */
+ 	    case 'U':
+ 	      saved_unwind_bits = var ('U');
+ 	      break;
+ 
+ 	    default:
+ 	      break;
+ 	    }
+ 	}
+ 
+       /* If we used a previous fixup, clean up after it.  */
+       if (prev_fixup)
+ 	{
+ 	  fixup = save_fixup + 1;
+ 	  prev_fixup = 0;
+ 	}
+       /* Queue it.  */
+       else if (fixup > save_fixup + 1)
+ 	som_reloc_queue_insert (save_fixup, fixup - save_fixup, reloc_queue);
+ 
+       /* We do not pass R_DATA_OVERRIDE or R_NO_RELOCATION
+ 	 fixups to BFD.  */
+       if (som_hppa_howto_table[op].type != R_DATA_OVERRIDE
+ 	  && som_hppa_howto_table[op].type != R_NO_RELOCATION)
+ 	{
+ 	  /* Done with a single reloction. Loop back to the top.  */
+ 	  if (! just_count)
+ 	    {
+ 	      if (som_hppa_howto_table[op].type == R_ENTRY)
+ 		rptr->addend = var ('T');
+ 	      else if (som_hppa_howto_table[op].type == R_EXIT)
+ 		rptr->addend = var ('U');
+ 	      else if (som_hppa_howto_table[op].type == R_PCREL_CALL
+ 		       || som_hppa_howto_table[op].type == R_ABS_CALL)
+ 		;
+ 	      else if (som_hppa_howto_table[op].type == R_DATA_ONE_SYMBOL)
+ 		{
+ 		  /* Try what was specified in R_DATA_OVERRIDE first
+ 		     (if anything).  Then the hard way using the
+ 		     section contents.  */
+ 		  rptr->addend = var ('V');
+ 
+ 		  if (rptr->addend == 0 && !section->contents)
+ 		    {
+ 		      /* Got to read the damn contents first.  We don't
+ 			 bother saving the contents (yet).  Add it one
+ 			 day if the need arises.  */
+ 		      bfd_byte *contents;
+ 		      if (!bfd_malloc_and_get_section (section->owner, section,
+ 						       &contents))
+ 			{
+ 			  free (contents);
+ 			  return (unsigned) -1;
+ 			}
+ 		      section->contents = contents;
+ 		      deallocate_contents = 1;
+ 		    }
+ 		  else if (rptr->addend == 0)
+ 		    rptr->addend = bfd_get_32 (section->owner,
+ 					       (section->contents
+ 						+ offset - var ('L')));
+ 
+ 		}
+ 	      else
+ 		rptr->addend = var ('V');
+ 	      rptr++;
+ 	    }
+ 	  count++;
+ 	  /* Now that we've handled a "full" relocation, reset
+ 	     some state.  */
+ 	  memset (variables, 0, sizeof (variables));
+ 	  memset (stack, 0, sizeof (stack));
+ 	}
+     }
+   if (deallocate_contents)
+     free (section->contents);
+ 
+   return count;
+ 
+ #undef var
+ #undef push
+ #undef pop
+ #undef emptystack
+ }
+ 
+ /* Read in the relocs (aka fixups in SOM terms) for a section.
+ 
+    som_get_reloc_upper_bound calls this routine with JUST_COUNT
+    set to TRUE to indicate it only needs a count of the number
+    of actual relocations.  */
+@@ -5278,73 +5279,74 @@ static bool
+ som_slurp_reloc_table (bfd *abfd,
+ 		       asection *section,
+ 		       asymbol **symbols,
+ 		       bool just_count)
+ {
+   unsigned char *external_relocs;
+   unsigned int fixup_stream_size;
+   arelent *internal_relocs;
+   unsigned int num_relocs;
+   size_t amt;
+ 
+   fixup_stream_size = som_section_data (section)->reloc_size;
+   /* If there were no relocations, then there is nothing to do.  */
+   if (section->reloc_count == 0)
+     return true;
+ 
+   /* If reloc_count is -1, then the relocation stream has not been
+      parsed.  We must do so now to know how many relocations exist.  */
+   if (section->reloc_count == (unsigned) -1)
+     {
+       /* Read in the external forms.  */
+       if (bfd_seek (abfd, obj_som_reloc_filepos (abfd) + section->rel_filepos,
+ 		    SEEK_SET) != 0)
+ 	return false;
+       amt = fixup_stream_size;
+       external_relocs = _bfd_malloc_and_read (abfd, amt, amt);
+       if (external_relocs == NULL)
+ 	return false;
+ 
+       /* Let callers know how many relocations found.
+ 	 also save the relocation stream as we will
+ 	 need it again.  */
+       section->reloc_count = som_set_reloc_info (external_relocs,
+ 						 fixup_stream_size,
+-						 NULL, NULL, NULL, true);
++						 NULL, NULL, NULL, 0, true);
+ 
+       som_section_data (section)->reloc_stream = external_relocs;
+     }
+ 
+   /* If the caller only wanted a count, then return now.  */
+   if (just_count)
+     return true;
+ 
+   num_relocs = section->reloc_count;
+   external_relocs = som_section_data (section)->reloc_stream;
+   /* Return saved information about the relocations if it is available.  */
+   if (section->relocation != NULL)
+     return true;
+ 
+   if (_bfd_mul_overflow (num_relocs, sizeof (arelent), &amt))
+     {
+       bfd_set_error (bfd_error_file_too_big);
+       return false;
+     }
+   internal_relocs = bfd_zalloc (abfd, amt);
+   if (internal_relocs == NULL)
+     return false;
+ 
+   /* Process and internalize the relocations.  */
+   som_set_reloc_info (external_relocs, fixup_stream_size,
+-		      internal_relocs, section, symbols, false);
++		      internal_relocs, section, symbols,
++		      bfd_get_symcount (abfd), false);
+ 
+   /* We're done with the external relocations.  Free them.  */
+   free (external_relocs);
+   som_section_data (section)->reloc_stream = NULL;
+ 
+   /* Save our results and return success.  */
+   section->relocation = internal_relocs;
+   return true;
+ }
+ 
+ /* Return the number of bytes required to store the relocation
+    information associated with the given section.  */

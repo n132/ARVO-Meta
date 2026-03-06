@@ -1,0 +1,3016 @@
+commit c2d973627bab12abc5486a3f37ce40ed16da0641
+Author: Daniel Stenberg <daniel@haxx.se>
+Date:   Mon Jan 22 00:04:47 2024 +0100
+
+    pingpong: stop using the download buffer
+    
+    The pingpong logic now uses its own dynbuf for receiving command
+    response data.
+    
+    When the "final" response header for a commanad has been received, that
+    final line is left first in the recvbuf for the protocols to parse at
+    will. If there is additional data behind the final response line, the
+    'overflow' counter is indicate how many bytes.
+    
+    Closes #12757
+
+diff --git a/lib/ftp.c b/lib/ftp.c
+index 1cd0afe6c..b0177df71 100644
+--- a/lib/ftp.c
++++ b/lib/ftp.c
+@@ -350,80 +350,85 @@ static timediff_t ftp_timeleft_accept(struct Curl_easy *data)
+ /***********************************************************************
+  *
+  * ReceivedServerConnect()
+  *
+  * After allowing server to connect to us from data port, this function
+  * checks both data connection for connection establishment and ctrl
+  * connection for a negative response regarding a failure in connecting
+  *
+  */
+ static CURLcode ReceivedServerConnect(struct Curl_easy *data, bool *received)
+ {
+   struct connectdata *conn = data->conn;
+   curl_socket_t ctrl_sock = conn->sock[FIRSTSOCKET];
+   curl_socket_t data_sock = conn->sock[SECONDARYSOCKET];
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+   struct pingpong *pp = &ftpc->pp;
+-  int result;
++  int socketstate = 0;
+   timediff_t timeout_ms;
+   ssize_t nread;
+   int ftpcode;
++  bool response = FALSE;
+ 
+   *received = FALSE;
+ 
+   timeout_ms = ftp_timeleft_accept(data);
+   infof(data, "Checking for server connect");
+   if(timeout_ms < 0) {
+     /* if a timeout was already reached, bail out */
+     failf(data, "Accept timeout occurred while waiting server connect");
+     return CURLE_FTP_ACCEPT_TIMEOUT;
+   }
+ 
+   /* First check whether there is a cached response from server */
+-  if(pp->cache_size && pp->cache && pp->cache[0] > '3') {
++  if(Curl_dyn_len(&pp->recvbuf) && (*Curl_dyn_ptr(&pp->recvbuf) > '3')) {
+     /* Data connection could not be established, let's return */
+     infof(data, "There is negative response in cache while serv connect");
+     (void)Curl_GetFTPResponse(data, &nread, &ftpcode);
+     return CURLE_FTP_ACCEPT_FAILED;
+   }
+ 
+-  result = Curl_socket_check(ctrl_sock, data_sock, CURL_SOCKET_BAD, 0);
++  if(pp->overflow)
++    /* there is pending control data still in the buffer to read */
++    response = TRUE;
++  else
++    socketstate = Curl_socket_check(ctrl_sock, data_sock, CURL_SOCKET_BAD, 0);
+ 
+   /* see if the connection request is already here */
+-  switch(result) {
++  switch(socketstate) {
+   case -1: /* error */
+     /* let's die here */
+     failf(data, "Error while waiting for server connect");
+     return CURLE_FTP_ACCEPT_FAILED;
+   case 0:  /* Server connect is not received yet */
+     break; /* loop */
+   default:
+-
+-    if(result & CURL_CSELECT_IN2) {
++    if(socketstate & CURL_CSELECT_IN2) {
+       infof(data, "Ready to accept data connection from server");
+       *received = TRUE;
+     }
+-    else if(result & CURL_CSELECT_IN) {
+-      infof(data, "Ctrl conn has data while waiting for data conn");
+-      (void)Curl_GetFTPResponse(data, &nread, &ftpcode);
+-
+-      if(ftpcode/100 > 3)
+-        return CURLE_FTP_ACCEPT_FAILED;
++    else if(socketstate & CURL_CSELECT_IN)
++      response = TRUE;
++    break;
++  }
++  if(response) {
++    infof(data, "Ctrl conn has data while waiting for data conn");
++    (void)Curl_GetFTPResponse(data, &nread, &ftpcode);
+ 
+-      return CURLE_WEIRD_SERVER_REPLY;
+-    }
++    if(ftpcode/100 > 3)
++      return CURLE_FTP_ACCEPT_FAILED;
+ 
+-    break;
+-  } /* switch() */
++    return CURLE_WEIRD_SERVER_REPLY;
++  }
+ 
+   return CURLE_OK;
+ }
+ 
+ 
+ /***********************************************************************
+  *
+  * InitiateTransfer()
+  *
+  * After connection from server is accepted this function is called to
+  * setup transfer parameters and initiate the data transfer.
+  *
+  */
+@@ -545,61 +550,61 @@ static bool ftp_endofresp(struct Curl_easy *data, struct connectdata *conn,
+ static CURLcode ftp_readresp(struct Curl_easy *data,
+                              curl_socket_t sockfd,
+                              struct pingpong *pp,
+                              int *ftpcode, /* return the ftp-code if done */
+                              size_t *size) /* size of the response */
+ {
+   int code;
+   CURLcode result = Curl_pp_readresp(data, sockfd, pp, &code, size);
+ 
+ #ifdef HAVE_GSSAPI
+   {
+     struct connectdata *conn = data->conn;
+-    char * const buf = data->state.buffer;
++    char * const buf = Curl_dyn_ptr(&data->conn->proto.ftpc.pp.recvbuf);
+ 
+     /* handle the security-oriented responses 6xx ***/
+     switch(code) {
+     case 631:
+       code = Curl_sec_read_msg(data, conn, buf, PROT_SAFE);
+       break;
+     case 632:
+       code = Curl_sec_read_msg(data, conn, buf, PROT_PRIVATE);
+       break;
+     case 633:
+       code = Curl_sec_read_msg(data, conn, buf, PROT_CONFIDENTIAL);
+       break;
+     default:
+       /* normal ftp stuff we pass through! */
+       break;
+     }
+   }
+ #endif
+ 
+   /* store the latest code for later retrieval */
+   data->info.httpcode = code;
+ 
+   if(ftpcode)
+     *ftpcode = code;
+ 
+   if(421 == code) {
+     /* 421 means "Service not available, closing control connection." and FTP
+      * servers use it to signal that idle session timeout has been exceeded.
+      * If we ignored the response, it could end up hanging in some cases.
+      *
+      * This response code can come at any point so having it treated
+      * generically is a good idea.
+      */
+     infof(data, "We got a 421 - timeout");
+     ftp_state(data, FTP_STOP);
+     return CURLE_OPERATION_TIMEDOUT;
+   }
+ 
+   return result;
+ }
+ 
+ /* --- parse FTP server responses --- */
+ 
+ /*
+  * Curl_GetFTPResponse() is a BLOCKING function to read the full response
+  * from a server after a command.
+  *
+  */
+@@ -607,104 +612,104 @@ static CURLcode ftp_readresp(struct Curl_easy *data,
+ CURLcode Curl_GetFTPResponse(struct Curl_easy *data,
+                              ssize_t *nreadp, /* return number of bytes read */
+                              int *ftpcode) /* return the ftp-code */
+ {
+   /*
+    * We cannot read just one byte per read() and then go back to select() as
+    * the OpenSSL read() doesn't grok that properly.
+    *
+    * Alas, read as much as possible, split up into lines, use the ending
+    * line in a response or continue reading.  */
+ 
+   struct connectdata *conn = data->conn;
+   curl_socket_t sockfd = conn->sock[FIRSTSOCKET];
+   CURLcode result = CURLE_OK;
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+   struct pingpong *pp = &ftpc->pp;
+   size_t nread;
+   int cache_skip = 0;
+   int value_to_be_ignored = 0;
+ 
+   if(ftpcode)
+     *ftpcode = 0; /* 0 for errors */
+   else
+     /* make the pointer point to something for the rest of this function */
+     ftpcode = &value_to_be_ignored;
+ 
+   *nreadp = 0;
+ 
+   while(!*ftpcode && !result) {
+     /* check and reset timeout value every lap */
+     timediff_t timeout = Curl_pp_state_timeout(data, pp, FALSE);
+     timediff_t interval_ms;
+ 
+     if(timeout <= 0) {
+       failf(data, "FTP response timeout");
+       return CURLE_OPERATION_TIMEDOUT; /* already too little time */
+     }
+ 
+     interval_ms = 1000;  /* use 1 second timeout intervals */
+     if(timeout < interval_ms)
+       interval_ms = timeout;
+ 
+     /*
+      * Since this function is blocking, we need to wait here for input on the
+      * connection and only then we call the response reading function. We do
+      * timeout at least every second to make the timeout check run.
+      *
+      * A caution here is that the ftp_readresp() function has a cache that may
+      * contain pieces of a response from the previous invoke and we need to
+      * make sure we don't just wait for input while there is unhandled data in
+      * that cache. But also, if the cache is there, we call ftp_readresp() and
+      * the cache wasn't good enough to continue we must not just busy-loop
+      * around this function.
+      *
+      */
+ 
+-    if(pp->cache && (cache_skip < 2)) {
++    if(Curl_dyn_len(&pp->recvbuf) && (cache_skip < 2)) {
+       /*
+        * There's a cache left since before. We then skipping the wait for
+        * socket action, unless this is the same cache like the previous round
+        * as then the cache was deemed not enough to act on and we then need to
+        * wait for more data anyway.
+        */
+     }
+     else if(!Curl_conn_data_pending(data, FIRSTSOCKET)) {
+       switch(SOCKET_READABLE(sockfd, interval_ms)) {
+       case -1: /* select() error, stop reading */
+         failf(data, "FTP response aborted due to select/poll error: %d",
+               SOCKERRNO);
+         return CURLE_RECV_ERROR;
+ 
+       case 0: /* timeout */
+         if(Curl_pgrsUpdate(data))
+           return CURLE_ABORTED_BY_CALLBACK;
+         continue; /* just continue in our loop for the timeout duration */
+ 
+       default: /* for clarity */
+         break;
+       }
+     }
+     result = ftp_readresp(data, sockfd, pp, ftpcode, &nread);
+     if(result)
+       break;
+ 
+-    if(!nread && pp->cache)
++    if(!nread && Curl_dyn_len(&pp->recvbuf))
+       /* bump cache skip counter as on repeated skips we must wait for more
+          data */
+       cache_skip++;
+     else
+       /* when we got data or there is no cache left, we reset the cache skip
+          counter */
+       cache_skip = 0;
+ 
+     *nreadp += nread;
+ 
+   } /* while there's buffer left and loop is requested */
+ 
+   pp->pending_resp = FALSE;
+ 
+   return result;
+ }
+ 
+ #if defined(DEBUGBUILD) && !defined(CURL_DISABLE_VERBOSE_STRINGS)
+   /* for debug purposes */
+@@ -1815,187 +1820,189 @@ static bool match_pasv_6nums(const char *p,
+ static CURLcode ftp_state_pasv_resp(struct Curl_easy *data,
+                                     int ftpcode)
+ {
+   struct connectdata *conn = data->conn;
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+   CURLcode result;
+   struct Curl_dns_entry *addr = NULL;
+   enum resolve_t rc;
+   unsigned short connectport; /* the local port connect() should use! */
+-  char *str = &data->state.buffer[4];  /* start on the first letter */
++  struct pingpong *pp = &ftpc->pp;
++  char *str =
++    Curl_dyn_ptr(&pp->recvbuf) + 4; /* start on the first letter */
+ 
+   /* if we come here again, make sure the former name is cleared */
+   Curl_safefree(ftpc->newhost);
+ 
+   if((ftpc->count1 == 0) &&
+      (ftpcode == 229)) {
+     /* positive EPSV response */
+     char *ptr = strchr(str, '(');
+     if(ptr) {
+       char sep;
+       ptr++;
+       /* |||12345| */
+       sep = ptr[0];
+       /* the ISDIGIT() check here is because strtoul() accepts leading minus
+          etc */
+       if((ptr[1] == sep) && (ptr[2] == sep) && ISDIGIT(ptr[3])) {
+         char *endp;
+         unsigned long num = strtoul(&ptr[3], &endp, 10);
+         if(*endp != sep)
+           ptr = NULL;
+         else if(num > 0xffff) {
+           failf(data, "Illegal port number in EPSV reply");
+           return CURLE_FTP_WEIRD_PASV_REPLY;
+         }
+         if(ptr) {
+           ftpc->newport = (unsigned short)(num & 0xffff);
+           ftpc->newhost = strdup(control_address(conn));
+           if(!ftpc->newhost)
+             return CURLE_OUT_OF_MEMORY;
+         }
+       }
+       else
+         ptr = NULL;
+     }
+     if(!ptr) {
+       failf(data, "Weirdly formatted EPSV reply");
+       return CURLE_FTP_WEIRD_PASV_REPLY;
+     }
+   }
+   else if((ftpc->count1 == 1) &&
+           (ftpcode == 227)) {
+     /* positive PASV response */
+     unsigned int ip[6];
+ 
+     /*
+      * Scan for a sequence of six comma-separated numbers and use them as
+      * IP+port indicators.
+      *
+      * Found reply-strings include:
+      * "227 Entering Passive Mode (127,0,0,1,4,51)"
+      * "227 Data transfer will passively listen to 127,0,0,1,4,51"
+      * "227 Entering passive mode. 127,0,0,1,4,51"
+      */
+     while(*str) {
+       if(match_pasv_6nums(str, ip))
+         break;
+       str++;
+     }
+ 
+     if(!*str) {
+       failf(data, "Couldn't interpret the 227-response");
+       return CURLE_FTP_WEIRD_227_FORMAT;
+     }
+ 
+     /* we got OK from server */
+     if(data->set.ftp_skip_ip) {
+       /* told to ignore the remotely given IP but instead use the host we used
+          for the control connection */
+       infof(data, "Skip %u.%u.%u.%u for data connection, reuse %s instead",
+             ip[0], ip[1], ip[2], ip[3],
+             conn->host.name);
+       ftpc->newhost = strdup(control_address(conn));
+     }
+     else
+       ftpc->newhost = aprintf("%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+ 
+     if(!ftpc->newhost)
+       return CURLE_OUT_OF_MEMORY;
+ 
+     ftpc->newport = (unsigned short)(((ip[4]<<8) + ip[5]) & 0xffff);
+   }
+   else if(ftpc->count1 == 0) {
+     /* EPSV failed, move on to PASV */
+     return ftp_epsv_disable(data, conn);
+   }
+   else {
+     failf(data, "Bad PASV/EPSV response: %03d", ftpcode);
+     return CURLE_FTP_WEIRD_PASV_REPLY;
+   }
+ 
+ #ifndef CURL_DISABLE_PROXY
+   if(conn->bits.proxy) {
+     /*
+      * This connection uses a proxy and we need to connect to the proxy again
+      * here. We don't want to rely on a former host lookup that might've
+      * expired now, instead we remake the lookup here and now!
+      */
+     const char * const host_name = conn->bits.socksproxy ?
+       conn->socks_proxy.host.name : conn->http_proxy.host.name;
+     rc = Curl_resolv(data, host_name, conn->port, FALSE, &addr);
+     if(rc == CURLRESOLV_PENDING)
+       /* BLOCKING, ignores the return code but 'addr' will be NULL in
+          case of failure */
+       (void)Curl_resolver_wait_resolv(data, &addr);
+ 
+     connectport =
+       (unsigned short)conn->port; /* we connect to the proxy's port */
+ 
+     if(!addr) {
+       failf(data, "Can't resolve proxy host %s:%hu", host_name, connectport);
+       return CURLE_COULDNT_RESOLVE_PROXY;
+     }
+   }
+   else
+ #endif
+   {
+     /* normal, direct, ftp connection */
+     DEBUGASSERT(ftpc->newhost);
+ 
+     /* postponed address resolution in case of tcp fastopen */
+     if(conn->bits.tcp_fastopen && !conn->bits.reuse && !ftpc->newhost[0]) {
+       Curl_conn_ev_update_info(data, conn);
+       Curl_safefree(ftpc->newhost);
+       ftpc->newhost = strdup(control_address(conn));
+       if(!ftpc->newhost)
+         return CURLE_OUT_OF_MEMORY;
+     }
+ 
+     rc = Curl_resolv(data, ftpc->newhost, ftpc->newport, FALSE, &addr);
+     if(rc == CURLRESOLV_PENDING)
+       /* BLOCKING */
+       (void)Curl_resolver_wait_resolv(data, &addr);
+ 
+     connectport = ftpc->newport; /* we connect to the remote port */
+ 
+     if(!addr) {
+       failf(data, "Can't resolve new host %s:%hu", ftpc->newhost, connectport);
+       return CURLE_FTP_CANT_GET_HOST;
+     }
+   }
+ 
+   result = Curl_conn_setup(data, conn, SECONDARYSOCKET, addr,
+                            conn->bits.ftp_use_data_ssl?
+                            CURL_CF_SSL_ENABLE : CURL_CF_SSL_DISABLE);
+ 
+   if(result) {
+     Curl_resolv_unlock(data, addr); /* we're done using this address */
+     if(ftpc->count1 == 0 && ftpcode == 229)
+       return ftp_epsv_disable(data, conn);
+ 
+     return result;
+   }
+ 
+ 
+   /*
+    * When this is used from the multi interface, this might've returned with
+    * the 'connected' set to FALSE and thus we are now awaiting a non-blocking
+    * connect to connect.
+    */
+ 
+   if(data->set.verbose)
+     /* this just dumps information about this second connection */
+     ftp_pasv_verbose(data, addr->addr, ftpc->newhost, connectport);
+ 
+   Curl_resolv_unlock(data, addr); /* we're done using this address */
+ 
+   Curl_safefree(conn->secondaryhostname);
+   conn->secondary_port = ftpc->newport;
+   conn->secondaryhostname = strdup(ftpc->newhost);
+   if(!conn->secondaryhostname)
+     return CURLE_OUT_OF_MEMORY;
+ 
+   conn->bits.do_more = TRUE;
+   ftp_state(data, FTP_STOP); /* this phase is completed */
+ 
+   return result;
+ }
+@@ -2088,105 +2095,106 @@ static CURLcode client_write_header(struct Curl_easy *data,
+ static CURLcode ftp_state_mdtm_resp(struct Curl_easy *data,
+                                     int ftpcode)
+ {
+   CURLcode result = CURLE_OK;
+   struct FTP *ftp = data->req.p.ftp;
+   struct connectdata *conn = data->conn;
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+ 
+   switch(ftpcode) {
+   case 213:
+     {
+       /* we got a time. Format should be: "YYYYMMDDHHMMSS[.sss]" where the
+          last .sss part is optional and means fractions of a second */
+       int year, month, day, hour, minute, second;
+-      if(ftp_213_date(&data->state.buffer[4],
+-                      &year, &month, &day, &hour, &minute, &second)) {
++      struct pingpong *pp = &ftpc->pp;
++      char *resp = Curl_dyn_ptr(&pp->recvbuf) + 4;
++      if(ftp_213_date(resp, &year, &month, &day, &hour, &minute, &second)) {
+         /* we have a time, reformat it */
+         char timebuf[24];
+         msnprintf(timebuf, sizeof(timebuf),
+                   "%04d%02d%02d %02d:%02d:%02d GMT",
+                   year, month, day, hour, minute, second);
+         /* now, convert this into a time() value: */
+         data->info.filetime = Curl_getdate_capped(timebuf);
+       }
+ 
+ #ifdef CURL_FTP_HTTPSTYLE_HEAD
+       /* If we asked for a time of the file and we actually got one as well,
+          we "emulate" an HTTP-style header in our output. */
+ 
+       if(data->req.no_body &&
+          ftpc->file &&
+          data->set.get_filetime &&
+          (data->info.filetime >= 0) ) {
+         char headerbuf[128];
+         int headerbuflen;
+         time_t filetime = data->info.filetime;
+         struct tm buffer;
+         const struct tm *tm = &buffer;
+ 
+         result = Curl_gmtime(filetime, &buffer);
+         if(result)
+           return result;
+ 
+         /* format: "Tue, 15 Nov 1994 12:45:26" */
+         headerbuflen = msnprintf(headerbuf, sizeof(headerbuf),
+                   "Last-Modified: %s, %02d %s %4d %02d:%02d:%02d GMT\r\n",
+                   Curl_wkday[tm->tm_wday?tm->tm_wday-1:6],
+                   tm->tm_mday,
+                   Curl_month[tm->tm_mon],
+                   tm->tm_year + 1900,
+                   tm->tm_hour,
+                   tm->tm_min,
+                   tm->tm_sec);
+         result = client_write_header(data, headerbuf, headerbuflen);
+         if(result)
+           return result;
+       } /* end of a ridiculous amount of conditionals */
+ #endif
+     }
+     break;
+   default:
+     infof(data, "unsupported MDTM reply format");
+     break;
+   case 550: /* 550 is used for several different problems, e.g.
+                "No such file or directory" or "Permission denied".
+                It does not mean that the file does not exist at all. */
+     infof(data, "MDTM failed: file does not exist or permission problem,"
+           " continuing");
+     break;
+   }
+ 
+   if(data->set.timecondition) {
+     if((data->info.filetime > 0) && (data->set.timevalue > 0)) {
+       switch(data->set.timecondition) {
+       case CURL_TIMECOND_IFMODSINCE:
+       default:
+         if(data->info.filetime <= data->set.timevalue) {
+           infof(data, "The requested document is not new enough");
+           ftp->transfer = PPTRANSFER_NONE; /* mark to not transfer data */
+           data->info.timecond = TRUE;
+           ftp_state(data, FTP_STOP);
+           return CURLE_OK;
+         }
+         break;
+       case CURL_TIMECOND_IFUNMODSINCE:
+         if(data->info.filetime > data->set.timevalue) {
+           infof(data, "The requested document is not old enough");
+           ftp->transfer = PPTRANSFER_NONE; /* mark to not transfer data */
+           data->info.timecond = TRUE;
+           ftp_state(data, FTP_STOP);
+           return CURLE_OK;
+         }
+         break;
+       } /* switch */
+     }
+     else {
+       infof(data, "Skipping time comparison");
+     }
+   }
+ 
+   if(!result)
+     result = ftp_state_type(data);
+ 
+   return result;
+ }
+@@ -2308,62 +2316,63 @@ static CURLcode ftp_state_retr(struct Curl_easy *data,
+ static CURLcode ftp_state_size_resp(struct Curl_easy *data,
+                                     int ftpcode,
+                                     ftpstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   curl_off_t filesize = -1;
+-  char *buf = data->state.buffer;
++  char *buf = Curl_dyn_ptr(&data->conn->proto.ftpc.pp.recvbuf);
++  size_t len = data->conn->proto.ftpc.pp.nfinal;
+ 
+   /* get the size from the ascii string: */
+   if(ftpcode == 213) {
+     /* To allow servers to prepend "rubbish" in the response string, we scan
+        for all the digits at the end of the response and parse only those as a
+        number. */
+     char *start = &buf[4];
+-    char *fdigit = strchr(start, '\r');
++    char *fdigit = memchr(start, '\r', len);
+     if(fdigit) {
+-      do
++      fdigit--;
++      if(*fdigit == '\n')
++        fdigit--;
++      while(ISDIGIT(fdigit[-1]) && (fdigit > start))
+         fdigit--;
+-      while(ISDIGIT(*fdigit) && (fdigit > start));
+-      if(!ISDIGIT(*fdigit))
+-        fdigit++;
+     }
+     else
+       fdigit = start;
+     /* ignores parsing errors, which will make the size remain unknown */
+     (void)curlx_strtoofft(fdigit, NULL, 10, &filesize);
+ 
+   }
+   else if(ftpcode == 550) { /* "No such file or directory" */
+     /* allow a SIZE failure for (resumed) uploads, when probing what command
+        to use */
+     if(instate != FTP_STOR_SIZE) {
+       failf(data, "The file does not exist");
+       return CURLE_REMOTE_FILE_NOT_FOUND;
+     }
+   }
+ 
+   if(instate == FTP_SIZE) {
+ #ifdef CURL_FTP_HTTPSTYLE_HEAD
+     if(-1 != filesize) {
+       char clbuf[128];
+       int clbuflen = msnprintf(clbuf, sizeof(clbuf),
+                 "Content-Length: %" CURL_FORMAT_CURL_OFF_T "\r\n", filesize);
+       result = client_write_header(data, clbuf, clbuflen);
+       if(result)
+         return result;
+     }
+ #endif
+     Curl_pgrsSetDownloadSize(data, filesize);
+     result = ftp_state_rest(data, data->conn);
+   }
+   else if(instate == FTP_RETR_SIZE) {
+     Curl_pgrsSetDownloadSize(data, filesize);
+     result = ftp_state_retr(data, filesize);
+   }
+   else if(instate == FTP_STOR_SIZE) {
+     data->state.resume_from = filesize;
+     result = ftp_state_ul_setup(data, TRUE);
+   }
+ 
+   return result;
+ }
+@@ -2445,131 +2454,131 @@ static CURLcode ftp_state_stor_resp(struct Curl_easy *data,
+ /* for LIST and RETR responses */
+ static CURLcode ftp_state_get_resp(struct Curl_easy *data,
+                                    int ftpcode,
+                                    ftpstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct FTP *ftp = data->req.p.ftp;
+   struct connectdata *conn = data->conn;
+ 
+   if((ftpcode == 150) || (ftpcode == 125)) {
+ 
+     /*
+       A;
+       150 Opening BINARY mode data connection for /etc/passwd (2241
+       bytes).  (ok, the file is being transferred)
+ 
+       B:
+       150 Opening ASCII mode data connection for /bin/ls
+ 
+       C:
+       150 ASCII data connection for /bin/ls (137.167.104.91,37445) (0 bytes).
+ 
+       D:
+       150 Opening ASCII mode data connection for [file] (0.0.0.0,0) (545 bytes)
+ 
+       E:
+       125 Data connection already open; Transfer starting. */
+ 
+     curl_off_t size = -1; /* default unknown size */
+ 
+ 
+     /*
+      * It appears that there are FTP-servers that return size 0 for files when
+      * SIZE is used on the file while being in BINARY mode. To work around
+      * that (stupid) behavior, we attempt to parse the RETR response even if
+      * the SIZE returned size zero.
+      *
+      * Debugging help from Salvatore Sorrentino on February 26, 2003.
+      */
+ 
+     if((instate != FTP_LIST) &&
+        !data->state.prefer_ascii &&
+        !data->set.ignorecl &&
+        (ftp->downloadsize < 1)) {
+       /*
+        * It seems directory listings either don't show the size or very
+        * often uses size 0 anyway. ASCII transfers may very well turn out
+        * that the transferred amount of data is not the same as this line
+        * tells, why using this number in those cases only confuses us.
+        *
+        * Example D above makes this parsing a little tricky */
+       char *bytes;
+-      char *buf = data->state.buffer;
++      char *buf = Curl_dyn_ptr(&conn->proto.ftpc.pp.recvbuf);
+       bytes = strstr(buf, " bytes");
+       if(bytes) {
+         long in = (long)(--bytes-buf);
+         /* this is a hint there is size information in there! ;-) */
+         while(--in) {
+           /* scan for the left parenthesis and break there */
+           if('(' == *bytes)
+             break;
+           /* skip only digits */
+           if(!ISDIGIT(*bytes)) {
+             bytes = NULL;
+             break;
+           }
+           /* one more estep backwards */
+           bytes--;
+         }
+         /* if we have nothing but digits: */
+         if(bytes) {
+           ++bytes;
+           /* get the number! */
+           (void)curlx_strtoofft(bytes, NULL, 10, &size);
+         }
+       }
+     }
+     else if(ftp->downloadsize > -1)
+       size = ftp->downloadsize;
+ 
+     if(size > data->req.maxdownload && data->req.maxdownload > 0)
+       size = data->req.size = data->req.maxdownload;
+     else if((instate != FTP_LIST) && (data->state.prefer_ascii))
+       size = -1; /* kludge for servers that understate ASCII mode file size */
+ 
+     infof(data, "Maxdownload = %" CURL_FORMAT_CURL_OFF_T,
+           data->req.maxdownload);
+ 
+     if(instate != FTP_LIST)
+       infof(data, "Getting file with size: %" CURL_FORMAT_CURL_OFF_T,
+             size);
+ 
+     /* FTP download: */
+     conn->proto.ftpc.state_saved = instate;
+     conn->proto.ftpc.retr_size_saved = size;
+ 
+     if(data->set.ftp_use_port) {
+       bool connected;
+ 
+       result = AllowServerConnect(data, &connected);
+       if(result)
+         return result;
+ 
+       if(!connected) {
+         struct ftp_conn *ftpc = &conn->proto.ftpc;
+         infof(data, "Data conn was not available immediately");
+         ftp_state(data, FTP_STOP);
+         ftpc->wait_data_conn = TRUE;
+       }
+     }
+     else
+       return InitiateTransfer(data);
+   }
+   else {
+     if((instate == FTP_LIST) && (ftpcode == 450)) {
+       /* simply no matching files in the dir listing */
+       ftp->transfer = PPTRANSFER_NONE; /* don't download anything */
+       ftp_state(data, FTP_STOP); /* this phase is over */
+     }
+     else {
+       failf(data, "RETR response: %03d", ftpcode);
+       return instate == FTP_RETR && ftpcode == 550?
+         CURLE_REMOTE_FILE_NOT_FOUND:
+         CURLE_FTP_COULDNT_RETR_FILE;
+     }
+   }
+ 
+   return result;
+ }
+ 
+ /* after USER, PASS and ACCT */
+@@ -2681,451 +2690,451 @@ static CURLcode ftp_state_acct_resp(struct Curl_easy *data,
+ static CURLcode ftp_statemachine(struct Curl_easy *data,
+                                  struct connectdata *conn)
+ {
+   CURLcode result;
+   curl_socket_t sock = conn->sock[FIRSTSOCKET];
+   int ftpcode;
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+   struct pingpong *pp = &ftpc->pp;
+   static const char * const ftpauth[] = { "SSL", "TLS" };
+   size_t nread = 0;
+ 
+   if(pp->sendleft)
+     return Curl_pp_flushsend(data, pp);
+ 
+   result = ftp_readresp(data, sock, pp, &ftpcode, &nread);
+   if(result)
+     return result;
+ 
+   if(ftpcode) {
+     /* we have now received a full FTP server response */
+     switch(ftpc->state) {
+     case FTP_WAIT220:
+       if(ftpcode == 230) {
+         /* 230 User logged in - already! Take as 220 if TLS required. */
+         if(data->set.use_ssl <= CURLUSESSL_TRY ||
+            conn->bits.ftp_use_control_ssl)
+           return ftp_state_user_resp(data, ftpcode);
+       }
+       else if(ftpcode != 220) {
+         failf(data, "Got a %03d ftp-server response when 220 was expected",
+               ftpcode);
+         return CURLE_WEIRD_SERVER_REPLY;
+       }
+ 
+       /* We have received a 220 response fine, now we proceed. */
+ #ifdef HAVE_GSSAPI
+       if(data->set.krb) {
+         /* If not anonymous login, try a secure login. Note that this
+            procedure is still BLOCKING. */
+ 
+         Curl_sec_request_prot(conn, "private");
+         /* We set private first as default, in case the line below fails to
+            set a valid level */
+         Curl_sec_request_prot(conn, data->set.str[STRING_KRB_LEVEL]);
+ 
+         if(Curl_sec_login(data, conn)) {
+           failf(data, "secure login failed");
+           return CURLE_WEIRD_SERVER_REPLY;
+         }
+         infof(data, "Authentication successful");
+       }
+ #endif
+ 
+       if(data->set.use_ssl && !conn->bits.ftp_use_control_ssl) {
+         /* We don't have a SSL/TLS control connection yet, but FTPS is
+            requested. Try a FTPS connection now */
+ 
+         ftpc->count3 = 0;
+         switch(data->set.ftpsslauth) {
+         case CURLFTPAUTH_DEFAULT:
+         case CURLFTPAUTH_SSL:
+           ftpc->count2 = 1; /* add one to get next */
+           ftpc->count1 = 0;
+           break;
+         case CURLFTPAUTH_TLS:
+           ftpc->count2 = -1; /* subtract one to get next */
+           ftpc->count1 = 1;
+           break;
+         default:
+           failf(data, "unsupported parameter to CURLOPT_FTPSSLAUTH: %d",
+                 (int)data->set.ftpsslauth);
+           return CURLE_UNKNOWN_OPTION; /* we don't know what to do */
+         }
+         result = Curl_pp_sendf(data, &ftpc->pp, "AUTH %s",
+                                ftpauth[ftpc->count1]);
+         if(!result)
+           ftp_state(data, FTP_AUTH);
+       }
+       else
+         result = ftp_state_user(data, conn);
+       break;
+ 
+     case FTP_AUTH:
+       /* we have gotten the response to a previous AUTH command */
+ 
+-      if(pp->cache_size)
++      if(pp->overflow)
+         return CURLE_WEIRD_SERVER_REPLY; /* Forbid pipelining in response. */
+ 
+       /* RFC2228 (page 5) says:
+        *
+        * If the server is willing to accept the named security mechanism,
+        * and does not require any security data, it must respond with
+        * reply code 234/334.
+        */
+ 
+       if((ftpcode == 234) || (ftpcode == 334)) {
+         /* this was BLOCKING, keep it so for now */
+         bool done;
+         if(!Curl_conn_is_ssl(conn, FIRSTSOCKET)) {
+           result = Curl_ssl_cfilter_add(data, conn, FIRSTSOCKET);
+           if(result) {
+             /* we failed and bail out */
+             return CURLE_USE_SSL_FAILED;
+           }
+         }
+         result = Curl_conn_connect(data, FIRSTSOCKET, TRUE, &done);
+         if(!result) {
+           conn->bits.ftp_use_data_ssl = FALSE; /* clear-text data */
+           conn->bits.ftp_use_control_ssl = TRUE; /* SSL on control */
+           result = ftp_state_user(data, conn);
+         }
+       }
+       else if(ftpc->count3 < 1) {
+         ftpc->count3++;
+         ftpc->count1 += ftpc->count2; /* get next attempt */
+         result = Curl_pp_sendf(data, &ftpc->pp, "AUTH %s",
+                                ftpauth[ftpc->count1]);
+         /* remain in this same state */
+       }
+       else {
+         if(data->set.use_ssl > CURLUSESSL_TRY)
+           /* we failed and CURLUSESSL_CONTROL or CURLUSESSL_ALL is set */
+           result = CURLE_USE_SSL_FAILED;
+         else
+           /* ignore the failure and continue */
+           result = ftp_state_user(data, conn);
+       }
+       break;
+ 
+     case FTP_USER:
+     case FTP_PASS:
+       result = ftp_state_user_resp(data, ftpcode);
+       break;
+ 
+     case FTP_ACCT:
+       result = ftp_state_acct_resp(data, ftpcode);
+       break;
+ 
+     case FTP_PBSZ:
+       result =
+         Curl_pp_sendf(data, &ftpc->pp, "PROT %c",
+                       data->set.use_ssl == CURLUSESSL_CONTROL ? 'C' : 'P');
+       if(!result)
+         ftp_state(data, FTP_PROT);
+       break;
+ 
+     case FTP_PROT:
+       if(ftpcode/100 == 2)
+         /* We have enabled SSL for the data connection! */
+         conn->bits.ftp_use_data_ssl =
+           (data->set.use_ssl != CURLUSESSL_CONTROL) ? TRUE : FALSE;
+       /* FTP servers typically responds with 500 if they decide to reject
+          our 'P' request */
+       else if(data->set.use_ssl > CURLUSESSL_CONTROL)
+         /* we failed and bails out */
+         return CURLE_USE_SSL_FAILED;
+ 
+       if(data->set.ftp_ccc) {
+         /* CCC - Clear Command Channel
+          */
+         result = Curl_pp_sendf(data, &ftpc->pp, "%s", "CCC");
+         if(!result)
+           ftp_state(data, FTP_CCC);
+       }
+       else
+         result = ftp_state_pwd(data, conn);
+       break;
+ 
+     case FTP_CCC:
+       if(ftpcode < 500) {
+         /* First shut down the SSL layer (note: this call will block) */
+         result = Curl_ssl_cfilter_remove(data, FIRSTSOCKET);
+ 
+         if(result)
+           failf(data, "Failed to clear the command channel (CCC)");
+       }
+       if(!result)
+         /* Then continue as normal */
+         result = ftp_state_pwd(data, conn);
+       break;
+ 
+     case FTP_PWD:
+       if(ftpcode == 257) {
+-        char *ptr = &data->state.buffer[4];  /* start on the first letter */
+-        const size_t buf_size = data->set.buffer_size;
++        char *ptr = Curl_dyn_ptr(&pp->recvbuf) + 4; /* start on the first
++                                                       letter */
+         bool entry_extracted = FALSE;
+         struct dynbuf out;
+         Curl_dyn_init(&out, 1000);
+ 
+         /* Reply format is like
+            257<space>[rubbish]"<directory-name>"<space><commentary> and the
+            RFC959 says
+ 
+            The directory name can contain any character; embedded
+            double-quotes should be escaped by double-quotes (the
+            "quote-doubling" convention).
+         */
+ 
+         /* scan for the first double-quote for non-standard responses */
+-        while(ptr < &data->state.buffer[buf_size]
+-              && *ptr != '\n' && *ptr != '\0' && *ptr != '"')
++        while(*ptr != '\n' && *ptr != '\0' && *ptr != '"')
+           ptr++;
+ 
+         if('\"' == *ptr) {
+           /* it started good */
+           for(ptr++; *ptr; ptr++) {
+             if('\"' == *ptr) {
+               if('\"' == ptr[1]) {
+                 /* "quote-doubling" */
+                 result = Curl_dyn_addn(&out, &ptr[1], 1);
+                 ptr++;
+               }
+               else {
+                 /* end of path */
+                 if(Curl_dyn_len(&out))
+                   entry_extracted = TRUE;
+                 break; /* get out of this loop */
+               }
+             }
+             else
+               result = Curl_dyn_addn(&out, ptr, 1);
+             if(result)
+               return result;
+           }
+         }
+         if(entry_extracted) {
+           /* If the path name does not look like an absolute path (i.e.: it
+              does not start with a '/'), we probably need some server-dependent
+              adjustments. For example, this is the case when connecting to
+              an OS400 FTP server: this server supports two name syntaxes,
+              the default one being incompatible with standard paths. In
+              addition, this server switches automatically to the regular path
+              syntax when one is encountered in a command: this results in
+              having an entrypath in the wrong syntax when later used in CWD.
+                The method used here is to check the server OS: we do it only
+              if the path name looks strange to minimize overhead on other
+              systems. */
+           char *dir = Curl_dyn_ptr(&out);
+ 
+           if(!ftpc->server_os && dir[0] != '/') {
+             result = Curl_pp_sendf(data, &ftpc->pp, "%s", "SYST");
+             if(result) {
+               free(dir);
+               return result;
+             }
+             Curl_safefree(ftpc->entrypath);
+             ftpc->entrypath = dir; /* remember this */
+             infof(data, "Entry path is '%s'", ftpc->entrypath);
+             /* also save it where getinfo can access it: */
+             data->state.most_recent_ftp_entrypath = ftpc->entrypath;
+             ftp_state(data, FTP_SYST);
+             break;
+           }
+ 
+           Curl_safefree(ftpc->entrypath);
+           ftpc->entrypath = dir; /* remember this */
+           infof(data, "Entry path is '%s'", ftpc->entrypath);
+           /* also save it where getinfo can access it: */
+           data->state.most_recent_ftp_entrypath = ftpc->entrypath;
+         }
+         else {
+           /* couldn't get the path */
+           Curl_dyn_free(&out);
+           infof(data, "Failed to figure out path");
+         }
+       }
+       ftp_state(data, FTP_STOP); /* we are done with the CONNECT phase! */
+       DEBUGF(infof(data, "protocol connect phase DONE"));
+       break;
+ 
+     case FTP_SYST:
+       if(ftpcode == 215) {
+-        char *ptr = &data->state.buffer[4];  /* start on the first letter */
++        char *ptr = Curl_dyn_ptr(&pp->recvbuf) + 4; /* start on the first
++                                                       letter */
+         char *os;
+         char *start;
+ 
+         /* Reply format is like
+            215<space><OS-name><space><commentary>
+         */
+         while(*ptr == ' ')
+           ptr++;
+         for(start = ptr; *ptr && *ptr != ' '; ptr++)
+           ;
+         os = Curl_memdup0(start, ptr - start);
+         if(!os)
+           return CURLE_OUT_OF_MEMORY;
+ 
+         /* Check for special servers here. */
+         if(strcasecompare(os, "OS/400")) {
+           /* Force OS400 name format 1. */
+           result = Curl_pp_sendf(data, &ftpc->pp, "%s", "SITE NAMEFMT 1");
+           if(result) {
+             free(os);
+             return result;
+           }
+           /* remember target server OS */
+           Curl_safefree(ftpc->server_os);
+           ftpc->server_os = os;
+           ftp_state(data, FTP_NAMEFMT);
+           break;
+         }
+         /* Nothing special for the target server. */
+         /* remember target server OS */
+         Curl_safefree(ftpc->server_os);
+         ftpc->server_os = os;
+       }
+       else {
+         /* Cannot identify server OS. Continue anyway and cross fingers. */
+       }
+ 
+       ftp_state(data, FTP_STOP); /* we are done with the CONNECT phase! */
+       DEBUGF(infof(data, "protocol connect phase DONE"));
+       break;
+ 
+     case FTP_NAMEFMT:
+       if(ftpcode == 250) {
+         /* Name format change successful: reload initial path. */
+         ftp_state_pwd(data, conn);
+         break;
+       }
+ 
+       ftp_state(data, FTP_STOP); /* we are done with the CONNECT phase! */
+       DEBUGF(infof(data, "protocol connect phase DONE"));
+       break;
+ 
+     case FTP_QUOTE:
+     case FTP_POSTQUOTE:
+     case FTP_RETR_PREQUOTE:
+     case FTP_STOR_PREQUOTE:
+       if((ftpcode >= 400) && !ftpc->count2) {
+         /* failure response code, and not allowed to fail */
+         failf(data, "QUOT command failed with %03d", ftpcode);
+         result = CURLE_QUOTE_ERROR;
+       }
+       else
+         result = ftp_state_quote(data, FALSE, ftpc->state);
+       break;
+ 
+     case FTP_CWD:
+       if(ftpcode/100 != 2) {
+         /* failure to CWD there */
+         if(data->set.ftp_create_missing_dirs &&
+            ftpc->cwdcount && !ftpc->count2) {
+           /* try making it */
+           ftpc->count2++; /* counter to prevent CWD-MKD loops */
+ 
+           /* count3 is set to allow MKD to fail once per dir. In the case when
+           CWD fails and then MKD fails (due to another session raced it to
+           create the dir) this then allows for a second try to CWD to it. */
+           ftpc->count3 = (data->set.ftp_create_missing_dirs == 2) ? 1 : 0;
+ 
+           result = Curl_pp_sendf(data, &ftpc->pp, "MKD %s",
+                                  ftpc->dirs[ftpc->cwdcount - 1]);
+           if(!result)
+             ftp_state(data, FTP_MKD);
+         }
+         else {
+           /* return failure */
+           failf(data, "Server denied you to change to the given directory");
+           ftpc->cwdfail = TRUE; /* don't remember this path as we failed
+                                    to enter it */
+           result = CURLE_REMOTE_ACCESS_DENIED;
+         }
+       }
+       else {
+         /* success */
+         ftpc->count2 = 0;
+         if(++ftpc->cwdcount <= ftpc->dirdepth)
+           /* send next CWD */
+           result = Curl_pp_sendf(data, &ftpc->pp, "CWD %s",
+                                  ftpc->dirs[ftpc->cwdcount - 1]);
+         else
+           result = ftp_state_mdtm(data);
+       }
+       break;
+ 
+     case FTP_MKD:
+       if((ftpcode/100 != 2) && !ftpc->count3--) {
+         /* failure to MKD the dir */
+         failf(data, "Failed to MKD dir: %03d", ftpcode);
+         result = CURLE_REMOTE_ACCESS_DENIED;
+       }
+       else {
+         ftp_state(data, FTP_CWD);
+         /* send CWD */
+         result = Curl_pp_sendf(data, &ftpc->pp, "CWD %s",
+                                ftpc->dirs[ftpc->cwdcount - 1]);
+       }
+       break;
+ 
+     case FTP_MDTM:
+       result = ftp_state_mdtm_resp(data, ftpcode);
+       break;
+ 
+     case FTP_TYPE:
+     case FTP_LIST_TYPE:
+     case FTP_RETR_TYPE:
+     case FTP_STOR_TYPE:
+       result = ftp_state_type_resp(data, ftpcode, ftpc->state);
+       break;
+ 
+     case FTP_SIZE:
+     case FTP_RETR_SIZE:
+     case FTP_STOR_SIZE:
+       result = ftp_state_size_resp(data, ftpcode, ftpc->state);
+       break;
+ 
+     case FTP_REST:
+     case FTP_RETR_REST:
+       result = ftp_state_rest_resp(data, conn, ftpcode, ftpc->state);
+       break;
+ 
+     case FTP_PRET:
+       if(ftpcode != 200) {
+         /* there only is this one standard OK return code. */
+         failf(data, "PRET command not accepted: %03d", ftpcode);
+         return CURLE_FTP_PRET_FAILED;
+       }
+       result = ftp_state_use_pasv(data, conn);
+       break;
+ 
+     case FTP_PASV:
+       result = ftp_state_pasv_resp(data, ftpcode);
+       break;
+ 
+     case FTP_PORT:
+       result = ftp_state_port_resp(data, ftpcode);
+       break;
+ 
+     case FTP_LIST:
+     case FTP_RETR:
+       result = ftp_state_get_resp(data, ftpcode, ftpc->state);
+       break;
+ 
+     case FTP_STOR:
+       result = ftp_state_stor_resp(data, ftpcode, ftpc->state);
+       break;
+ 
+     case FTP_QUIT:
+     default:
+       /* internal error */
+       ftp_state(data, FTP_STOP);
+       break;
+     }
+   } /* if(ftpcode) */
+ 
+   return result;
+ }
+ 
+ 
+ /* called repeatedly until done from multi.c */
+@@ -3163,52 +3172,51 @@ static CURLcode ftp_block_statemach(struct Curl_easy *data,
+ /*
+  * ftp_connect() should do everything that is to be considered a part of
+  * the connection phase.
+  *
+  * The variable 'done' points to will be TRUE if the protocol-layer connect
+  * phase is done when this function returns, or FALSE if not.
+  *
+  */
+ static CURLcode ftp_connect(struct Curl_easy *data,
+                             bool *done) /* see description above */
+ {
+   CURLcode result;
+   struct connectdata *conn = data->conn;
+   struct ftp_conn *ftpc = &conn->proto.ftpc;
+   struct pingpong *pp = &ftpc->pp;
+ 
+   *done = FALSE; /* default to not done yet */
+ 
+   /* We always support persistent connections on ftp */
+   connkeep(conn, "FTP default");
+ 
+   PINGPONG_SETUP(pp, ftp_statemachine, ftp_endofresp);
+ 
+   if(conn->handler->flags & PROTOPT_SSL) {
+     /* BLOCKING */
+     result = Curl_conn_connect(data, FIRSTSOCKET, TRUE, done);
+     if(result)
+       return result;
+     conn->bits.ftp_use_control_ssl = TRUE;
+   }
+ 
+-  Curl_pp_setup(pp); /* once per transfer */
+-  Curl_pp_init(data, pp); /* init the generic pingpong data */
++  Curl_pp_init(pp); /* once per transfer */
+ 
+   /* When we connect, we start in the state where we await the 220
+      response */
+   ftp_state(data, FTP_WAIT220);
+ 
+   result = ftp_multi_statemach(data, done);
+ 
+   return result;
+ }
+ 
+ /***********************************************************************
+  *
+  * ftp_done()
+  *
+  * The DONE function. This does what needs to be done after a single DO has
+  * performed.
+  *
+  * Input argument is already checked for validity.
+  */
+diff --git a/lib/imap.c b/lib/imap.c
+index 869ded85a..f9211d966 100644
+--- a/lib/imap.c
++++ b/lib/imap.c
+@@ -350,40 +350,40 @@ static bool imap_endofresp(struct Curl_easy *data, struct connectdata *conn,
+ /***********************************************************************
+  *
+  * imap_get_message()
+  *
+  * Gets the authentication message from the response buffer.
+  */
+ static CURLcode imap_get_message(struct Curl_easy *data, struct bufref *out)
+ {
+-  char *message = data->state.buffer;
+-  size_t len = strlen(message);
++  char *message = Curl_dyn_ptr(&data->conn->proto.imapc.pp.recvbuf);
++  size_t len = data->conn->proto.imapc.pp.nfinal;
+ 
+   if(len > 2) {
+     /* Find the start of the message */
+     len -= 2;
+     for(message += 2; *message == ' ' || *message == '\t'; message++, len--)
+       ;
+ 
+     /* Find the end of the message */
+     while(len--)
+       if(message[len] != '\r' && message[len] != '\n' && message[len] != ' ' &&
+          message[len] != '\t')
+         break;
+ 
+     /* Terminate the message */
+     message[++len] = '\0';
+     Curl_bufref_set(out, message, len, NULL);
+   }
+   else
+     /* junk input => zero length output */
+     Curl_bufref_set(out, "", 0, NULL);
+ 
+   return CURLE_OK;
+ }
+ 
+ /***********************************************************************
+  *
+  * imap_state()
+  *
+  * This is the ONLY way to change IMAP state!
+  */
+@@ -891,112 +891,112 @@ static CURLcode imap_state_servergreet_resp(struct Curl_easy *data,
+ /* For CAPABILITY responses */
+ static CURLcode imap_state_capability_resp(struct Curl_easy *data,
+                                            int imapcode,
+                                            imapstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct imap_conn *imapc = &conn->proto.imapc;
+-  const char *line = data->state.buffer;
++  const char *line = Curl_dyn_ptr(&imapc->pp.recvbuf);
+ 
+   (void)instate; /* no use for this yet */
+ 
+   /* Do we have a untagged response? */
+   if(imapcode == '*') {
+     line += 2;
+ 
+     /* Loop through the data line */
+     for(;;) {
+       size_t wordlen;
+       while(*line &&
+             (*line == ' ' || *line == '\t' ||
+               *line == '\r' || *line == '\n')) {
+ 
+         line++;
+       }
+ 
+       if(!*line)
+         break;
+ 
+       /* Extract the word */
+       for(wordlen = 0; line[wordlen] && line[wordlen] != ' ' &&
+             line[wordlen] != '\t' && line[wordlen] != '\r' &&
+             line[wordlen] != '\n';)
+         wordlen++;
+ 
+       /* Does the server support the STARTTLS capability? */
+       if(wordlen == 8 && !memcmp(line, "STARTTLS", 8))
+         imapc->tls_supported = TRUE;
+ 
+       /* Has the server explicitly disabled clear text authentication? */
+       else if(wordlen == 13 && !memcmp(line, "LOGINDISABLED", 13))
+         imapc->login_disabled = TRUE;
+ 
+       /* Does the server support the SASL-IR capability? */
+       else if(wordlen == 7 && !memcmp(line, "SASL-IR", 7))
+         imapc->ir_supported = TRUE;
+ 
+       /* Do we have a SASL based authentication mechanism? */
+       else if(wordlen > 5 && !memcmp(line, "AUTH=", 5)) {
+         size_t llen;
+         unsigned short mechbit;
+ 
+         line += 5;
+         wordlen -= 5;
+ 
+         /* Test the word for a matching authentication mechanism */
+         mechbit = Curl_sasl_decode_mech(line, wordlen, &llen);
+         if(mechbit && llen == wordlen)
+           imapc->sasl.authmechs |= mechbit;
+       }
+ 
+       line += wordlen;
+     }
+   }
+   else if(data->set.use_ssl && !Curl_conn_is_ssl(conn, FIRSTSOCKET)) {
+     /* PREAUTH is not compatible with STARTTLS. */
+     if(imapcode == IMAP_RESP_OK && imapc->tls_supported && !imapc->preauth) {
+       /* Switch to TLS connection now */
+       result = imap_perform_starttls(data);
+     }
+     else if(data->set.use_ssl <= CURLUSESSL_TRY)
+       result = imap_perform_authentication(data, conn);
+     else {
+       failf(data, "STARTTLS not available.");
+       result = CURLE_USE_SSL_FAILED;
+     }
+   }
+   else
+     result = imap_perform_authentication(data, conn);
+ 
+   return result;
+ }
+ 
+ /* For STARTTLS responses */
+ static CURLcode imap_state_starttls_resp(struct Curl_easy *data,
+                                          int imapcode,
+                                          imapstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   /* Pipelining in response is forbidden. */
+-  if(data->conn->proto.imapc.pp.cache_size)
++  if(data->conn->proto.imapc.pp.overflow)
+     return CURLE_WEIRD_SERVER_REPLY;
+ 
+   if(imapcode != IMAP_RESP_OK) {
+     if(data->set.use_ssl != CURLUSESSL_TRY) {
+       failf(data, "STARTTLS denied");
+       result = CURLE_USE_SSL_FAILED;
+     }
+     else
+       result = imap_perform_authentication(data, conn);
+   }
+   else
+     result = imap_perform_upgrade_tls(data, conn);
+ 
+   return result;
+ }
+ 
+ /* For SASL authentication responses */
+@@ -1055,186 +1055,182 @@ static CURLcode imap_state_login_resp(struct Curl_easy *data,
+ /* For LIST and SEARCH responses */
+ static CURLcode imap_state_listsearch_resp(struct Curl_easy *data,
+                                            int imapcode,
+                                            imapstate instate)
+ {
+   CURLcode result = CURLE_OK;
+-  char *line = data->state.buffer;
+-  size_t len = strlen(line);
++  char *line = Curl_dyn_ptr(&data->conn->proto.imapc.pp.recvbuf);
++  size_t len = data->conn->proto.imapc.pp.nfinal;
+ 
+   (void)instate; /* No use for this yet */
+ 
+-  if(imapcode == '*') {
+-    /* Temporarily add the LF character back and send as body to the client */
+-    line[len] = '\n';
+-    result = Curl_client_write(data, CLIENTWRITE_BODY, line, len + 1);
+-    line[len] = '\0';
+-  }
++  if(imapcode == '*')
++    result = Curl_client_write(data, CLIENTWRITE_BODY, line, len);
+   else if(imapcode != IMAP_RESP_OK)
+     result = CURLE_QUOTE_ERROR;
+   else
+     /* End of DO phase */
+     imap_state(data, IMAP_STOP);
+ 
+   return result;
+ }
+ 
+ /* For SELECT responses */
+ static CURLcode imap_state_select_resp(struct Curl_easy *data, int imapcode,
+                                        imapstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct IMAP *imap = data->req.p.imap;
+   struct imap_conn *imapc = &conn->proto.imapc;
+-  const char *line = data->state.buffer;
++  const char *line = Curl_dyn_ptr(&data->conn->proto.imapc.pp.recvbuf);
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if(imapcode == '*') {
+     /* See if this is an UIDVALIDITY response */
+     if(checkprefix("OK [UIDVALIDITY ", line + 2)) {
+       size_t len = 0;
+       const char *p = &line[2] + strlen("OK [UIDVALIDITY ");
+       while((len < 20) && p[len] && ISDIGIT(p[len]))
+         len++;
+       if(len && (p[len] == ']')) {
+         struct dynbuf uid;
+         Curl_dyn_init(&uid, 20);
+         if(Curl_dyn_addn(&uid, p, len))
+           return CURLE_OUT_OF_MEMORY;
+         Curl_safefree(imapc->mailbox_uidvalidity);
+         imapc->mailbox_uidvalidity = Curl_dyn_ptr(&uid);
+       }
+     }
+   }
+   else if(imapcode == IMAP_RESP_OK) {
+     /* Check if the UIDVALIDITY has been specified and matches */
+     if(imap->uidvalidity && imapc->mailbox_uidvalidity &&
+        !strcasecompare(imap->uidvalidity, imapc->mailbox_uidvalidity)) {
+       failf(data, "Mailbox UIDVALIDITY has changed");
+       result = CURLE_REMOTE_FILE_NOT_FOUND;
+     }
+     else {
+       /* Note the currently opened mailbox on this connection */
+       DEBUGASSERT(!imapc->mailbox);
+       imapc->mailbox = strdup(imap->mailbox);
+       if(!imapc->mailbox)
+         return CURLE_OUT_OF_MEMORY;
+ 
+       if(imap->custom)
+         result = imap_perform_list(data);
+       else if(imap->query)
+         result = imap_perform_search(data);
+       else
+         result = imap_perform_fetch(data);
+     }
+   }
+   else {
+     failf(data, "Select failed");
+     result = CURLE_LOGIN_DENIED;
+   }
+ 
+   return result;
+ }
+ 
+ /* For the (first line of the) FETCH responses */
+ static CURLcode imap_state_fetch_resp(struct Curl_easy *data,
+                                       struct connectdata *conn, int imapcode,
+                                       imapstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct imap_conn *imapc = &conn->proto.imapc;
+   struct pingpong *pp = &imapc->pp;
+-  const char *ptr = data->state.buffer;
++  const char *ptr = Curl_dyn_ptr(&data->conn->proto.imapc.pp.recvbuf);
++  size_t len = data->conn->proto.imapc.pp.nfinal;
+   bool parsed = FALSE;
+   curl_off_t size = 0;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if(imapcode != '*') {
+     Curl_pgrsSetDownloadSize(data, -1);
+     imap_state(data, IMAP_STOP);
+     return CURLE_REMOTE_FILE_NOT_FOUND;
+   }
+ 
+   /* Something like this is received "* 1 FETCH (BODY[TEXT] {2021}\r" so parse
+      the continuation data contained within the curly brackets */
+-  while(*ptr && (*ptr != '{'))
+-    ptr++;
+-
+-  if(*ptr == '{') {
++  ptr = memchr(ptr, '{', len);
++  if(ptr) {
+     char *endptr;
+-    if(!curlx_strtoofft(ptr + 1, &endptr, 10, &size)) {
+-      if(endptr - ptr > 1 && endptr[0] == '}' &&
+-         endptr[1] == '\r' && endptr[2] == '\0')
+-        parsed = TRUE;
+-    }
++    if(!curlx_strtoofft(ptr + 1, &endptr, 10, &size) &&
++       (endptr - ptr > 1 && *endptr == '}'))
++      parsed = TRUE;
+   }
+ 
+   if(parsed) {
+     infof(data, "Found %" CURL_FORMAT_CURL_OFF_T " bytes to download",
+           size);
+     Curl_pgrsSetDownloadSize(data, size);
+ 
+-    if(pp->cache) {
+-      /* At this point there is a bunch of data in the header "cache" that is
+-         actually body content, send it as body and then skip it. Do note
+-         that there may even be additional "headers" after the body. */
+-      size_t chunk = pp->cache_size;
++    if(pp->overflow) {
++      /* At this point there is a data in the receive buffer that is body
++         content, send it as body and then skip it. Do note that there may
++         even be additional "headers" after the body. */
++      size_t chunk = pp->overflow;
++
++      /* keep only the overflow */
++      Curl_dyn_tail(&pp->recvbuf, chunk);
++      pp->nfinal = 0; /* done */
+ 
+       if(chunk > (size_t)size)
+         /* The conversion from curl_off_t to size_t is always fine here */
+         chunk = (size_t)size;
+ 
+       if(!chunk) {
+         /* no size, we're done with the data */
+         imap_state(data, IMAP_STOP);
+         return CURLE_OK;
+       }
+-      result = Curl_client_write(data, CLIENTWRITE_BODY, pp->cache, chunk);
++      result = Curl_client_write(data, CLIENTWRITE_BODY,
++                                 Curl_dyn_ptr(&pp->recvbuf), chunk);
+       if(result)
+         return result;
+ 
+       infof(data, "Written %zu bytes, %" CURL_FORMAT_CURL_OFF_TU
+             " bytes are left for transfer", chunk, size - chunk);
+ 
+-      /* Have we used the entire cache or just part of it?*/
+-      if(pp->cache_size > chunk) {
+-        /* Only part of it so shrink the cache to fit the trailing data */
+-        memmove(pp->cache, pp->cache + chunk, pp->cache_size - chunk);
+-        pp->cache_size -= chunk;
++      /* Have we used the entire overflow or just part of it?*/
++      if(pp->overflow > chunk) {
++        /* remember the remaining trailing overflow data */
++        pp->overflow -= chunk;
++        Curl_dyn_tail(&pp->recvbuf, pp->overflow);
+       }
+       else {
++        pp->overflow = 0; /* handled */
+         /* Free the cache */
+-        Curl_safefree(pp->cache);
+-
+-        /* Reset the cache size */
+-        pp->cache_size = 0;
++        Curl_dyn_reset(&pp->recvbuf);
+       }
+     }
+ 
+     if(data->req.bytecount == size)
+       /* The entire data is already transferred! */
+       Curl_setup_transfer(data, -1, -1, FALSE, -1);
+     else {
+       /* IMAP download */
+       data->req.maxdownload = size;
+       /* force a recv/send check of this connection, as the data might've been
+        read off the socket already */
+       data->state.select_bits = CURL_CSELECT_IN;
+       Curl_setup_transfer(data, FIRSTSOCKET, size, FALSE, -1);
+     }
+   }
+   else {
+     /* We don't know how to parse this line */
+     failf(data, "Failed to parse FETCH response.");
+     result = CURLE_WEIRD_SERVER_REPLY;
+   }
+ 
+   /* End of DO phase */
+   imap_state(data, IMAP_STOP);
+ 
+   return result;
+ }
+ 
+ /* For final FETCH responses performed after the download */
+@@ -1446,58 +1442,56 @@ static int imap_getsock(struct Curl_easy *data,
+ /***********************************************************************
+  *
+  * imap_connect()
+  *
+  * This function should do everything that is to be considered a part of the
+  * connection phase.
+  *
+  * The variable 'done' points to will be TRUE if the protocol-layer connect
+  * phase is done when this function returns, or FALSE if not.
+  */
+ static CURLcode imap_connect(struct Curl_easy *data, bool *done)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct imap_conn *imapc = &conn->proto.imapc;
+   struct pingpong *pp = &imapc->pp;
+ 
+   *done = FALSE; /* default to not done yet */
+ 
+   /* We always support persistent connections in IMAP */
+   connkeep(conn, "IMAP default");
+ 
+   PINGPONG_SETUP(pp, imap_statemachine, imap_endofresp);
+ 
+   /* Set the default preferred authentication type and mechanism */
+   imapc->preftype = IMAP_TYPE_ANY;
+   Curl_sasl_init(&imapc->sasl, data, &saslimap);
+ 
+   Curl_dyn_init(&imapc->dyn, DYN_IMAP_CMD);
+-  /* Initialise the pingpong layer */
+-  Curl_pp_setup(pp);
+-  Curl_pp_init(data, pp);
++  Curl_pp_init(pp);
+ 
+   /* Parse the URL options */
+   result = imap_parse_url_options(conn);
+   if(result)
+     return result;
+ 
+   /* Start off waiting for the server greeting response */
+   imap_state(data, IMAP_SERVERGREET);
+ 
+   /* Start off with an response id of '*' */
+   strcpy(imapc->resptag, "*");
+ 
+   result = imap_multi_statemach(data, done);
+ 
+   return result;
+ }
+ 
+ /***********************************************************************
+  *
+  * imap_done()
+  *
+  * The DONE function. This does what needs to be done after a single DO has
+  * performed.
+  *
+  * Input argument is already checked for validity.
+  */
+diff --git a/lib/pingpong.c b/lib/pingpong.c
+index 2e062e249..b976ffbea 100644
+--- a/lib/pingpong.c
++++ b/lib/pingpong.c
+@@ -80,368 +80,298 @@ timediff_t Curl_pp_state_timeout(struct Curl_easy *data,
+ /*
+  * Curl_pp_statemach()
+  */
+ CURLcode Curl_pp_statemach(struct Curl_easy *data,
+                            struct pingpong *pp, bool block,
+                            bool disconnecting)
+ {
+   struct connectdata *conn = data->conn;
+   curl_socket_t sock = conn->sock[FIRSTSOCKET];
+   int rc;
+   timediff_t interval_ms;
+   timediff_t timeout_ms = Curl_pp_state_timeout(data, pp, disconnecting);
+   CURLcode result = CURLE_OK;
+ 
+   if(timeout_ms <= 0) {
+     failf(data, "server response timeout");
+     return CURLE_OPERATION_TIMEDOUT; /* already too little time */
+   }
+ 
+   if(block) {
+     interval_ms = 1000;  /* use 1 second timeout intervals */
+     if(timeout_ms < interval_ms)
+       interval_ms = timeout_ms;
+   }
+   else
+     interval_ms = 0; /* immediate */
+ 
+   if(Curl_conn_data_pending(data, FIRSTSOCKET))
+     rc = 1;
+-  else if(Curl_pp_moredata(pp))
++  else if(pp->overflow)
+     /* We are receiving and there is data in the cache so just read it */
+     rc = 1;
+   else if(!pp->sendleft && Curl_conn_data_pending(data, FIRSTSOCKET))
+     /* We are receiving and there is data ready in the SSL library */
+     rc = 1;
+   else
+     rc = Curl_socket_check(pp->sendleft?CURL_SOCKET_BAD:sock, /* reading */
+                            CURL_SOCKET_BAD,
+                            pp->sendleft?sock:CURL_SOCKET_BAD, /* writing */
+                            interval_ms);
+ 
+   if(block) {
+     /* if we didn't wait, we don't have to spend time on this now */
+     if(Curl_pgrsUpdate(data))
+       result = CURLE_ABORTED_BY_CALLBACK;
+     else
+       result = Curl_speedcheck(data, Curl_now());
+ 
+     if(result)
+       return result;
+   }
+ 
+   if(rc == -1) {
+     failf(data, "select/poll error");
+     result = CURLE_OUT_OF_MEMORY;
+   }
+   else if(rc)
+     result = pp->statemachine(data, data->conn);
+ 
+   return result;
+ }
+ 
+ /* initialize stuff to prepare for reading a fresh new response */
+-void Curl_pp_init(struct Curl_easy *data, struct pingpong *pp)
++void Curl_pp_init(struct pingpong *pp)
+ {
+-  DEBUGASSERT(data);
+   pp->nread_resp = 0;
+-  pp->linestart_resp = data->state.buffer;
+-  pp->pending_resp = TRUE;
+   pp->response = Curl_now(); /* start response time-out now! */
+-}
+-
+-/* setup for the coming transfer */
+-void Curl_pp_setup(struct pingpong *pp)
+-{
++  pp->pending_resp = TRUE;
+   Curl_dyn_init(&pp->sendbuf, DYN_PINGPPONG_CMD);
++  Curl_dyn_init(&pp->recvbuf, DYN_PINGPPONG_CMD);
+ }
+ 
+ /***********************************************************************
+  *
+  * Curl_pp_vsendf()
+  *
+  * Send the formatted string as a command to a pingpong server. Note that
+  * the string should not have any CRLF appended, as this function will
+  * append the necessary things itself.
+  *
+  * made to never block
+  */
+ CURLcode Curl_pp_vsendf(struct Curl_easy *data,
+                         struct pingpong *pp,
+                         const char *fmt,
+                         va_list args)
+ {
+   ssize_t bytes_written = 0;
+   size_t write_len;
+   char *s;
+   CURLcode result;
+   struct connectdata *conn = data->conn;
+ 
+ #ifdef HAVE_GSSAPI
+   enum protection_level data_sec;
+ #endif
+ 
+   DEBUGASSERT(pp->sendleft == 0);
+   DEBUGASSERT(pp->sendsize == 0);
+   DEBUGASSERT(pp->sendthis == NULL);
+ 
+   if(!conn)
+     /* can't send without a connection! */
+     return CURLE_SEND_ERROR;
+ 
+   Curl_dyn_reset(&pp->sendbuf);
+   result = Curl_dyn_vaddf(&pp->sendbuf, fmt, args);
+   if(result)
+     return result;
+ 
+   /* append CRLF */
+   result = Curl_dyn_addn(&pp->sendbuf, "\r\n", 2);
+   if(result)
+     return result;
+ 
++  pp->pending_resp = TRUE;
+   write_len = Curl_dyn_len(&pp->sendbuf);
+   s = Curl_dyn_ptr(&pp->sendbuf);
+-  Curl_pp_init(data, pp);
+ 
+ #ifdef HAVE_GSSAPI
+   conn->data_prot = PROT_CMD;
+ #endif
+   result = Curl_nwrite(data, FIRSTSOCKET, s, write_len, &bytes_written);
+   if(result)
+     return result;
+ #ifdef HAVE_GSSAPI
+   data_sec = conn->data_prot;
+   DEBUGASSERT(data_sec > PROT_NONE && data_sec < PROT_LAST);
+   conn->data_prot = (unsigned char)data_sec;
+ #endif
+ 
+   Curl_debug(data, CURLINFO_HEADER_OUT, s, (size_t)bytes_written);
+ 
+   if(bytes_written != (ssize_t)write_len) {
+     /* the whole chunk was not sent, keep it around and adjust sizes */
+     pp->sendthis = s;
+     pp->sendsize = write_len;
+     pp->sendleft = write_len - bytes_written;
+   }
+   else {
+     pp->sendthis = NULL;
+     pp->sendleft = pp->sendsize = 0;
+     pp->response = Curl_now();
+   }
+ 
+   return CURLE_OK;
+ }
+ 
+ 
+ /***********************************************************************
+  *
+  * Curl_pp_sendf()
+  *
+  * Send the formatted string as a command to a pingpong server. Note that
+  * the string should not have any CRLF appended, as this function will
+  * append the necessary things itself.
+  *
+  * made to never block
+  */
+ CURLcode Curl_pp_sendf(struct Curl_easy *data, struct pingpong *pp,
+                        const char *fmt, ...)
+ {
+   CURLcode result;
+   va_list ap;
+   va_start(ap, fmt);
+ 
+   result = Curl_pp_vsendf(data, pp, fmt, ap);
+ 
+   va_end(ap);
+ 
+   return result;
+ }
+ 
++static CURLcode pingpong_read(struct Curl_easy *data,
++                              curl_socket_t sockfd,
++                              char *buffer,
++                              size_t buflen,
++                              ssize_t *nread)
++{
++  CURLcode result;
++#ifdef HAVE_GSSAPI
++  enum protection_level prot = data->conn->data_prot;
++  data->conn->data_prot = PROT_CLEAR;
++#endif
++  result = Curl_read(data, sockfd, buffer, buflen, nread);
++#ifdef HAVE_GSSAPI
++  DEBUGASSERT(prot  > PROT_NONE && prot < PROT_LAST);
++  data->conn->data_prot = (unsigned char)prot;
++#endif
++  return result;
++}
++
+ /*
+  * Curl_pp_readresp()
+  *
+  * Reads a piece of a server response.
+  */
+ CURLcode Curl_pp_readresp(struct Curl_easy *data,
+                           curl_socket_t sockfd,
+                           struct pingpong *pp,
+                           int *code, /* return the server code if done */
+                           size_t *size) /* size of the response */
+ {
+-  ssize_t perline; /* count bytes per line */
+-  bool keepon = TRUE;
+-  ssize_t gotbytes;
+-  char *ptr;
+   struct connectdata *conn = data->conn;
+-  char * const buf = data->state.buffer;
+   CURLcode result = CURLE_OK;
+ 
+   *code = 0; /* 0 for errors or not done */
+   *size = 0;
+ 
+-  ptr = buf + pp->nread_resp;
++  if(pp->nfinal) {
++    /* a previous call left this many bytes in the beginning of the buffer as
++       that was the final line; now ditch that */
++    size_t full = Curl_dyn_len(&pp->recvbuf);
+ 
+-  /* number of bytes in the current line, so far */
+-  perline = (ssize_t)(ptr-pp->linestart_resp);
++    /* trim off the "final" leading part */
++    Curl_dyn_tail(&pp->recvbuf, full -  pp->nfinal);
+ 
+-  while((pp->nread_resp < (size_t)data->set.buffer_size) &&
+-        (keepon && !result)) {
++    pp->nfinal = 0; /* now gone */
++  }
++  if(!pp->overflow) {
++    ssize_t gotbytes = 0;
++    char buffer[900];
+ 
+-    if(pp->cache) {
+-      /* we had data in the "cache", copy that instead of doing an actual
+-       * read
+-       *
+-       * pp->cache_size is cast to ssize_t here.  This should be safe, because
+-       * it would have been populated with something of size int to begin
+-       * with, even though its datatype may be larger than an int.
+-       */
+-      if((ptr + pp->cache_size) > (buf + data->set.buffer_size + 1)) {
+-        failf(data, "cached response data too big to handle");
+-        return CURLE_WEIRD_SERVER_REPLY;
+-      }
+-      memcpy(ptr, pp->cache, pp->cache_size);
+-      gotbytes = (ssize_t)pp->cache_size;
+-      free(pp->cache);    /* free the cache */
+-      pp->cache = NULL;   /* clear the pointer */
+-      pp->cache_size = 0; /* zero the size just in case */
+-    }
+-    else {
+-#ifdef HAVE_GSSAPI
+-      enum protection_level prot = conn->data_prot;
+-      conn->data_prot = PROT_CLEAR;
+-#endif
+-      DEBUGASSERT((ptr + data->set.buffer_size - pp->nread_resp) <=
+-                  (buf + data->set.buffer_size + 1));
+-      result = Curl_read(data, sockfd, ptr,
+-                         data->set.buffer_size - pp->nread_resp,
+-                         &gotbytes);
+-#ifdef HAVE_GSSAPI
+-      DEBUGASSERT(prot  > PROT_NONE && prot < PROT_LAST);
+-      conn->data_prot = (unsigned char)prot;
+-#endif
+-      if(result == CURLE_AGAIN)
+-        return CURLE_OK; /* return */
++    result = pingpong_read(data, sockfd, buffer, sizeof(buffer), &gotbytes);
++    if(result == CURLE_AGAIN)
++      return CURLE_OK;
+ 
+-      if(result)
+-        /* Set outer result variable to this error. */
+-        keepon = FALSE;
+-    }
++    if(result)
++      return result;
+ 
+-    if(!keepon)
+-      ;
+-    else if(gotbytes <= 0) {
+-      keepon = FALSE;
+-      result = CURLE_RECV_ERROR;
++    if(gotbytes <= 0) {
+       failf(data, "response reading failed (errno: %d)", SOCKERRNO);
++      return CURLE_RECV_ERROR;
+     }
+-    else {
+-      /* we got a whole chunk of data, which can be anything from one
+-       * byte to a set of lines and possible just a piece of the last
+-       * line */
+-      ssize_t i;
+-      ssize_t clipamount = 0;
+-      bool restart = FALSE;
+-
+-      data->req.headerbytecount += (unsigned int)gotbytes;
+-
+-      pp->nread_resp += gotbytes;
+-      for(i = 0; i < gotbytes; ptr++, i++) {
+-        perline++;
+-        if(*ptr == '\n') {
+-          /* a newline is CRLF in pp-talk, so the CR is ignored as
+-             the line isn't really terminated until the LF comes */
+-
+-          /* output debug output if that is requested */
++
++    result = Curl_dyn_addn(&pp->recvbuf, buffer, gotbytes);
++    if(result)
++      return result;
++
++    data->req.headerbytecount += (unsigned int)gotbytes;
++
++    pp->nread_resp += gotbytes;
++  }
++
++  do {
++    char *line = Curl_dyn_ptr(&pp->recvbuf);
++    char *nl = memchr(line, '\n', Curl_dyn_len(&pp->recvbuf));
++    if(nl) {
++      /* a newline is CRLF in pp-talk, so the CR is ignored as
++         the line isn't really terminated until the LF comes */
++      size_t length = nl - line + 1;
++
++      /* output debug output if that is requested */
+ #ifdef HAVE_GSSAPI
+-          if(!conn->sec_complete)
++      if(!conn->sec_complete)
+ #endif
+-            Curl_debug(data, CURLINFO_HEADER_IN,
+-                       pp->linestart_resp, (size_t)perline);
+-
+-          /*
+-           * We pass all response-lines to the callback function registered
+-           * for "headers". The response lines can be seen as a kind of
+-           * headers.
+-           */
+-          result = Curl_client_write(data, CLIENTWRITE_INFO,
+-                                     pp->linestart_resp, perline);
+-          if(result)
+-            return result;
+-
+-          if(pp->endofresp(data, conn, pp->linestart_resp, perline, code)) {
+-            /* This is the end of the last line, copy the last line to the
+-               start of the buffer and null-terminate, for old times sake */
+-            size_t n = ptr - pp->linestart_resp;
+-            memmove(buf, pp->linestart_resp, n);
+-            buf[n] = 0; /* null-terminate */
+-            keepon = FALSE;
+-            pp->linestart_resp = ptr + 1; /* advance pointer */
+-            i++; /* skip this before getting out */
+-
+-            *size = pp->nread_resp; /* size of the response */
+-            pp->nread_resp = 0; /* restart */
+-            break;
+-          }
+-          perline = 0; /* line starts over here */
+-          pp->linestart_resp = ptr + 1;
+-        }
+-      }
++        Curl_debug(data, CURLINFO_HEADER_IN, line, length);
+ 
+-      if(!keepon && (i != gotbytes)) {
+-        /* We found the end of the response lines, but we didn't parse the
+-           full chunk of data we have read from the server. We therefore need
+-           to store the rest of the data to be checked on the next invoke as
+-           it may actually contain another end of response already! */
+-        clipamount = gotbytes - i;
+-        restart = TRUE;
+-        DEBUGF(infof(data, "Curl_pp_readresp_ %d bytes of trailing "
+-                     "server response left",
+-                     (int)clipamount));
+-      }
+-      else if(keepon) {
+-
+-        if((perline == gotbytes) &&
+-           (gotbytes > (ssize_t)data->set.buffer_size/2)) {
+-          /* We got an excessive line without newlines and we need to deal
+-             with it. We keep the first bytes of the line then we throw
+-             away the rest. */
+-          infof(data, "Excessive server response line length received, "
+-                "%zd bytes. Stripping", gotbytes);
+-          restart = TRUE;
+-
+-          /* we keep 40 bytes since all our pingpong protocols are only
+-             interested in the first piece */
+-          clipamount = 40;
+-        }
+-        else if(pp->nread_resp > (size_t)data->set.buffer_size/2) {
+-          /* We got a large chunk of data and there's potentially still
+-             trailing data to take care of, so we put any such part in the
+-             "cache", clear the buffer to make space and restart. */
+-          clipamount = perline;
+-          restart = TRUE;
+-        }
+-      }
+-      else if(i == gotbytes)
+-        restart = TRUE;
+-
+-      if(clipamount) {
+-        pp->cache_size = clipamount;
+-        pp->cache = Curl_memdup(pp->linestart_resp, pp->cache_size);
+-        if(!pp->cache)
+-          return CURLE_OUT_OF_MEMORY;
+-      }
+-      if(restart) {
+-        /* now reset a few variables to start over nicely from the start of
+-           the big buffer */
+-        pp->nread_resp = 0; /* start over from scratch in the buffer */
+-        ptr = pp->linestart_resp = buf;
+-        perline = 0;
++      /*
++       * Pass all response-lines to the callback function registered for
++       * "headers". The response lines can be seen as a kind of headers.
++       */
++      result = Curl_client_write(data, CLIENTWRITE_INFO, line, length);
++      if(result)
++        return result;
++
++      if(pp->endofresp(data, conn, line, length, code)) {
++        /* When at "end of response", keep the endofresp line first in the
++           buffer since it will be accessed outside (by pingpong
++           parsers). Store the overflow counter to inform about additional
++           data in this buffer after the endofresp line. */
++        pp->nfinal = length;
++        if(Curl_dyn_len(&pp->recvbuf) > length)
++          pp->overflow = Curl_dyn_len(&pp->recvbuf) - length;
++        else
++          pp->overflow = 0;
++        *size = pp->nread_resp; /* size of the response */
++        pp->nread_resp = 0; /* restart */
++        break;
+       }
++      if(Curl_dyn_len(&pp->recvbuf) > length)
++        /* keep the remaining piece */
++        Curl_dyn_tail((&pp->recvbuf), Curl_dyn_len(&pp->recvbuf) - length);
++      else
++        Curl_dyn_reset(&pp->recvbuf);
++    }
++    else {
++      /* without a newline, there is no overflow */
++      pp->overflow = 0;
++      break;
++    }
+ 
+-    } /* there was data */
+-
+-  } /* while there's buffer left and loop is requested */
++  } while(1); /* while there's buffer left to scan */
+ 
+   pp->pending_resp = FALSE;
+ 
+   return result;
+ }
+@@ -487,14 +417,13 @@ CURLcode Curl_pp_flushsend(struct Curl_easy *data,
+ CURLcode Curl_pp_disconnect(struct pingpong *pp)
+ {
+   Curl_dyn_free(&pp->sendbuf);
+-  Curl_safefree(pp->cache);
++  Curl_dyn_free(&pp->recvbuf);
+   return CURLE_OK;
+ }
+ 
+ bool Curl_pp_moredata(struct pingpong *pp)
+ {
+-  return (!pp->sendleft && pp->cache && pp->nread_resp < pp->cache_size) ?
+-    TRUE : FALSE;
++  return (!pp->sendleft && Curl_dyn_len(&pp->recvbuf));
+ }
+ 
+ #endif
+diff --git a/lib/pingpong.h b/lib/pingpong.h
+index 24061d86a..006b9c538 100644
+--- a/lib/pingpong.h
++++ b/lib/pingpong.h
+@@ -43,46 +43,45 @@ typedef enum {
+ /*
+  * 'pingpong' is the generic struct used for protocols doing server<->client
+  * conversations in a back-and-forth style such as FTP, IMAP, POP3, SMTP etc.
+  *
+  * It holds response cache and non-blocking sending data.
+  */
+ struct pingpong {
+-  char *cache;     /* data cache between getresponse()-calls */
+-  size_t cache_size;  /* size of cache in bytes */
+   size_t nread_resp;  /* number of bytes currently read of a server response */
+-  char *linestart_resp; /* line start pointer for the server response
+-                           reader function */
+   bool pending_resp;  /* set TRUE when a server response is pending or in
+                          progress, and is cleared once the last response is
+                          read */
+-  char *sendthis; /* allocated pointer to a buffer that is to be sent to the
+-                     server */
++  char *sendthis; /* pointer to a buffer that is to be sent to the server */
+   size_t sendleft; /* number of bytes left to send from the sendthis buffer */
+   size_t sendsize; /* total size of the sendthis buffer */
+   struct curltime response; /* set to Curl_now() when a command has been sent
+                                off, used to time-out response reading */
+   timediff_t response_time; /* When no timeout is given, this is the amount of
+                                milliseconds we await for a server response. */
+   struct dynbuf sendbuf;
++  struct dynbuf recvbuf;
++  size_t overflow; /* number of bytes left after a final response line */
++  size_t nfinal;   /* number of bytes in the final response line, which
++                      after a match is first in the receice buffer */
+ 
+   /* Function pointers the protocols MUST implement and provide for the
+      pingpong layer to function */
+ 
+   CURLcode (*statemachine)(struct Curl_easy *data, struct connectdata *conn);
+   bool (*endofresp)(struct Curl_easy *data, struct connectdata *conn,
+                     char *ptr, size_t len, int *code);
+ };
+ 
+ #define PINGPONG_SETUP(pp,s,e)                   \
+   do {                                           \
+     pp->response_time = RESP_TIMEOUT;            \
+     pp->statemachine = s;                        \
+     pp->endofresp = e;                           \
+   } while(0)
+ 
+ /*
+  * Curl_pp_statemach()
+  *
+  * called repeatedly until done. Set 'wait' to make it wait a while on the
+  * socket if there's no traffic.
+  */
+@@ -90,10 +89,7 @@ CURLcode Curl_pp_statemach(struct Curl_easy *data, struct pingpong *pp,
+                            bool block, bool disconnecting);
+ 
+ /* initialize stuff to prepare for reading a fresh new response */
+-void Curl_pp_init(struct Curl_easy *data, struct pingpong *pp);
+-
+-/* setup for the transfer */
+-void Curl_pp_setup(struct pingpong *pp);
++void Curl_pp_init(struct pingpong *pp);
+ 
+ /* Returns timeout in ms. 0 or negative number means the timeout has already
+    triggered */
+diff --git a/lib/pop3.c b/lib/pop3.c
+index 64e786d71..cf2519282 100644
+--- a/lib/pop3.c
++++ b/lib/pop3.c
+@@ -247,40 +247,40 @@ static bool pop3_endofresp(struct Curl_easy *data, struct connectdata *conn,
+ /***********************************************************************
+  *
+  * pop3_get_message()
+  *
+  * Gets the authentication message from the response buffer.
+  */
+ static CURLcode pop3_get_message(struct Curl_easy *data, struct bufref *out)
+ {
+-  char *message = data->state.buffer;
+-  size_t len = strlen(message);
++  char *message = Curl_dyn_ptr(&data->conn->proto.pop3c.pp.recvbuf);
++  size_t len = data->conn->proto.pop3c.pp.nfinal;
+ 
+   if(len > 2) {
+     /* Find the start of the message */
+     len -= 2;
+     for(message += 2; *message == ' ' || *message == '\t'; message++, len--)
+       ;
+ 
+     /* Find the end of the message */
+     while(len--)
+       if(message[len] != '\r' && message[len] != '\n' && message[len] != ' ' &&
+          message[len] != '\t')
+         break;
+ 
+     /* Terminate the message */
+     message[++len] = '\0';
+     Curl_bufref_set(out, message, len, NULL);
+   }
+   else
+     /* junk input => zero length output */
+     Curl_bufref_set(out, "", 0, NULL);
+ 
+   return CURLE_OK;
+ }
+ 
+ /***********************************************************************
+  *
+  * pop3_state()
+  *
+  * This is the ONLY way to change POP3 state!
+  */
+@@ -644,171 +644,164 @@ static CURLcode pop3_perform_quit(struct Curl_easy *data,
+ /* For the initial server greeting */
+ static CURLcode pop3_state_servergreet_resp(struct Curl_easy *data,
+                                             int pop3code,
+                                             pop3state instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct pop3_conn *pop3c = &conn->proto.pop3c;
+-  const char *line = data->state.buffer;
+-  size_t len = strlen(line);
++  const char *line = Curl_dyn_ptr(&data->conn->proto.pop3c.pp.recvbuf);
++  size_t len = data->conn->proto.pop3c.pp.nfinal;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if(pop3code != '+') {
+     failf(data, "Got unexpected pop3-server response");
+     result = CURLE_WEIRD_SERVER_REPLY;
+   }
+-  else {
++  else if(len > 3) {
+     /* Does the server support APOP authentication? */
+-    if(len >= 4 && line[len - 2] == '>') {
+-      /* Look for the APOP timestamp */
+-      size_t i;
+-      for(i = 3; i < len - 2; ++i) {
+-        if(line[i] == '<') {
+-          /* Calculate the length of the timestamp */
+-          size_t timestamplen = len - 1 - i;
+-          char *at;
+-          if(!timestamplen)
+-            break;
+-
+-          /* dupe the timestamp */
+-          pop3c->apoptimestamp = Curl_memdup0(&line[i], timestamplen);
+-          if(!pop3c->apoptimestamp) {
+-            result = CURLE_OUT_OF_MEMORY;
+-            break;
+-          }
+-
+-          /* If the timestamp does not contain '@' it is not (as required by
+-             RFC-1939) conformant to the RFC-822 message id syntax, and we
+-             therefore do not use APOP authentication. */
+-          at = strchr(pop3c->apoptimestamp, '@');
+-          if(!at)
+-            Curl_safefree(pop3c->apoptimestamp);
+-          else
+-            /* Store the APOP capability */
+-            pop3c->authtypes |= POP3_TYPE_APOP;
+-          break;
+-        }
++    char *lt;
++    char *gt = NULL;
++
++    /* Look for the APOP timestamp */
++    lt = memchr(line, '<', len);
++    if(lt)
++      /* search the remainder for '>' */
++      gt = memchr(lt, '>', len - (lt - line));
++    if(gt) {
++      /* the length of the timestamp, including the brackets */
++      size_t timestamplen = gt - lt + 1;
++      char *at = memchr(lt, '@', timestamplen);
++      /* If the timestamp does not contain '@' it is not (as required by
++         RFC-1939) conformant to the RFC-822 message id syntax, and we
++         therefore do not use APOP authentication. */
++      if(at) {
++        /* dupe the timestamp */
++        pop3c->apoptimestamp = Curl_memdup0(lt, timestamplen);
++        if(!pop3c->apoptimestamp)
++          return CURLE_OUT_OF_MEMORY;
++        /* Store the APOP capability */
++        pop3c->authtypes |= POP3_TYPE_APOP;
+       }
+     }
+ 
+     if(!result)
+       result = pop3_perform_capa(data, conn);
+   }
+ 
+   return result;
+ }
+ 
+ /* For CAPA responses */
+ static CURLcode pop3_state_capa_resp(struct Curl_easy *data, int pop3code,
+                                      pop3state instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct pop3_conn *pop3c = &conn->proto.pop3c;
+-  const char *line = data->state.buffer;
+-  size_t len = strlen(line);
++  const char *line = Curl_dyn_ptr(&data->conn->proto.pop3c.pp.recvbuf);
++  size_t len = data->conn->proto.pop3c.pp.nfinal;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   /* Do we have a untagged continuation response? */
+   if(pop3code == '*') {
+     /* Does the server support the STLS capability? */
+     if(len >= 4 && !memcmp(line, "STLS", 4))
+       pop3c->tls_supported = TRUE;
+ 
+     /* Does the server support clear text authentication? */
+     else if(len >= 4 && !memcmp(line, "USER", 4))
+       pop3c->authtypes |= POP3_TYPE_CLEARTEXT;
+ 
+     /* Does the server support SASL based authentication? */
+     else if(len >= 5 && !memcmp(line, "SASL ", 5)) {
+       pop3c->authtypes |= POP3_TYPE_SASL;
+ 
+       /* Advance past the SASL keyword */
+       line += 5;
+       len -= 5;
+ 
+       /* Loop through the data line */
+       for(;;) {
+         size_t llen;
+         size_t wordlen;
+         unsigned short mechbit;
+ 
+         while(len &&
+               (*line == ' ' || *line == '\t' ||
+                *line == '\r' || *line == '\n')) {
+ 
+           line++;
+           len--;
+         }
+ 
+         if(!len)
+           break;
+ 
+         /* Extract the word */
+         for(wordlen = 0; wordlen < len && line[wordlen] != ' ' &&
+               line[wordlen] != '\t' && line[wordlen] != '\r' &&
+               line[wordlen] != '\n';)
+           wordlen++;
+ 
+         /* Test the word for a matching authentication mechanism */
+         mechbit = Curl_sasl_decode_mech(line, wordlen, &llen);
+         if(mechbit && llen == wordlen)
+           pop3c->sasl.authmechs |= mechbit;
+ 
+         line += wordlen;
+         len -= wordlen;
+       }
+     }
+   }
+   else {
+     /* Clear text is supported when CAPA isn't recognised */
+     if(pop3code != '+')
+       pop3c->authtypes |= POP3_TYPE_CLEARTEXT;
+ 
+     if(!data->set.use_ssl || Curl_conn_is_ssl(conn, FIRSTSOCKET))
+       result = pop3_perform_authentication(data, conn);
+     else if(pop3code == '+' && pop3c->tls_supported)
+       /* Switch to TLS connection now */
+       result = pop3_perform_starttls(data, conn);
+     else if(data->set.use_ssl <= CURLUSESSL_TRY)
+       /* Fallback and carry on with authentication */
+       result = pop3_perform_authentication(data, conn);
+     else {
+       failf(data, "STLS not supported.");
+       result = CURLE_USE_SSL_FAILED;
+     }
+   }
+ 
+   return result;
+ }
+ 
+ /* For STARTTLS responses */
+ static CURLcode pop3_state_starttls_resp(struct Curl_easy *data,
+                                          struct connectdata *conn,
+                                          int pop3code,
+                                          pop3state instate)
+ {
+   CURLcode result = CURLE_OK;
+   (void)instate; /* no use for this yet */
+ 
+   /* Pipelining in response is forbidden. */
+-  if(data->conn->proto.pop3c.pp.cache_size)
++  if(data->conn->proto.pop3c.pp.overflow)
+     return CURLE_WEIRD_SERVER_REPLY;
+ 
+   if(pop3code != '+') {
+     if(data->set.use_ssl != CURLUSESSL_TRY) {
+       failf(data, "STARTTLS denied");
+       result = CURLE_USE_SSL_FAILED;
+     }
+     else
+       result = pop3_perform_authentication(data, conn);
+   }
+   else
+     result = pop3_perform_upgrade_tls(data, conn);
+ 
+   return result;
+ }
+ 
+ /* For SASL authentication responses */
+@@ -914,56 +907,61 @@ static CURLcode pop3_state_pass_resp(struct Curl_easy *data, int pop3code,
+ /* For command responses */
+ static CURLcode pop3_state_command_resp(struct Curl_easy *data,
+                                         int pop3code,
+                                         pop3state instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct POP3 *pop3 = data->req.p.pop3;
+   struct pop3_conn *pop3c = &conn->proto.pop3c;
+   struct pingpong *pp = &pop3c->pp;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if(pop3code != '+') {
+     pop3_state(data, POP3_STOP);
+     return CURLE_WEIRD_SERVER_REPLY;
+   }
+ 
+   /* This 'OK' line ends with a CR LF pair which is the two first bytes of the
+      EOB string so count this is two matching bytes. This is necessary to make
+      the code detect the EOB if the only data than comes now is %2e CR LF like
+      when there is no body to return. */
+   pop3c->eob = 2;
+ 
+   /* But since this initial CR LF pair is not part of the actual body, we set
+      the strip counter here so that these bytes won't be delivered. */
+   pop3c->strip = 2;
+ 
+   if(pop3->transfer == PPTRANSFER_BODY) {
+     /* POP3 download */
+     Curl_setup_transfer(data, FIRSTSOCKET, -1, FALSE, -1);
+ 
+-    if(pp->cache) {
+-      /* The header "cache" contains a bunch of data that is actually body
+-         content so send it as such. Note that there may even be additional
+-         "headers" after the body */
++    if(pp->overflow) {
++      /* The recv buffer contains data that is actually body content so send
++         it as such. Note that there may even be additional "headers" after
++         the body */
++
++      /* keep only the overflow */
++      Curl_dyn_tail(&pp->recvbuf, pp->overflow);
++      pp->nfinal = 0; /* done */
+ 
+       if(!data->req.no_body) {
+-        result = Curl_pop3_write(data, pp->cache, pp->cache_size);
++        result = Curl_pop3_write(data, Curl_dyn_ptr(&pp->recvbuf),
++                                 Curl_dyn_len(&pp->recvbuf));
+         if(result)
+           return result;
+       }
+ 
+-      /* Free the cache */
+-      Curl_safefree(pp->cache);
+-
+-      /* Reset the cache size */
+-      pp->cache_size = 0;
++      /* reset the buffer */
++      Curl_dyn_reset(&pp->recvbuf);
++      pp->overflow = 0;
+     }
+   }
++  else
++    pp->overflow = 0;
+ 
+   /* End of DO phase */
+   pop3_state(data, POP3_STOP);
+ 
+   return result;
+ }
+@@ -1104,54 +1102,53 @@ static int pop3_getsock(struct Curl_easy *data,
+ /***********************************************************************
+  *
+  * pop3_connect()
+  *
+  * This function should do everything that is to be considered a part of the
+  * connection phase.
+  *
+  * The variable 'done' points to will be TRUE if the protocol-layer connect
+  * phase is done when this function returns, or FALSE if not.
+  */
+ static CURLcode pop3_connect(struct Curl_easy *data, bool *done)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct pop3_conn *pop3c = &conn->proto.pop3c;
+   struct pingpong *pp = &pop3c->pp;
+ 
+   *done = FALSE; /* default to not done yet */
+ 
+   /* We always support persistent connections in POP3 */
+   connkeep(conn, "POP3 default");
+ 
+   PINGPONG_SETUP(pp, pop3_statemachine, pop3_endofresp);
+ 
+   /* Set the default preferred authentication type and mechanism */
+   pop3c->preftype = POP3_TYPE_ANY;
+   Curl_sasl_init(&pop3c->sasl, data, &saslpop3);
+ 
+   /* Initialise the pingpong layer */
+-  Curl_pp_setup(pp);
+-  Curl_pp_init(data, pp);
++  Curl_pp_init(pp);
+ 
+   /* Parse the URL options */
+   result = pop3_parse_url_options(conn);
+   if(result)
+     return result;
+ 
+   /* Start off waiting for the server greeting response */
+   pop3_state(data, POP3_SERVERGREET);
+ 
+   result = pop3_multi_statemach(data, done);
+ 
+   return result;
+ }
+ 
+ /***********************************************************************
+  *
+  * pop3_done()
+  *
+  * The DONE function. This does what needs to be done after a single DO has
+  * performed.
+  *
+  * Input argument is already checked for validity.
+  */
+diff --git a/lib/smtp.c b/lib/smtp.c
+index db1a96b31..bfe7b8f12 100644
+--- a/lib/smtp.c
++++ b/lib/smtp.c
+@@ -245,40 +245,40 @@ static bool smtp_endofresp(struct Curl_easy *data, struct connectdata *conn,
+ /***********************************************************************
+  *
+  * smtp_get_message()
+  *
+  * Gets the authentication message from the response buffer.
+  */
+ static CURLcode smtp_get_message(struct Curl_easy *data, struct bufref *out)
+ {
+-  char *message = data->state.buffer;
+-  size_t len = strlen(message);
++  char *message = Curl_dyn_ptr(&data->conn->proto.smtpc.pp.recvbuf);
++  size_t len = data->conn->proto.smtpc.pp.nfinal;
+ 
+   if(len > 4) {
+     /* Find the start of the message */
+     len -= 4;
+     for(message += 4; *message == ' ' || *message == '\t'; message++, len--)
+       ;
+ 
+     /* Find the end of the message */
+     while(len--)
+       if(message[len] != '\r' && message[len] != '\n' && message[len] != ' ' &&
+          message[len] != '\t')
+         break;
+ 
+     /* Terminate the message */
+     message[++len] = '\0';
+     Curl_bufref_set(out, message, len, NULL);
+   }
+   else
+     /* junk input => zero length output */
+     Curl_bufref_set(out, "", 0, NULL);
+ 
+   return CURLE_OK;
+ }
+ 
+ /***********************************************************************
+  *
+  * smtp_state()
+  *
+  * This is the ONLY way to change SMTP state!
+  */
+@@ -853,131 +853,131 @@ static CURLcode smtp_state_servergreet_resp(struct Curl_easy *data,
+ /* For STARTTLS responses */
+ static CURLcode smtp_state_starttls_resp(struct Curl_easy *data,
+                                          int smtpcode,
+                                          smtpstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   (void)instate; /* no use for this yet */
+ 
+   /* Pipelining in response is forbidden. */
+-  if(data->conn->proto.smtpc.pp.cache_size)
++  if(data->conn->proto.smtpc.pp.overflow)
+     return CURLE_WEIRD_SERVER_REPLY;
+ 
+   if(smtpcode != 220) {
+     if(data->set.use_ssl != CURLUSESSL_TRY) {
+       failf(data, "STARTTLS denied, code %d", smtpcode);
+       result = CURLE_USE_SSL_FAILED;
+     }
+     else
+       result = smtp_perform_authentication(data);
+   }
+   else
+     result = smtp_perform_upgrade_tls(data);
+ 
+   return result;
+ }
+ 
+ /* For EHLO responses */
+ static CURLcode smtp_state_ehlo_resp(struct Curl_easy *data,
+                                      struct connectdata *conn, int smtpcode,
+                                      smtpstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct smtp_conn *smtpc = &conn->proto.smtpc;
+-  const char *line = data->state.buffer;
+-  size_t len = strlen(line);
++  const char *line = Curl_dyn_ptr(&smtpc->pp.recvbuf);
++  size_t len = smtpc->pp.nfinal;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if(smtpcode/100 != 2 && smtpcode != 1) {
+     if(data->set.use_ssl <= CURLUSESSL_TRY
+        || Curl_conn_is_ssl(conn, FIRSTSOCKET))
+       result = smtp_perform_helo(data, conn);
+     else {
+       failf(data, "Remote access denied: %d", smtpcode);
+       result = CURLE_REMOTE_ACCESS_DENIED;
+     }
+   }
+   else if(len >= 4) {
+     line += 4;
+     len -= 4;
+ 
+     /* Does the server support the STARTTLS capability? */
+     if(len >= 8 && !memcmp(line, "STARTTLS", 8))
+       smtpc->tls_supported = TRUE;
+ 
+     /* Does the server support the SIZE capability? */
+     else if(len >= 4 && !memcmp(line, "SIZE", 4))
+       smtpc->size_supported = TRUE;
+ 
+     /* Does the server support the UTF-8 capability? */
+     else if(len >= 8 && !memcmp(line, "SMTPUTF8", 8))
+       smtpc->utf8_supported = TRUE;
+ 
+     /* Does the server support authentication? */
+     else if(len >= 5 && !memcmp(line, "AUTH ", 5)) {
+       smtpc->auth_supported = TRUE;
+ 
+       /* Advance past the AUTH keyword */
+       line += 5;
+       len -= 5;
+ 
+       /* Loop through the data line */
+       for(;;) {
+         size_t llen;
+         size_t wordlen;
+         unsigned short mechbit;
+ 
+         while(len &&
+               (*line == ' ' || *line == '\t' ||
+                *line == '\r' || *line == '\n')) {
+ 
+           line++;
+           len--;
+         }
+ 
+         if(!len)
+           break;
+ 
+         /* Extract the word */
+         for(wordlen = 0; wordlen < len && line[wordlen] != ' ' &&
+               line[wordlen] != '\t' && line[wordlen] != '\r' &&
+               line[wordlen] != '\n';)
+           wordlen++;
+ 
+         /* Test the word for a matching authentication mechanism */
+         mechbit = Curl_sasl_decode_mech(line, wordlen, &llen);
+         if(mechbit && llen == wordlen)
+           smtpc->sasl.authmechs |= mechbit;
+ 
+         line += wordlen;
+         len -= wordlen;
+       }
+     }
+ 
+     if(smtpcode != 1) {
+       if(data->set.use_ssl && !Curl_conn_is_ssl(conn, FIRSTSOCKET)) {
+         /* We don't have a SSL/TLS connection yet, but SSL is requested */
+         if(smtpc->tls_supported)
+           /* Switch to TLS connection now */
+           result = smtp_perform_starttls(data, conn);
+         else if(data->set.use_ssl == CURLUSESSL_TRY)
+           /* Fallback and carry on with authentication */
+           result = smtp_perform_authentication(data);
+         else {
+           failf(data, "STARTTLS not supported.");
+           result = CURLE_USE_SSL_FAILED;
+         }
+       }
+       else
+         result = smtp_perform_authentication(data);
+     }
+   }
+   else {
+     failf(data, "Unexpectedly short EHLO response");
+     result = CURLE_WEIRD_SERVER_REPLY;
+   }
+ 
+   return result;
+ }
+ 
+ /* For HELO responses */
+@@ -1030,46 +1030,42 @@ static CURLcode smtp_state_auth_resp(struct Curl_easy *data,
+ /* For command responses */
+ static CURLcode smtp_state_command_resp(struct Curl_easy *data, int smtpcode,
+                                         smtpstate instate)
+ {
+   CURLcode result = CURLE_OK;
+   struct SMTP *smtp = data->req.p.smtp;
+-  char *line = data->state.buffer;
+-  size_t len = strlen(line);
++  char *line = Curl_dyn_ptr(&data->conn->proto.smtpc.pp.recvbuf);
++  size_t len = data->conn->proto.smtpc.pp.nfinal;
+ 
+   (void)instate; /* no use for this yet */
+ 
+   if((smtp->rcpt && smtpcode/100 != 2 && smtpcode != 553 && smtpcode != 1) ||
+      (!smtp->rcpt && smtpcode/100 != 2 && smtpcode != 1)) {
+     failf(data, "Command failed: %d", smtpcode);
+     result = CURLE_WEIRD_SERVER_REPLY;
+   }
+   else {
+-    /* Temporarily add the LF character back and send as body to the client */
+-    if(!data->req.no_body) {
+-      line[len] = '\n';
+-      result = Curl_client_write(data, CLIENTWRITE_BODY, line, len + 1);
+-      line[len] = '\0';
+-    }
++    if(!data->req.no_body)
++      result = Curl_client_write(data, CLIENTWRITE_BODY, line, len);
+ 
+     if(smtpcode != 1) {
+       if(smtp->rcpt) {
+         smtp->rcpt = smtp->rcpt->next;
+ 
+         if(smtp->rcpt) {
+           /* Send the next command */
+           result = smtp_perform_command(data);
+         }
+         else
+           /* End of DO phase */
+           smtp_state(data, SMTP_STOP);
+       }
+       else
+         /* End of DO phase */
+         smtp_state(data, SMTP_STOP);
+     }
+   }
+ 
+   return result;
+ }
+ 
+ /* For MAIL responses */
+@@ -1336,58 +1332,57 @@ static int smtp_getsock(struct Curl_easy *data,
+ /***********************************************************************
+  *
+  * smtp_connect()
+  *
+  * This function should do everything that is to be considered a part of
+  * the connection phase.
+  *
+  * The variable pointed to by 'done' will be TRUE if the protocol-layer
+  * connect phase is done when this function returns, or FALSE if not.
+  */
+ static CURLcode smtp_connect(struct Curl_easy *data, bool *done)
+ {
+   CURLcode result = CURLE_OK;
+   struct connectdata *conn = data->conn;
+   struct smtp_conn *smtpc = &conn->proto.smtpc;
+   struct pingpong *pp = &smtpc->pp;
+ 
+   *done = FALSE; /* default to not done yet */
+ 
+   /* We always support persistent connections in SMTP */
+   connkeep(conn, "SMTP default");
+ 
+   PINGPONG_SETUP(pp, smtp_statemachine, smtp_endofresp);
+ 
+   /* Initialize the SASL storage */
+   Curl_sasl_init(&smtpc->sasl, data, &saslsmtp);
+ 
+   /* Initialise the pingpong layer */
+-  Curl_pp_setup(pp);
+-  Curl_pp_init(data, pp);
++  Curl_pp_init(pp);
+ 
+   /* Parse the URL options */
+   result = smtp_parse_url_options(conn);
+   if(result)
+     return result;
+ 
+   /* Parse the URL path */
+   result = smtp_parse_url_path(data);
+   if(result)
+     return result;
+ 
+   /* Start off waiting for the server greeting response */
+   smtp_state(data, SMTP_SERVERGREET);
+ 
+   result = smtp_multi_statemach(data, done);
+ 
+   return result;
+ }
+ 
+ /***********************************************************************
+  *
+  * smtp_done()
+  *
+  * The DONE function. This does what needs to be done after a single DO has
+  * performed.
+  *
+  * Input argument is already checked for validity.
+  */
+@@ -1531,31 +1526,33 @@ static CURLcode smtp_perform(struct Curl_easy *data, bool *connected,
+ /***********************************************************************
+  *
+  * smtp_do()
+  *
+  * This function is registered as 'curl_do' function. It decodes the path
+  * parts etc as a wrapper to the actual DO function (smtp_perform).
+  *
+  * The input argument is already checked for validity.
+  */
+ static CURLcode smtp_do(struct Curl_easy *data, bool *done)
+ {
+   CURLcode result = CURLE_OK;
++  DEBUGASSERT(data);
++  DEBUGASSERT(data->conn);
+   *done = FALSE; /* default to false */
+ 
+   /* Parse the custom request */
+   result = smtp_parse_custom_request(data);
+   if(result)
+     return result;
+ 
+   result = smtp_regular_transfer(data, done);
+ 
+   return result;
+ }
+ 
+ /***********************************************************************
+  *
+  * smtp_disconnect()
+  *
+  * Disconnect from an SMTP server. Cleanup protocol-specific per-connection
+  * resources. BLOCKING.
+  */
+diff --git a/tests/data/test250 b/tests/data/test250
+index 3c16fcd7b..455d9ea1a 100644
+--- a/tests/data/test250
++++ b/tests/data/test250
+@@ -37,8 +37,8 @@ ftp
+ </server>
+ <name>
+ FTP dir list PASV with slow response
+ </name>
+-<command>
++<command option="binary-trace">
+ ftp://%HOSTIP:%FTPPORT/
+ </command>
+ </client>

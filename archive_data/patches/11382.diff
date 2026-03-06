@@ -1,0 +1,178 @@
+commit 4209a5125802e714a6342a74ff0835c5c4a2397d
+Author: Patrick Steinhardt <ps@pks.im>
+Date:   Wed Nov 14 12:04:42 2018 +0100
+
+    strntol: fix out-of-bounds reads when parsing numbers with leading sign
+    
+    When parsing a number, we accept a leading plus or minus sign to return
+    a positive or negative number. When the parsed string has such a leading
+    sign, we set up a flag indicating that the number is negative and
+    advance the pointer to the next character in that string. This misses
+    updating the number of bytes in the string, though, which is why the
+    parser may later on do an out-of-bounds read.
+    
+    Fix the issue by correctly updating both the pointer and the number of
+    remaining bytes. Furthermore, we need to check whether we actually have
+    any bytes left after having advanced the pointer, as otherwise the
+    auto-detection of the base may do an out-of-bonuds access. Add a test
+    that detects the out-of-bound read.
+    
+    Note that this is not actually security critical. While there are a lot
+    of places where the function is called, all of these places are guarded
+    or irrelevant:
+    
+    - commit list: this operates on objects from the ODB, which are always
+      NUL terminated any may thus not trigger the off-by-one OOB read.
+    
+    - config: the configuration is NUL terminated.
+    
+    - curl stream: user input is being parsed that is always NUL terminated
+    
+    - index: the index is read via `git_futils_readbuffer`, which always NUL
+      terminates it.
+    
+    - loose objects: used to parse the length from the object's header. As
+      we check previously that the buffer contains a NUL byte, this is safe.
+    
+    - rebase: this parses numbers from the rebase instruction sheet. As the
+      rebase code uses `git_futils_readbuffer`, the buffer is always NUL
+      terminated.
+    
+    - revparse: this parses a user provided buffer that is NUL terminated.
+    
+    - signature: this parser the header information of objects. As objects
+      read from the ODB are always NUL terminated, this is a non-issue. The
+      constructor `git_signature_from_buffer` does not accept a length
+      parameter for the buffer, so the buffer needs to be NUL terminated, as
+      well.
+    
+    - smart transport: the buffer that is parsed is NUL terminated
+    
+    - tree cache: this parses the tree cache from the index extension. The
+      index itself is read via `git_futils_readbuffer`, which always NUL
+      terminates it.
+    
+    - winhttp transport: user input is being parsed that is always NUL
+      terminated
+
+diff --git a/src/util.c b/src/util.c
+index 735f0b547..9952a60fe 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -71,87 +71,93 @@ int git_strarray_copy(git_strarray *tgt, const git_strarray *src)
+ int git__strntol64(int64_t *result, const char *nptr, size_t nptr_len, const char **endptr, int base)
+ {
+ 	const char *p;
+ 	int64_t n, nn;
+ 	int c, ovfl, v, neg, ndig;
+ 
+ 	p = nptr;
+ 	neg = 0;
+ 	n = 0;
+ 	ndig = 0;
+ 	ovfl = 0;
+ 
+ 	/*
+ 	 * White space
+ 	 */
+ 	while (nptr_len && git__isspace(*p))
+ 		p++, nptr_len--;
+ 
+ 	if (!nptr_len)
+ 		goto Return;
+ 
+ 	/*
+ 	 * Sign
+ 	 */
+-	if (*p == '-' || *p == '+')
+-		if (*p++ == '-')
++	if (*p == '-' || *p == '+') {
++		if (*p == '-')
+ 			neg = 1;
++		p++;
++		nptr_len--;
++	}
++
++	if (!nptr_len)
++		goto Return;
+ 
+ 	/*
+ 	 * Automatically detect the base if none was given to us.
+ 	 * Right now, we assume that a number starting with '0x'
+ 	 * is hexadecimal and a number starting with '0' is
+ 	 * octal.
+ 	 */
+ 	if (base == 0) {
+ 		if (*p != '0')
+ 			base = 10;
+ 		else if (nptr_len > 2 && (p[1] == 'x' || p[1] == 'X'))
+ 			base = 16;
+ 		else
+ 			base = 8;
+ 	}
+ 
+ 	if (base < 0 || 36 < base)
+ 		goto Return;
+ 
+ 	/*
+ 	 * Skip prefix of '0x'-prefixed hexadecimal numbers. There is no
+ 	 * need to do the same for '0'-prefixed octal numbers as a
+ 	 * leading '0' does not have any impact. Also, if we skip a
+ 	 * leading '0' in such a string, then we may end up with no
+ 	 * digits left and produce an error later on which isn't one.
+ 	 */
+ 	if (base == 16 && nptr_len > 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+ 		p += 2;
+ 		nptr_len -= 2;
+ 	}
+ 
+ 	/*
+ 	 * Non-empty sequence of digits
+ 	 */
+ 	for (; nptr_len > 0; p++,ndig++,nptr_len--) {
+ 		c = *p;
+ 		v = base;
+ 		if ('0'<=c && c<='9')
+ 			v = c - '0';
+ 		else if ('a'<=c && c<='z')
+ 			v = c - 'a' + 10;
+ 		else if ('A'<=c && c<='Z')
+ 			v = c - 'A' + 10;
+ 		if (v >= base)
+ 			break;
+ 		v = neg ? -v : v;
+ 		if (n > INT64_MAX / base || n < INT64_MIN / base) {
+ 			ovfl = 1;
+ 			/* Keep on iterating until the end of this number */
+ 			continue;
+ 		}
+ 		nn = n * base;
+ 		if ((v > 0 && nn > INT64_MAX - v) ||
+ 		    (v < 0 && nn < INT64_MIN - v)) {
+ 			ovfl = 1;
+ 			/* Keep on iterating until the end of this number */
+ 			continue;
+ 		}
+ 		n = nn + v;
+ 	}
+diff --git a/tests/core/strtol.c b/tests/core/strtol.c
+index 71af3325e..6f4e63af3 100644
+--- a/tests/core/strtol.c
++++ b/tests/core/strtol.c
+@@ -108,6 +108,16 @@ void test_core_strtol__buffer_length_with_leading_ws_truncates(void)
+ 	cl_assert_equal_i(i64, 1);
+ }
+ 
++void test_core_strtol__buffer_length_with_leading_sign_truncates(void)
++{
++	int64_t i64;
++
++	cl_git_fail(git__strntol64(&i64, "-1", 1, NULL, 10));
++
++	cl_git_pass(git__strntol64(&i64, "-11", 2, NULL, 10));
++	cl_assert_equal_i(i64, -1);
++}
++
+ void test_core_strtol__error_message_cuts_off(void)
+ {
+ 	assert_l32_fails("2147483657foobar", 10);

@@ -1,0 +1,208 @@
+commit 45fec14c029491329d769eae29021b4cb0cdd2c3
+Author: Alan Modra <amodra@gmail.com>
+Date:   Wed Mar 29 22:05:59 2023 +1030
+
+    Tidy leaked objcopy memory
+    
+            * objcopy.c (delete_symbol_htabs): Also free symbols.
+            (write_debugging_info): Free strings and syms once written.
+            * wrstabs.c (write_stabs_in_sections_debugging_info): memset
+            entire info struct.  Free hash tables before returning.  Free
+            syms on error return.
+
+diff --git a/binutils/objcopy.c b/binutils/objcopy.c
+index cf830442b3c..72585ea9ed7 100644
+--- a/binutils/objcopy.c
++++ b/binutils/objcopy.c
+@@ -1057,14 +1057,18 @@ static void
+ delete_symbol_htabs (void)
+ {
+   htab_delete (strip_specific_htab);
+   htab_delete (strip_unneeded_htab);
+   htab_delete (keep_specific_htab);
+   htab_delete (localize_specific_htab);
+   htab_delete (globalize_specific_htab);
+   htab_delete (keepglobal_specific_htab);
+   htab_delete (weaken_specific_htab);
+   htab_delete (redefine_specific_htab);
+   htab_delete (redefine_specific_reverse_htab);
++
++  free (isympp);
++  if (osympp != isympp)
++    free (osympp);
+ }
+ 
+ /* Add a symbol to strip_specific_list.  */
+@@ -4648,58 +4652,61 @@ static bool
+ write_debugging_info (bfd *obfd, void *dhandle,
+ 		      long *symcountp ATTRIBUTE_UNUSED,
+ 		      asymbol ***symppp ATTRIBUTE_UNUSED)
+ {
+   if (bfd_get_flavour (obfd) == bfd_target_coff_flavour
+       || bfd_get_flavour (obfd) == bfd_target_elf_flavour)
+     {
+       bfd_byte *syms, *strings = NULL;
+       bfd_size_type symsize, stringsize;
+       asection *stabsec, *stabstrsec;
+       flagword flags;
++      bool ret;
+ 
+       if (! write_stabs_in_sections_debugging_info (obfd, dhandle, &syms,
+ 						    &symsize, &strings,
+ 						    &stringsize))
+ 	return false;
+ 
+       flags = SEC_HAS_CONTENTS | SEC_READONLY | SEC_DEBUGGING;
+       stabsec = bfd_make_section_with_flags (obfd, ".stab", flags);
+       stabstrsec = bfd_make_section_with_flags (obfd, ".stabstr", flags);
+       if (stabsec == NULL
+ 	  || stabstrsec == NULL
+ 	  || !bfd_set_section_size (stabsec, symsize)
+ 	  || !bfd_set_section_size (stabstrsec, stringsize)
+ 	  || !bfd_set_section_alignment (stabsec, 2)
+ 	  || !bfd_set_section_alignment (stabstrsec, 0))
+ 	{
+ 	  bfd_nonfatal_message (NULL, obfd, NULL,
+ 				_("can't create debugging section"));
+ 	  free (strings);
+ 	  return false;
+ 	}
+ 
+       /* We can get away with setting the section contents now because
+ 	 the next thing the caller is going to do is copy over the
+ 	 real sections.  We may someday have to split the contents
+ 	 setting out of this function.  */
++      ret = true;
+       if (! bfd_set_section_contents (obfd, stabsec, syms, 0, symsize)
+ 	  || ! bfd_set_section_contents (obfd, stabstrsec, strings, 0,
+ 					 stringsize))
+ 	{
+ 	  bfd_nonfatal_message (NULL, obfd, NULL,
+ 				_("can't set debugging section contents"));
+-	  free (strings);
+-	  return false;
++	  ret = false;
+ 	}
+ 
+-      return true;
++      free (strings);
++      free (syms);
++      return ret;
+     }
+ 
+   bfd_nonfatal_message (NULL, obfd, NULL,
+ 			_("don't know how to write debugging information for %s"),
+ 			bfd_get_target (obfd));
+   return false;
+ }
+ 
+ /* If neither -D nor -U was specified explicitly,
+    then use the configured default.  */
+diff --git a/binutils/wrstabs.c b/binutils/wrstabs.c
+index 2df2b041434..53ade2eafbd 100644
+--- a/binutils/wrstabs.c
++++ b/binutils/wrstabs.c
+@@ -462,82 +462,84 @@ bool
+ write_stabs_in_sections_debugging_info (bfd *abfd, void *dhandle,
+ 					bfd_byte **psyms,
+ 					bfd_size_type *psymsize,
+ 					bfd_byte **pstrings,
+ 					bfd_size_type *pstringsize)
+ {
+   struct stab_write_handle info;
+   struct string_hash_entry *h;
+   bfd_byte *p;
+ 
++  memset (&info, 0, sizeof info);
+   info.abfd = abfd;
+ 
+-  info.symbols_size = 0;
+   info.symbols_alloc = 500;
+   info.symbols = (bfd_byte *) xmalloc (info.symbols_alloc);
+ 
+-  info.strings = NULL;
+-  info.last_string = NULL;
+   /* Reserve 1 byte for a null byte.  */
+   info.strings_size = 1;
++  info.type_index = 1;
++  info.so_offset = -1;
++  info.fun_offset = -1;
++  info.pending_lbrac = (bfd_vma) -1;
+ 
+   if (!bfd_hash_table_init (&info.strhash.table, string_hash_newfunc,
+ 			    sizeof (struct string_hash_entry))
+       || !bfd_hash_table_init (&info.typedef_hash.table, string_hash_newfunc,
+ 			       sizeof (struct string_hash_entry)))
+     {
+       non_fatal ("bfd_hash_table_init_failed: %s",
+ 		 bfd_errmsg (bfd_get_error ()));
+-      return false;
++      goto fail;
+     }
+ 
+-  info.type_stack = NULL;
+-  info.type_index = 1;
+-  memset (&info.type_cache, 0, sizeof info.type_cache);
+-  info.so_offset = -1;
+-  info.fun_offset = -1;
+-  info.last_text_address = 0;
+-  info.nesting = 0;
+-  info.fnaddr = 0;
+-  info.pending_lbrac = (bfd_vma) -1;
+-
+   /* The initial symbol holds the string size.  */
+   if (! stab_write_symbol (&info, 0, 0, 0, (const char *) NULL))
+-    return false;
++    goto fail;
+ 
+   /* Output an initial N_SO symbol.  */
+   info.so_offset = info.symbols_size;
+   if (! stab_write_symbol (&info, N_SO, 0, 0, bfd_get_filename (abfd)))
+-    return false;
++    goto fail;
+ 
+   if (! debug_write (dhandle, &stab_fns, (void *) &info))
+-    return false;
++    goto fail;
+ 
+   if (info.pending_lbrac != (bfd_vma) -1)
+-    return false;
++    goto fail;
+ 
+   /* Output a trailing N_SO.  */
+   if (! stab_write_symbol (&info, N_SO, 0, info.last_text_address,
+ 			   (const char *) NULL))
+-    return false;
++    goto fail;
+ 
+   /* Put the string size in the initial symbol.  */
+   bfd_put_32 (abfd, info.strings_size, info.symbols + 8);
+ 
+   *psyms = info.symbols;
+   *psymsize = info.symbols_size;
+ 
+   *pstringsize = info.strings_size;
+   *pstrings = (bfd_byte *) xmalloc (info.strings_size);
+ 
+   p = *pstrings;
+   *p++ = '\0';
+   for (h = info.strings; h != NULL; h = h->next)
+     {
+       strcpy ((char *) p, h->root.string);
+       p += strlen ((char *) p) + 1;
+     }
+ 
++  bfd_hash_table_free (&info.typedef_hash.table);
++  bfd_hash_table_free (&info.strhash.table);
+   return true;
++
++ fail:
++  if (info.typedef_hash.table.memory)
++    bfd_hash_table_free (&info.typedef_hash.table);
++  if (info.strhash.table.memory)
++    bfd_hash_table_free (&info.strhash.table);
++  free (info.symbols);
++  return false;
+ }
+ 
+ /* Start writing out information for a compilation unit.  */

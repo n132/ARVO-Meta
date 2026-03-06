@@ -1,0 +1,506 @@
+commit cb2cf2f2a4714d161535837d90b025feef5bca5c
+Author: Antoine Pitrou <antoine@python.org>
+Date:   Thu Jul 2 15:17:59 2020 -0500
+
+    ARROW-9298: [C++] Fix crashes with invalid IPC input
+    
+    These issues are related to the new delta dictionary support.
+    Should fix the following issues:
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23846
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23848
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=23854
+    
+    Closes #7617 from pitrou/ARROW-9298-oss-fuzz
+    
+    Authored-by: Antoine Pitrou <antoine@python.org>
+    Signed-off-by: Wes McKinney <wesm@apache.org>
+
+diff --git a/cpp/src/arrow/array/validate.cc b/cpp/src/arrow/array/validate.cc
+index f42296165..0562e8e4c 100644
+--- a/cpp/src/arrow/array/validate.cc
++++ b/cpp/src/arrow/array/validate.cc
+@@ -1,32 +1,33 @@
+ // Licensed to the Apache Software Foundation (ASF) under one
+ // or more contributor license agreements.  See the NOTICE file
+ // distributed with this work for additional information
+ // regarding copyright ownership.  The ASF licenses this file
+ // to you under the Apache License, Version 2.0 (the
+ // "License"); you may not use this file except in compliance
+ // with the License.  You may obtain a copy of the License at
+ //
+ //   http://www.apache.org/licenses/LICENSE-2.0
+ //
+ // Unless required by applicable law or agreed to in writing,
+ // software distributed under the License is distributed on an
+ // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ // KIND, either express or implied.  See the License for the
+ // specific language governing permissions and limitations
+ // under the License.
+ 
+ #include "arrow/array/validate.h"
+ 
+ #include <vector>
+ 
+ #include "arrow/array.h"  // IWYU pragma: keep
+ #include "arrow/buffer.h"
+ #include "arrow/extension_type.h"
+ #include "arrow/type.h"
+ #include "arrow/type_traits.h"
+ #include "arrow/util/bit_util.h"
+ #include "arrow/util/checked_cast.h"
+ #include "arrow/util/int_util.h"
++#include "arrow/util/logging.h"
+ #include "arrow/visitor_inline.h"
+ 
+ namespace arrow {
+@@ -40,240 +41,272 @@ namespace {
+ struct ValidateArrayVisitor {
+   Status Visit(const NullArray& array) {
+     ARROW_RETURN_IF(array.null_count() != array.length(),
+                     Status::Invalid("null_count is invalid"));
+     return Status::OK();
+   }
+ 
+   Status Visit(const PrimitiveArray& array) {
+     ARROW_RETURN_IF(array.data()->buffers.size() != 2,
+                     Status::Invalid("number of buffers is != 2"));
+ 
+     if (array.length() > 0) {
+       if (array.data()->buffers[1] == nullptr) {
+         return Status::Invalid("values buffer is null");
+       }
+       if (array.values() == nullptr) {
+         return Status::Invalid("values is null");
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const Decimal128Array& array) {
+     if (array.data()->buffers.size() != 2) {
+       return Status::Invalid("number of buffers is != 2");
+     }
+     if (array.length() > 0 && array.values() == nullptr) {
+       return Status::Invalid("values is null");
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const StringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const BinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeStringArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const LargeBinaryArray& array) { return ValidateBinaryArray(array); }
+ 
+   Status Visit(const ListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const LargeListArray& array) { return ValidateListArray(array); }
+ 
+   Status Visit(const MapArray& array) {
+     if (!array.keys()) {
+       return Status::Invalid("keys is null");
+     }
+     return ValidateListArray(array);
+   }
+ 
+   Status Visit(const FixedSizeListArray& array) {
+     const int64_t len = array.length();
+     const int64_t value_size = array.value_length();
+     if (len > 0 && !array.values()) {
+       return Status::Invalid("values is null");
+     }
+     if (value_size < 0) {
+       return Status::Invalid("FixedSizeListArray has negative value size ", value_size);
+     }
+     if (HasMultiplyOverflow(len, value_size) ||
+         array.values()->length() != len * value_size) {
+       return Status::Invalid("Values Length (", array.values()->length(),
+                              ") is not equal to the length (", len,
+                              ") multiplied by the value size (", value_size, ")");
+     }
+ 
+     return Status::OK();
+   }
+ 
+   Status Visit(const StructArray& array) {
+     const auto& struct_type = checked_cast<const StructType&>(*array.type());
+     // Validate fields
+     for (int i = 0; i < array.num_fields(); ++i) {
+       // array.field() may crash due to an assertion in ArrayData::Slice(),
+       // so check invariants before
+       const auto& field_data = *array.data()->child_data[i];
+       if (field_data.length < array.offset()) {
+         return Status::Invalid("Struct child array #", i,
+                                " has length smaller than struct array offset (",
+                                field_data.length, " < ", array.offset(), ")");
+       }
+ 
+       auto it = array.field(i);
+       if (it->length() != array.length()) {
+         return Status::Invalid("Struct child array #", i,
+                                " has length different from struct array (", it->length(),
+                                " != ", array.length(), ")");
+       }
+ 
+       auto it_type = struct_type.field(i)->type();
+       if (!it->type()->Equals(it_type)) {
+         return Status::Invalid("Struct child array #", i,
+                                " does not match type field: ", it->type()->ToString(),
+                                " vs ", it_type->ToString());
+       }
+ 
+       const Status child_valid = ValidateArray(*it);
+       if (!child_valid.ok()) {
+         return Status::Invalid("Struct child array #", i,
+                                " invalid: ", child_valid.ToString());
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const UnionArray& array) {
+     const auto& union_type = *array.union_type();
+     // Validate fields
+     for (int i = 0; i < array.num_fields(); ++i) {
+       if (union_type.mode() == UnionMode::SPARSE) {
+         // array.field() may crash due to an assertion in ArrayData::Slice(),
+         // so check invariants before
+         const auto& child_data = *array.data()->child_data[i];
+         if (child_data.length < array.offset()) {
+           return Status::Invalid("Sparse union child array #", i,
+                                  " has length smaller than union array offset (",
+                                  child_data.length, " < ", array.offset(), ")");
+         }
+       }
+ 
+       auto it = array.field(i);
+       if (union_type.mode() == UnionMode::SPARSE && it->length() != array.length()) {
+         return Status::Invalid("Sparse union child array #", i,
+                                " has length different from union array (", it->length(),
+                                " != ", array.length(), ")");
+       }
+ 
+       auto it_type = union_type.field(i)->type();
+       if (!it->type()->Equals(it_type)) {
+         return Status::Invalid("Union child array #", i,
+                                " does not match type field: ", it->type()->ToString(),
+                                " vs ", it_type->ToString());
+       }
+ 
+       const Status child_valid = ValidateArray(*it);
+       if (!child_valid.ok()) {
+         return Status::Invalid("Union child array #", i,
+                                " invalid: ", child_valid.ToString());
+       }
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const DictionaryArray& array) {
+     Type::type index_type_id = array.indices()->type()->id();
+     if (!is_integer(index_type_id)) {
+       return Status::Invalid("Dictionary indices must be integer type");
+     }
+     if (!array.data()->dictionary) {
+       return Status::Invalid("Dictionary values must be non-null");
+     }
+     const Status dict_valid = ValidateArray(*MakeArray(array.data()->dictionary));
+     if (!dict_valid.ok()) {
+       return Status::Invalid("Dictionary array invalid: ", dict_valid.ToString());
+     }
+     return Status::OK();
+   }
+ 
+   Status Visit(const ExtensionArray& array) {
+     const auto& ext_type = checked_cast<const ExtensionType&>(*array.type());
+ 
+     if (!array.storage()->type()->Equals(*ext_type.storage_type())) {
+       return Status::Invalid("Extension array of type '", array.type()->ToString(),
+                              "' has storage array of incompatible type '",
+                              array.storage()->type()->ToString(), "'");
+     }
+     return ValidateArray(*array.storage());
+   }
+ 
+  protected:
+   template <typename BinaryArrayType>
+   Status ValidateBinaryArray(const BinaryArrayType& array) {
+     if (array.data()->buffers.size() != 3) {
+       return Status::Invalid("number of buffers is != 3");
+     }
+     if (array.value_data() == nullptr) {
+       return Status::Invalid("value data buffer is null");
+     }
+-    return ValidateOffsets(array);
++    RETURN_NOT_OK(ValidateOffsets(array));
++
++    if (array.length() > 0) {
++      const auto first_offset = array.value_offset(0);
++      const auto last_offset = array.value_offset(array.length());
++      // This early test avoids undefined behaviour when computing `data_extent`
++      if (first_offset < 0 || last_offset < 0) {
++        return Status::Invalid("Negative offsets in binary array");
++      }
++      const auto data_extent = last_offset - first_offset;
++      const auto values_length = array.value_data()->size();
++      if (values_length < data_extent) {
++        return Status::Invalid("Length spanned by binary offsets (", data_extent,
++                               ") larger than values array (size ", values_length, ")");
++      }
++      // These tests ensure that array concatenation is safe if Validate() succeeds
++      // (for delta dictionaries)
++      if (first_offset > values_length || last_offset > values_length) {
++        return Status::Invalid("First or last binary offset out of bounds");
++      }
++      if (first_offset > last_offset) {
++        return Status::Invalid("First offset larger than last offset in binary array");
++      }
++    }
++    return Status::OK();
+   }
+ 
+   template <typename ListArrayType>
+   Status ValidateListArray(const ListArrayType& array) {
+     // First validate offsets, to make sure the accesses below are valid
+     RETURN_NOT_OK(ValidateOffsets(array));
+ 
+     // An empty list array can have 0 offsets
+     if (array.length() > 0) {
+       const auto first_offset = array.value_offset(0);
+       const auto last_offset = array.value_offset(array.length());
+       // This early test avoids undefined behaviour when computing `data_extent`
+       if (first_offset < 0 || last_offset < 0) {
+         return Status::Invalid("Negative offsets in list array");
+       }
+       const auto data_extent = last_offset - first_offset;
+       if (data_extent > 0 && !array.values()) {
+         return Status::Invalid("values is null");
+       }
+       const auto values_length = array.values()->length();
+       if (values_length < data_extent) {
+         return Status::Invalid("Length spanned by list offsets (", data_extent,
+                                ") larger than values array (length ", values_length, ")");
+       }
++      // These tests ensure that array concatenation is safe if Validate() succeeds
++      // (for delta dictionaries)
++      if (first_offset > values_length || last_offset > values_length) {
++        return Status::Invalid("First or last list offset out of bounds");
++      }
++      if (first_offset > last_offset) {
++        return Status::Invalid("First offset larger than last offset in list array");
++      }
+     }
+ 
+     const Status child_valid = ValidateArray(*array.values());
+     if (!child_valid.ok()) {
+       return Status::Invalid("List child array invalid: ", child_valid.ToString());
+     }
+     return Status::OK();
+   }
+ 
+   template <typename ArrayType>
+   Status ValidateOffsets(const ArrayType& array) {
+     using offset_type = typename ArrayType::offset_type;
+ 
+     auto value_offsets = array.value_offsets();
+     if (value_offsets == nullptr) {
+       // For length 0, an empty offsets array seems accepted as a special case (ARROW-544)
+       if (array.length() > 0) {
+         return Status::Invalid("non-empty array but value_offsets_ is null");
+       }
+       return Status::OK();
+     }
+ 
+     // An empty list array can have 0 offsets
+     auto required_offsets =
+         (array.length() > 0) ? array.length() + array.offset() + 1 : 0;
+     if (value_offsets->size() / static_cast<int>(sizeof(offset_type)) <
+         required_offsets) {
+       return Status::Invalid("offset buffer size (bytes): ", value_offsets->size(),
+                              " isn't large enough for length: ", array.length());
+     }
+ 
+     return Status::OK();
+   }
+ };
+ 
+ }  // namespace
+diff --git a/cpp/src/arrow/ipc/reader.cc b/cpp/src/arrow/ipc/reader.cc
+index 52aaef222..faab0920e 100644
+--- a/cpp/src/arrow/ipc/reader.cc
++++ b/cpp/src/arrow/ipc/reader.cc
+@@ -645,47 +645,49 @@ Result<std::shared_ptr<RecordBatch>> ReadRecordBatch(
+ Status ReadDictionary(const Buffer& metadata, DictionaryMemo* dictionary_memo,
+                       const IpcReadOptions& options, io::RandomAccessFile* file) {
+   const flatbuf::Message* message = nullptr;
+   RETURN_NOT_OK(internal::VerifyMessage(metadata.data(), metadata.size(), &message));
+   auto dictionary_batch = message->header_as_DictionaryBatch();
+   if (dictionary_batch == nullptr) {
+     return Status::IOError(
+         "Header-type of flatbuffer-encoded Message is not DictionaryBatch.");
+   }
+ 
+   // The dictionary is embedded in a record batch with a single column
+   auto batch_meta = dictionary_batch->data();
+ 
+   CHECK_FLATBUFFERS_NOT_NULL(batch_meta, "DictionaryBatch.data");
+ 
+   Compression::type compression;
+   RETURN_NOT_OK(GetCompression(batch_meta, &compression));
+   if (compression == Compression::UNCOMPRESSED &&
+       message->version() == flatbuf::MetadataVersion::V4) {
+     // Possibly obtain codec information from experimental serialization format
+     // in 0.17.x
+     RETURN_NOT_OK(GetCompressionExperimental(message, &compression));
+   }
+ 
+   int64_t id = dictionary_batch->id();
+ 
+   // Look up the field, which must have been added to the
+   // DictionaryMemo already prior to invoking this function
+   std::shared_ptr<DataType> value_type;
+   RETURN_NOT_OK(dictionary_memo->GetDictionaryType(id, &value_type));
+ 
+   auto value_field = ::arrow::field("dummy", value_type);
+ 
+   std::shared_ptr<RecordBatch> batch;
+   ARROW_ASSIGN_OR_RAISE(
+       batch, LoadRecordBatch(batch_meta, ::arrow::schema({value_field}),
+                              /*field_inclusion_mask=*/{}, dictionary_memo, options,
+                              compression, file));
+   if (batch->num_columns() != 1) {
+     return Status::Invalid("Dictionary record batch must only contain one field");
+   }
+   auto dictionary = batch->column(0);
++  // Validate the dictionary for safe delta concatenation
++  RETURN_NOT_OK(dictionary->Validate());
+   if (dictionary_batch->isDelta()) {
+     return dictionary_memo->AddDictionaryDelta(id, dictionary, options.memory_pool);
+   }
+   return dictionary_memo->AddOrReplaceDictionary(id, dictionary);
+ }
+@@ -710,108 +712,109 @@ Status UpdateDictionaries(const Message& message, DictionaryMemo* dictionary_mem
+ class RecordBatchStreamReaderImpl : public RecordBatchStreamReader {
+  public:
+   Status Open(std::unique_ptr<MessageReader> message_reader,
+               const IpcReadOptions& options) {
+     message_reader_ = std::move(message_reader);
+     options_ = options;
+ 
+     // Read schema
+     ARROW_ASSIGN_OR_RAISE(std::unique_ptr<Message> message,
+                           message_reader_->ReadNextMessage());
+     if (!message) {
+       return Status::Invalid("Tried reading schema message, was null or length 0");
+     }
+ 
+     return UnpackSchemaMessage(*message, options, &dictionary_memo_, &schema_,
+                                &out_schema_, &field_inclusion_mask_);
+   }
+ 
+   Status ReadNext(std::shared_ptr<RecordBatch>* batch) override {
+     if (!have_read_initial_dictionaries_) {
+       RETURN_NOT_OK(ReadInitialDictionaries());
+     }
+ 
+     if (empty_stream_) {
+       // ARROW-6006: Degenerate case where stream contains no data, we do not
+       // bother trying to read a RecordBatch message from the stream
+       *batch = nullptr;
+       return Status::OK();
+     }
+ 
++    // Continue to read other dictionaries, if any
+     std::unique_ptr<Message> message;
+     ARROW_ASSIGN_OR_RAISE(message, message_reader_->ReadNextMessage());
++
++    while (message != nullptr && message->type() == MessageType::DICTIONARY_BATCH) {
++      RETURN_NOT_OK(UpdateDictionaries(*message, &dictionary_memo_, options_));
++      ARROW_ASSIGN_OR_RAISE(message, message_reader_->ReadNextMessage());
++    }
++
+     if (message == nullptr) {
+       // End of stream
+       *batch = nullptr;
+       return Status::OK();
+     }
+ 
+-    // continue to read other dictionaries, if any
+-    while (message->type() == MessageType::DICTIONARY_BATCH) {
+-      RETURN_NOT_OK(UpdateDictionaries(*message, &dictionary_memo_, options_));
+-      ARROW_ASSIGN_OR_RAISE(message, message_reader_->ReadNextMessage());
+-    }
+-
+     CHECK_HAS_BODY(*message);
+     ARROW_ASSIGN_OR_RAISE(auto reader, Buffer::GetReader(message->body()));
+     return ReadRecordBatchInternal(*message->metadata(), schema_, field_inclusion_mask_,
+                                    &dictionary_memo_, options_, reader.get())
+         .Value(batch);
+   }
+ 
+   std::shared_ptr<Schema> schema() const override { return out_schema_; }
+ 
+  private:
+   Status ReadInitialDictionaries() {
+     // We must receive all dictionaries before reconstructing the
+     // first record batch. Subsequent dictionary deltas modify the memo
+     std::unique_ptr<Message> message;
+ 
+     // TODO(wesm): In future, we may want to reconcile the ids in the stream with
+     // those found in the schema
+     for (int i = 0; i < dictionary_memo_.num_fields(); ++i) {
+       ARROW_ASSIGN_OR_RAISE(message, message_reader_->ReadNextMessage());
+       if (!message) {
+         if (i == 0) {
+           /// ARROW-6006: If we fail to find any dictionaries in the stream, then
+           /// it may be that the stream has a schema but no actual data. In such
+           /// case we communicate that we were unable to find the dictionaries
+           /// (but there was no failure otherwise), so the caller can decide what
+           /// to do
+           empty_stream_ = true;
+           break;
+         } else {
+           // ARROW-6126, the stream terminated before receiving the expected
+           // number of dictionaries
+           return Status::Invalid("IPC stream ended without reading the expected number (",
+                                  dictionary_memo_.num_fields(), ") of dictionaries");
+         }
+       }
+ 
+       if (message->type() != MessageType::DICTIONARY_BATCH) {
+         return Status::Invalid("IPC stream did not have the expected number (",
+                                dictionary_memo_.num_fields(),
+                                ") of dictionaries at the start of the stream");
+       }
+       RETURN_NOT_OK(ParseDictionary(*message, &dictionary_memo_, options_));
+     }
+ 
+     have_read_initial_dictionaries_ = true;
+     return Status::OK();
+   }
+ 
+   std::unique_ptr<MessageReader> message_reader_;
+   IpcReadOptions options_;
+   std::vector<bool> field_inclusion_mask_;
+ 
+   bool have_read_initial_dictionaries_ = false;
+ 
+   // Flag to set in case where we fail to observe all dictionaries in a stream,
+   // and so the reader should not attempt to parse any messages
+   bool empty_stream_ = false;
+ 
+   DictionaryMemo dictionary_memo_;
+   std::shared_ptr<Schema> schema_, out_schema_;
+ };
+ 
+ // ----------------------------------------------------------------------
+ // Stream reader constructors
+diff --git a/testing b/testing
+index bb555cd8d..10ab9dd6d 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit bb555cd8df1e49b40ad9d4cc053c6a61f3146e86
++Subproject commit 10ab9dd6d4bd8276574d9efe55b759c1ad1a27a4

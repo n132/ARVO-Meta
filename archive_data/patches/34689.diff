@@ -1,0 +1,368 @@
+commit 40e9a9cc24f959336dc81b1b3589b2d9291a8918
+Author: chaoqin-li1123 <55518381+chaoqin-li1123@users.noreply.github.com>
+Date:   Thu Jun 10 08:35:33 2021 -0500
+
+    [fuzz]: Fix oss fuxx 34689,  close both locally and remotely after response decoder has been closed (#16823)
+    
+    * close local and remote after response stream closed
+    
+    Signed-off-by: chaoqin-li1123 <chaoqinli@google.com>
+
+diff --git a/test/common/http/codec_impl_corpus/send_request_after_response_closed b/test/common/http/codec_impl_corpus/send_request_after_response_closed
+new file mode 100644
+index 0000000000..98183d850e
+--- /dev/null
++++ b/test/common/http/codec_impl_corpus/send_request_after_response_closed
+@@ -0,0 +1,38 @@
++actions {
++  new_stream {
++    request_headers {
++      headers {
++        key: ":method"
++        value: "HEAD"
++      }
++      headers {
++        key: ":path"
++        value: "/"
++      }
++    }
++  }
++}
++actions {
++  quiesce_drain {
++  }
++}
++actions {
++  stream_action {
++    response {
++      headers {
++      }
++    }
++  }
++}
++actions {
++  server_drain {
++  }
++}
++actions {
++  stream_action {
++    request {
++      trailers {
++      }
++    }
++  }
++}
+diff --git a/test/common/http/codec_impl_fuzz_test.cc b/test/common/http/codec_impl_fuzz_test.cc
+index 4145325905..61e8bbd736 100644
+--- a/test/common/http/codec_impl_fuzz_test.cc
++++ b/test/common/http/codec_impl_fuzz_test.cc
+@@ -101,299 +101,306 @@ class HttpStream : public LinkedObject<HttpStream> {
+ public:
+   // We track stream state here to prevent illegal operations, e.g. applying an
+   // encodeData() to the codec after encodeTrailers(). This is necessary to
+   // maintain the preconditions for operations on the codec at the API level. Of
+   // course, it's the codecs must be robust to wire-level violations. We
+   // explore these violations via MutateAction and SwapAction at the connection
+   // buffer level.
+   enum class StreamState : int { PendingHeaders, PendingDataOrTrailers, Closed };
+ 
+   struct DirectionalState {
+     // TODO(mattklein123): Split this more clearly into request and response directional state.
+     RequestEncoder* request_encoder_;
+     ResponseEncoder* response_encoder_;
+     TestRequestHeaderMapImpl request_headers_;
+     NiceMock<MockResponseDecoder> response_decoder_;
+     NiceMock<MockRequestDecoder> request_decoder_;
+     NiceMock<MockStreamCallbacks> stream_callbacks_;
+     StreamState stream_state_;
+     bool local_closed_{false};
+     bool remote_closed_{false};
+     uint32_t read_disable_count_{};
+ 
+     bool isLocalOpen() const { return !local_closed_; }
+ 
+     void closeLocal() {
+       local_closed_ = true;
+       if (local_closed_ && remote_closed_) {
+         stream_state_ = StreamState::Closed;
+       }
+     }
+ 
+     void closeRemote() {
+       remote_closed_ = true;
+       if (local_closed_ && remote_closed_) {
+         stream_state_ = StreamState::Closed;
+       }
+     }
++
++    void closeLocalAndRemote() {
++      remote_closed_ = true;
++      local_closed_ = true;
++      stream_state_ = StreamState::Closed;
++    }
++
+   } request_, response_;
+ 
+   HttpStream(ClientConnection& client, const TestRequestHeaderMapImpl& request_headers,
+              bool end_stream, StreamResetCallbackFn stream_reset_callback,
+              MockConnectionManagerConfig* config)
+       : stream_reset_callback_(stream_reset_callback), conn_manager_config_(config) {
+     request_.request_encoder_ = &client.newStream(response_.response_decoder_);
+     ON_CALL(request_.stream_callbacks_, onResetStream(_, _))
+         .WillByDefault(InvokeWithoutArgs([this] {
+           ENVOY_LOG_MISC(trace, "reset request for stream index {}", stream_index_);
+           resetStream();
+           stream_reset_callback_();
+         }));
+     ON_CALL(response_.stream_callbacks_, onResetStream(_, _))
+         .WillByDefault(InvokeWithoutArgs([this] {
+           ENVOY_LOG_MISC(trace, "reset response for stream index {}", stream_index_);
+           // Reset the client stream when we know the server stream has been reset. This ensures
+           // that the internal book keeping resetStream() below is consistent with the state of the
+           // client codec state, which is necessary to prevent multiple simultaneous streams for the
+           // HTTP/1 codec.
+           request_.request_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
+           resetStream();
+           stream_reset_callback_();
+         }));
+     ON_CALL(request_.request_decoder_, decodeHeaders_(_, true))
+         .WillByDefault(InvokeWithoutArgs([this] {
+           // The HTTP/1 codec needs this to cleanup any latent stream resources.
+           response_.response_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
+           request_.closeRemote();
+         }));
+     ON_CALL(request_.request_decoder_, decodeData(_, true)).WillByDefault(InvokeWithoutArgs([this] {
+       // The HTTP/1 codec needs this to cleanup any latent stream resources.
+       response_.response_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
+       request_.closeRemote();
+     }));
+     ON_CALL(request_.request_decoder_, decodeTrailers_(_)).WillByDefault(InvokeWithoutArgs([this] {
+       // The HTTP/1 codec needs this to cleanup any latent stream resources.
+       response_.response_encoder_->getStream().resetStream(StreamResetReason::LocalReset);
+       request_.closeRemote();
+     }));
+     ON_CALL(response_.response_decoder_, decodeHeaders_(_, true))
+-        .WillByDefault(InvokeWithoutArgs([this] { response_.closeRemote(); }));
++        .WillByDefault(InvokeWithoutArgs([this] { response_.closeLocalAndRemote(); }));
+     ON_CALL(response_.response_decoder_, decodeData(_, true))
+-        .WillByDefault(InvokeWithoutArgs([this] { response_.closeRemote(); }));
++        .WillByDefault(InvokeWithoutArgs([this] { response_.closeLocalAndRemote(); }));
+     ON_CALL(response_.response_decoder_, decodeTrailers_(_))
+-        .WillByDefault(InvokeWithoutArgs([this] { response_.closeRemote(); }));
++        .WillByDefault(InvokeWithoutArgs([this] { response_.closeLocalAndRemote(); }));
+     if (!end_stream) {
+       request_.request_encoder_->getStream().addCallbacks(request_.stream_callbacks_);
+     }
+     request_.request_headers_ = request_headers;
+     request_.request_encoder_->encodeHeaders(request_headers, end_stream).IgnoreError();
+     request_.stream_state_ = end_stream ? StreamState::Closed : StreamState::PendingDataOrTrailers;
+     response_.stream_state_ = StreamState::PendingHeaders;
+   }
+ 
+   void resetStream() {
+     request_.closeLocal();
+     request_.closeRemote();
+     response_.closeLocal();
+     response_.closeRemote();
+   }
+ 
+   // Some stream action applied in either the request or response direction.
+   void directionalAction(DirectionalState& state,
+                          const test::common::http::DirectionalAction& directional_action) {
+     const bool end_stream = directional_action.end_stream();
+     const bool response = &state == &response_;
+     switch (directional_action.directional_action_selector_case()) {
+     case test::common::http::DirectionalAction::kContinueHeaders: {
+       if (state.isLocalOpen() && state.stream_state_ == StreamState::PendingHeaders) {
+         auto headers =
+             fromSanitizedHeaders<TestResponseHeaderMapImpl>(directional_action.continue_headers());
+         headers.setReferenceKey(Headers::get().Status, "100");
+         state.response_encoder_->encode100ContinueHeaders(headers);
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kHeaders: {
+       if (state.isLocalOpen() && state.stream_state_ == StreamState::PendingHeaders) {
+         if (response) {
+           auto headers =
+               fromSanitizedHeaders<TestResponseHeaderMapImpl>(directional_action.headers());
+           ConnectionManagerUtility::mutateResponseHeaders(headers, &request_.request_headers_,
+                                                           *conn_manager_config_, "");
+           if (headers.Status() == nullptr) {
+             headers.setReferenceKey(Headers::get().Status, "200");
+           }
+           state.response_encoder_->encodeHeaders(headers, end_stream);
+         } else {
+           state.request_encoder_
+               ->encodeHeaders(
+                   fromSanitizedHeaders<TestRequestHeaderMapImpl>(directional_action.headers()),
+                   end_stream)
+               .IgnoreError();
+         }
+         if (end_stream) {
+           state.closeLocal();
+         } else {
+           state.stream_state_ = StreamState::PendingDataOrTrailers;
+         }
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kData: {
+       if (state.isLocalOpen() && state.stream_state_ == StreamState::PendingDataOrTrailers) {
+         Buffer::OwnedImpl buf(std::string(directional_action.data() % (1024 * 1024), 'a'));
+         if (response) {
+           state.response_encoder_->encodeData(buf, end_stream);
+         } else {
+           state.request_encoder_->encodeData(buf, end_stream);
+         }
+         if (end_stream) {
+           state.closeLocal();
+         }
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kDataValue: {
+       if (state.isLocalOpen() && state.stream_state_ == StreamState::PendingDataOrTrailers) {
+         Buffer::OwnedImpl buf(directional_action.data_value());
+         if (response) {
+           state.response_encoder_->encodeData(buf, end_stream);
+         } else {
+           state.request_encoder_->encodeData(buf, end_stream);
+         }
+         if (end_stream) {
+           state.closeLocal();
+         }
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kTrailers: {
+       if (state.isLocalOpen() && state.stream_state_ == StreamState::PendingDataOrTrailers) {
+         if (response) {
+           state.response_encoder_->encodeTrailers(
+               fromSanitizedHeaders<TestResponseTrailerMapImpl>(directional_action.trailers()));
+         } else {
+           state.request_encoder_->encodeTrailers(
+               fromSanitizedHeaders<TestRequestTrailerMapImpl>(directional_action.trailers()));
+         }
+         state.stream_state_ = StreamState::Closed;
+         state.closeLocal();
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kMetadata: {
+       if (state.isLocalOpen() && state.stream_state_ != StreamState::Closed) {
+         if (response) {
+           state.response_encoder_->encodeMetadata(
+               Fuzz::fromMetadata(directional_action.metadata()));
+         } else {
+           state.request_encoder_->encodeMetadata(Fuzz::fromMetadata(directional_action.metadata()));
+         }
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kResetStream: {
+       if (state.stream_state_ != StreamState::Closed) {
+         StreamEncoder* encoder;
+         if (response) {
+           encoder = state.response_encoder_;
+         } else {
+           encoder = state.request_encoder_;
+         }
+         encoder->getStream().resetStream(
+             static_cast<Http::StreamResetReason>(directional_action.reset_stream()));
+         request_.stream_state_ = response_.stream_state_ = StreamState::Closed;
+       }
+       break;
+     }
+     case test::common::http::DirectionalAction::kReadDisable: {
+       if (state.stream_state_ != StreamState::Closed) {
+         const bool disable = directional_action.read_disable();
+         if (state.read_disable_count_ == 0 && !disable) {
+           return;
+         }
+         if (disable) {
+           ++state.read_disable_count_;
+         } else {
+           --state.read_disable_count_;
+         }
+         StreamEncoder* encoder;
+         if (response) {
+           encoder = state.response_encoder_;
+         } else {
+           encoder = state.request_encoder_;
+         }
+         encoder->getStream().readDisable(disable);
+       }
+       break;
+     }
+     default:
+       // Maybe nothing is set?
+       break;
+     }
+   }
+ 
+   void streamAction(const test::common::http::StreamAction& stream_action) {
+     switch (stream_action.stream_action_selector_case()) {
+     case test::common::http::StreamAction::kRequest: {
+       ENVOY_LOG_MISC(debug, "Request stream action on {} in state {} {}", stream_index_,
+                      static_cast<int>(request_.stream_state_),
+                      static_cast<int>(response_.stream_state_));
+       if (stream_action.has_dispatching_action()) {
+         // Simulate some response action while dispatching request headers, data, or trailers. This
+         // may happen as a result of a filter sending a direct response.
+         ENVOY_LOG_MISC(debug, "Setting dispatching action  on {} in state {} {}", stream_index_,
+                        static_cast<int>(request_.stream_state_),
+                        static_cast<int>(response_.stream_state_));
+         auto request_action = stream_action.dispatching_action().directional_action_selector_case();
+         if (request_action == test::common::http::DirectionalAction::kHeaders) {
+           EXPECT_CALL(request_.request_decoder_, decodeHeaders_(_, _))
+               .WillOnce(InvokeWithoutArgs(
+                   [&] { directionalAction(response_, stream_action.dispatching_action()); }));
+         } else if (request_action == test::common::http::DirectionalAction::kData) {
+           EXPECT_CALL(request_.request_decoder_, decodeData(_, _))
+               .Times(testing::AtLeast(1))
+               .WillRepeatedly(InvokeWithoutArgs(
+                   [&] { directionalAction(response_, stream_action.dispatching_action()); }));
+         } else if (request_action == test::common::http::DirectionalAction::kTrailers) {
+           EXPECT_CALL(request_.request_decoder_, decodeTrailers_(_))
+               .WillOnce(InvokeWithoutArgs(
+                   [&] { directionalAction(response_, stream_action.dispatching_action()); }));
+         }
+       }
+       // Perform the stream action.
+       // The request_.request_encoder_ is initialized from the response_.response_decoder_.
+       // Fuzz test codec_impl_fuzz_test-5766628005642240 created a situation where the response
+       // stream was in closed state leading to the state.request_encoder_ in directionalAction()
+       // kData case no longer being a valid address.
+       if (response_.stream_state_ != HttpStream::StreamState::Closed) {
+         directionalAction(request_, stream_action.request());
+       }
+       break;
+     }
+     case test::common::http::StreamAction::kResponse: {
+       ENVOY_LOG_MISC(debug, "Response stream action on {} in state {} {}", stream_index_,
+                      static_cast<int>(request_.stream_state_),
+                      static_cast<int>(response_.stream_state_));
+       directionalAction(response_, stream_action.response());
+       break;
+     }
+     default:
+       // Maybe nothing is set?
+       break;
+     }
+     ENVOY_LOG_MISC(debug, "Stream action complete");
+   }
+ 
+   bool active() const {
+     return request_.stream_state_ != StreamState::Closed ||
+            response_.stream_state_ != StreamState::Closed;
+   }
+ 
+   int32_t stream_index_{-1};
+   StreamResetCallbackFn stream_reset_callback_;
+   MockConnectionManagerConfig* conn_manager_config_;
+ };
+ 
+ // Buffer between client and server H1/H2 codecs. This models each write operation
+ // as adding a distinct fragment that might be reordered with other fragments in
+ // the buffer via swap() or modified with mutate().

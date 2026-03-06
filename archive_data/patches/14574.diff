@@ -1,0 +1,517 @@
+commit 9950d89616d31fe2d83f5134d357560c423794ee
+Merge: 9d9fb860 f7b1d38b
+Author: Martin Matuška <martin@matuska.org>
+Date:   Mon May 6 13:00:12 2019 +0200
+
+    Merge pull request #1190 from antekone/rar5_ossfuzz_fixes_6
+    
+     RAR5 reader: don't try to unpack entries marked as directories
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index fff93462..7bb98074 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -91,27 +91,28 @@ static const size_t g_unpack_window_size = 0x20000;
+ struct file_header {
+ 	ssize_t bytes_remaining;
+ 	ssize_t unpacked_size;
+ 	int64_t last_offset;         /* Used in sanity checks. */
+ 	int64_t last_size;           /* Used in sanity checks. */
+ 
+ 	uint8_t solid : 1;           /* Is this a solid stream? */
+ 	uint8_t service : 1;         /* Is this file a service data? */
+ 	uint8_t eof : 1;             /* Did we finish unpacking the file? */
++	uint8_t dir : 1;             /* Is this file entry a directory? */
+ 
+ 	/* Optional time fields. */
+ 	uint64_t e_mtime;
+ 	uint64_t e_ctime;
+ 	uint64_t e_atime;
+ 	uint32_t e_unix_ns;
+ 
+ 	/* Optional hash fields. */
+ 	uint32_t stored_crc32;
+ 	uint32_t calculated_crc32;
+ 	uint8_t blake2sp[32];
+ 	blake2sp_state b2state;
+ 	char has_blake2;
+ 
+ 	/* Optional redir fields */
+ 	uint64_t redir_type;
+ 	uint64_t redir_flags;
+ };
+@@ -1536,215 +1537,215 @@ static int process_head_file_extra(struct archive_read* a,
+ static int process_head_file(struct archive_read* a, struct rar5* rar,
+ 		struct archive_entry* entry, size_t block_flags)
+ {
+ 	ssize_t extra_data_size = 0;
+ 	size_t data_size = 0;
+ 	size_t file_flags = 0;
+ 	size_t file_attr = 0;
+ 	size_t compression_info = 0;
+ 	size_t host_os = 0;
+ 	size_t name_size = 0;
+ 	uint64_t unpacked_size;
+ 	uint32_t mtime = 0, crc = 0;
+-	int c_method = 0, c_version = 0, is_dir;
++	int c_method = 0, c_version = 0;
+ 	char name_utf8_buf[MAX_NAME_IN_BYTES];
+ 	const uint8_t* p;
+ 
+ 	archive_entry_clear(entry);
+ 
+ 	/* Do not reset file context if we're switching archives. */
+ 	if(!rar->cstate.switch_multivolume) {
+ 		reset_file_context(rar);
+ 	}
+ 
+ 	if(block_flags & HFL_EXTRA_DATA) {
+ 		size_t edata_size = 0;
+ 		if(!read_var_sized(a, &edata_size, NULL))
+ 			return ARCHIVE_EOF;
+ 
+ 		/* Intentional type cast from unsigned to signed. */
+ 		extra_data_size = (ssize_t) edata_size;
+ 	}
+ 
+ 	if(block_flags & HFL_DATA) {
+ 		if(!read_var_sized(a, &data_size, NULL))
+ 			return ARCHIVE_EOF;
+ 
+ 		rar->file.bytes_remaining = data_size;
+ 	} else {
+ 		rar->file.bytes_remaining = 0;
+ 
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 				"no data found in file/service block");
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	enum FILE_FLAGS {
+ 		DIRECTORY = 0x0001, UTIME = 0x0002, CRC32 = 0x0004,
+ 		UNKNOWN_UNPACKED_SIZE = 0x0008,
+ 	};
+ 
+ 	enum FILE_ATTRS {
+ 		ATTR_READONLY = 0x1, ATTR_HIDDEN = 0x2, ATTR_SYSTEM = 0x4,
+ 		ATTR_DIRECTORY = 0x10,
+ 	};
+ 
+ 	enum COMP_INFO_FLAGS {
+ 		SOLID = 0x0040,
+ 	};
+ 
+ 	if(!read_var_sized(a, &file_flags, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	if(!read_var(a, &unpacked_size, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	if(file_flags & UNKNOWN_UNPACKED_SIZE) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+ 				"Files with unknown unpacked size are not supported");
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+-	is_dir = (int) (file_flags & DIRECTORY);
++	rar->file.dir = (uint8_t) ((file_flags & DIRECTORY) > 0);
+ 
+ 	if(!read_var_sized(a, &file_attr, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	if(file_flags & UTIME) {
+ 		if(!read_u32(a, &mtime))
+ 			return ARCHIVE_EOF;
+ 	}
+ 
+ 	if(file_flags & CRC32) {
+ 		if(!read_u32(a, &crc))
+ 			return ARCHIVE_EOF;
+ 	}
+ 
+ 	if(!read_var_sized(a, &compression_info, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	c_method = (int) (compression_info >> 7) & 0x7;
+ 	c_version = (int) (compression_info & 0x3f);
+ 
+-	rar->cstate.window_size = is_dir ?
++	rar->cstate.window_size = (rar->file.dir > 0) ?
+ 		0 :
+ 		g_unpack_window_size << ((compression_info >> 10) & 15);
+ 	rar->cstate.method = c_method;
+ 	rar->cstate.version = c_version + 50;
+ 
+ 	rar->file.solid = (compression_info & SOLID) > 0;
+ 	rar->file.service = 0;
+ 
+ 	if(!read_var_sized(a, &host_os, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	enum HOST_OS {
+ 		HOST_WINDOWS = 0,
+ 		HOST_UNIX = 1,
+ 	};
+ 
+ 	if(host_os == HOST_WINDOWS) {
+ 		/* Host OS is Windows */
+ 
+ 		__LA_MODE_T mode;
+ 
+ 		if(file_attr & ATTR_DIRECTORY) {
+ 			mode = 0755 | AE_IFDIR;
+ 		} else {
+ 			if (file_attr & ATTR_READONLY) {
+ 				mode = 0444 | AE_IFREG;
+ 			} else {
+ 				mode = 0644 | AE_IFREG;
+ 			}
+ 		}
+ 
+ 		archive_entry_set_mode(entry, mode);
+ 
+ 		/*
+ 		 * TODO: implement attribute support (READONLY, HIDDEN, SYSTEM)
+ 		 * This requires a platform-independent extended attribute handling
+ 		 */
+ 	} else if(host_os == HOST_UNIX) {
+ 		/* Host OS is Unix */
+ 		archive_entry_set_mode(entry, (__LA_MODE_T) file_attr);
+ 	} else {
+ 		/* Unknown host OS */
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 				"Unsupported Host OS: 0x%x", (int) host_os);
+ 
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	if(!read_var_sized(a, &name_size, NULL))
+ 		return ARCHIVE_EOF;
+ 
+ 	if(!read_ahead(a, name_size, &p))
+ 		return ARCHIVE_EOF;
+ 
+ 	if(name_size > (MAX_NAME_IN_CHARS - 1)) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 				"Filename is too long");
+ 
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	if(name_size == 0) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+ 				"No filename specified");
+ 
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	memcpy(name_utf8_buf, p, name_size);
+ 	name_utf8_buf[name_size] = 0;
+ 	if(ARCHIVE_OK != consume(a, name_size)) {
+ 		return ARCHIVE_EOF;
+ 	}
+ 
+ 	archive_entry_update_pathname_utf8(entry, name_utf8_buf);
+ 
+ 	if(extra_data_size > 0) {
+ 		int ret = process_head_file_extra(a, entry, rar, extra_data_size);
+ 
+ 		/* Sanity check. */
+ 		if(extra_data_size < 0) {
+ 			archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+ 					"File extra data size is not zero");
+ 			return ARCHIVE_FATAL;
+ 		}
+ 
+ 		if(ret != ARCHIVE_OK)
+ 			return ret;
+ 	}
+ 
+ 	if((file_flags & UNKNOWN_UNPACKED_SIZE) == 0) {
+ 		rar->file.unpacked_size = (ssize_t) unpacked_size;
+ 		if(rar->file.redir_type == REDIR_TYPE_NONE)
+ 			archive_entry_set_size(entry, unpacked_size);
+ 	}
+ 
+ 	if(file_flags & UTIME) {
+ 		archive_entry_set_mtime(entry, (time_t) mtime, 0);
+ 	}
+ 
+ 	if(file_flags & CRC32) {
+ 		rar->file.stored_crc32 = crc;
+ 	}
+ 
+ 	if(!rar->cstate.switch_multivolume) {
+ 		/* Do not reinitialize unpacking state if we're switching archives. */
+ 		rar->cstate.block_parsing_finished = 1;
+ 		rar->cstate.all_filters_applied = 1;
+ 		rar->cstate.initialized = 0;
+ 	}
+ 
+ 	if(rar->generic.split_before > 0) {
+ 		/* If now we're standing on a header that has a 'split before' mark,
+ 		 * it means we're standing on a 'continuation' file header. Signal
+ 		 * the caller that if it wants to move to another file, it must call
+ 		 * rar5_read_header() function again. */
+ 
+ 		return ARCHIVE_RETRY;
+ 	} else {
+ 		return ARCHIVE_OK;
+ 	}
+ }
+@@ -2150,23 +2151,27 @@ static int rar5_read_header(struct archive_read *a,
+ static void init_unpack(struct rar5* rar) {
+ 	rar->file.calculated_crc32 = 0;
+ 	if (rar->cstate.window_size)
+ 		rar->cstate.window_mask = rar->cstate.window_size - 1;
+ 	else
+ 		rar->cstate.window_mask = 0;
+ 
+ 	free(rar->cstate.window_buf);
+-
+ 	free(rar->cstate.filtered_buf);
+ 
+-	rar->cstate.window_buf = calloc(1, rar->cstate.window_size);
+-	rar->cstate.filtered_buf = calloc(1, rar->cstate.window_size);
++	if(rar->cstate.window_size > 0) {
++		rar->cstate.window_buf = calloc(1, rar->cstate.window_size);
++		rar->cstate.filtered_buf = calloc(1, rar->cstate.window_size);
++	} else {
++		rar->cstate.window_buf = NULL;
++		rar->cstate.filtered_buf = NULL;
++	}
+ 
+ 	rar->cstate.write_ptr = 0;
+ 	rar->cstate.last_write_ptr = 0;
+ 
+ 	memset(&rar->cstate.bd, 0, sizeof(rar->cstate.bd));
+ 	memset(&rar->cstate.ld, 0, sizeof(rar->cstate.ld));
+ 	memset(&rar->cstate.dd, 0, sizeof(rar->cstate.dd));
+ 	memset(&rar->cstate.ldd, 0, sizeof(rar->cstate.ldd));
+ 	memset(&rar->cstate.rd, 0, sizeof(rar->cstate.rd));
+ }
+@@ -3672,41 +3677,51 @@ static int verify_global_checksums(struct archive_read* a) {
+ static int rar5_read_data(struct archive_read *a, const void **buff,
+ 								  size_t *size, int64_t *offset) {
+ 	int ret;
+ 	struct rar5* rar = get_context(a);
+ 
++	if(rar->file.dir > 0) {
++		/* Don't process any data if this file entry was declared
++		 * as a directory. This is needed, because entries marked as
++		 * directory doesn't have any dictionary buffer allocated, so
++		 * it's impossible to perform any decompression. */
++		archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
++				"Can't decompress an entry marked as a directory");
++		return ARCHIVE_FAILED;
++	}
++
+ 	if(!rar->skip_mode && (rar->cstate.last_write_ptr > rar->file.unpacked_size)) {
+ 		archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+ 				"Unpacker has written too many bytes");
+ 		return ARCHIVE_FATAL;
+ 	}
+ 
+ 	ret = use_data(rar, buff, size, offset);
+ 	if(ret == ARCHIVE_OK) {
+ 		return ret;
+ 	}
+ 
+ 	if(rar->file.eof == 1) {
+ 		return ARCHIVE_EOF;
+ 	}
+ 
+ 	ret = do_unpack(a, rar, buff, size, offset);
+ 	if(ret != ARCHIVE_OK) {
+ 		return ret;
+ 	}
+ 
+ 	if(rar->file.bytes_remaining == 0 &&
+ 			rar->cstate.last_write_ptr == rar->file.unpacked_size)
+ 	{
+ 		/* If all bytes of current file were processed, run finalization.
+ 		 *
+ 		 * Finalization will check checksum against proper values. If
+ 		 * some of the checksums will not match, we'll return an error
+ 		 * value in the last `archive_read_data` call to signal an error
+ 		 * to the user. */
+ 
+ 		rar->file.eof = 1;
+ 		return verify_global_checksums(a);
+ 	}
+ 
+ 	return ARCHIVE_OK;
+ }
+@@ -3775,17 +3790,16 @@ static int64_t rar5_seek_data(struct archive_read *a, int64_t offset,
+ static int rar5_cleanup(struct archive_read *a) {
+ 	struct rar5* rar = get_context(a);
+ 
+ 	free(rar->cstate.window_buf);
+-
+ 	free(rar->cstate.filtered_buf);
+ 
+ 	free(rar->vol.push_buf);
+ 
+ 	free_filters(rar);
+ 	cdeque_free(&rar->cstate.filters);
+ 
+ 	free(rar);
+ 	a->format->data = NULL;
+ 
+ 	return ARCHIVE_OK;
+ }
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index ecbd4440..29af4ea6 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -966,14 +966,16 @@ DEFINE_TEST(test_read_format_rar5_extra_field_version)
+ DEFINE_TEST(test_read_format_rar5_readtables_overflow)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_readtables_overflow.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * buffer overflow errors during reading rar5 tables. */
+-	assertA(0 == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+@@ -981,14 +983,16 @@ DEFINE_TEST(test_read_format_rar5_readtables_overflow)
+ DEFINE_TEST(test_read_format_rar5_leftshift1)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_leftshift1.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * errors related to undefined operations when using -fsanitize. */
+-	assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+@@ -996,14 +1000,17 @@ DEFINE_TEST(test_read_format_rar5_leftshift1)
+ DEFINE_TEST(test_read_format_rar5_leftshift2)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_leftshift2.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
++
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * errors related to undefined operations when using -fsanitize. */
+-	assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+@@ -1011,14 +1018,17 @@ DEFINE_TEST(test_read_format_rar5_leftshift2)
+ DEFINE_TEST(test_read_format_rar5_truncated_huff)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_truncated_huff.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
++
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * errors related to undefined operations when using -fsanitize. */
+-	assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_FATAL == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+@@ -1026,14 +1036,17 @@ DEFINE_TEST(test_read_format_rar5_truncated_huff)
+ DEFINE_TEST(test_read_format_rar5_invalid_dict_reference)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_invalid_dict_reference.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
++
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * errors related to buffer underflow when using -fsanitize. */
+-	assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+@@ -1041,14 +1054,35 @@ DEFINE_TEST(test_read_format_rar5_invalid_dict_reference)
+ DEFINE_TEST(test_read_format_rar5_distance_overflow)
+ {
+ 	uint8_t buf[16];
+ 
+ 	PROLOGUE("test_read_format_rar5_distance_overflow.rar");
+ 
+ 	assertA(0 == archive_read_next_header(a, &ae));
++
+ 	/* This archive is invalid. However, processing it shouldn't cause any
+ 	 * errors related to variable overflows when using -fsanitize. */
+-	assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
+-	assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
++
++	EPILOGUE();
++}
++
++DEFINE_TEST(test_read_format_rar5_nonempty_dir_stream)
++{
++	uint8_t buf[16];
++
++	PROLOGUE("test_read_format_rar5_nonempty_dir_stream.rar");
++
++	assertA(0 == archive_read_next_header(a, &ae));
++
++	/* This archive is invalid. However, processing it shouldn't cause any
++	 * errors related to buffer overflows when using -fsanitize. */
++	assertA(archive_read_data(a, buf, sizeof(buf)) <= 0);
++
++	/* This test only cares about not returning success here. */
++	assertA(ARCHIVE_OK != archive_read_next_header(a, &ae));
+ 
+ 	EPILOGUE();
+ }
+diff --git a/libarchive/test/test_read_format_rar5_nonempty_dir_stream.rar.uu b/libarchive/test/test_read_format_rar5_nonempty_dir_stream.rar.uu
+new file mode 100644
+index 00000000..c508c1f9
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_nonempty_dir_stream.rar.uu
+@@ -0,0 +1,9 @@
++begin 644 test_read_format_rar5_nonempty_dir_stream.rar
++M4F%R(1H'`0"-[P+2``(''($'$7\`_R4``BP<`0(`(0#_Y@```"#2````____
++M_P`(`/__^P#_W0`"(8#_`(:&;;%DS+?,L8```!;(&P#>``#__^_P```4```&
++M`````````````+`!`@`A`/_F````(-(```#_____``@`___[`/_=``(A``++
++M``"`]/^`!P!#^_____\"(2$!`@`A````_R4``B$A`0(`@````0```"#&`/_=
++M``(A@/\`AH9ML63,M\R`_P```,@;`````!@`````_0`````````!87(A&@<`
++5`(WO`M(``O8'&X`'`#C[_X`E``(A
++`
++end

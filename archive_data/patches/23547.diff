@@ -1,0 +1,245 @@
+commit 55717656097918baf21fe272a788db501ed33854
+Author: Nikita Popov <nikita.ppv@gmail.com>
+Date:   Fri Jun 19 09:27:19 2020 +0200
+
+    Forbid use of <?= as a semi-reserved identifier
+    
+    One of the weirdest pieces of PHP code I've ever seen. In terms
+    of tokens, this gets internally translated to
+    
+        use x as y; echo as my_echo;
+    
+    On master it crashes because this "echo" does not have attached
+    identifier metadata. Make sure it is added and then reject the
+    use of "<?=" as an identifier inside zend_lex_tstring.
+    
+    Fixes oss-fuzz #23547.
+
+diff --git a/Zend/tests/short_echo_as_identifier.phpt b/Zend/tests/short_echo_as_identifier.phpt
+new file mode 100644
+index 0000000000..7fc1684861
+--- /dev/null
++++ b/Zend/tests/short_echo_as_identifier.phpt
+@@ -0,0 +1,15 @@
++--TEST--
++<?= cannot be used as an identifier
++--FILE--
++<?php
++trait T {
++    public function x() {}
++}
++class C {
++    use T {
++        x as y?><?= as my_echo;
++    }
++}
++?>
++--EXPECTF--
++Parse error: Cannot use "<?=" as an identifier in %s on line %d
+diff --git a/Zend/zend_language_parser.y b/Zend/zend_language_parser.y
+index f930cf0e5d..8ec740a05c 100644
+--- a/Zend/zend_language_parser.y
++++ b/Zend/zend_language_parser.y
+@@ -295,8 +295,8 @@ semi_reserved:
+ identifier:
+ 		T_STRING { $$ = $1; }
+ 	| 	semi_reserved  {
+ 			zval zv;
+-			zend_lex_tstring(&zv, $1);
++			if (zend_lex_tstring(&zv, $1) == FAILURE) { YYABORT; }
+ 			$$ = zend_ast_create_zval(&zv);
+ 		}
+ ;
+@@ -851,11 +851,12 @@ trait_precedence:
+ trait_alias:
+ 		trait_method_reference T_AS T_STRING
+ 			{ $$ = zend_ast_create(ZEND_AST_TRAIT_ALIAS, $1, $3); }
+ 	|	trait_method_reference T_AS reserved_non_modifiers
+-			{ zval zv; zend_lex_tstring(&zv, $3);
++			{ zval zv;
++			  if (zend_lex_tstring(&zv, $3) == FAILURE) { YYABORT; }
+ 			  $$ = zend_ast_create(ZEND_AST_TRAIT_ALIAS, $1, zend_ast_create_zval(&zv)); }
+ 	|	trait_method_reference T_AS member_modifier identifier
+ 			{ $$ = zend_ast_create_ex(ZEND_AST_TRAIT_ALIAS, $3, $1, $4); }
+ 	|	trait_method_reference T_AS member_modifier
+ 			{ $$ = zend_ast_create_ex(ZEND_AST_TRAIT_ALIAS, $3, $1, NULL); }
+ ;
+diff --git a/Zend/zend_language_scanner.h b/Zend/zend_language_scanner.h
+index 35d4d0269e..c15f11af2e 100644
+--- a/Zend/zend_language_scanner.h
++++ b/Zend/zend_language_scanner.h
+@@ -78,7 +78,7 @@ ZEND_API void zend_restore_lexical_state(zend_lex_state *lex_state);
+ ZEND_API int zend_prepare_string_for_scanning(zval *str, const char *filename);
+ ZEND_API void zend_multibyte_yyinput_again(zend_encoding_filter old_input_filter, const zend_encoding *old_encoding);
+ ZEND_API int zend_multibyte_set_filter(const zend_encoding *onetime_encoding);
+-ZEND_API void zend_lex_tstring(zval *zv, zend_lexer_ident_ref ident_ref);
++ZEND_API int zend_lex_tstring(zval *zv, zend_lexer_ident_ref ident_ref);
+ 
+ END_EXTERN_C()
+ 
+diff --git a/Zend/zend_language_scanner.l b/Zend/zend_language_scanner.l
+index 7b5a8ab1c8..ffb5158938 100644
+--- a/Zend/zend_language_scanner.l
++++ b/Zend/zend_language_scanner.l
+@@ -306,19 +306,25 @@ ZEND_API void zend_destroy_file_handle(zend_file_handle *file_handle)
+ 	}
+ }
+ 
+-ZEND_API void zend_lex_tstring(zval *zv, zend_lexer_ident_ref ident_ref)
++ZEND_API int zend_lex_tstring(zval *zv, zend_lexer_ident_ref ident_ref)
+ {
+ 	char *ident = (char *) SCNG(yy_start) + ident_ref.offset;
+ 	size_t length = ident_ref.len;
++	if (length == sizeof("<?=")-1 && memcmp(ident, "<?=", sizeof("<?=")-1) == 0) {
++		zend_throw_exception(zend_ce_parse_error, "Cannot use \"<?=\" as an identifier", 0);
++		return FAILURE;
++	}
++
+ 	if (SCNG(on_event)) {
+ 		SCNG(on_event)(ON_FEEDBACK, T_STRING, 0, ident, length, SCNG(on_event_context));
+ 	}
+ 
+ 	ZVAL_STRINGL(zv, ident, length);
++	return SUCCESS;
+ }
+ 
+ #define BOM_UTF32_BE	"\x00\x00\xfe\xff"
+ #define	BOM_UTF32_LE	"\xff\xfe\x00\x00"
+ #define	BOM_UTF16_BE	"\xfe\xff"
+ #define	BOM_UTF16_LE	"\xff\xfe"
+ #define	BOM_UTF8		"\xef\xbb\xbf"
+@@ -2060,132 +2066,133 @@ NEWLINE ("\r"|"\n"|"\r\n")
+ <ST_VAR_OFFSET>[0]|([1-9][0-9]*) { /* Offset could be treated as a long */
+ 	if (yyleng < MAX_LENGTH_OF_LONG - 1 || (yyleng == MAX_LENGTH_OF_LONG - 1 && strcmp(yytext, long_min_digits) < 0)) {
+ 		char *end;
+ 		errno = 0;
+ 		ZVAL_LONG(zendlval, ZEND_STRTOL(yytext, &end, 10));
+ 		if (errno == ERANGE) {
+ 			goto string;
+ 		}
+ 		ZEND_ASSERT(end == yytext + yyleng);
+ 	} else {
+ string:
+ 		ZVAL_STRINGL(zendlval, yytext, yyleng);
+ 	}
+ 	RETURN_TOKEN_WITH_VAL(T_NUM_STRING);
+ }
+ 
+ <ST_VAR_OFFSET>{LNUM}|{HNUM}|{BNUM} { /* Offset must be treated as a string */
+ 	if (yyleng == 1) {
+ 		ZVAL_INTERNED_STR(zendlval, ZSTR_CHAR((zend_uchar)*(yytext)));
+ 	} else {
+ 		ZVAL_STRINGL(zendlval, yytext, yyleng);
+ 	}
+ 	RETURN_TOKEN_WITH_VAL(T_NUM_STRING);
+ }
+ 
+ <ST_IN_SCRIPTING>{DNUM}|{EXPONENT_DNUM} {
+ 	const char *end;
+ 	size_t len = yyleng;
+ 	char *dnum = yytext;
+ 	zend_bool contains_underscores = (memchr(dnum, '_', len) != NULL);
+ 
+ 	if (contains_underscores) {
+ 		dnum = estrndup(dnum, len);
+ 		strip_underscores(dnum, &len);
+ 	}
+ 
+ 	ZVAL_DOUBLE(zendlval, zend_strtod(dnum, &end));
+ 	/* errno isn't checked since we allow HUGE_VAL/INF overflow */
+ 	ZEND_ASSERT(end == dnum + len);
+ 	if (contains_underscores) {
+ 		efree(dnum);
+ 	}
+ 	RETURN_TOKEN_WITH_VAL(T_DNUMBER);
+ }
+ 
+ <ST_IN_SCRIPTING>"__CLASS__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_CLASS_C);
+ }
+ 
+ <ST_IN_SCRIPTING>"__TRAIT__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_TRAIT_C);
+ }
+ 
+ <ST_IN_SCRIPTING>"__FUNCTION__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_FUNC_C);
+ }
+ 
+ <ST_IN_SCRIPTING>"__METHOD__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_METHOD_C);
+ }
+ 
+ <ST_IN_SCRIPTING>"__LINE__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_LINE);
+ }
+ 
+ <ST_IN_SCRIPTING>"__FILE__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_FILE);
+ }
+ 
+ <ST_IN_SCRIPTING>"__DIR__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_DIR);
+ }
+ 
+ <ST_IN_SCRIPTING>"__NAMESPACE__" {
+ 	RETURN_TOKEN_WITH_IDENT(T_NS_C);
+ }
+ 
+ <SHEBANG>"#!" .* {NEWLINE} {
+ 	CG(zend_lineno)++;
+ 	BEGIN(INITIAL);
+ 	goto restart;
+ }
+ 
+ <SHEBANG>{ANY_CHAR} {
+ 	yyless(0);
+ 	BEGIN(INITIAL);
+ 	goto restart;
+ }
+ 
+ <INITIAL>"<?=" {
+ 	BEGIN(ST_IN_SCRIPTING);
+ 	if (PARSER_MODE()) {
+-		RETURN_TOKEN(T_ECHO);
++		/* We'll reject this as an identifier in zend_lex_tstring. */
++		RETURN_TOKEN_WITH_IDENT(T_ECHO);
+ 	}
+ 	RETURN_TOKEN(T_OPEN_TAG_WITH_ECHO);
+ }
+ 
+ 
+ <INITIAL>"<?php"([ \t]|{NEWLINE}) {
+ 	HANDLE_NEWLINE(yytext[yyleng-1]);
+ 	BEGIN(ST_IN_SCRIPTING);
+ 	RETURN_OR_SKIP_TOKEN(T_OPEN_TAG);
+ }
+ 
+ <INITIAL>"<?php" {
+ 	/* Allow <?php followed by end of file. */
+ 	if (YYCURSOR == YYLIMIT) {
+ 		BEGIN(ST_IN_SCRIPTING);
+ 		RETURN_OR_SKIP_TOKEN(T_OPEN_TAG);
+ 	}
+ 	/* Degenerate case: <?phpX is interpreted as <? phpX with short tags. */
+ 	if (CG(short_tags)) {
+ 		yyless(2);
+ 		BEGIN(ST_IN_SCRIPTING);
+ 		RETURN_OR_SKIP_TOKEN(T_OPEN_TAG);
+ 	}
+ 	goto inline_char_handler;
+ }
+ 
+ <INITIAL>"<?" {
+ 	if (CG(short_tags)) {
+ 		BEGIN(ST_IN_SCRIPTING);
+ 		RETURN_OR_SKIP_TOKEN(T_OPEN_TAG);
+ 	} else {
+ 		goto inline_char_handler;
+ 	}
+ }
+ 
+ <INITIAL>{ANY_CHAR} {
+ 	if (YYCURSOR > YYLIMIT) {
+ 		RETURN_END_TOKEN;
+ 	}

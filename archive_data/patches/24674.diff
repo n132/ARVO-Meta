@@ -1,0 +1,655 @@
+commit 1313d1aa7a18d9c3f2dc6f9d04fc8c24bc91870c
+Author: Brian Osman <brianosman@google.com>
+Date:   Tue Sep 8 10:34:30 2020 -0400
+
+    Make enum symbol tables standalone (no parent table)
+    
+    Fixes cases where symbol lookup inside an enum would be allowed to
+    resolve things from the outer scope.
+    
+    Bug: oss-fuzz:24674
+    Change-Id: I841224a7449d2a4f97e41a9d2edd4631ba888a7d
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/315602
+    Commit-Queue: Brian Osman <brianosman@google.com>
+    Reviewed-by: Ethan Nicholas <ethannicholas@google.com>
+    Reviewed-by: John Stiles <johnstiles@google.com>
+
+diff --git a/src/sksl/SkSLIRGenerator.cpp b/src/sksl/SkSLIRGenerator.cpp
+index f3b9b0eaed..90b5c77cde 100644
+--- a/src/sksl/SkSLIRGenerator.cpp
++++ b/src/sksl/SkSLIRGenerator.cpp
+@@ -1255,40 +1255,46 @@ bool IRGenerator::getConstantInt(const Expression& value, int64_t* out) {
+ void IRGenerator::convertEnum(const ASTNode& e) {
+     if (fKind == Program::kPipelineStage_Kind) {
+         fErrors.error(e.fOffset, "enum is not allowed here");
+         return;
+     }
+ 
+     SkASSERT(e.fKind == ASTNode::Kind::kEnum);
+     int64_t currentValue = 0;
+     Layout layout;
+     ASTNode enumType(e.fNodes, e.fOffset, ASTNode::Kind::kType,
+                      ASTNode::TypeData(e.getString(), false, false));
+     const Type* type = this->convertType(enumType);
+     Modifiers modifiers(layout, Modifiers::kConst_Flag);
+-    AutoSymbolTable table(this);
++    std::shared_ptr<SymbolTable> oldTable = fSymbolTable;
++    fSymbolTable = std::make_shared<SymbolTable>(fSymbolTable);
+     for (auto iter = e.begin(); iter != e.end(); ++iter) {
+         const ASTNode& child = *iter;
+         SkASSERT(child.fKind == ASTNode::Kind::kEnumCase);
+         std::unique_ptr<Expression> value;
+         if (child.begin() != child.end()) {
+             value = this->convertExpression(*child.begin());
+             if (!value) {
++                fSymbolTable = oldTable;
+                 return;
+             }
+             if (!this->getConstantInt(*value, &currentValue)) {
+                 fErrors.error(value->fOffset, "enum value must be a constant integer");
++                fSymbolTable = oldTable;
+                 return;
+             }
+         }
+         value = std::unique_ptr<Expression>(new IntLiteral(fContext, e.fOffset, currentValue));
+         ++currentValue;
+         fSymbolTable->add(child.getString(),
+                           std::make_unique<Variable>(e.fOffset, modifiers, child.getString(), *type,
+                                                      Variable::kGlobal_Storage, value.get()));
+         fSymbolTable->takeOwnershipOfIRNode(std::move(value));
+     }
++    // Now we orphanize the Enum's symbol table, so that future lookups in it are strict
++    fSymbolTable->fParent = nullptr;
+     fProgramElements->push_back(std::unique_ptr<ProgramElement>(
+             new Enum(e.fOffset, e.getString(), fSymbolTable, fIsBuiltinCode)));
++    fSymbolTable = oldTable;
+ }
+ 
+ const Type* IRGenerator::convertType(const ASTNode& type) {
+@@ -2626,49 +2632,52 @@ std::unique_ptr<Expression> IRGenerator::getCap(int offset, String name) {
+                                                    found->second.literal(fContext, offset)));
+ }
+ 
+-std::unique_ptr<Expression> IRGenerator::findEnumRef(
+-                                           int offset,
+-                                           const Type& type,
+-                                           StringFragment field,
+-                                           std::vector<std::unique_ptr<ProgramElement>>& elements) {
+-    for (const auto& e : elements) {
+-        if (e->kind() == ProgramElement::Kind::kEnum && type.name() == e->as<Enum>().fTypeName) {
+-            std::shared_ptr<SymbolTable> old = fSymbolTable;
+-            fSymbolTable = e->as<Enum>().fSymbols;
+-            std::unique_ptr<Expression> result = convertIdentifier(ASTNode(&fFile->fNodes, offset,
+-                                                                         ASTNode::Kind::kIdentifier,
+-                                                                         field));
+-            if (result) {
+-                const Variable& v = result->as<VariableReference>().fVariable;
+-                SkASSERT(v.fInitialValue);
+-                result = std::make_unique<IntLiteral>(
+-                        offset, v.fInitialValue->as<IntLiteral>().fValue, &type);
++std::unique_ptr<Expression> IRGenerator::convertTypeField(int offset, const Type& type,
++                                                          StringFragment field) {
++    // Find the Enum element that this type refers to (if any)
++    auto findEnum = [=](std::vector<std::unique_ptr<ProgramElement>>& elements) -> ProgramElement* {
++        for (const auto& e : elements) {
++            if (e->is<Enum>() && type.name() == e->as<Enum>().fTypeName) {
++                return e.get();
+             }
+-            fSymbolTable = old;
+-            return result;
+         }
++        return nullptr;
++    };
++    const ProgramElement* enumElement = findEnum(*fProgramElements);
++    if (fInherited && !enumElement) {
++        enumElement = findEnum(*fInherited);
+     }
+-    return nullptr;
+-}
+ 
+-std::unique_ptr<Expression> IRGenerator::convertTypeField(int offset, const Type& type,
+-                                                          StringFragment field) {
+-    std::unique_ptr<Expression> result = this->findEnumRef(offset, type, field, *fProgramElements);
+-    if (fInherited && !result) {
+-        result = this->findEnumRef(offset, type, field, *fInherited);
+-    }
+-    if (!result) {
++    if (enumElement) {
++        // We found the Enum element. Look for 'field' as a member.
++        std::shared_ptr<SymbolTable> old = fSymbolTable;
++        fSymbolTable = enumElement->as<Enum>().fSymbols;
++        std::unique_ptr<Expression> result = convertIdentifier(
++                ASTNode(&fFile->fNodes, offset, ASTNode::Kind::kIdentifier, field));
++        if (result) {
++            const Variable& v = result->as<VariableReference>().fVariable;
++            SkASSERT(v.fInitialValue);
++            result = std::make_unique<IntLiteral>(
++                    offset, v.fInitialValue->as<IntLiteral>().fValue, &type);
++        } else {
++            fErrors.error(offset,
++                          "type '" + type.fName + "' does not have a field named '" + field + "'");
++        }
++        fSymbolTable = old;
++        return result;
++    } else {
++        // No Enum element? Check the intrinsics, clone it into the program, try again.
+         auto found = fIntrinsics->find(type.fName);
+         if (found != fIntrinsics->end()) {
+             SkASSERT(!found->second.fAlreadyIncluded);
+             found->second.fAlreadyIncluded = true;
+             fProgramElements->push_back(found->second.fIntrinsic->clone());
+             return this->convertTypeField(offset, type, field);
+         }
+-        fErrors.error(offset, "type '" + type.fName + "' does not have a field named '" + field +
+-                              "'");
++        fErrors.error(offset,
++                      "type '" + type.fName + "' does not have a field named '" + field + "'");
++        return nullptr;
+     }
+-    return result;
+ }
+ 
+ std::unique_ptr<Expression> IRGenerator::convertIndexExpression(const ASTNode& index) {
+diff --git a/src/sksl/SkSLIRGenerator.h b/src/sksl/SkSLIRGenerator.h
+index 478bc64891..365fe62985 100644
+--- a/src/sksl/SkSLIRGenerator.h
++++ b/src/sksl/SkSLIRGenerator.h
+@@ -76,132 +76,128 @@ public:
+ private:
+     /**
+      * Prepare to compile a program. Resets state, pushes a new symbol table, and installs the
+      * settings.
+      */
+     void start(const Program::Settings* settings,
+                std::vector<std::unique_ptr<ProgramElement>>* inherited,
+                bool isBuiltinCode = false);
+ 
+     /**
+      * Performs cleanup after compilation is complete.
+      */
+     void finish();
+ 
+     void pushSymbolTable();
+     void popSymbolTable();
+ 
+     void checkModifiers(int offset, const Modifiers& modifiers, int permitted);
+     std::unique_ptr<VarDeclarations> convertVarDeclarations(const ASTNode& decl,
+                                                             Variable::Storage storage);
+     void convertFunction(const ASTNode& f);
+     std::unique_ptr<Statement> convertSingleStatement(const ASTNode& statement);
+     std::unique_ptr<Statement> convertStatement(const ASTNode& statement);
+     std::unique_ptr<Expression> convertExpression(const ASTNode& expression);
+     std::unique_ptr<ModifiersDeclaration> convertModifiersDeclaration(const ASTNode& m);
+ 
+     const Type* convertType(const ASTNode& type);
+     std::unique_ptr<Expression> call(int offset,
+                                      const FunctionDeclaration& function,
+                                      std::vector<std::unique_ptr<Expression>> arguments);
+     int callCost(const FunctionDeclaration& function,
+                  const std::vector<std::unique_ptr<Expression>>& arguments);
+     std::unique_ptr<Expression> call(int offset, std::unique_ptr<Expression> function,
+                                      std::vector<std::unique_ptr<Expression>> arguments);
+     int coercionCost(const Expression& expr, const Type& type);
+     std::unique_ptr<Expression> coerce(std::unique_ptr<Expression> expr, const Type& type);
+     std::unique_ptr<Block> convertBlock(const ASTNode& block);
+     std::unique_ptr<Statement> convertBreak(const ASTNode& b);
+     std::unique_ptr<Expression> convertNumberConstructor(
+                                                    int offset,
+                                                    const Type& type,
+                                                    std::vector<std::unique_ptr<Expression>> params);
+     std::unique_ptr<Expression> convertCompoundConstructor(
+                                                    int offset,
+                                                    const Type& type,
+                                                    std::vector<std::unique_ptr<Expression>> params);
+     std::unique_ptr<Expression> convertConstructor(int offset,
+                                                    const Type& type,
+                                                    std::vector<std::unique_ptr<Expression>> params);
+     std::unique_ptr<Statement> convertContinue(const ASTNode& c);
+     std::unique_ptr<Statement> convertDiscard(const ASTNode& d);
+     std::unique_ptr<Statement> convertDo(const ASTNode& d);
+     std::unique_ptr<Statement> convertSwitch(const ASTNode& s);
+     std::unique_ptr<Expression> convertBinaryExpression(const ASTNode& expression);
+     std::unique_ptr<Extension> convertExtension(int offset, StringFragment name);
+     std::unique_ptr<Statement> convertExpressionStatement(const ASTNode& s);
+     std::unique_ptr<Statement> convertFor(const ASTNode& f);
+     std::unique_ptr<Expression> convertIdentifier(const ASTNode& identifier);
+     std::unique_ptr<Statement> convertIf(const ASTNode& s);
+     std::unique_ptr<Expression> convertIndex(std::unique_ptr<Expression> base,
+                                              const ASTNode& index);
+     std::unique_ptr<InterfaceBlock> convertInterfaceBlock(const ASTNode& s);
+     Modifiers convertModifiers(const Modifiers& m);
+     std::unique_ptr<Expression> convertPrefixExpression(const ASTNode& expression);
+     std::unique_ptr<Statement> convertReturn(const ASTNode& r);
+     std::unique_ptr<Section> convertSection(const ASTNode& e);
+     std::unique_ptr<Expression> getCap(int offset, String name);
+     std::unique_ptr<Expression> convertCallExpression(const ASTNode& expression);
+     std::unique_ptr<Expression> convertFieldExpression(const ASTNode& expression);
+     std::unique_ptr<Expression> convertIndexExpression(const ASTNode& expression);
+     std::unique_ptr<Expression> convertPostfixExpression(const ASTNode& expression);
+-    std::unique_ptr<Expression> findEnumRef(int offset,
+-                                            const Type& type,
+-                                            StringFragment field,
+-                                            std::vector<std::unique_ptr<ProgramElement>>& elements);
+     std::unique_ptr<Expression> convertTypeField(int offset, const Type& type,
+                                                  StringFragment field);
+     std::unique_ptr<Expression> convertField(std::unique_ptr<Expression> base,
+                                              StringFragment field);
+     std::unique_ptr<Expression> convertSwizzle(std::unique_ptr<Expression> base,
+                                                StringFragment fields);
+     std::unique_ptr<Expression> convertTernaryExpression(const ASTNode& expression);
+     std::unique_ptr<Statement> convertVarDeclarationStatement(const ASTNode& s);
+     std::unique_ptr<Statement> convertWhile(const ASTNode& w);
+     void convertEnum(const ASTNode& e);
+     std::unique_ptr<Block> applyInvocationIDWorkaround(std::unique_ptr<Block> main);
+     // returns a statement which converts sk_Position from device to normalized coordinates
+     std::unique_ptr<Statement> getNormalizeSkPositionCode();
+ 
+     void checkValid(const Expression& expr);
+     bool setRefKind(Expression& expr, VariableReference::RefKind kind);
+     bool getConstantInt(const Expression& value, int64_t* out);
+     bool checkSwizzleWrite(const Swizzle& swizzle);
+     void copyIntrinsicIfNeeded(const FunctionDeclaration& function);
+ 
+     Inliner* fInliner = nullptr;
+     std::unique_ptr<ASTFile> fFile;
+     const FunctionDeclaration* fCurrentFunction;
+     std::unordered_map<String, Program::Settings::Value> fCapsMap;
+     std::shared_ptr<SymbolTable> fRootSymbolTable;
+     std::shared_ptr<SymbolTable> fSymbolTable;
+     // additional statements that need to be inserted before the one that convertStatement is
+     // currently working on
+     std::vector<std::unique_ptr<Statement>> fExtraStatements;
+     // Symbols which have definitions in the include files.
+     IRIntrinsicMap* fIntrinsics = nullptr;
+     std::unordered_set<const FunctionDeclaration*> fReferencedIntrinsics;
+     int fLoopLevel;
+     int fSwitchLevel;
+     ErrorReporter& fErrors;
+     int fInvocations;
+     std::vector<std::unique_ptr<ProgramElement>>* fInherited;
+     std::vector<std::unique_ptr<ProgramElement>>* fProgramElements;
+     const Variable* fSkPerVertex = nullptr;
+     const Variable* fRTAdjust;
+     const Variable* fRTAdjustInterfaceBlock;
+     int fRTAdjustFieldIndex;
+     int fTmpSwizzleCounter;
+     bool fCanInline = true;
+     // true if we are currently processing one of the built-in SkSL include files
+     bool fIsBuiltinCode;
+ 
+     friend class AutoSymbolTable;
+     friend class AutoLoopLevel;
+     friend class AutoSwitchLevel;
+     friend class AutoDisableInline;
+     friend class Compiler;
+ };
+ 
+ }  // namespace SkSL
+ 
+ #endif
+diff --git a/src/sksl/SkSLRehydrator.cpp b/src/sksl/SkSLRehydrator.cpp
+index c0c2783bd2..73bb03d91b 100644
+--- a/src/sksl/SkSLRehydrator.cpp
++++ b/src/sksl/SkSLRehydrator.cpp
+@@ -263,65 +263,65 @@ std::vector<std::unique_ptr<ProgramElement>> Rehydrator::elements() {
+ std::unique_ptr<ProgramElement> Rehydrator::element() {
+     int kind = this->readU8();
+     switch (kind) {
+         case Rehydrator::kEnum_Command: {
+             StringFragment typeName = this->readString();
+-            std::shared_ptr<SymbolTable> symbols = this->symbolTable();
++            std::shared_ptr<SymbolTable> symbols = this->symbolTable(/*inherit=*/false);
+             for (auto& s : symbols->fOwnedSymbols) {
+                 SkASSERT(s->kind() == Symbol::Kind::kVariable);
+                 Variable& v = (Variable&) *s;
+                 int value = this->readS32();
+                 v.fInitialValue = symbols->takeOwnershipOfIRNode(
+                         std::make_unique<IntLiteral>(fContext, /*offset=*/-1, value));
+                 v.fWriteCount = 1;
+             }
+             return std::unique_ptr<ProgramElement>(new Enum(-1, typeName, std::move(symbols)));
+         }
+         case Rehydrator::kFunctionDefinition_Command: {
+             const FunctionDeclaration* decl = this->symbolRef<FunctionDeclaration>(
+                                                                 Symbol::Kind::kFunctionDeclaration);
+             std::unique_ptr<Statement> body = this->statement();
+             std::unordered_set<const FunctionDeclaration*> refs;
+             uint8_t refCount = this->readU8();
+             for (int i = 0; i < refCount; ++i) {
+                 refs.insert(this->symbolRef<FunctionDeclaration>(
+                                                                Symbol::Kind::kFunctionDeclaration));
+             }
+             FunctionDefinition* result = new FunctionDefinition(-1, *decl, std::move(body),
+                                                                 std::move(refs));
+             decl->fDefinition = result;
+             return std::unique_ptr<ProgramElement>(result);
+         }
+         case Rehydrator::kInterfaceBlock_Command: {
+             const Symbol* var = this->symbol();
+             SkASSERT(var && var->kind() == Symbol::Kind::kVariable);
+             StringFragment typeName = this->readString();
+             StringFragment instanceName = this->readString();
+             uint8_t sizeCount = this->readU8();
+             std::vector<std::unique_ptr<Expression>> sizes;
+             sizes.reserve(sizeCount);
+             for (int i = 0; i < sizeCount; ++i) {
+                 sizes.push_back(this->expression());
+             }
+             return std::unique_ptr<ProgramElement>(new InterfaceBlock(-1, (Variable*) var, typeName,
+                                                                       instanceName,
+                                                                       std::move(sizes), nullptr));
+         }
+         case Rehydrator::kVarDeclarations_Command: {
+             const Type* baseType = this->type();
+             int count = this->readU8();
+             std::vector<std::unique_ptr<VarDeclaration>> vars;
+             vars.reserve(count);
+             for (int i = 0 ; i < count; ++i) {
+                 std::unique_ptr<Statement> s = this->statement();
+                 SkASSERT(s->kind() == Statement::Kind::kVarDeclaration);
+                 vars.emplace_back((VarDeclaration*) s.release());
+             }
+             return std::unique_ptr<ProgramElement>(new VarDeclarations(-1, baseType,
+                                                                        std::move(vars)));
+         }
+         default:
+             printf("unsupported element %d\n", kind);
+             SkASSERT(false);
+             return nullptr;
+     }
+ }
+@@ -560,30 +560,32 @@ std::unique_ptr<Expression> Rehydrator::expression() {
+     }
+ }
+ 
+-std::shared_ptr<SymbolTable> Rehydrator::symbolTable() {
++std::shared_ptr<SymbolTable> Rehydrator::symbolTable(bool inherit) {
+     int command = this->readU8();
+     if (command == kVoid_Command) {
+         return nullptr;
+     }
+     SkASSERT(command == kSymbolTable_Command);
+     uint16_t ownedCount = this->readU16();
+-    std::shared_ptr<SymbolTable> result(new SymbolTable(fSymbolTable));
++    std::shared_ptr<SymbolTable> oldTable = fSymbolTable;
++    std::shared_ptr<SymbolTable> result = inherit ? std::make_shared<SymbolTable>(fSymbolTable)
++                                                  : std::make_shared<SymbolTable>(fErrors);
+     fSymbolTable = result;
+     std::vector<const Symbol*> ownedSymbols;
+     ownedSymbols.reserve(ownedCount);
+     for (int i = 0; i < ownedCount; ++i) {
+         ownedSymbols.push_back(this->symbol());
+     }
+     uint16_t symbolCount = this->readU16();
+     std::vector<std::pair<StringFragment, int>> symbols;
+     symbols.reserve(symbolCount);
+     for (int i = 0; i < symbolCount; ++i) {
+         StringFragment name = this->readString();
+         int index = this->readU16();
+         fSymbolTable->addWithoutOwnership(name, ownedSymbols[index]);
+     }
+-    fSymbolTable = fSymbolTable->fParent;
++    fSymbolTable = oldTable;
+     return result;
+ }
+ 
+ }  // namespace SkSL
+diff --git a/src/sksl/SkSLRehydrator.h b/src/sksl/SkSLRehydrator.h
+index 1b4ee6f423..9b208aeaed 100644
+--- a/src/sksl/SkSLRehydrator.h
++++ b/src/sksl/SkSLRehydrator.h
+@@ -39,201 +39,203 @@ class Rehydrator {
+ public:
+     enum Command {
+         // uint16 id, Type componentType, uint8 count
+         kArrayType_Command,
+         // Expression left, uint8 op, Expression right, Type type
+         kBinary_Command,
+         // SymbolTable symbolTable, uint8 statementCount, Statement[] statements, bool isScope
+         kBlock_Command,
+         // bool value
+         kBoolLiteral_Command,
+         kBreak_Command,
+         // int16 builtin
+         kBuiltinLayout_Command,
+         // Type type, uint8 argCount, Expression[] arguments
+         kConstructor_Command,
+         kContinue_Command,
+         kDefaultLayout_Command,
+         kDefaultModifiers_Command,
+         kDiscard_Command,
+         // Statement stmt, Expression test
+         kDo_Command,
+         // uint8 count, uint8 index
+         kElements_Command,
+         // String typeName, SymbolTable symbols, int32[] values
+         kEnum_Command,
+         // uint16 id, String name
+         kEnumType_Command,
+         // Expression expression
+         kExpressionStatement_Command,
+         // uint16 ownerId, uint8 index
+         kField_Command,
+         // Expression base, uint8 index, uint8 ownerKind
+         kFieldAccess_Command,
+         // float value
+         kFloatLiteral_Command,
+         // Statement initializer, Expression test, Expression next, Statement body,
+         // SymbolTable symbols
+         kFor_Command,
+         // Type type, uint16 function, uint8 argCount, Expression[] arguments
+         kFunctionCall_Command,
+         // uint16 declaration, Statement body, uint8 refCount, uint16[] referencedIntrinsics
+         kFunctionDefinition_Command,
+         // uint16 id, Modifiers modifiers, String name, uint8 parameterCount, uint16[] parameterIds,
+         // Type returnType
+         kFunctionDeclaration_Command,
+         // bool isStatic, Expression test, Statement ifTrue, Statement ifFalse
+         kIf_Command,
+         // Expression base, Expression index
+         kIndex_Command,
+         // Variable* var, String typeName, String instanceName, uint8 sizeCount, Expression[] sizes
+         kInterfaceBlock_Command,
+         // int32 value
+         kIntLiteral_Command,
+         // int32 flags, int8 location, int8 offset, int8 binding, int8 index, int8 set,
+         // int16 builtin, int8 inputAttachmentIndex, int8 format, int8 primitive, int8 maxVertices,
+         // int8 invocations, String marker, String when, int8 key, int8 ctype
+         kLayout_Command,
+         // Layout layout, uint8 flags
+         kModifiers8Bit_Command,
+         // Layout layout, uint32 flags
+         kModifiers_Command,
+         // uint16 id, Type baseType
+         kNullableType_Command,
+         kNullLiteral_Command,
+         // uint8 op, Expression operand
+         kPostfix_Command,
+         // uint8 op, Expression operand
+         kPrefix_Command,
+         // Expression value
+         kReturn_Command,
+         // String name, Expression value
+         kSetting_Command,
+         // uint16 id, String name, uint8 fieldCount, (Modifiers, String, Type)[] fields
+         kStructType_Command,
+         // bool isStatic, SymbolTable symbols, Expression value, uint8 caseCount,
+         // (Expression value, uint8 statementCount, Statement[] statements)[] cases
+         kSwitch_Command,
+         // Expression base, uint8 componentCount, uint8[] components
+         kSwizzle_Command,
+         // uint16 id
+         kSymbolRef_Command,
+         // uint16 owned symbol count, Symbol[] ownedSymbols, uint16 symbol count,
+         // (String, uint16/*index*/)[].
+         kSymbolTable_Command,
+         // uint16 id, String name
+         kSystemType_Command,
+         // Expression test, Expression ifTrue, Expression ifFalse
+         kTernary_Command,
+         // uint16 id, FunctionDeclaration[] functions
+         kUnresolvedFunction_Command,
+         // uint16 id, Modifiers modifiers, String name, Type type, uint8 storage
+         kVariable_Command,
+         // uint16 varId, uint8 sizeCount, Expression[] sizes, Expression? value
+         kVarDeclaration_Command,
+         // Type baseType, uint8 varCount, VarDeclaration vars
+         kVarDeclarations_Command,
+         // uint16 varId, uint8 refKind
+         kVariableReference_Command,
+         kVoid_Command,
+         // Expression test, Statement body
+         kWhile_Command,
+     };
+ 
+     // src must remain in memory as long as the objects created from it do
+     Rehydrator(Context* context, std::shared_ptr<SymbolTable> symbolTable,
+                ErrorReporter* errorReporter, const uint8_t* src, size_t length)
+         : fContext(*context)
++        , fErrors(errorReporter)
+         , fSymbolTable(std::move(symbolTable))
+         , fStart(src)
+         SkDEBUGCODE(, fEnd(fStart + length)) {
+         SkASSERT(fSymbolTable);
+         // skip past string data
+         fIP = fStart;
+         fIP += this->readU16();
+     }
+ 
+     std::vector<std::unique_ptr<ProgramElement>> elements();
+ 
+-    std::shared_ptr<SymbolTable> symbolTable();
++    std::shared_ptr<SymbolTable> symbolTable(bool inherit = true);
+ 
+ private:
+     int8_t readS8() {
+         SkASSERT(fIP < fEnd);
+         return *(fIP++);
+     }
+ 
+     uint8_t readU8() {
+         return this->readS8();
+     }
+ 
+     int16_t readS16() {
+         uint8_t b1 = this->readU8();
+         uint8_t b2 = this->readU8();
+         return (b2 << 8) + b1;
+     }
+ 
+     uint16_t readU16() {
+         return this->readS16();
+     }
+ 
+     int32_t readS32() {
+         uint8_t b1 = this->readU8();
+         uint8_t b2 = this->readU8();
+         uint8_t b3 = this->readU8();
+         uint8_t b4 = this->readU8();
+         return (b4 << 24) + (b3 << 16) + (b2 << 8) + b1;
+     }
+ 
+     uint32_t readU32() {
+         return this->readS32();
+     }
+ 
+     StringFragment readString() {
+         uint16_t offset = this->readU16();
+         uint8_t length = *(uint8_t*) (fStart + offset);
+         const char* chars = (const char*) fStart + offset + 1;
+         return StringFragment(chars, length);
+     }
+ 
+     void addSymbol(int id, const Symbol* symbol) {
+         while ((size_t) id >= fSymbols.size()) {
+             fSymbols.push_back(nullptr);
+         }
+         fSymbols[id] = symbol;
+     }
+ 
+     template<typename T>
+     T* symbolRef(Symbol::Kind kind) {
+         uint16_t result = this->readU16();
+         SkASSERT(fSymbols.size() > result);
+         return (T*) fSymbols[result];
+     }
+ 
+     Layout layout();
+ 
+     Modifiers modifiers();
+ 
+     const Symbol* symbol();
+ 
+     std::unique_ptr<ProgramElement> element();
+ 
+     std::unique_ptr<Statement> statement();
+ 
+     std::unique_ptr<Expression> expression();
+ 
+     const Type* type();
+ 
+     Context& fContext;
++    ErrorReporter* fErrors;
+     std::shared_ptr<SymbolTable> fSymbolTable;
+     std::vector<const Symbol*> fSymbols;
+ 
+     const uint8_t* fStart;
+     const uint8_t* fIP;
+     SkDEBUGCODE(const uint8_t* fEnd;)
+ 
+     friend class AutoRehydratorSymbolTable;
+ };
+ 
+ }  // namespace SkSL
+ 
+ #endif
+diff --git a/src/sksl/ir/SkSLSymbolTable.h b/src/sksl/ir/SkSLSymbolTable.h
+index be541ada1a..058fe29e42 100644
+--- a/src/sksl/ir/SkSLSymbolTable.h
++++ b/src/sksl/ir/SkSLSymbolTable.h
+@@ -26,44 +26,44 @@ class SymbolTable {
+ public:
+     SymbolTable(ErrorReporter* errorReporter)
+     : fErrorReporter(*errorReporter) {}
+ 
+     SymbolTable(std::shared_ptr<SymbolTable> parent)
+     : fParent(parent)
+     , fErrorReporter(parent->fErrorReporter) {}
+ 
+     const Symbol* operator[](StringFragment name);
+ 
+     void addWithoutOwnership(StringFragment name, const Symbol* symbol);
+ 
+     template <typename T>
+     const T* add(StringFragment name, std::unique_ptr<T> symbol) {
+         const T* ptr = symbol.get();
+         this->addWithoutOwnership(name, ptr);
+         this->takeOwnershipOfSymbol(std::move(symbol));
+         return ptr;
+     }
+ 
+     template <typename T>
+     const T* takeOwnershipOfSymbol(std::unique_ptr<T> symbol) {
+         const T* ptr = symbol.get();
+         fOwnedSymbols.push_back(std::move(symbol));
+         return ptr;
+     }
+ 
+     template <typename T>
+     const T* takeOwnershipOfIRNode(std::unique_ptr<T> node) {
+         const T* ptr = node.get();
+         fOwnedNodes.push_back(std::move(node));
+         return ptr;
+     }
+ 
+     const String* takeOwnershipOfString(std::unique_ptr<String> n);
+ 
+     std::unordered_map<StringFragment, const Symbol*>::iterator begin();
+ 
+     std::unordered_map<StringFragment, const Symbol*>::iterator end();
+ 
+-    const std::shared_ptr<SymbolTable> fParent;
++    std::shared_ptr<SymbolTable> fParent;
+ 
+     std::vector<std::unique_ptr<const Symbol>> fOwnedSymbols;
+ 

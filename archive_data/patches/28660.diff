@@ -1,0 +1,375 @@
+commit e2b0a850d7f7087efc15181b8ab11a6b8a566228
+Author: Alex Rebert <alexandre.rebert@gmail.com>
+Date:   Sat Feb 5 23:06:38 2022 -0500
+
+    Fix memory safety issues found by OSS-Fuzz (#4983)
+    
+    * RWMol: replace atom in stereo groups
+    
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=36998, a
+    use-after-free in initFromOther.
+    
+    * Fix out-of-bounds write in iterateCIPRanks
+    
+    If the rank has not changed in the current iteration, the cipEntries
+    vectors might not have increased in size. Accessing `numIts + 1`
+    resulted in an out-of-bounds write. This commit skip the cipEntries
+    update when the rank is unchanged.
+    
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=28660
+    
+    * Fix use of uninitialized values in MolSGroupParsing
+    
+    `stream >> count` may silently fail without an exception. In that case,
+    `count` was uninitialized but used. This commit initalizes `count` to 0,
+    as well as other variables that may be read without being initialized.
+    
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25220
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25225
+    
+    * Fix vector size cast in streamReadVec
+    
+    In 32-bit systems, the implicit conversions from 64-bit to a 32-bit
+    size_t could lead to an underallocation of the vector. This would follow
+    by a out-of-bounds write while trying to populate the vector. Now, the
+    code throws an exception in case of a cast that would change the size.
+    
+    Fix https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=28034
+    
+    * RWMol: improve atom replacement in stereo groups
+    
+    This code is cleaner and more efficient.
+    
+    * Add test for replaceAtom and stereo groups
+
+diff --git a/Code/GraphMol/Chirality.cpp b/Code/GraphMol/Chirality.cpp
+index bdbcfc7cf..c1abab5a0 100644
+--- a/Code/GraphMol/Chirality.cpp
++++ b/Code/GraphMol/Chirality.cpp
+@@ -892,166 +892,168 @@ void buildCIPInvariants(const ROMol &mol, DOUBLE_VECT &res) {
+ void iterateCIPRanks(const ROMol &mol, const DOUBLE_VECT &invars,
+                      UINT_VECT &ranks, bool seedWithInvars) {
+   PRECONDITION(invars.size() == mol.getNumAtoms(), "bad invars size");
+   PRECONDITION(ranks.size() >= mol.getNumAtoms(), "bad ranks size");
+ 
+   unsigned int numAtoms = mol.getNumAtoms();
+   CIP_ENTRY_VECT cipEntries(numAtoms);
+   for (auto &vec : cipEntries) {
+     vec.reserve(16);
+   }
+ #ifdef VERBOSE_CANON
+   BOOST_LOG(rdDebugLog) << "invariants:" << std::endl;
+   for (unsigned int i = 0; i < numAtoms; i++) {
+     BOOST_LOG(rdDebugLog) << i << ": " << invars[i] << std::endl;
+   }
+ #endif
+ 
+   // rank those:
+   Rankers::rankVect(invars, ranks);
+ #ifdef VERBOSE_CANON
+   BOOST_LOG(rdDebugLog) << "initial ranks:" << std::endl;
+   for (unsigned int i = 0; i < numAtoms; ++i) {
+     BOOST_LOG(rdDebugLog) << i << ": " << ranks[i] << std::endl;
+   }
+ #endif
+   // Start each atom's rank vector with its atomic number:
+   //  Note: in general one should avoid the temptation to
+   //  use invariants here, those lead to incorrect answers
+   for (unsigned int i = 0; i < numAtoms; i++) {
+     if (seedWithInvars) {
+       cipEntries[i].push_back(static_cast<int>(invars[i]));
+     } else {
+       cipEntries[i].push_back(mol[i]->getAtomicNum());
+       cipEntries[i].push_back(static_cast<int>(ranks[i]));
+     }
+   }
+ 
+   // Loop until either:
+   //   1) all classes are uniquified
+   //   2) the number of ranks doesn't change from one iteration to
+   //      the next
+   //   3) we've gone through maxIts times
+   //      maxIts is calculated by dividing the number of atoms
+   //      by 2. That's a pessimal version of the
+   //      maximum number of steps required for two atoms to
+   //      "feel" each other (each influences one additional
+   //      neighbor shell per iteration).
+   unsigned int maxIts = numAtoms / 2 + 1;
+   unsigned int numIts = 0;
+   int lastNumRanks = -1;
+   unsigned int numRanks = *std::max_element(ranks.begin(), ranks.end()) + 1;
+   std::vector<unsigned int> counts(ranks.size());
+   std::vector<unsigned int> updatedNbrIdxs;
+   updatedNbrIdxs.reserve(8);
+   while (numRanks < numAtoms && numIts < maxIts &&
+          (lastNumRanks < 0 ||
+           static_cast<unsigned int>(lastNumRanks) < numRanks)) {
+     unsigned int longestEntry = 0;
+     // ----------------------------------------------------
+     //
+     // for each atom, get a sorted list of its neighbors' ranks:
+     //
+     for (unsigned int index = 0; index < numAtoms; ++index) {
+       // Note: counts is cleaned up when we drain into cipEntries.
+       updatedNbrIdxs.clear();
+ 
+       // start by pushing on our neighbors' ranks:
+       ROMol::OEDGE_ITER beg, end;
+       boost::tie(beg, end) = mol.getAtomBonds(mol[index]);
+       while (beg != end) {
+         const Bond *bond = mol[*beg];
+         ++beg;
+         unsigned int nbrIdx = bond->getOtherAtomIdx(index);
+         updatedNbrIdxs.push_back(nbrIdx);
+ 
+         // put the neighbor in 2N times where N is the bond order as a double.
+         // this is to treat aromatic linkages on fair footing. i.e. at least in
+         // the first iteration --c(:c):c and --C(=C)-C should look the same.
+         // this was part of issue 3009911
+ 
+         // a special case for chiral phosphorus compounds
+         // (this was leading to incorrect assignment of R/S labels ):
+         bool isChiralPhosphorusSpecialCase = false;
+         if (bond->getBondType() == Bond::DOUBLE) {
+           const Atom *nbr = mol[nbrIdx];
+           if (nbr->getAtomicNum() == 15) {
+             unsigned int nbrDeg = nbr->getDegree();
+             isChiralPhosphorusSpecialCase = nbrDeg == 3 || nbrDeg == 4;
+           }
+         };
+ 
+         // general justification of this is:
+         // Paragraph 2.2. in the 1966 article is "Valence-Bond Conventions:
+         // Multiple-Bond Unsaturation and Aromaticity". It contains several
+         // conventions of which convention (b) is the one applying here:
+         // "(b) Contributions by d orbitals to bonds of quadriligant atoms are
+         // neglected."
+         // FIX: this applies to more than just P
+         if (isChiralPhosphorusSpecialCase) {
+           counts[nbrIdx] += 1;
+         } else {
+           counts[nbrIdx] += getTwiceBondType(*bond);
+         }
+       }
+ 
+       // For each of our neighbors' ranks weighted by bond type, copy it N times
+       // to our cipEntry in reverse rank order, where N is the weight.
+       if (updatedNbrIdxs.size() > 1) {  // compare vs 1 for performance.
+         std::sort(std::begin(updatedNbrIdxs), std::end(updatedNbrIdxs),
+                   [&ranks](unsigned int idx1, unsigned int idx2) {
+                     return ranks[idx1] > ranks[idx2];
+                   });
+       }
+       auto &cipEntry = cipEntries[index];
+       for (auto nbrIdx : updatedNbrIdxs) {
+         unsigned int count = counts[nbrIdx];
+         cipEntry.insert(cipEntry.end(), count, ranks[nbrIdx] + 1);
+         counts[nbrIdx] = 0;
+       }
+       // add a zero for each coordinated H as long as we're not a query atom
+       if (!mol[index]->hasQuery()) {
+         cipEntry.insert(cipEntry.end(), mol[index]->getTotalNumHs(), 0);
+       }
+ 
+       if (cipEntry.size() > longestEntry) {
+         longestEntry = rdcast<unsigned int>(cipEntry.size());
+       }
+     }
+     // ----------------------------------------------------
+     //
+     // pad the entries so that we compare rounds to themselves:
+     //
+     for (unsigned int index = 0; index < numAtoms; ++index) {
+       auto sz = rdcast<unsigned int>(cipEntries[index].size());
+       if (sz < longestEntry) {
+         cipEntries[index].insert(cipEntries[index].end(), longestEntry - sz,
+                                  -1);
+       }
+     }
+     // ----------------------------------------------------
+     //
+     // sort the new ranks and update the list of active indices:
+     //
+     lastNumRanks = numRanks;
+ 
+     Rankers::rankVect(cipEntries, ranks);
+     numRanks = *std::max_element(ranks.begin(), ranks.end()) + 1;
+ 
+     // now truncate each vector and stick the rank at the end
+-    for (unsigned int i = 0; i < numAtoms; ++i) {
+-      cipEntries[i][numIts + 1] = ranks[i];
+-      cipEntries[i].erase(cipEntries[i].begin() + numIts + 2,
+-                          cipEntries[i].end());
++    if (static_cast<unsigned int>(lastNumRanks) != numRanks) {
++      for (unsigned int i = 0; i < numAtoms; ++i) {
++        cipEntries[i][numIts + 1] = ranks[i];
++        cipEntries[i].erase(cipEntries[i].begin() + numIts + 2,
++                            cipEntries[i].end());
++      }
+     }
+ 
+     ++numIts;
+ #ifdef VERBOSE_CANON
+     BOOST_LOG(rdDebugLog) << "strings and ranks:" << std::endl;
+     for (unsigned int i = 0; i < numAtoms; i++) {
+       BOOST_LOG(rdDebugLog) << i << ": " << ranks[i] << " > ";
+       debugVect(cipEntries[i]);
+     }
+ #endif
+   }
+ }
+ // Figure out the CIP ranks for the atoms of a molecule
+diff --git a/Code/GraphMol/FileParsers/MolSGroupParsing.cpp b/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
+index e5c7ae489..50cf60a77 100644
+--- a/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
++++ b/Code/GraphMol/FileParsers/MolSGroupParsing.cpp
+@@ -937,31 +937,31 @@ template <class T>
+ std::vector<T> ParseV3000Array(std::stringstream &stream, int maxV,
+                                bool strictParsing) {
+   auto paren = stream.get();  // discard parentheses
+   if (paren != '(') {
+     BOOST_LOG(rdWarningLog)
+         << "WARNING: first character of V3000 array is not '('" << std::endl;
+   }
+ 
+-  unsigned int count;
++  unsigned int count = 0;
+   stream >> count;
+   std::vector<T> values;
+   if (maxV >= 0 && count > static_cast<unsigned int>(maxV)) {
+     SGroupWarnOrThrow(strictParsing, "invalid count value");
+     return values;
+   }
+ 
+   values.reserve(count);
+   T value;
+   for (unsigned i = 0; i < count; ++i) {
+     stream >> value;
+     values.push_back(value);
+   }
+   paren = stream.get();  // discard parentheses
+   if (paren != ')') {
+     BOOST_LOG(rdWarningLog)
+         << "WARNING: final character of V3000 array is not ')'" << std::endl;
+   }
+   return values;
+ }
+ 
+ // force instantiation of the versions of this that we use
+@@ -1008,34 +1008,34 @@ void ParseV3000CStateLabel(RWMol *mol, SubstanceGroup &sgroup,
+ void ParseV3000SAPLabel(RWMol *mol, SubstanceGroup &sgroup,
+                         std::stringstream &stream, bool strictParsing) {
+   stream.get();  // discard parentheses
+ 
+-  unsigned int count;
+-  unsigned int aIdxMark;
++  unsigned int count = 0;
++  unsigned int aIdxMark = 0;
+   std::string lvIdxStr;  // In V3000 this may be a string
+   std::string sapIdStr;
+   stream >> count >> aIdxMark >> lvIdxStr >> sapIdStr;
+ 
+   // remove final parentheses that gets parsed into sapIdStr
+   sapIdStr.pop_back();
+ 
+   unsigned int aIdx = mol->getAtomWithBookmark(aIdxMark)->getIdx();
+   int lvIdx = -1;
+ 
+   boost::to_upper(lvIdxStr);
+   if (lvIdxStr == "AIDX") {
+     lvIdx = aIdx;
+   } else {
+     unsigned int lvIdxTmp = FileParserUtils::toInt(lvIdxStr);
+     if (lvIdxTmp > 0) {
+       lvIdx = mol->getAtomWithBookmark(lvIdxTmp)->getIdx();
+     }
+   }
+ 
+   try {
+     sgroup.addAttachPoint(aIdx, lvIdx, sapIdStr);
+   } catch (const std::exception &e) {
+     SGroupWarnOrThrow<>(strictParsing, e.what());
+     sgroup.setIsValid(false);
+     return;
+   }
+ }
+diff --git a/Code/GraphMol/RWMol.cpp b/Code/GraphMol/RWMol.cpp
+index 171658474..a1e4838fe 100644
+--- a/Code/GraphMol/RWMol.cpp
++++ b/Code/GraphMol/RWMol.cpp
+@@ -129,28 +129,38 @@ unsigned int RWMol::addAtom(bool updateLabel) {
+ void RWMol::replaceAtom(unsigned int idx, Atom *atom_pin, bool,
+                         bool preserveProps) {
+   PRECONDITION(atom_pin, "bad atom passed to replaceAtom");
+   URANGE_CHECK(idx, getNumAtoms());
+   Atom *atom_p = atom_pin->copy();
+   atom_p->setOwningMol(this);
+   atom_p->setIdx(idx);
+   MolGraph::vertex_descriptor vd = boost::vertex(idx, d_graph);
+   if (preserveProps) {
+     const bool replaceExistingData = false;
+     atom_p->updateProps(*d_graph[vd], replaceExistingData);
+   }
+ 
+   const auto orig_p = d_graph[vd];
+   delete orig_p;
+   d_graph[vd] = atom_p;
+ 
+   // handle bookmarks
+   for (auto &ab : d_atomBookmarks) {
+     for (auto &elem : ab.second) {
+       if (elem == orig_p) {
+         elem = atom_p;
+       }
+     }
+   }
++
++  // handle stereo group
++  for (auto &group : d_stereo_groups) {
++    auto atoms = group.getAtoms();
++    auto aiter = std::find(atoms.begin(), atoms.end(), orig_p);
++    if (aiter != atoms.end()) {
++      *aiter = atom_p;
++      group = StereoGroup(group.getGroupType(), std::move(atoms));
++    }
++  }
+ };
+ 
+ void RWMol::replaceBond(unsigned int idx, Bond *bond_pin, bool preserveProps,
+diff --git a/Code/GraphMol/catch_chirality.cpp b/Code/GraphMol/catch_chirality.cpp
+index 9cc403f58..0891c0197 100644
+--- a/Code/GraphMol/catch_chirality.cpp
++++ b/Code/GraphMol/catch_chirality.cpp
+@@ -1738,3 +1738,19 @@ TEST_CASE("StereoGroup Testing") {
+     CHECK(mol->getStereoGroups().size() == 1);
+   }
+ }
++
++TEST_CASE("replaceAtom and StereoGroups") {
++  SECTION("basics") {
++    auto mol = "C[C@](O)(Cl)[C@H](F)Cl |o1:1,4|"_smiles;
++    REQUIRE(mol);
++    CHECK(mol->getStereoGroups().size() == 1);
++    CHECK(mol->getStereoGroups()[0].getAtoms().size() == 2);
++    CHECK(mol->getStereoGroups()[0].getAtoms()[0] == mol->getAtomWithIdx(1));
++
++    Atom acp(*mol->getAtomWithIdx(1));
++    mol->replaceAtom(1, &acp);
++    CHECK(mol->getStereoGroups().size() == 1);
++    CHECK(mol->getStereoGroups()[0].getAtoms().size() == 2);
++    CHECK(mol->getStereoGroups()[0].getAtoms()[0] == mol->getAtomWithIdx(1));
++  }
++}
+diff --git a/Code/RDGeneral/StreamOps.h b/Code/RDGeneral/StreamOps.h
+index 57ce42c78..8b08f0f59 100644
+--- a/Code/RDGeneral/StreamOps.h
++++ b/Code/RDGeneral/StreamOps.h
+@@ -307,7 +307,7 @@ template <class T>
+ void streamReadVec(std::istream &ss, T &val) {
+   boost::uint64_t size;
+   streamRead(ss, size);
+-  val.resize(size);
++  val.resize(boost::numeric_cast<size_t>(size));
+ 
+   for (size_t i = 0; i < size; ++i) streamRead(ss, val[i]);
+ }

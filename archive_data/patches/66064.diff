@@ -1,0 +1,518 @@
+commit 69c51eee4df002cc4f2c3650012c54cddae256fc
+Author: John Reiser <jreiser@BitWagon.com>
+Date:   Sat Jan 27 11:11:07 2024 -0800
+
+    better checking of DT_STRSZ for ELF
+    
+    https://github.com/upx/upx/issues/779
+    https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=66064
+            modified:   p_lx_elf.cpp
+            modified:   p_lx_elf.h
+
+diff --git a/src/p_lx_elf.cpp b/src/p_lx_elf.cpp
+index a3178d18..bd2fe4a3 100644
+--- a/src/p_lx_elf.cpp
++++ b/src/p_lx_elf.cpp
+@@ -251,15 +251,15 @@ PackLinuxElf64::checkEhdr(Elf64_Ehdr const *ehdr) const
+ PackLinuxElf::PackLinuxElf(InputFile *f)
+     : super(f), e_phnum(0), dynstr(nullptr),
+     sz_phdrs(0), sz_elf_hdrs(0), sz_pack2(0), sz_pack2a(0),
+     lg2_page(12), page_size(1u<<lg2_page), is_pie(0), is_asl(0),
+     xct_off(0), o_binfo(0), so_slide(0), xct_va(0), jni_onload_va(0),
+     user_init_va(0), user_init_off(0),
+     e_machine(0), ei_class(0), ei_data(0), ei_osabi(0), osabi_note(nullptr),
+     shstrtab(nullptr),
+     o_elf_shnum(0)
+ {
+     memset(dt_table, 0, sizeof(dt_table));
+-    symnum_end = 0;
++    symnum_max = 0;
+     user_init_rp = nullptr;
+ }
+ 
+@@ -2067,175 +2067,181 @@ void
+ PackLinuxElf32::invert_pt_dynamic(Elf32_Dyn const *dynp, u32_t headway)
+ {
+     if (dt_table[Elf32_Dyn::DT_NULL]) {
+         return;  // not 1st time; do not change upx_dt_init
+     }
+     Elf32_Dyn const *const dynp0 = dynp;
+     unsigned ndx = 0;
+     unsigned const limit = headway / sizeof(*dynp);
+     if (dynp)
+     for (; ; ++ndx, ++dynp) {
+         if (limit <= ndx) {
+             throwCantPack("DT_NULL not found");
+         }
+         u32_t const d_tag = get_te32(&dynp->d_tag);
+         if (d_tag < DT_NUM) {
+             if (Elf32_Dyn::DT_NEEDED != d_tag
+             &&  dt_table[d_tag]
+             &&    get_te32(&dynp->d_val)
+                != get_te32(&dynp0[-1+ dt_table[d_tag]].d_val)) {
+                 char msg[50]; snprintf(msg, sizeof(msg),
+                     "duplicate DT_%#x: [%#x] [%#x]",
+                     (unsigned)d_tag, -1+ dt_table[d_tag], ndx);
+                 throwCantPack(msg);
+             }
+             dt_table[d_tag] = 1+ ndx;
+         }
+         if (Elf32_Dyn::DT_NULL == d_tag) {
+             break;  // check here so that dt_table[DT_NULL] is set
+         }
+     }
+     sort_DT32_offsets(dynp0);
+ 
+     upx_dt_init = 0;
+          if (dt_table[Elf32_Dyn::DT_INIT])          upx_dt_init = Elf32_Dyn::DT_INIT;
+     else if (dt_table[Elf32_Dyn::DT_PREINIT_ARRAY]) upx_dt_init = Elf32_Dyn::DT_PREINIT_ARRAY;
+     else if (dt_table[Elf32_Dyn::DT_INIT_ARRAY])    upx_dt_init = Elf32_Dyn::DT_INIT_ARRAY;
+ 
+     unsigned const z_str = dt_table[Elf32_Dyn::DT_STRSZ];
+-    strtab_end = !z_str ? 0 : get_te32(&dynp0[-1+ z_str].d_val);
+-    if (!z_str || (u32_t)file_size <= strtab_end) { // FIXME: weak
++    strtab_max = !z_str ? 0 : get_te32(&dynp0[-1+ z_str].d_val);
++    unsigned const z_tab = dt_table[Elf32_Dyn::DT_STRTAB];
++    unsigned const strtab_beg = !z_tab ? 0 : get_te32(&dynp0[-1+ z_tab].d_val);
++    if (!z_str || !z_tab
++    || (this->file_size - strtab_beg) < strtab_max  // strtab overlaps EOF
++        // last string in table must have terminating NUL
++    ||  '\0' != ((char *)file_image.getVoidPtr())[-1+ strtab_max + strtab_beg]
++    ) {
+         char msg[50]; snprintf(msg, sizeof(msg),
+-            "bad DT_STRSZ %#x", strtab_end);
++            "bad DT_STRSZ %#x", strtab_max);
+         throwCantPack(msg);
+     }
+ 
+     // Find end of DT_SYMTAB
+-    symnum_end = elf_find_table_size(
++    symnum_max = elf_find_table_size(
+         Elf32_Dyn::DT_SYMTAB, Elf32_Shdr::SHT_DYNSYM) / sizeof(Elf32_Sym);
+ 
+     unsigned const x_sym = dt_table[Elf32_Dyn::DT_SYMTAB];
+     unsigned const v_hsh = elf_unsigned_dynamic(Elf32_Dyn::DT_HASH);
+     if (v_hsh && file_image) {
+         hashtab = (unsigned const *)elf_find_dynamic(Elf32_Dyn::DT_HASH);
+         if (!hashtab) {
+             char msg[40]; snprintf(msg, sizeof(msg),
+                "bad DT_HASH %#x", v_hsh);
+             throwCantPack(msg);
+         }
+         // Find end of DT_HASH
+         hashend = (unsigned const *)(void const *)(elf_find_table_size(
+             Elf32_Dyn::DT_HASH, Elf32_Shdr::SHT_HASH) + (char const *)hashtab);
+ 
+         unsigned const nbucket = get_te32(&hashtab[0]);
+         unsigned const *const buckets = &hashtab[2];
+         unsigned const *const chains = &buckets[nbucket]; (void)chains;
+ 
+         unsigned const v_sym = !x_sym ? 0 : get_te32(&dynp0[-1+ x_sym].d_val);
+         if ((unsigned)(hashend - buckets) < nbucket
+         || !v_sym || (unsigned)file_size <= v_sym
+         || ((v_hsh < v_sym) && (v_sym - v_hsh) < sizeof(*buckets)*(2+ nbucket))
+         ) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad DT_HASH nbucket=%#x  len=%#x",
+                 nbucket, (v_sym - v_hsh));
+             throwCantPack(msg);
+         }
+         unsigned chmax = 0;
+         for (unsigned j= 0; j < nbucket; ++j) {
+             unsigned x = get_te32(&buckets[j]);
+             if (chmax < x) {
+                 chmax = x;
+             }
+         }
+         if ((v_hsh < v_sym) && (v_sym - v_hsh) <
+                 (sizeof(*buckets)*(2+ nbucket) + sizeof(*chains)*(1+ chmax))) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad DT_HASH nbucket=%#x  len=%#x",
+                 nbucket, (v_sym - v_hsh));
+             throwCantPack(msg);
+         }
+     }
+     unsigned const v_gsh = elf_unsigned_dynamic(Elf32_Dyn::DT_GNU_HASH);
+     if (v_gsh && file_image) {
+         gashtab = (unsigned const *)elf_find_dynamic(Elf32_Dyn::DT_GNU_HASH);
+         if (!gashtab) {
+             char msg[40]; snprintf(msg, sizeof(msg),
+                "bad DT_GNU_HASH %#x", v_gsh);
+             throwCantPack(msg);
+         }
+         gashend = (unsigned const *)(void const *)(elf_find_table_size(
+             Elf32_Dyn::DT_GNU_HASH, Elf32_Shdr::SHT_GNU_HASH) + (char const *)gashtab);
+         unsigned const n_bucket = get_te32(&gashtab[0]);
+         unsigned const symbias  = get_te32(&gashtab[1]);
+         unsigned const n_bitmask = get_te32(&gashtab[2]);
+         unsigned const gnu_shift = get_te32(&gashtab[3]);
+         u32_t const *const bitmask = (u32_t const *)(void const *)&gashtab[4];
+         unsigned     const *const buckets = (unsigned const *)&bitmask[n_bitmask];
+         unsigned     const *const hasharr = &buckets[n_bucket]; (void)hasharr;
+         if (!n_bucket || (1u<<31) <= n_bucket  /* fie on fuzzers */
+         || (unsigned)(gashend - buckets) < n_bucket
+         || (void const *)&file_image[file_size] <= (void const *)hasharr) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad n_bucket %#x\n", n_bucket);
+             throwCantPack(msg);
+         }
+         // unsigned const *const gashend = &hasharr[n_bucket];
+         // minimum, except:
+         // Rust and Android trim unused zeroes from high end of hasharr[]
+         unsigned bmax = 0;
+         for (unsigned j= 0; j < n_bucket; ++j) {
+             unsigned bj = get_te32(&buckets[j]);
+             if (bj) {
+                 if (bj < symbias) {
+                     char msg[90]; snprintf(msg, sizeof(msg),
+                             "bad DT_GNU_HASH bucket[%d] < symbias{%#x}\n",
+                             bj, symbias);
+                     throwCantPack(msg);
+                 }
+                 if (bmax < bj) {
+                     bmax = bj;
+                 }
+             }
+         }
+         if (1==n_bucket  && 0==buckets[0]
+         &&  1==n_bitmask && 0==bitmask[0]) {
+             // 2021-09-11 Rust on RaspberryPi apparently uses this to minimize space.
+             // But then the DT_GNU_HASH symbol lookup algorithm always fails?
+             // https://github.com/upx/upx/issues/525
+         } else
+         if ((1+ bmax) < symbias) {
+             char msg[90]; snprintf(msg, sizeof(msg),
+                     "bad DT_GNU_HASH (1+ max_bucket)=%#x < symbias=%#x", 1+ bmax, symbias);
+             throwCantPack(msg);
+         }
+         bmax -= symbias;
+ 
+         u32_t const v_sym = !x_sym ? 0 : get_te32(&dynp0[-1+ x_sym].d_val);
+         unsigned r = 0;
+         if (!n_bucket || !n_bitmask || !v_sym
+         || (r=1, ((-1+ n_bitmask) & n_bitmask))  // not a power of 2
+         || (r=2, (8*sizeof(u32_t) <= gnu_shift))  // shifted result always == 0
+         || (r=3, (n_bucket>>30))  // fie on fuzzers
+         || (r=4, (n_bitmask>>30))
+         || (r=5, ((file_size/sizeof(unsigned))
+                 <= ((sizeof(*bitmask)/sizeof(unsigned))*n_bitmask + 2*n_bucket)))  // FIXME: weak
+         || (r=6, ((v_gsh < v_sym) && (v_sym - v_gsh) < (sizeof(unsigned)*4  // headers
+                 + sizeof(*bitmask)*n_bitmask  // bitmask
+                 + sizeof(*buckets)*n_bucket  // buckets
+                 + sizeof(*hasharr)*(1+ bmax)  // hasharr
+             )) )
+         ) {
+             char msg[90]; snprintf(msg, sizeof(msg),
+                 "bad DT_GNU_HASH n_bucket=%#x  n_bitmask=%#x  len=%#lx  r=%d",
+                 n_bucket, n_bitmask, (long unsigned)(v_sym - v_gsh), r);
+             throwCantPack(msg);
+         }
+     }
+     e_shstrndx = get_te16(&ehdri.e_shstrndx);  // who omitted this?
+     if (e_shnum <= e_shstrndx
+     &&  !(0==e_shnum && 0==e_shstrndx) ) {
+         char msg[40]; snprintf(msg, sizeof(msg),
+             "bad .e_shstrndx %d >= .e_shnum %d", e_shstrndx, e_shnum);
+         throwCantPack(msg);
+     }
+ }
+@@ -2346,20 +2352,20 @@ Elf64_Shdr *PackLinuxElf64::elf_find_section_type(
+ 
+ char const *PackLinuxElf64::get_str_name(unsigned st_name, unsigned symnum) const
+ {
+-    if (strtab_end <= st_name) {
++    if (strtab_max <= st_name) {
+         char msg[70]; snprintf(msg, sizeof(msg),
+             "bad .st_name %#x in DT_SYMTAB[%d]", st_name, symnum);
+         throwCantPack(msg);
+     }
+     return &dynstr[st_name];
+ }
+ 
+ char const *PackLinuxElf64::get_dynsym_name(unsigned symnum, unsigned relnum) const
+ {
+-    if (symnum_end <= symnum) {
++    if (symnum_max <= symnum) {
+         char msg[70]; snprintf(msg, sizeof(msg),
+             "bad symnum %#x in Elf64_Rel[%d]", symnum, relnum);
+         throwCantPack(msg);
+     }
+     return get_str_name(get_te32(&dynsym[symnum].st_name), symnum);
+ }
+@@ -2383,20 +2389,20 @@ bool PackLinuxElf64::calls_crt1(Elf64_Rela const *rela, int sz)
+ 
+ char const *PackLinuxElf32::get_str_name(unsigned st_name, unsigned symnum) const
+ {
+-    if (strtab_end <= st_name) {
++    if (strtab_max <= st_name) {
+         char msg[70]; snprintf(msg, sizeof(msg),
+             "bad .st_name %#x in DT_SYMTAB[%d]\n", st_name, symnum);
+         throwCantPack(msg);
+     }
+     return &dynstr[st_name];
+ }
+ 
+ char const *PackLinuxElf32::get_dynsym_name(unsigned symnum, unsigned relnum) const
+ {
+-    if (symnum_end <= symnum) {
++    if (symnum_max <= symnum) {
+         char msg[70]; snprintf(msg, sizeof(msg),
+             "bad symnum %#x in Elf32_Rel[%d]\n", symnum, relnum);
+         throwCantPack(msg);
+     }
+     return get_str_name(get_te32(&dynsym[symnum].st_name), symnum);
+ }
+@@ -7962,180 +7968,186 @@ void
+ PackLinuxElf64::invert_pt_dynamic(Elf64_Dyn const *dynp, upx_uint64_t headway)
+ {
+     if (dt_table[Elf64_Dyn::DT_NULL]) {
+         return;  // not 1st time; do not change upx_dt_init
+     }
+     Elf64_Dyn const *const dynp0 = dynp;
+     unsigned ndx = 0;
+     unsigned const limit = headway / sizeof(*dynp);
+     if (dynp)
+     for (; ; ++ndx, ++dynp) {
+         if (limit <= ndx) {
+             throwCantPack("DT_NULL not found");
+         }
+         upx_uint64_t const d_tag = get_te64(&dynp->d_tag);
+         if (d_tag>>32) { // outrageous
+             char msg[50]; snprintf(msg, sizeof(msg),
+                 "bad Elf64_Dyn[%d].d_tag %#lx", ndx, (long unsigned)d_tag);
+             throwCantPack(msg);
+         }
+         if (d_tag < DT_NUM) {
+             if (Elf64_Dyn::DT_NEEDED != d_tag
+             &&  dt_table[d_tag]
+             &&    get_te64(&dynp->d_val)
+                != get_te64(&dynp0[-1+ dt_table[d_tag]].d_val)) {
+                 char msg[50]; snprintf(msg, sizeof(msg),
+                     "duplicate DT_%#x: [%#x] [%#x]",
+                     (unsigned)d_tag, -1+ dt_table[d_tag], ndx);
+                 throwCantPack(msg);
+             }
+             dt_table[d_tag] = 1+ ndx;
+         }
+         if (Elf64_Dyn::DT_NULL == d_tag) {
+             break;  // check here so that dt_table[DT_NULL] is set
+         }
+     }
+     sort_DT64_offsets(dynp0);
+ 
+     upx_dt_init = 0;
+          if (dt_table[Elf64_Dyn::DT_INIT])          upx_dt_init = Elf64_Dyn::DT_INIT;
+     else if (dt_table[Elf64_Dyn::DT_PREINIT_ARRAY]) upx_dt_init = Elf64_Dyn::DT_PREINIT_ARRAY;
+     else if (dt_table[Elf64_Dyn::DT_INIT_ARRAY])    upx_dt_init = Elf64_Dyn::DT_INIT_ARRAY;
+ 
+     unsigned const z_str = dt_table[Elf64_Dyn::DT_STRSZ];
+-    strtab_end = !z_str ? 0 : get_te64(&dynp0[-1+ z_str].d_val);
+-    if (!z_str || (u64_t)file_size <= strtab_end) { // FIXME: weak
++    strtab_max = !z_str ? 0 : get_te64(&dynp0[-1+ z_str].d_val);
++    unsigned const z_tab = dt_table[Elf64_Dyn::DT_STRTAB];
++    unsigned const strtab_beg = !z_tab ? 0 : get_te64(&dynp0[-1+ z_tab].d_val);
++    if (!z_str || !z_tab
++    || (this->file_size - strtab_beg) < strtab_max  // strtab overlaps EOF
++        // last string in table must have terminating NUL
++    ||  '\0' != ((char *)file_image.getVoidPtr())[-1+ strtab_max + strtab_beg]
++    ) {
+         char msg[50]; snprintf(msg, sizeof(msg),
+-            "bad DT_STRSZ %#x", strtab_end);
++            "bad DT_STRSZ %#x", strtab_max);
+         throwCantPack(msg);
+     }
+ 
+     // Find end of DT_SYMTAB
+-    symnum_end = elf_find_table_size(
++    symnum_max = elf_find_table_size(
+         Elf64_Dyn::DT_SYMTAB, Elf64_Shdr::SHT_DYNSYM) / sizeof(Elf64_Sym);
+ 
+     unsigned const x_sym = dt_table[Elf64_Dyn::DT_SYMTAB];
+     unsigned const v_hsh = elf_unsigned_dynamic(Elf64_Dyn::DT_HASH);
+     if (v_hsh && file_image) {
+         hashtab = (unsigned const *)elf_find_dynamic(Elf64_Dyn::DT_HASH);
+         if (!hashtab) {
+             char msg[40]; snprintf(msg, sizeof(msg),
+                "bad DT_HASH %#x", v_hsh);
+             throwCantPack(msg);
+         }
+         // Find end of DT_HASH
+         hashend = (unsigned const *)(void const *)(elf_find_table_size(
+             Elf64_Dyn::DT_HASH, Elf64_Shdr::SHT_HASH) + (char const *)hashtab);
+ 
+         unsigned const nbucket = get_te32(&hashtab[0]);
+         unsigned const *const buckets = &hashtab[2];
+         unsigned const *const chains = &buckets[nbucket]; (void)chains;
+ 
+         unsigned const v_sym = !x_sym ? 0 : get_te64(&dynp0[-1+ x_sym].d_val);  // UPX_RSIZE_MAX_MEM
+         if ((unsigned)(hashend - buckets) < nbucket
+         || !v_sym || (unsigned)file_size <= v_sym
+         || ((v_hsh < v_sym) && (v_sym - v_hsh) < sizeof(*buckets)*(2+ nbucket))
+         ) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad DT_HASH nbucket=%#x  len=%#x",
+                 nbucket, (v_sym - v_hsh));
+             throwCantPack(msg);
+         }
+         unsigned chmax = 0;
+         for (unsigned j= 0; j < nbucket; ++j) {
+             unsigned x = get_te32(&buckets[j]);
+             if (chmax < x) {
+                 chmax = x;
+             }
+         }
+         if ((v_hsh < v_sym) && (v_sym - v_hsh) <
+                 (sizeof(*buckets)*(2+ nbucket) + sizeof(*chains)*(1+ chmax))) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad DT_HASH nbucket=%#x  len=%#x",
+                 nbucket, (v_sym - v_hsh));
+             throwCantPack(msg);
+         }
+     }
+     unsigned const v_gsh = elf_unsigned_dynamic(Elf64_Dyn::DT_GNU_HASH);
+     if (v_gsh && file_image) {
+         gashtab = (unsigned const *)elf_find_dynamic(Elf64_Dyn::DT_GNU_HASH);
+         if (!gashtab) {
+             char msg[40]; snprintf(msg, sizeof(msg),
+                "bad DT_GNU_HASH %#x", v_gsh);
+             throwCantPack(msg);
+         }
+         gashend = (unsigned const *)(void const *)(elf_find_table_size(
+             Elf64_Dyn::DT_GNU_HASH, Elf64_Shdr::SHT_GNU_HASH) + (char const *)gashtab);
+         unsigned const n_bucket = get_te32(&gashtab[0]);
+         unsigned const symbias  = get_te32(&gashtab[1]);
+         unsigned const n_bitmask = get_te32(&gashtab[2]);
+         unsigned const gnu_shift = get_te32(&gashtab[3]);
+         upx_uint64_t const *const bitmask = (upx_uint64_t const *)(void const *)&gashtab[4];
+         unsigned     const *const buckets = (unsigned const *)&bitmask[n_bitmask];
+         unsigned     const *const hasharr = &buckets[n_bucket]; (void)hasharr;
+         if (!n_bucket || (1u<<31) <= n_bucket  /* fie on fuzzers */
+         || (unsigned)(gashend - buckets) < n_bucket
+         || (void const *)&file_image[file_size] <= (void const *)hasharr) {
+             char msg[80]; snprintf(msg, sizeof(msg),
+                 "bad n_bucket %#x\n", n_bucket);
+             throwCantPack(msg);
+         }
+         // unsigned const *const gashend = &hasharr[n_bucket];
+         // minimum, except:
+         // Rust and Android trim unused zeroes from high end of hasharr[]
+         unsigned bmax = 0;
+         for (unsigned j= 0; j < n_bucket; ++j) {
+             unsigned bj = get_te32(&buckets[j]);
+             if (bj) {
+                 if (bj < symbias) {
+                     char msg[90]; snprintf(msg, sizeof(msg),
+                             "bad DT_GNU_HASH bucket[%d] < symbias{%#x}\n",
+                             bj, symbias);
+                     throwCantPack(msg);
+                 }
+                 if (bmax < bj) {
+                     bmax = bj;
+                 }
+             }
+         }
+         if (1==n_bucket  && 0==buckets[0]
+         &&  1==n_bitmask && 0==bitmask[0]) {
+             // 2021-09-11 Rust on RaspberryPi apparently uses this to minimize space.
+             // But then the DT_GNU_HASH symbol lookup algorithm always fails?
+             // https://github.com/upx/upx/issues/525
+         } else
+         if ((1+ bmax) < symbias) {
+             char msg[90]; snprintf(msg, sizeof(msg),
+                     "bad DT_GNU_HASH (1+ max_bucket)=%#x < symbias=%#x", 1+ bmax, symbias);
+             throwCantPack(msg);
+         }
+         bmax -= symbias;
+ 
+         upx_uint64_t const v_sym = !x_sym ? 0 : get_te64(&dynp0[-1+ x_sym].d_val);
+         unsigned r = 0;
+         if (!n_bucket || !n_bitmask || !v_sym
+         || (r=1, ((-1+ n_bitmask) & n_bitmask))  // not a power of 2
+         || (r=2, (8*sizeof(upx_uint64_t) <= gnu_shift))  // shifted result always == 0
+         || (r=3, (n_bucket>>30))  // fie on fuzzers
+         || (r=4, (n_bitmask>>30))
+         || (r=5, ((file_size/sizeof(unsigned))
+                 <= ((sizeof(*bitmask)/sizeof(unsigned))*n_bitmask + 2*n_bucket)))  // FIXME: weak
+         || (r=6, ((v_gsh < v_sym) && (v_sym - v_gsh) < (sizeof(unsigned)*4  // headers
+                 + sizeof(*bitmask)*n_bitmask  // bitmask
+                 + sizeof(*buckets)*n_bucket  // buckets
+                 + sizeof(*hasharr)*(1+ bmax)  // hasharr
+             )) )
+         ) {
+             char msg[90]; snprintf(msg, sizeof(msg),
+                 "bad DT_GNU_HASH n_bucket=%#x  n_bitmask=%#x  len=%#lx  r=%d",
+                 n_bucket, n_bitmask, (long unsigned)(v_sym - v_gsh), r);
+             throwCantPack(msg);
+         }
+     }
+     e_shstrndx = get_te16(&ehdri.e_shstrndx);  // who omitted this?
+     if (e_shnum <= e_shstrndx
+     &&  !(0==e_shnum && 0==e_shstrndx) ) {
+         char msg[40]; snprintf(msg, sizeof(msg),
+             "bad .e_shstrndx %d >= .e_shnum %d", e_shstrndx, e_shnum);
+         throwCantPack(msg);
+     }
+ }
+diff --git a/src/p_lx_elf.h b/src/p_lx_elf.h
+index 5a574523..55b0ac9d 100644
+--- a/src/p_lx_elf.h
++++ b/src/p_lx_elf.h
+@@ -76,56 +76,56 @@ protected:
+ protected:
+     static unsigned int const asl_delta = (1u<<12);  // --android-shlib extra page
+     unsigned e_type;
+     unsigned e_phnum;       /* Program header table entry count */
+     unsigned e_shnum;
+     unsigned e_shstrndx;
+     MemBuffer file_image;   // if ET_DYN investigation
+     MemBuffer lowmem;  // at least including PT_LOAD[0]
+     MemBuffer mb_shdr;      // Shdr might not be near Phdr
+     MemBuffer mb_dt_offsets;  // file offset of various DT_ tables
+     unsigned *dt_offsets;  // index by dt_table[]
+-    unsigned symnum_end;
+-    unsigned strtab_end;
++    unsigned symnum_max;
++    unsigned strtab_max;
+     char const *dynstr;   // from DT_STRTAB
+ 
+     unsigned sz_phdrs;  // sizeof Phdr[]
+     unsigned sz_elf_hdrs;  // all Elf headers
+     unsigned sz_pack2;  // after pack2(), before loader
+     unsigned sz_pack2a;  // after pack2() of all PT_LOAD
+     unsigned lg2_page;  // log2(PAGE_SIZE)
+     unsigned page_size;  // 1u<<lg2_page
+     bool is_pie;  // is Position-Independent-Executable (ET_DYN main program)
+     unsigned is_asl;  // is Android Shared Library
+     unsigned xct_off;  // shared library: file offset of SHT_EXECINSTR
+     unsigned hatch_off;  // file offset of escape hatch
+     unsigned o_binfo;  // offset to first b_info
+     upx_off_t so_slide;
+     upx_uint64_t load_va;  // PT_LOAD[0].p_vaddr
+     upx_uint64_t xct_va;  // minimum SHT_EXECINSTR virtual address
+     upx_uint64_t jni_onload_va;  // runtime &JNI_OnLoad
+     upx_uint64_t user_init_va;
+     void *user_init_rp;  // Elf32_Rel *, Elf64_Rela *, ...
+     upx_uint64_t plt_va, plt_off;
+     unsigned user_init_off;  // within file_image
+     unsigned linfo_off;
+     unsigned loader_offset;  // during de-compression
+ 
+     upx_uint16_t  e_machine;
+     unsigned char ei_class;
+     unsigned char ei_data;
+     unsigned char ei_osabi;
+     unsigned char prev_method;
+     char const *osabi_note;
+     unsigned upx_dt_init;  // DT_INIT, DT_PREINIT_ARRAY, DT_INIT_ARRAY
+     static unsigned const DT_NUM = 34;  // elf.h
+     unsigned dt_table[DT_NUM];  // 1+ index of DT_xxxxx in PT_DYNAMIC
+ 
+     MemBuffer mb_shstrtab;   // via ElfXX_Shdr
+     char const *shstrtab;
+     MemBuffer jump_slots;  // is_asl de-compression fixing
+     MemBuffer buildid_data;
+     MemBuffer note_body;  // concatenated contents of PT_NOTEs, if any
+     unsigned note_size;  // total size of PT_NOTEs
+     int o_elf_shnum; // num output Shdrs
+     static const unsigned char o_shstrtab[];
+ };

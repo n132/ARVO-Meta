@@ -1,0 +1,305 @@
+commit f7ac3512f5b5cb8eb149f37300b43461d8e93af3
+Author: Leo Izen <leo.izen@gmail.com>
+Date:   Tue Oct 3 11:00:35 2023 -0400
+
+    avcodec/jpegxl_parser: fix various memory issues
+    
+    The spec caps the prefix alphabet size to 32768 (i.e. 1 << 15) so we
+    should check for that and reject alphabets that are too large, in order
+    to prevent over-allocating.
+    
+    Additionally, there's no need to allocate buffers that are as large as
+    the maximum alphabet size as these aren't stack-allocated, they're heap
+    allocated and thus can be variable size.
+    
+    Added an overflow check as well, which fixes leaking the buffer, and
+    capping the alphabet size fixes two potential overruns as well.
+    
+    Fixes: out of array access
+    Fixes: 62089/clusterfuzz-testcase-minimized-ffmpeg_DEMUXER_fuzzer-
+        5437089094959104.fuzz
+    
+    Found-by: continuous fuzzing process
+        https://github.com/google/oss-fuzz/tree/master/projects/ffmpeg
+    Found-by: Hardik Shah of Vehere (Dawn Treaders team)
+    Co-authored-by: Michael Niedermayer <michael@niedermayer.cc>
+    Signed-off-by: Leo Izen <leo.izen@gmail.com>
+
+diff --git a/libavcodec/jpegxl_parser.c b/libavcodec/jpegxl_parser.c
+index bbd7338a61..dde36b0d6e 100644
+--- a/libavcodec/jpegxl_parser.c
++++ b/libavcodec/jpegxl_parser.c
+@@ -1,52 +1,54 @@
+ /**
+  * JPEG XL parser
+  * Copyright (c) 2023 Leo Izen <leo.izen@gmail.com>
+  *
+  * This file is part of FFmpeg.
+  *
+  * FFmpeg is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+  * License as published by the Free Software Foundation; either
+  * version 2.1 of the License, or (at your option) any later version.
+  *
+  * FFmpeg is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  * Lesser General Public License for more details.
+  *
+  * You should have received a copy of the GNU Lesser General Public
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
+ #include <errno.h>
+ #include <stdint.h>
+ #include <string.h>
+ 
+ #include "libavutil/attributes.h"
+ #include "libavutil/error.h"
+ #include "libavutil/intmath.h"
+ #include "libavutil/macros.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/pixfmt.h"
+ 
+ #include "bytestream.h"
+ #include "codec_id.h"
+ #define UNCHECKED_BITSTREAM_READER 0
+ #define BITSTREAM_READER_LE
+ #include "get_bits.h"
+ #include "jpegxl.h"
+ #include "jpegxl_parse.h"
+ #include "parser.h"
+ #include "vlc.h"
+ 
+ #define JXL_FLAG_NOISE 1
+ #define JXL_FLAG_PATCHES 2
+ #define JXL_FLAG_SPLINES 16
+ #define JXL_FLAG_USE_LF_FRAME 32
+ #define JXL_FLAG_SKIP_ADAPTIVE_LF_SMOOTH 128
+ 
++#define MAX_PREFIX_ALPHABET_SIZE (1u << 15)
++
+ #define clog1p(x) (ff_log2(x) + !!(x))
+ #define unpack_signed(x) (((x) & 1 ? -(x)-1 : (x))/2)
+ #define div_ceil(x, y) (((x) - 1) / (y) + 1)
+ #define vlm(a,b) {.sym = (a), .len = (b)}
+@@ -670,119 +672,126 @@ static int read_simple_vlc_prefix(GetBitContext *gb, JXLEntropyDecoder *dec, JXL
+ static int read_vlc_prefix(GetBitContext *gb, JXLEntropyDecoder *dec, JXLSymbolDistribution *dist)
+ {
+     int8_t level1_lens[18] = { 0 };
+     int8_t level1_lens_s[18] = { 0 };
+     int16_t level1_syms[18] = { 0 };
+     uint32_t level1_codecounts[19] = { 0 };
+     uint8_t *buf = NULL;
+     int8_t *level2_lens, *level2_lens_s;
+     int16_t *level2_syms;
+     uint32_t *level2_codecounts;
+ 
+     int repeat_count_prev = 0, repeat_count_zero = 0, prev = 8;
+     int total_code = 0, len, hskip, num_codes = 0, ret;
+ 
+     VLC level1_vlc;
+ 
+     if (dist->alphabet_size == 1) {
+         dist->vlc.bits = 0;
+         dist->default_symbol = 0;
+         return 0;
+     }
+ 
+     hskip = get_bits(gb, 2);
+     if (hskip == 1)
+         return read_simple_vlc_prefix(gb, dec, dist);
+ 
+     level1_codecounts[0] = hskip;
+     for (int i = hskip; i < 18; i++) {
+         len = level1_lens[prefix_codelen_map[i]] = get_vlc2(gb, level0_table, 4, 1);
+         level1_codecounts[len]++;
+         if (len) {
+             total_code += (32 >> len);
+             num_codes++;
+         }
+         if (total_code >= 32) {
+             level1_codecounts[0] += 18 - i - 1;
+             break;
+         }
+     }
+ 
+     if (total_code != 32 && num_codes >= 2 || num_codes < 1)
+         return AVERROR_INVALIDDATA;
+ 
+     for (int i = 1; i < 19; i++)
+          level1_codecounts[i] += level1_codecounts[i - 1];
+ 
+     for (int i = 17; i >= 0; i--) {
+         int idx = --level1_codecounts[level1_lens[i]];
+         level1_lens_s[idx] = level1_lens[i];
+         level1_syms[idx] = i;
+     }
+ 
+     ret = ff_vlc_init_from_lengths(&level1_vlc, 5, 18, level1_lens_s, 1, level1_syms, 2, 2,
+         0, VLC_INIT_LE, dec->logctx);
+     if (ret < 0)
+         goto end;
+ 
+-    buf = av_calloc(1, 262148); // 32768 * 8 + 4
++    buf = av_mallocz(dist->alphabet_size * (2 * sizeof(int8_t) + sizeof(int16_t) + sizeof(uint32_t))
++                     + sizeof(uint32_t));
+     if (!buf) {
+         ret = AVERROR(ENOMEM);
+         goto end;
+     }
+ 
+     level2_lens = (int8_t *)buf;
+-    level2_lens_s = (int8_t *)(buf + 32768);
+-    level2_syms = (int16_t *)(buf + 65536);
+-    level2_codecounts = (uint32_t *)(buf + 131072);
++    level2_lens_s = (int8_t *)(buf + dist->alphabet_size * sizeof(int8_t));
++    level2_syms = (int16_t *)(buf + dist->alphabet_size * (2 * sizeof(int8_t)));
++    level2_codecounts = (uint32_t *)(buf + dist->alphabet_size * (2 * sizeof(int8_t) + sizeof(int16_t)));
+ 
+     total_code = 0;
+     for (int i = 0; i < dist->alphabet_size; i++) {
+         len = get_vlc2(gb, level1_vlc.table, 5, 1);
+         if (len == 16) {
+             int extra = 3 + get_bits(gb, 2);
+             if (repeat_count_prev)
+                 extra = 4 * (repeat_count_prev - 2) - repeat_count_prev + extra;
++            if (i + extra > dist->alphabet_size) {
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
+             for (int j = 0; j < extra; j++)
+                 level2_lens[i + j] = prev;
+             total_code += (32768 >> prev) * extra;
+             i += extra - 1;
+             repeat_count_prev += extra;
+             repeat_count_zero = 0;
+             level2_codecounts[prev] += extra;
+         } else if (len == 17) {
+             int extra = 3 + get_bits(gb, 3);
+             if (repeat_count_zero > 0)
+                 extra = 8 * (repeat_count_zero - 2) - repeat_count_zero + extra;
+             i += extra - 1;
+             repeat_count_prev = 0;
+             repeat_count_zero += extra;
+             level2_codecounts[0] += extra;
+         } else {
+             level2_lens[i] = len;
+             repeat_count_prev = repeat_count_zero = 0;
+             if (len) {
+                 total_code += (32768 >> len);
+                 prev = len;
+             }
+             level2_codecounts[len]++;
+         }
+         if (total_code >= 32768) {
+             level2_codecounts[0] += dist->alphabet_size - i - 1;
+             break;
+         }
+     }
+ 
+-    if (total_code != 32768 && level2_codecounts[0] < dist->alphabet_size - 1)
+-        return AVERROR_INVALIDDATA;
++    if (total_code != 32768 && level2_codecounts[0] < dist->alphabet_size - 1) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
+ 
+     for (int i = 1; i < dist->alphabet_size + 1; i++)
+         level2_codecounts[i] += level2_codecounts[i - 1];
+ 
+     for (int i = dist->alphabet_size - 1; i >= 0; i--) {
+         int idx = --level2_codecounts[level2_lens[i]];
+         level2_lens_s[idx] = level2_lens[i];
+         level2_syms[idx] = i;
+     }
+ 
+     ret = ff_vlc_init_from_lengths(&dist->vlc, 15, dist->alphabet_size, level2_lens_s,
+                                     1, level2_syms, 2, 2, 0, VLC_INIT_LE, dec->logctx);
+@@ -797,83 +806,85 @@ end:
+ static int read_distribution_bundle(GetBitContext *gb, JXLEntropyDecoder *dec,
+                                     JXLDistributionBundle *bundle, int num_dist, int disallow_lz77)
+ {
+     int ret;
+ 
+     if (num_dist <= 0)
+         return AVERROR(EINVAL);
+ 
+     bundle->num_dist = num_dist;
+     bundle->lz77_enabled = get_bits1(gb);
+     if (bundle->lz77_enabled) {
+         if (disallow_lz77)
+             return AVERROR_INVALIDDATA;
+         bundle->lz77_min_symbol = jxl_u32(gb, 224, 512, 4096, 8, 0, 0, 0, 15);
+         bundle->lz77_min_length = jxl_u32(gb, 3, 4, 5, 9, 0, 0, 2, 8);
+         bundle->num_dist++;
+         ret = read_hybrid_uint_conf(gb, &bundle->lz_len_conf, 8);
+         if (ret < 0)
+             return ret;
+     }
+ 
+     if (bundle->lz77_enabled && !dec->window) {
+         dec->window = av_malloc_array(1 << 20, sizeof(uint32_t));
+         if (!dec->window)
+             return AVERROR(ENOMEM);
+     }
+ 
+     ret = read_dist_clustering(gb, dec, bundle);
+     if (ret < 0)
+         return ret;
+     if (get_bits_left(gb) < 0)
+         return AVERROR_BUFFER_TOO_SMALL;
+ 
+     bundle->dists = av_calloc(bundle->num_clusters, sizeof(JXLSymbolDistribution));
+     if (!bundle->dists)
+         return AVERROR(ENOMEM);
+ 
+     bundle->use_prefix_code = get_bits1(gb);
+     bundle->log_alphabet_size = bundle->use_prefix_code ? 15 : 5 + get_bits(gb, 2);
+ 
+     for (int i = 0; i < bundle->num_clusters; i++) {
+         ret = read_hybrid_uint_conf(gb, &bundle->dists[i].config, bundle->log_alphabet_size);
+         if (ret < 0)
+             return ret;
+         if (get_bits_left(gb) < 0)
+             return AVERROR_BUFFER_TOO_SMALL;
+     }
+ 
+     if (bundle->use_prefix_code) {
+         for (int i = 0; i < bundle->num_clusters; i++) {
+             JXLSymbolDistribution *dist = &bundle->dists[i];
+             if (get_bits1(gb)) {
+                 int n = get_bits(gb, 4);
+                 dist->alphabet_size = 1 + (1 << n) + get_bitsz(gb, n);
++                if (dist->alphabet_size > MAX_PREFIX_ALPHABET_SIZE)
++                    return AVERROR_INVALIDDATA;
+             } else {
+                 dist->alphabet_size = 1;
+             }
+             dist->log_alphabet_size = clog1p(dist->alphabet_size - 1);
+         }
+         for (int i = 0; i < bundle->num_clusters; i++) {
+             ret = read_vlc_prefix(gb, dec, &bundle->dists[i]);
+             if (ret < 0)
+                 return ret;
+             if (get_bits_left(gb) < 0)
+                 return AVERROR_BUFFER_TOO_SMALL;
+         }
+     } else {
+         for (int i = 0; i < bundle->num_clusters; i++) {
+             ret = populate_distribution(gb, &bundle->dists[i], bundle->log_alphabet_size);
+             if (ret < 0)
+                 return ret;
+             if (get_bits_left(gb) < 0)
+                 return AVERROR_BUFFER_TOO_SMALL;
+         }
+         for (int i = 0; i < bundle->num_clusters; i++) {
+             ret = gen_alias_map(dec, &bundle->dists[i], bundle->log_alphabet_size);
+             if (ret < 0)
+                 return ret;
+         }
+     }
+ 
+     return 0;
+ }

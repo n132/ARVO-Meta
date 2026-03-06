@@ -1,0 +1,412 @@
+commit 299f5cae228c6d4e4089ae43c81fc51e249d0024
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Tue Apr 2 20:05:39 2019 +0200
+
+    Fix uninitialized memory read in KZip
+    
+    Summary:
+    We were passing handledextralen instead of n to parseExtraField
+    
+    We could also do a n < parseExtraField check earlier and fail, but given that parseExtraField always returns true and it has good checks for not over-reading from the buffer it seemed better just to pass n and let it parse as much as possible
+    
+    Reviewers: dfaure
+    
+    Reviewed By: dfaure
+    
+    Subscribers: dfaure, kde-frameworks-devel
+    
+    Tags: #frameworks
+    
+    Differential Revision: https://phabricator.kde.org/D20208
+
+diff --git a/src/kzip.cpp b/src/kzip.cpp
+index 0ba652c..4543c54 100644
+--- a/src/kzip.cpp
++++ b/src/kzip.cpp
+@@ -439,385 +439,385 @@ KZip::~KZip()
+ bool KZip::openArchive(QIODevice::OpenMode mode)
+ {
+     //qCDebug(KArchiveLog);
+     d->m_fileList.clear();
+ 
+     if (mode == QIODevice::WriteOnly) {
+         return true;
+     }
+ 
+     char buffer[47];
+ 
+     // Check that it's a valid ZIP file
+     // KArchive::open() opened the underlying device already.
+ 
+     quint64 offset = 0; // holds offset, where we read
+     // contains information gathered from the local file headers
+     QHash<QByteArray, ParseFileInfo> pfi_map;
+ 
+     QIODevice *dev = device();
+ 
+     // We set a bool for knowing if we are allowed to skip the start of the file
+     bool startOfFile = true;
+ 
+     for (;;) { // repeat until 'end of entries' signature is reached
+         //qCDebug(KArchiveLog) << "loop starts";
+         //qCDebug(KArchiveLog) << "dev->pos() now : " << dev->pos();
+         int n = dev->read(buffer, 4);
+ 
+         if (n < 4) {
+             setErrorString(tr("Invalid ZIP file. Unexpected end of file. (Error code: %1)").arg(1));
+             return false;
+         }
+ 
+         if (!memcmp(buffer, "PK\5\6", 4)) { // 'end of entries'
+             //qCDebug(KArchiveLog) << "PK56 found end of archive";
+             startOfFile = false;
+             break;
+         }
+ 
+         if (!memcmp(buffer, "PK\3\4", 4)) { // local file header
+             //qCDebug(KArchiveLog) << "PK34 found local file header";
+             startOfFile = false;
+             // can this fail ???
+             dev->seek(dev->pos() + 2); // skip 'version needed to extract'
+ 
+             // read static header stuff
+             n = dev->read(buffer, 24);
+             if (n < 24) {
+                 setErrorString(tr("Invalid ZIP file. Unexpected end of file. (Error code: %1)").arg(4));
+                 return false;
+             }
+ 
+             int gpf = (uchar)buffer[0]; // "general purpose flag" not "general protection fault" ;-)
+             int compression_mode = (uchar)buffer[2] | (uchar)buffer[3] << 8;
+             uint mtime = transformFromMsDos(buffer + 4);
+ 
+             const qint64 compr_size = uint(uchar(buffer[12])) | uint(uchar(buffer[13])) << 8 |
+                                       uint(uchar(buffer[14])) << 16 | uint(uchar(buffer[15])) << 24;
+             const qint64 uncomp_size = uint(uchar(buffer[16])) | uint(uchar(buffer[17])) << 8 |
+                                        uint(uchar(buffer[18])) << 16 | uint(uchar(buffer[19])) << 24;
+             const int namelen = uint(uchar(buffer[20])) | uint(uchar(buffer[21])) << 8;
+             const int extralen = uint(uchar(buffer[22])) | uint(uchar(buffer[23])) << 8;
+ 
+             /*
+               qCDebug(KArchiveLog) << "general purpose bit flag: " << gpf;
+               qCDebug(KArchiveLog) << "compressed size: " << compr_size;
+               qCDebug(KArchiveLog) << "uncompressed size: " << uncomp_size;
+               qCDebug(KArchiveLog) << "namelen: " << namelen;
+               qCDebug(KArchiveLog) << "extralen: " << extralen;
+               qCDebug(KArchiveLog) << "archive size: " << dev->size();
+             */
+ 
+             // read fileName
+             Q_ASSERT(namelen > 0);
+             QByteArray fileName = dev->read(namelen);
+             if (fileName.size() < namelen) {
+                 setErrorString(tr("Invalid ZIP file. Name not completely read (#2)"));
+                 return false;
+             }
+ 
+             ParseFileInfo pfi;
+             pfi.mtime = mtime;
+ 
+             // read and parse the beginning of the extra field,
+             // skip rest of extra field in case it is too long
+             unsigned int extraFieldEnd = dev->pos() + extralen;
+             pfi.extralen = extralen;
+             int handledextralen = qMin(extralen, (int)sizeof buffer);
+ 
+             //if (handledextralen)
+             //    qCDebug(KArchiveLog) << "handledextralen: " << handledextralen;
+ 
+             n = dev->read(buffer, handledextralen);
+             // no error msg necessary as we deliberately truncate the extra field
+-            if (!parseExtraField(buffer, handledextralen, true, pfi)) {
++            if (!parseExtraField(buffer, n, true, pfi)) {
+                 setErrorString(tr("Invalid ZIP File. Broken ExtraField."));
+                 return false;
+             }
+ 
+             // jump to end of extra field
+             dev->seek(extraFieldEnd);
+ 
+             // we have to take care of the 'general purpose bit flag'.
+             // if bit 3 is set, the header doesn't contain the length of
+             // the file and we look for the signature 'PK\7\8'.
+             if (gpf & 8) {
+                 // here we have to read through the compressed data to find
+                 // the next PKxx
+                 if (!seekToNextHeaderToken(dev, true)) {
+                     setErrorString(tr("Could not seek to next header token"));
+                     return false;
+                 }
+             } else {
+                 // here we skip the compressed data and jump to the next header
+                 //qCDebug(KArchiveLog) << "general purpose bit flag indicates, that local file header contains valid size";
+                 bool foundSignature = false;
+                 // check if this could be a symbolic link
+                 if (compression_mode == NoCompression
+                     && uncomp_size <= max_path_len
+                     && uncomp_size > 0) {
+                     // read content and store it
+                     // If it's not a symlink, then we'll just discard the data for now.
+                     pfi.guessed_symlink = dev->read(uncomp_size);
+                     if (pfi.guessed_symlink.size() < uncomp_size) {
+                         setErrorString(tr("Invalid ZIP file. Unexpected end of file. (#5)"));
+                         return false;
+                     }
+                 } else {
+                     if (compr_size > dev->size()) {
+                         // here we cannot trust the compressed size, so scan through the compressed
+                         // data to find the next header
+                         if (!seekToNextHeaderToken(dev, false)) {
+                             setErrorString(tr("Could not seek to next header token"));
+                             return false;
+                         }
+                         foundSignature = true;
+                     } else {
+ //          qCDebug(KArchiveLog) << "before interesting dev->pos(): " << dev->pos();
+                         bool success = dev->seek(dev->pos() + compr_size); // can this fail ???
+                         Q_UNUSED(success); // prevent warning in release builds.
+                         Q_ASSERT(success); // let's see...
+                         /*          qCDebug(KArchiveLog) << "after interesting dev->pos(): " << dev->pos();
+                                                 if (success)
+                                                 qCDebug(KArchiveLog) << "dev->at was successful... ";
+                                                 else
+                                                 qCDebug(KArchiveLog) << "dev->at failed... ";*/
+                     }
+ 
+                 }
+                 // test for optional data descriptor
+                 if (!foundSignature) {
+ //                     qCDebug(KArchiveLog) << "Testing for optional data descriptor";
+                     // read static data descriptor
+                     n = dev->read(buffer, 4);
+                     if (n < 4) {
+                         setErrorString(tr("Invalid ZIP file. Unexpected end of file. (#1)"));
+                         return false;
+                     }
+ 
+                     if (buffer[0] != 'P' || !handlePossibleHeaderBegin(buffer + 1, dev, false)) {
+                         // assume data descriptor without signature
+                         dev->seek(dev->pos() + 8); // skip rest of the 'data_descriptor'
+                     }
+                 }
+ 
+ // not needed any more
+                 /*                // here we calculate the length of the file in the zip
+                 // with headers and jump to the next header.
+                 uint skip = compr_size + namelen + extralen;
+                 offset += 30 + skip;*/
+             }
+             pfi_map.insert(fileName, pfi);
+         } else if (!memcmp(buffer, "PK\1\2", 4)) { // central block
+             //qCDebug(KArchiveLog) << "PK12 found central block";
+             startOfFile = false;
+ 
+             // so we reached the central header at the end of the zip file
+             // here we get all interesting data out of the central header
+             // of a file
+             offset = dev->pos() - 4;
+ 
+             //set offset for appending new files
+             if (d->m_offset == 0) {
+                 d->m_offset = offset;
+             }
+ 
+             n = dev->read(buffer + 4, 42);
+             if (n < 42) {
+                 setErrorString(tr(
+                     "Invalid ZIP file, central entry too short "
+                     "(not long enough for valid entry)"));
+                 return false;
+             }
+ 
+             //int gpf = (uchar)buffer[9] << 8 | (uchar)buffer[10];
+             //qCDebug(KArchiveLog) << "general purpose flag=" << gpf;
+             // length of the fileName (well, pathname indeed)
+             int namelen = (uchar)buffer[29] << 8 | (uchar)buffer[28];
+             Q_ASSERT(namelen > 0);
+             QByteArray bufferName = dev->read(namelen);
+             if (bufferName.size() < namelen) {
+                 //qCWarning(KArchiveLog) << "Invalid ZIP file. Name not completely read";
+             }
+ 
+             ParseFileInfo pfi = pfi_map.value(bufferName, ParseFileInfo());
+ 
+             QString name(QFile::decodeName(bufferName));
+ 
+             //qCDebug(KArchiveLog) << "name: " << name;
+             // only in central header ! see below.
+             // length of extra attributes
+             int extralen = (uchar)buffer[31] << 8 | (uchar)buffer[30];
+             // length of comment for this file
+             int commlen = (uchar)buffer[33] << 8 | (uchar)buffer[32];
+             // compression method of this file
+             int cmethod = (uchar)buffer[11] << 8 | (uchar)buffer[10];
+ 
+             //qCDebug(KArchiveLog) << "cmethod: " << cmethod;
+             //qCDebug(KArchiveLog) << "extralen: " << extralen;
+ 
+             // crc32 of the file
+             uint crc32 = (uchar)buffer[19] << 24 | (uchar)buffer[18] << 16 |
+                          (uchar)buffer[17] << 8 | (uchar)buffer[16];
+ 
+             // uncompressed file size
+             uint ucsize = (uchar)buffer[27] << 24 | (uchar)buffer[26] << 16 |
+                           (uchar)buffer[25] << 8 | (uchar)buffer[24];
+             // compressed file size
+             uint csize = (uchar)buffer[23] << 24 | (uchar)buffer[22] << 16 |
+                          (uchar)buffer[21] << 8 | (uchar)buffer[20];
+ 
+             // offset of local header
+             uint localheaderoffset = (uchar)buffer[45] << 24 | (uchar)buffer[44] << 16 |
+                                      (uchar)buffer[43] << 8 | (uchar)buffer[42];
+ 
+             // some clever people use different extra field lengths
+             // in the central header and in the local header... funny.
+             // so we need to get the localextralen to calculate the offset
+             // from localheaderstart to dataoffset
+             int localextralen = pfi.extralen; // FIXME: this will not work if
+             // no local header exists
+ 
+             //qCDebug(KArchiveLog) << "localextralen: " << localextralen;
+ 
+             // offset, where the real data for uncompression starts
+             uint dataoffset = localheaderoffset + 30 + localextralen + namelen; //comment only in central header
+ 
+             //qCDebug(KArchiveLog) << "esize: " << esize;
+             //qCDebug(KArchiveLog) << "eoffset: " << eoffset;
+             //qCDebug(KArchiveLog) << "csize: " << csize;
+ 
+             int os_madeby = (uchar)buffer[5];
+             bool isdir = false;
+             int access = 0100644;
+ 
+             if (os_madeby == 3) {   // good ole unix
+                 access = (uchar)buffer[40] | (uchar)buffer[41] << 8;
+             }
+ 
+             QString entryName;
+ 
+             if (name.endsWith(QLatin1Char('/'))) { // Entries with a trailing slash are directories
+                 isdir = true;
+                 name = name.left(name.length() - 1);
+                 if (os_madeby != 3) {
+                     access = S_IFDIR | 0755;
+                 } else {
+                     access |= S_IFDIR | 0700;
+                 }
+             }
+ 
+             int pos = name.lastIndexOf(QLatin1Char('/'));
+             if (pos == -1) {
+                 entryName = name;
+             } else {
+                 entryName = name.mid(pos + 1);
+             }
+             Q_ASSERT(!entryName.isEmpty());
+ 
+             KArchiveEntry *entry;
+             if (isdir) {
+                 QString path = QDir::cleanPath(name);
+                 const KArchiveEntry *ent = rootDir()->entry(path);
+                 if (ent && ent->isDirectory()) {
+                     //qCDebug(KArchiveLog) << "Directory already exists, NOT going to add it again";
+                     entry = nullptr;
+                 } else {
+                     QDateTime mtime = KArchivePrivate::time_tToDateTime(pfi.mtime);
+                     entry = new KArchiveDirectory(this, entryName, access, mtime, rootDir()->user(), rootDir()->group(), QString());
+                     //qCDebug(KArchiveLog) << "KArchiveDirectory created, entryName= " << entryName << ", name=" << name;
+                 }
+             } else {
+                 QString symlink;
+                 if ((access & QT_STAT_MASK) == QT_STAT_LNK) {
+                     symlink = QFile::decodeName(pfi.guessed_symlink);
+                 }
+                 QDateTime mtime = KArchivePrivate::time_tToDateTime(pfi.mtime);
+                 entry = new KZipFileEntry(this, entryName, access, mtime,
+                                           rootDir()->user(), rootDir()->group(),
+                                           symlink, name, dataoffset,
+                                           ucsize, cmethod, csize);
+                 static_cast<KZipFileEntry *>(entry)->setHeaderStart(localheaderoffset);
+                 static_cast<KZipFileEntry *>(entry)->setCRC32(crc32);
+                 //qCDebug(KArchiveLog) << "KZipFileEntry created, entryName= " << entryName << ", name=" << name;
+                 d->m_fileList.append(static_cast<KZipFileEntry *>(entry));
+             }
+ 
+             if (entry) {
+                 if (pos == -1) {
+                     rootDir()->addEntry(entry);
+                 } else {
+                     // In some tar files we can find dir/./file => call cleanPath
+                     QString path = QDir::cleanPath(name.left(pos));
+                     // Ensure container directory exists, create otherwise
+                     KArchiveDirectory *tdir = findOrCreate(path);
+                     if (tdir) {
+                         tdir->addEntry(entry);
+                     } else {
+                         setErrorString(tr("File %1 is in folder %2, but %3 is actually a file.").arg(entryName, path, path));
+                         delete entry;
+                         return false;
+                     }
+                 }
+             }
+ 
+             //calculate offset to next entry
+             offset += 46 + commlen + extralen + namelen;
+             bool b = dev->seek(offset);
+             Q_ASSERT(b);
+             if (!b) {
+                 setErrorString(tr("Could not seek to next entry"));
+                 return false;
+             }
+         } else if (startOfFile) {
+             // The file does not start with any ZIP header (e.g. self-extractable ZIP files)
+             // Therefore we need to find the first PK\003\004 (local header)
+             //qCDebug(KArchiveLog) << "Try to skip start of file";
+             startOfFile = false;
+             bool foundSignature = false;
+ 
+             while (!foundSignature) {
+                 n = dev->read(buffer, 1);
+                 if (n < 1) {
+                     setErrorString(tr("Invalid ZIP file. Unexpected end of file."));
+                     return false;
+                 }
+ 
+                 if (buffer[0] != 'P') {
+                     continue;
+                 }
+ 
+                 n = dev->read(buffer, 3);
+                 if (n < 3) {
+                     setErrorString(tr("Invalid ZIP file. Unexpected end of file."));
+                     return false;
+                 }
+ 
+                 // We have to detect the magic token for a local header: PK\003\004
+                 /*
+                  * Note: we do not need to check the other magics, if the ZIP file has no
+                  * local header, then it has not any files!
+                  */
+                 if (buffer[0] == 'K' && buffer[1] == 3 && buffer[2] == 4) {
+                     foundSignature = true;
+                     dev->seek(dev->pos() - 4); // go back 4 bytes, so that the magic bytes can be found...
+                 } else {
+                     for (int i = 0; i < 3; ++i) {
+                         if (buffer[i] == 'P') {
+                             // We have another P character so we must go back a little to check if it is a magic
+                             dev->seek(dev->pos() - 3 + i);
+                             break;
+                         }
+                     }
+                 }
+             }
+         } else {
+             setErrorString(
+                 tr("Invalid ZIP file. Unrecognized header at offset %1")
+                 .arg(dev->pos() - 4));
+             return false;
+         }
+     }
+     //qCDebug(KArchiveLog) << "*** done *** ";
+     return true;
+ }

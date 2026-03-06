@@ -1,0 +1,370 @@
+commit 65f13fc5fb879cd00f08904f14a9339c11be59c3
+Author: Even Rouault <even.rouault@spatialys.com>
+Date:   Thu Jun 28 11:37:56 2018 +0200
+
+    RMF: avoid double free. Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=9138. Credit to OSS Fuzz. master only
+
+diff --git a/gdal/frmts/rmf/rmfdataset.cpp b/gdal/frmts/rmf/rmfdataset.cpp
+index ca6f7feb24..c424b842db 100644
+--- a/gdal/frmts/rmf/rmfdataset.cpp
++++ b/gdal/frmts/rmf/rmfdataset.cpp
+@@ -213,358 +213,358 @@ CPLErr RMFRasterBand::ReadBuffer( GByte *pabyBuf, GUInt32 nBytes ) const
+ CPLErr RMFRasterBand::IReadBlock( int nBlockXOff, int nBlockYOff,
+                                   void * pImage )
+ {
+     RMFDataset  *poGDS = reinterpret_cast<RMFDataset *>( poDS );
+ 
+     CPLAssert( poGDS != nullptr
+                && nBlockXOff >= 0
+                && nBlockYOff >= 0
+                && pImage != nullptr );
+ 
+     memset( pImage, 0, nBlockBytes );
+ 
+     const GUInt32 nTile = nBlockYOff * poGDS->nXTiles + nBlockXOff;
+     if( 2 * nTile + 1 >= poGDS->sHeader.nTileTblSize / sizeof(GUInt32) )
+     {
+         return CE_Failure;
+     }
+ 
+     GUInt32 nTileBytes = poGDS->paiTiles[2 * nTile + 1];
+     const GUInt32 nCurBlockYSize =
+         (nLastTileHeight
+          && static_cast<GUInt32>( nBlockYOff ) == poGDS->nYTiles - 1 )
+         ? nLastTileHeight
+         : nBlockYSize;
+ 
+     vsi_l_offset nTileOffset =
+         poGDS->GetFileOffset( poGDS->paiTiles[2 * nTile] );
+ 
+     if( nTileOffset == 0 )
+     {
+         return CE_None;
+     }
+ 
+     if( VSIFSeekL( poGDS->fp, nTileOffset, SEEK_SET ) < 0 )
+     {
+         // XXX: We will not report error here, because file just may be
+         // in update state and data for this block will be available later
+         if( poGDS->eAccess == GA_Update )
+             return CE_None;
+ 
+         CPLError( CE_Failure, CPLE_FileIO,
+                   "Can't seek to offset %ld in input file to read data.\n%s",
+                   static_cast<long>( nTileOffset ),
+                   VSIStrerror( errno ) );
+         return CE_Failure;
+     }
+ 
+     GUInt32 nRawXSize = nBlockXSize;
+     GUInt32 nRawYSize = nBlockYSize;
+ 
+     if( nLastTileWidth && (GUInt32)nBlockXOff == poGDS->nXTiles - 1 )
+         nRawXSize = nLastTileWidth;
+ 
+     if( nLastTileHeight && (GUInt32)nBlockYOff == poGDS->nYTiles - 1 )
+         nRawYSize = nLastTileHeight;
+ 
+     if( poGDS->nBands == 1 &&
+         ( poGDS->sHeader.nBitDepth == 8
+           || poGDS->sHeader.nBitDepth == 16
+           || poGDS->sHeader.nBitDepth == 32
+           || poGDS->sHeader.nBitDepth == 64 ) )
+     {
+         if( nTileBytes > nBlockBytes )
+             nTileBytes = nBlockBytes;
+ 
+ /* -------------------------------------------------------------------- */
+ /*  Decompress buffer, if needed.                                       */
+ /* -------------------------------------------------------------------- */
+         if( poGDS->Decompress )
+         {
+             GUInt32 nRawBytes;
+ 
+             nRawBytes = poGDS->nBands * nRawXSize * nRawYSize * nDataSize;
+ 
+             if( nRawBytes > nTileBytes )
+             {
+                 GByte *pabyTile = reinterpret_cast<GByte *>(
+                     VSIMalloc( nTileBytes ) );
+ 
+                 if( !pabyTile )
+                 {
+                     CPLError( CE_Failure, CPLE_FileIO,
+                             "Can't allocate tile block of size %lu.\n%s",
+                             (unsigned long) nTileBytes, VSIStrerror( errno ) );
+                     return CE_Failure;
+                 }
+ 
+                 if( ReadBuffer( pabyTile, nTileBytes ) == CE_Failure )
+                 {
+                     // XXX: Do not fail here, just return empty block
+                     // and continue reading.
+                     CPLFree( pabyTile );
+                     return CE_None;
+                 }
+ 
+                 (*poGDS->Decompress)( pabyTile, nTileBytes,
+                                       reinterpret_cast<GByte*>( pImage ),
+                                       nRawBytes, nRawXSize, nRawYSize );
+                 CPLFree( pabyTile );
+                 // nTileBytes = nRawBytes;
+             }
+             else
+             {
+                 if( ReadBuffer( reinterpret_cast<GByte *>( pImage ),
+                                 nTileBytes ) == CE_Failure )
+                 {
+                     // XXX: Do not fail here, just return empty block
+                     // and continue reading.
+                     return CE_None;
+                 }
+             }
+         }
+         else
+         {
+             if( ReadBuffer( reinterpret_cast<GByte *>( pImage ),
+                             nTileBytes ) == CE_Failure )
+             {
+                 // XXX: Do not fail here, just return empty block
+                 // and continue reading.
+                 return CE_None;
+             }
+         }
+     }
+     else if( poGDS->eRMFType == RMFT_RSW )
+     {
+         if(poGDS->pabyCurrentTile == nullptr ||
+            poGDS->nCurrentTileXOff != nBlockXOff ||
+            poGDS->nCurrentTileYOff != nBlockYOff ||
+            poGDS->nCurrentTileBytes == 0)
+         {
+             const GUInt32 nMaxBlockBytes = nBlockBytes * 4; // 4 bands
+             if( nTileBytes > nMaxBlockBytes )
+             {
+                 CPLDebug("RMF",
+                          "Only reading %u bytes instead of the %u declared "
+                          "in the tile array",
+                          nMaxBlockBytes, nTileBytes);
+                 nTileBytes = nMaxBlockBytes;
+             }
+ 
+             GByte *pabyNewTile = reinterpret_cast<GByte *>(
+-                        VSIRealloc(poGDS->pabyCurrentTile, nTileBytes));
++                    VSIRealloc(poGDS->pabyCurrentTile, std::max(1U, nTileBytes)));
+             if( !pabyNewTile )
+             {
+                 CPLError( CE_Failure, CPLE_FileIO,
+                           "Can't allocate tile block of size %lu.\n%s",
+                           (unsigned long)nTileBytes, VSIStrerror( errno ) );
+                 poGDS->nCurrentTileBytes = 0;
+                 return CE_Failure;
+             }
+             poGDS->pabyCurrentTile = pabyNewTile;
+ 
+             poGDS->nCurrentTileXOff = nBlockXOff;
+             poGDS->nCurrentTileYOff = nBlockYOff;
+             poGDS->nCurrentTileBytes = nTileBytes;
+ 
+             if(CE_Failure == ReadBuffer(poGDS->pabyCurrentTile,
+                                         poGDS->nCurrentTileBytes))
+             {
+                 // XXX: Do not fail here, just return empty block
+                 // and continue reading.
+                 poGDS->nCurrentTileBytes = 0;
+                 return CE_None;
+             }
+ 
+ /* -------------------------------------------------------------------- */
+ /*  If buffer was compressed, decompress it first.                      */
+ /* -------------------------------------------------------------------- */
+             if( poGDS->Decompress )
+             {
+                 GUInt32 nRawBytes;
+ 
+                 nRawBytes = poGDS->nBands * nRawXSize * nRawYSize * nDataSize;
+                 if( nRawBytes > poGDS->nCurrentTileBytes )
+                 {
+                     GByte *pabyRawBuf = reinterpret_cast<GByte *>(
+                         VSIMalloc( nRawBytes ) );
+                     if( pabyRawBuf == nullptr )
+                     {
+                         CPLError( CE_Failure, CPLE_FileIO,
+                                   "Can't allocate a buffer for raw data of "
+                                   "size %lu.\n%s",
+                                   static_cast<unsigned long>( nRawBytes ),
+                                   VSIStrerror( errno ) );
+                         poGDS->nCurrentTileBytes = 0;
+                         return CE_Failure;
+                     }
+ 
+                     (*poGDS->Decompress)( poGDS->pabyCurrentTile,
+                                           poGDS->nCurrentTileBytes,
+                                           pabyRawBuf, nRawBytes,
+                                           nRawXSize, nRawYSize );
+                     CPLFree( poGDS->pabyCurrentTile );
+                     poGDS->pabyCurrentTile = pabyRawBuf;
+                     poGDS->nCurrentTileBytes = nRawBytes;
+                 }
+             }
+         }
+ /* -------------------------------------------------------------------- */
+ /*  Deinterleave pixels from input buffer.                              */
+ /* -------------------------------------------------------------------- */
+         if( poGDS->sHeader.nBitDepth == 24 || poGDS->sHeader.nBitDepth == 32 )
+         {
+             GUInt32 nTileSize = poGDS->nCurrentTileBytes / nBytesPerPixel;
+ 
+             if( nTileSize > nBlockSize )
+                 nTileSize = nBlockSize;
+ 
+             if(poGDS->bReverseBandLayout && poGDS->nCurrentTileBytes > nTileBytes)
+             {
+                 for( GUInt32 i = 0; i < nTileSize; i++ )
+                 {
+                     reinterpret_cast<GByte *>( pImage )[i] =
+                         poGDS->pabyCurrentTile[i * nBytesPerPixel + nBand - 1];
+                 }
+             }
+             else
+             {
+                 for( GUInt32 i = 0; i < nTileSize; i++ )
+                 {
+                     // Colour triplets in RMF file organized in reverse order:
+                     // blue, green, red. When we have 32-bit RMF the forth byte
+                     // in quadruplet should be discarded as it has no meaning.
+                     // That is why we always use 3 byte count in the following
+                     // pabyTemp index.
+                     reinterpret_cast<GByte *>( pImage )[i] =
+                         poGDS->pabyCurrentTile[i * nBytesPerPixel + 3 - nBand];
+                 }
+             }
+         }
+ 
+         else if( poGDS->sHeader.nBitDepth == 16 )
+         {
+             GUInt32 nTileSize = poGDS->nCurrentTileBytes / nBytesPerPixel;
+ 
+             if( nTileSize > nBlockSize )
+                 nTileSize = nBlockSize;
+ 
+             for( GUInt32 i = 0; i < nTileSize; i++ )
+             {
+                 switch( nBand )
+                 {
+                     case 1:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             static_cast<GByte>((reinterpret_cast<GUInt16 *>(
+                                 poGDS->pabyCurrentTile )[i] & 0x7c00) >> 7);
+                         break;
+                     case 2:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             static_cast<GByte>((reinterpret_cast<GUInt16 *>(
+                                 poGDS->pabyCurrentTile )[i] & 0x03e0) >> 2);
+                         break;
+                     case 3:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             static_cast<GByte>((reinterpret_cast<GUInt16 *>(
+                                 poGDS->pabyCurrentTile)[i] & 0x1F) << 3);
+                         break;
+                     default:
+                         break;
+                 }
+             }
+         }
+         else if( poGDS->sHeader.nBitDepth == 4 )
+         {
+             GByte *pabyTemp = poGDS->pabyCurrentTile;
+ 
+             if( poGDS->nCurrentTileBytes != (nBlockSize+1) / 2 )
+             {
+                 CPLError(CE_Failure, CPLE_AppDefined,
+                          "Tile has %d bytes, %d were expected",
+                          poGDS->nCurrentTileBytes, (nBlockSize+1) / 2 );
+                 return CE_Failure;
+             }
+ 
+             for( GUInt32 i = 0; i < nBlockSize; i++ )
+             {
+                 // Most significant part of the byte represents leftmost pixel
+                 if( i & 0x01 )
+                     reinterpret_cast<GByte *>( pImage )[i] = *pabyTemp++ & 0x0F;
+                 else
+                     reinterpret_cast<GByte *>( pImage )[i]
+                         = (*pabyTemp & 0xF0) >> 4;
+             }
+         }
+         else if( poGDS->sHeader.nBitDepth == 1 )
+         {
+             GByte *pabyTemp = poGDS->pabyCurrentTile;
+ 
+             if( poGDS->nCurrentTileBytes != (nBlockSize+7) / 8 )
+             {
+                 CPLError(CE_Failure, CPLE_AppDefined,
+                          "Tile has %d bytes, %d were expected",
+                          poGDS->nCurrentTileBytes, (nBlockSize+7) / 8 );
+                 return CE_Failure;
+             }
+ 
+             for( GUInt32 i = 0; i < nBlockSize; i++ )
+             {
+                 switch( i & 0x7 )
+                 {
+                     case 0:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x80) >> 7;
+                         break;
+                     case 1:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x40) >> 6;
+                         break;
+                     case 2:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x20) >> 5;
+                         break;
+                     case 3:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x10) >> 4;
+                         break;
+                     case 4:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x08) >> 3;
+                         break;
+                     case 5:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x04) >> 2;
+                         break;
+                     case 6:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             (*pabyTemp & 0x02) >> 1;
+                         break;
+                     case 7:
+                         reinterpret_cast<GByte *>( pImage )[i] =
+                             *pabyTemp++ & 0x01;
+                         break;
+                     default:
+                         break;
+                 }
+             }
+         }
+     }
+ 
+     if( nLastTileWidth
+         && static_cast<GUInt32>( nBlockXOff ) == poGDS->nXTiles - 1 )
+     {
+         for( GUInt32 iRow = nCurBlockYSize - 1; iRow > 0; iRow-- )
+         {
+             memmove( reinterpret_cast<GByte *>( pImage )
+                      + nBlockXSize * iRow * nDataSize,
+                      reinterpret_cast<GByte *>( pImage ) +
+                      iRow * nLastTileWidth * nDataSize,
+                      nLastTileWidth * nDataSize );
+         }
+     }
+ 
+     return CE_None;
+ }
+ 
+ /************************************************************************/
+ /*                            IWriteBlock()                             */
+ /************************************************************************/

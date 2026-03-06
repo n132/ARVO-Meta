@@ -1,0 +1,336 @@
+commit 21674033ee246f698887604c7af7ba1962a40ddf
+Author: Even Rouault <even.rouault@spatialys.com>
+Date:   Thu Aug 15 15:04:58 2019 +0200
+
+    Internal libtiff: fix integer overflow potentially causing write heap buffer overflow, especially on 32 bit builds. Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=16443. Credit to OSS Fuzz
+
+diff --git a/gdal/frmts/gtiff/libtiff/tif_getimage.c b/gdal/frmts/gtiff/libtiff/tif_getimage.c
+index c88b5fa67d..4da785d3a1 100644
+--- a/gdal/frmts/gtiff/libtiff/tif_getimage.c
++++ b/gdal/frmts/gtiff/libtiff/tif_getimage.c
+@@ -914,87 +914,94 @@ static int
+ gtStripContig(TIFFRGBAImage* img, uint32* raster, uint32 w, uint32 h)
+ {
+ 	TIFF* tif = img->tif;
+ 	tileContigRoutine put = img->put.contig;
+ 	uint32 row, y, nrow, nrowsub, rowstoread;
+ 	tmsize_t pos;
+ 	unsigned char* buf = NULL;
+ 	uint32 rowsperstrip;
+ 	uint16 subsamplinghor,subsamplingver;
+ 	uint32 imagewidth = img->width;
+ 	tmsize_t scanline;
+ 	int32 fromskew, toskew;
+ 	int ret = 1, flip;
+         tmsize_t maxstripsize;
+ 
+ 	TIFFGetFieldDefaulted(tif, TIFFTAG_YCBCRSUBSAMPLING, &subsamplinghor, &subsamplingver);
+ 	if( subsamplingver == 0 ) {
+ 		TIFFErrorExt(tif->tif_clientdata, TIFFFileName(tif), "Invalid vertical YCbCr subsampling");
+ 		return (0);
+ 	}
+ 	
+ 	maxstripsize = TIFFStripSize(tif);
+ 
+ 	flip = setorientation(img);
+ 	if (flip & FLIP_VERTICALLY) {
+ 		y = h - 1;
+ 		toskew = -(int32)(w + w);
+ 	} else {
+ 		y = 0;
+ 		toskew = -(int32)(w - w);
+ 	}
+ 
+ 	TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsperstrip);
+ 
+ 	scanline = TIFFScanlineSize(tif);
+ 	fromskew = (w < imagewidth ? imagewidth - w : 0);
+ 	for (row = 0; row < h; row += nrow)
+ 	{
++		uint32 temp;
+ 		rowstoread = rowsperstrip - (row + img->row_offset) % rowsperstrip;
+ 		nrow = (row + rowstoread > h ? h - row : rowstoread);
+ 		nrowsub = nrow;
+ 		if ((nrowsub%subsamplingver)!=0)
+ 			nrowsub+=subsamplingver-nrowsub%subsamplingver;
++		temp = (row + img->row_offset)%rowsperstrip + nrowsub;
++		if( scanline > 0 && temp > (size_t)(TIFF_TMSIZE_T_MAX / scanline) )
++		{
++			TIFFErrorExt(tif->tif_clientdata, TIFFFileName(tif), "Integer overflow in gtStripContig");
++			return 0;
++		}
+ 		if (_TIFFReadEncodedStripAndAllocBuffer(tif,
+ 		    TIFFComputeStrip(tif,row+img->row_offset, 0),
+ 		    (void**)(&buf),
+                     maxstripsize,
+-		    ((row + img->row_offset)%rowsperstrip + nrowsub) * scanline)==(tmsize_t)(-1)
++		    temp * scanline)==(tmsize_t)(-1)
+ 		    && (buf == NULL || img->stoponerr))
+ 		{
+ 			ret = 0;
+ 			break;
+ 		}
+ 
+ 		pos = ((row + img->row_offset) % rowsperstrip) * scanline + \
+ 			((tmsize_t) img->col_offset * img->samplesperpixel);
+ 		(*put)(img, raster+y*w, 0, y, w, nrow, fromskew, toskew, buf + pos);
+ 		y += ((flip & FLIP_VERTICALLY) ? -(int32) nrow : (int32) nrow);
+ 	}
+ 
+ 	if (flip & FLIP_HORIZONTALLY) {
+ 		uint32 line;
+ 
+ 		for (line = 0; line < h; line++) {
+ 			uint32 *left = raster + (line * w);
+ 			uint32 *right = left + w - 1;
+ 
+ 			while ( left < right ) {
+ 				uint32 temp = *left;
+ 				*left = *right;
+ 				*right = temp;
+ 				left++;
+ 				right--;
+ 			}
+ 		}
+ 	}
+ 
+ 	_TIFFfree(buf);
+ 	return (ret);
+ }
+ 
+ /*
+  * Get a strip-organized image with
+  *	 SamplesPerPixel > 1
+  *	 PlanarConfiguration separated
+  * We assume that all such images are RGB.
+  */
+@@ -1002,217 +1009,224 @@ static int
+ gtStripSeparate(TIFFRGBAImage* img, uint32* raster, uint32 w, uint32 h)
+ {
+ 	TIFF* tif = img->tif;
+ 	tileSeparateRoutine put = img->put.separate;
+ 	unsigned char *buf = NULL;
+ 	unsigned char *p0 = NULL, *p1 = NULL, *p2 = NULL, *pa = NULL;
+ 	uint32 row, y, nrow, rowstoread;
+ 	tmsize_t pos;
+ 	tmsize_t scanline;
+ 	uint32 rowsperstrip, offset_row;
+ 	uint32 imagewidth = img->width;
+ 	tmsize_t stripsize;
+ 	tmsize_t bufsize;
+ 	int32 fromskew, toskew;
+ 	int alpha = img->alpha;
+ 	int ret = 1, flip;
+         uint16 colorchannels;
+ 
+ 	stripsize = TIFFStripSize(tif);  
+ 	bufsize = _TIFFMultiplySSize(tif,alpha?4:3,stripsize, "gtStripSeparate");
+ 	if (bufsize == 0) {
+ 		return (0);
+ 	}
+ 
+ 	flip = setorientation(img);
+ 	if (flip & FLIP_VERTICALLY) {
+ 		y = h - 1;
+ 		toskew = -(int32)(w + w);
+ 	}
+ 	else {
+ 		y = 0;
+ 		toskew = -(int32)(w - w);
+ 	}
+ 
+         switch( img->photometric )
+         {
+           case PHOTOMETRIC_MINISWHITE:
+           case PHOTOMETRIC_MINISBLACK:
+           case PHOTOMETRIC_PALETTE:
+             colorchannels = 1;
+             break;
+ 
+           default:
+             colorchannels = 3;
+             break;
+         }
+ 
+ 	TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsperstrip);
+ 	scanline = TIFFScanlineSize(tif);  
+ 	fromskew = (w < imagewidth ? imagewidth - w : 0);
+ 	for (row = 0; row < h; row += nrow)
+ 	{
++                uint32 temp;
+ 		rowstoread = rowsperstrip - (row + img->row_offset) % rowsperstrip;
+ 		nrow = (row + rowstoread > h ? h - row : rowstoread);
+ 		offset_row = row + img->row_offset;
++                temp = (row + img->row_offset)%rowsperstrip + nrow;
++                if( scanline > 0 && temp > (size_t)(TIFF_TMSIZE_T_MAX / scanline) )
++                {
++                        TIFFErrorExt(tif->tif_clientdata, TIFFFileName(tif), "Integer overflow in gtStripSeparate");
++                        return 0;
++                }
+                 if( buf == NULL )
+                 {
+                     if (_TIFFReadEncodedStripAndAllocBuffer(
+                             tif, TIFFComputeStrip(tif, offset_row, 0),
+                             (void**) &buf, bufsize,
+-                            ((row + img->row_offset)%rowsperstrip + nrow) * scanline)==(tmsize_t)(-1)
++                            temp * scanline)==(tmsize_t)(-1)
+                         && (buf == NULL || img->stoponerr))
+                     {
+                             ret = 0;
+                             break;
+                     }
+                     p0 = buf;
+                     if( colorchannels == 1 )
+                     {
+                         p2 = p1 = p0;
+                         pa = (alpha?(p0+3*stripsize):NULL);
+                     }
+                     else
+                     {
+                         p1 = p0 + stripsize;
+                         p2 = p1 + stripsize;
+                         pa = (alpha?(p2+stripsize):NULL);
+                     }
+                 }
+ 		else if (TIFFReadEncodedStrip(tif, TIFFComputeStrip(tif, offset_row, 0),
+-		    p0, ((row + img->row_offset)%rowsperstrip + nrow) * scanline)==(tmsize_t)(-1)
++		    p0, temp * scanline)==(tmsize_t)(-1)
+ 		    && img->stoponerr)
+ 		{
+ 			ret = 0;
+ 			break;
+ 		}
+ 		if (colorchannels > 1 
+                     && TIFFReadEncodedStrip(tif, TIFFComputeStrip(tif, offset_row, 1),
+-                                            p1, ((row + img->row_offset)%rowsperstrip + nrow) * scanline) == (tmsize_t)(-1)
++                                            p1, temp * scanline) == (tmsize_t)(-1)
+ 		    && img->stoponerr)
+ 		{
+ 			ret = 0;
+ 			break;
+ 		}
+ 		if (colorchannels > 1 
+                     && TIFFReadEncodedStrip(tif, TIFFComputeStrip(tif, offset_row, 2),
+-                                            p2, ((row + img->row_offset)%rowsperstrip + nrow) * scanline) == (tmsize_t)(-1)
++                                            p2, temp * scanline) == (tmsize_t)(-1)
+ 		    && img->stoponerr)
+ 		{
+ 			ret = 0;
+ 			break;
+ 		}
+ 		if (alpha)
+ 		{
+ 			if (TIFFReadEncodedStrip(tif, TIFFComputeStrip(tif, offset_row, colorchannels),
+-			    pa, ((row + img->row_offset)%rowsperstrip + nrow) * scanline)==(tmsize_t)(-1)
++			    pa, temp * scanline)==(tmsize_t)(-1)
+ 			    && img->stoponerr)
+ 			{
+ 				ret = 0;
+ 				break;
+ 			}
+ 		}
+ 
+ 		pos = ((row + img->row_offset) % rowsperstrip) * scanline + \
+ 			((tmsize_t) img->col_offset * img->samplesperpixel);
+ 		(*put)(img, raster+y*w, 0, y, w, nrow, fromskew, toskew, p0 + pos, p1 + pos,
+ 		    p2 + pos, (alpha?(pa+pos):NULL));
+ 		y += ((flip & FLIP_VERTICALLY) ? -(int32) nrow : (int32) nrow);
+ 	}
+ 
+ 	if (flip & FLIP_HORIZONTALLY) {
+ 		uint32 line;
+ 
+ 		for (line = 0; line < h; line++) {
+ 			uint32 *left = raster + (line * w);
+ 			uint32 *right = left + w - 1;
+ 
+ 			while ( left < right ) {
+ 				uint32 temp = *left;
+ 				*left = *right;
+ 				*right = temp;
+ 				left++;
+ 				right--;
+ 			}
+ 		}
+ 	}
+ 
+ 	_TIFFfree(buf);
+ 	return (ret);
+ }
+ 
+ /*
+  * The following routines move decoded data returned
+  * from the TIFF library into rasters filled with packed
+  * ABGR pixels (i.e. suitable for passing to lrecwrite.)
+  *
+  * The routines have been created according to the most
+  * important cases and optimized.  PickContigCase and
+  * PickSeparateCase analyze the parameters and select
+  * the appropriate "get" and "put" routine to use.
+  */
+ #define	REPEAT8(op)	REPEAT4(op); REPEAT4(op)
+ #define	REPEAT4(op)	REPEAT2(op); REPEAT2(op)
+ #define	REPEAT2(op)	op; op
+ #define	CASE8(x,op)			\
+     switch (x) {			\
+     case 7: op; /*-fallthrough*/ \
+     case 6: op; /*-fallthrough*/ \
+     case 5: op; /*-fallthrough*/ \
+     case 4: op; /*-fallthrough*/ \
+     case 3: op; /*-fallthrough*/ \
+     case 2: op; /*-fallthrough*/ \
+     case 1: op;				\
+     }
+ #define	CASE4(x,op)	switch (x) { case 3: op; /*-fallthrough*/ case 2: op; /*-fallthrough*/ case 1: op; }
+ #define	NOP
+ 
+ #define	UNROLL8(w, op1, op2) {		\
+     uint32 _x;				\
+     for (_x = w; _x >= 8; _x -= 8) {	\
+ 	op1;				\
+ 	REPEAT8(op2);			\
+     }					\
+     if (_x > 0) {			\
+ 	op1;				\
+ 	CASE8(_x,op2);			\
+     }					\
+ }
+ #define	UNROLL4(w, op1, op2) {		\
+     uint32 _x;				\
+     for (_x = w; _x >= 4; _x -= 4) {	\
+ 	op1;				\
+ 	REPEAT4(op2);			\
+     }					\
+     if (_x > 0) {			\
+ 	op1;				\
+ 	CASE4(_x,op2);			\
+     }					\
+ }
+ #define	UNROLL2(w, op1, op2) {		\
+     uint32 _x;				\
+     for (_x = w; _x >= 2; _x -= 2) {	\
+ 	op1;				\
+ 	REPEAT2(op2);			\
+     }					\
+     if (_x) {				\
+ 	op1;				\
+ 	op2;				\
+     }					\
+ }
+     
+ #define	SKEW(r,g,b,skew)	{ r += skew; g += skew; b += skew; }
+ #define	SKEW4(r,g,b,a,skew)	{ r += skew; g += skew; b += skew; a+= skew; }
+ 
+ #define A1 (((uint32)0xffL)<<24)
+ #define	PACK(r,g,b)	\
+ 	((uint32)(r)|((uint32)(g)<<8)|((uint32)(b)<<16)|A1)
+ #define	PACK4(r,g,b,a)	\
+ 	((uint32)(r)|((uint32)(g)<<8)|((uint32)(b)<<16)|((uint32)(a)<<24))
+ #define W2B(v) (((v)>>8)&0xff)
+ /* TODO: PACKW should have be made redundant in favor of Bitdepth16To8 LUT */
+ #define	PACKW(r,g,b)	\
+ 	((uint32)W2B(r)|((uint32)W2B(g)<<8)|((uint32)W2B(b)<<16)|A1)
+ #define	PACKW4(r,g,b,a)	\
+ 	((uint32)W2B(r)|((uint32)W2B(g)<<8)|((uint32)W2B(b)<<16)|((uint32)W2B(a)<<24))
+ 
+ #define	DECLAREContigPutFunc(name) \

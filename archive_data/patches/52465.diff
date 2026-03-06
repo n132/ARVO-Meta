@@ -1,0 +1,192 @@
+commit 6cac0c842537b9b6aaa104d909a06b85192793a6
+Author: Bart Van Assche <bvanassche@acm.org>
+Date:   Sun Oct 16 15:24:18 2022 -0700
+
+    libsnmp: Fix a recently introduced buffer overflow
+    
+    The buffer overflow can be triggered by making the ASN encoding of the first
+    two components of an OID occupy more bytes than the ASN encoding of the first
+    two components truncated to 32 bits.
+    
+    Fixes: a0a02e5e5e8c ("libsnmp: Make the asn_build_objid() implementation shorter")
+    Fixes: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=52465
+
+diff --git a/snmplib/asn1.c b/snmplib/asn1.c
+index d575476420..8594559fc2 100644
+--- a/snmplib/asn1.c
++++ b/snmplib/asn1.c
+@@ -1558,41 +1558,41 @@ asn_parse_objid(u_char * data,
+ }
+ 
+ /* Number of bytes occupied by an ASN.1-encoded object identifier. */
+-static unsigned int encoded_oid_len(oid objid)
++static unsigned int encoded_oid_len(uint32_t objid)
+ {
+     unsigned int encoded_len = 0;
+ 
+     if (objid == 0)
+         return 1;
+ 
+     while (objid) {
+         encoded_len++;
+         objid >>= 7;
+     }
+ 
+     return encoded_len;
+ }
+ 
+ /**
+  * @internal
+  * asn_build_objid - Builds an ASN object identifier object containing the
+  * input string.
+  *
+  *  On entry, datalength is input as the number of valid bytes following
+  *   "data".  On exit, it is returned as the number of valid bytes
+  *   following the beginning of the next object.
+  *
+  *  Returns a pointer to the first byte past the end
+  *   of this object (i.e. the start of the next object).
+  *  Returns NULL on any error.
+  *
+  * @param data         IN - pointer to start of object
+  * @param datalength   IN/OUT - number of valid bytes left in buffer
+  * @param type         IN - asn type of object
+  * @param objid        IN - pointer to start of input buffer
+  * @param objidlength  IN - number of sub-id's in objid
+  *
+  * @return   Returns a pointer to the first byte past the end
+  *           of this object (i.e. the start of the next object).
+  *           Returns NULL on any error.
+  */
+@@ -1600,130 +1600,131 @@ u_char         *
+ asn_build_objid(u_char * data,
+                 size_t * datalength,
+                 u_char type, const oid * objid, size_t objidlength)
+ {
+     /*
+      * ASN.1 objid ::= 0x06 asnlength subidentifier {subidentifier}*
+      * subidentifier ::= {leadingbyte}* lastbyte
+      * leadingbyte ::= 1 7bitvalue
+      * lastbyte ::= 0 7bitvalue
+      */
+     size_t          asnlength;
+     const oid      *op = objid;
+     register u_long objid_val;
+     u_long          first_objid_val;
+     register int    i;
+     u_char         *initdatap = data;
+ 
+     /*
+      * check if there are at least 2 sub-identifiers 
+      */
+     if (objidlength == 0) {
+         /*
+          * there are not, so make the OID have two sub-identifiers with value
+          * zero. Both sub-identifiers are encoded as a single byte.
+          */
+         objid_val = 0;
+         objidlength = 1;
+     } else if (objid[0] > 2) {
+         ERROR_MSG("build objid: bad first subidentifier");
+         return NULL;
+     } else if (objidlength == 1) {
+         /*
+          * encode the first value 
+          */
+         objid_val = (op[0] * 40);
+         objidlength = 2;
+         op++;
+     } else {
+         /*
+          * combine the first two values 
+          */
+         if ((op[1] > 40) &&
+             (op[0] < 2)) {
+             ERROR_MSG("build objid: bad second subidentifier");
+             return NULL;
+         }
+         objid_val = (op[0] * 40) + op[1];
+         op += 2;
+     }
+     first_objid_val = objid_val;
++    CHECK_OVERFLOW_U(first_objid_val, 14);
+ 
+     /*
+      * ditch illegal calls now 
+      */
+     if (objidlength > MAX_OID_LEN)
+         return NULL;
+ 
+     /*
+      * calculate the number of bytes needed to store the encoded value 
+      */
+     for (i = 1, asnlength = 0;;) {
+         CHECK_OVERFLOW_U(objid_val,5);
+         asnlength += encoded_oid_len(objid_val);
+         i++;
+         if (i >= (int) objidlength)
+             break;
+         objid_val = *op++;	/* XXX - doesn't handle 2.X (X > 40) */
+     }
+ 
+     /*
+      * store the ASN.1 tag and length 
+      */
+     data = asn_build_header(data, datalength, type, asnlength);
+     if (_asn_build_header_check
+         ("build objid", data, *datalength, asnlength))
+         return NULL;
+ 
+     /*
+      * store the encoded OID value 
+      */
+     if (objidlength <= 1) {
+         *data++ = 0;
+     } else {
+         for (i = 1, objid_val = first_objid_val, op = objid + 2;
+              i < (int) objidlength; i++) {
+             unsigned int encoded_len;
+             int j;
+ 
+             if (i != 1)
+                 objid_val = (uint32_t)(*op++); /* already logged warning above */
+             encoded_len = encoded_oid_len(objid_val);
+             for (j = encoded_len - 1; j >= 0; j--) {
+                 data[j] = (objid_val & 0x7f) |
+                     (j == encoded_len - 1 ? 0 : 0x80);
+                 objid_val >>= 7;
+             }
+             data += encoded_len;
+         }
+     }
+ 
+     /*
+      * return the length and data ptr 
+      */
+     *datalength -= asnlength;
+     DEBUGDUMPSETUP("send", initdatap, data - initdatap);
+     DEBUGMSG(("dumpv_send", "  ObjID: "));
+     DEBUGMSGOID(("dumpv_send", objid, objidlength));
+     DEBUGMSG(("dumpv_send", "\n"));
+     return data;
+ }
+ 
+ /**
+  * @internal
+  * asn_parse_null - Interprets an ASN null type.
+  *
+  *  On entry, datalength is input as the number of valid bytes following
+  *   "data".  On exit, it is returned as the number of valid bytes
+  *   following the beginning of the next object.
+  *
+  *  Returns a pointer to the first byte past the end
+  *   of this object (i.e. the start of the next object).
+  *  Returns NULL on any error.
+  *
+  * @param data         IN - pointer to start of object
+  * @param datalength   IN/OUT - number of valid bytes left in buffer
+  * @param type         OUT - asn type of object
+  *  @return Returns a pointer to the first byte past the end
+  *          of this object (i.e. the start of the next object).
+  *          Returns NULL on any error.
+  */

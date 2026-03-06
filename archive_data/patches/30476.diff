@@ -1,0 +1,2003 @@
+commit 0ac6c15075208c0812130a767b650c2a44344cea
+Author: John Stiles <johnstiles@google.com>
+Date:   Wed Feb 10 14:04:24 2021 -0500
+
+    Reduce self-assignment expressions (`x = x`) into just `x`.
+    
+    Change-Id: I44356aa781f208f4941dbeb617a30318e36c1081
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/367062
+    Reviewed-by: Ethan Nicholas <ethannicholas@google.com>
+    Commit-Queue: Ethan Nicholas <ethannicholas@google.com>
+    Auto-Submit: John Stiles <johnstiles@google.com>
+
+diff --git a/gn/sksl_tests.gni b/gn/sksl_tests.gni
+index faedbab010..03d4264b29 100644
+--- a/gn/sksl_tests.gni
++++ b/gn/sksl_tests.gni
+@@ -421,12 +421,13 @@ sksl_shared_tests = [
+ sksl_folding_tests = [
+   "/sksl/folding/AssignmentOps.sksl",
+   "/sksl/folding/BoolFolding.sksl",
+   "/sksl/folding/FloatFolding.sksl",
+   "/sksl/folding/IntFoldingES2.sksl",
+   "/sksl/folding/IntFoldingES3.sksl",
+   "/sksl/folding/MatrixFoldingES2.sksl",
+   "/sksl/folding/MatrixFoldingES3.sksl",
++  "/sksl/folding/SelfAssignment.sksl",
+   "/sksl/folding/ShortCircuitBoolFolding.sksl",
+   "/sksl/folding/VectorScalarFolding.sksl",
+   "/sksl/folding/VectorVectorFolding.sksl",
+ ]
+diff --git a/resources/sksl/folding/SelfAssignment.sksl b/resources/sksl/folding/SelfAssignment.sksl
+new file mode 100644
+index 0000000000..012f6fa6cb
+--- /dev/null
++++ b/resources/sksl/folding/SelfAssignment.sksl
+@@ -0,0 +1,34 @@
++uniform half4 colorRed, colorGreen;
++
++struct S {
++    half i;
++    half j;
++};
++
++half4 main() {
++    // All of these assignments can be preserved.
++    half4 x = half4(3, 2, 1, 0);
++    x.xyz = x.zyx;
++
++    S s;
++    s.i = 2;
++    s.j = 2;
++    s.i = s.j;
++    s.j = s.i;
++
++    half a[2];
++    a[0] = 0;
++    a[1] = 1;
++    a[1] = a[0];
++
++    // All of these assignments should be eliminated.
++    x.ay = x.ay;
++    x.xyz = x.xyz;
++    x = x;
++    s.i = s.i;
++    s.j = s.j;
++    a[0] = a[0];
++    a[1] = a[1];
++
++    return half4(x.w, s.i / s.j, a[0], a[1]);
++}
+diff --git a/src/sksl/SkSLCompiler.cpp b/src/sksl/SkSLCompiler.cpp
+index 3668e6ada9..fe119cee6d 100644
+--- a/src/sksl/SkSLCompiler.cpp
++++ b/src/sksl/SkSLCompiler.cpp
+@@ -437,6 +437,50 @@ static bool dead_assignment(const BinaryExpression& b, ProgramUsage* usage) {
+     return is_dead(*b.left(), usage);
+ }
+ 
++/**
++ * Returns true if both expression trees are the same. The left side is expected to be an lvalue.
++ * This only needs to check for trees that can plausibly terminate in a variable, so some basic
++ * candidates like `FloatLiteral` are missing.
++ */
++static bool is_matching_expression_tree(const Expression& left, const Expression& right) {
++    if (left.kind() != right.kind() || left.type() != right.type()) {
++        return false;
++    }
++
++    switch (left.kind()) {
++        case Expression::Kind::kIntLiteral:
++            return left.as<IntLiteral>().value() == right.as<IntLiteral>().value();
++
++        case Expression::Kind::kFieldAccess:
++            return left.as<FieldAccess>().fieldIndex() == right.as<FieldAccess>().fieldIndex() &&
++                   is_matching_expression_tree(*left.as<FieldAccess>().base(),
++                                               *right.as<FieldAccess>().base());
++
++        case Expression::Kind::kIndex:
++            return is_matching_expression_tree(*left.as<IndexExpression>().index(),
++                                               *right.as<IndexExpression>().index()) &&
++                   is_matching_expression_tree(*left.as<IndexExpression>().base(),
++                                               *right.as<IndexExpression>().base());
++
++        case Expression::Kind::kSwizzle:
++            return left.as<Swizzle>().components() == right.as<Swizzle>().components() &&
++                   is_matching_expression_tree(*left.as<Swizzle>().base(),
++                                               *right.as<Swizzle>().base());
++
++        case Expression::Kind::kVariableReference:
++            return left.as<VariableReference>().variable() ==
++                   right.as<VariableReference>().variable();
++
++        default:
++            return false;
++    }
++}
++
++static bool self_assignment(const BinaryExpression& b) {
++    return b.getOperator() == Token::Kind::TK_EQ &&
++           is_matching_expression_tree(*b.left(), *b.right());
++}
++
+ void Compiler::computeDataFlow(CFG* cfg) {
+     cfg->fBlocks[cfg->fStart].fBefore.computeStartState(*cfg);
+ 
+@@ -655,470 +699,470 @@ static void vectorize_right(BasicBlock* b,
+ void Compiler::simplifyExpression(DefinitionMap& definitions,
+                                   BasicBlock& b,
+                                   std::vector<BasicBlock::Node>::iterator* iter,
+                                   OptimizationContext* optimizationContext) {
+     Expression* expr = (*iter)->expression()->get();
+     SkASSERT(expr);
+ 
+     if ((*iter)->fConstantPropagation) {
+         std::unique_ptr<Expression> optimized = expr->constantPropagate(*fIRGenerator,
+                                                                         definitions);
+         if (optimized) {
+             optimizationContext->fUpdated = true;
+             optimized = fIRGenerator->coerce(std::move(optimized), expr->type());
+             SkASSERT(optimized);
+             // Remove references within 'expr', add references within 'optimized'
+             optimizationContext->fUsage->replace(expr, optimized.get());
+             if (!try_replace_expression(&b, iter, &optimized)) {
+                 optimizationContext->fNeedsRescan = true;
+                 return;
+             }
+             SkASSERT((*iter)->isExpression());
+             expr = (*iter)->expression()->get();
+         }
+     }
+     switch (expr->kind()) {
+         case Expression::Kind::kVariableReference: {
+             const VariableReference& ref = expr->as<VariableReference>();
+             const Variable* var = ref.variable();
+             if (ref.refKind() != VariableReference::RefKind::kWrite &&
+                 ref.refKind() != VariableReference::RefKind::kPointer &&
+                 var->storage() == Variable::Storage::kLocal && !definitions.get(var) &&
+                 optimizationContext->fSilences.find(var) == optimizationContext->fSilences.end()) {
+                 optimizationContext->fSilences.insert(var);
+                 this->error(expr->fOffset,
+                             "'" + var->name() + "' has not been assigned");
+             }
+             break;
+         }
+         case Expression::Kind::kTernary: {
+             TernaryExpression* t = &expr->as<TernaryExpression>();
+             if (t->test()->is<BoolLiteral>()) {
+                 // ternary has a constant test, replace it with either the true or
+                 // false branch
+                 if (t->test()->as<BoolLiteral>().value()) {
+                     (*iter)->setExpression(std::move(t->ifTrue()), optimizationContext->fUsage);
+                 } else {
+                     (*iter)->setExpression(std::move(t->ifFalse()), optimizationContext->fUsage);
+                 }
+                 optimizationContext->fUpdated = true;
+                 optimizationContext->fNeedsRescan = true;
+             }
+             break;
+         }
+         case Expression::Kind::kBinary: {
+             BinaryExpression* bin = &expr->as<BinaryExpression>();
+-            if (dead_assignment(*bin, optimizationContext->fUsage)) {
++            if (dead_assignment(*bin, optimizationContext->fUsage) || self_assignment(*bin)) {
+                 delete_left(&b, iter, optimizationContext);
+                 break;
+             }
+             Expression& left = *bin->left();
+             Expression& right = *bin->right();
+             const Type& leftType = left.type();
+             const Type& rightType = right.type();
+             // collapse useless expressions like x * 1 or x + 0
+             if ((!leftType.isScalar() && !leftType.isVector()) ||
+                 (!rightType.isScalar() && !rightType.isVector())) {
+                 break;
+             }
+             switch (bin->getOperator()) {
+                 case Token::Kind::TK_STAR:
+                     if (is_constant(left, 1)) {
+                         if (leftType.isVector() && rightType.isScalar()) {
+                             // float4(1) * x -> float4(x)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // 1 * x -> x
+                             // 1 * float4(x) -> float4(x)
+                             // float4(1) * float4(x) -> float4(x)
+                             delete_left(&b, iter, optimizationContext);
+                         }
+                     }
+                     else if (is_constant(left, 0)) {
+                         if (leftType.isScalar() && rightType.isVector() &&
+                             !right.hasSideEffects()) {
+                             // 0 * float4(x) -> float4(0)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // 0 * x -> 0
+                             // float4(0) * x -> float4(0)
+                             // float4(0) * float4(x) -> float4(0)
+                             if (!right.hasSideEffects()) {
+                                 delete_right(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     else if (is_constant(right, 1)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x * float4(1) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x * 1 -> x
+                             // float4(x) * 1 -> float4(x)
+                             // float4(x) * float4(1) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     else if (is_constant(right, 0)) {
+                         if (leftType.isVector() && rightType.isScalar() && !left.hasSideEffects()) {
+                             // float4(x) * 0 -> float4(0)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // x * 0 -> 0
+                             // x * float4(0) -> float4(0)
+                             // float4(x) * float4(0) -> float4(0)
+                             if (!left.hasSideEffects()) {
+                                 delete_left(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_PLUS:
+                     if (is_constant(left, 0)) {
+                         if (leftType.isVector() && rightType.isScalar()) {
+                             // float4(0) + x -> float4(x)
+                             vectorize_right(&b, iter, optimizationContext);
+                         } else {
+                             // 0 + x -> x
+                             // 0 + float4(x) -> float4(x)
+                             // float4(0) + float4(x) -> float4(x)
+                             delete_left(&b, iter, optimizationContext);
+                         }
+                     } else if (is_constant(right, 0)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x + float4(0) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x + 0 -> x
+                             // float4(x) + 0 -> float4(x)
+                             // float4(x) + float4(0) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_MINUS:
+                     if (is_constant(right, 0)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x - float4(0) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x - 0 -> x
+                             // float4(x) - 0 -> float4(x)
+                             // float4(x) - float4(0) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_SLASH:
+                     if (is_constant(right, 1)) {
+                         if (leftType.isScalar() && rightType.isVector()) {
+                             // x / float4(1) -> float4(x)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // x / 1 -> x
+                             // float4(x) / 1 -> float4(x)
+                             // float4(x) / float4(1) -> float4(x)
+                             delete_right(&b, iter, optimizationContext);
+                         }
+                     } else if (is_constant(left, 0)) {
+                         if (leftType.isScalar() && rightType.isVector() &&
+                             !right.hasSideEffects()) {
+                             // 0 / float4(x) -> float4(0)
+                             vectorize_left(&b, iter, optimizationContext);
+                         } else {
+                             // 0 / x -> 0
+                             // float4(0) / x -> float4(0)
+                             // float4(0) / float4(x) -> float4(0)
+                             if (!right.hasSideEffects()) {
+                                 delete_right(&b, iter, optimizationContext);
+                             }
+                         }
+                     }
+                     break;
+                 case Token::Kind::TK_PLUSEQ:
+                     if (is_constant(right, 0)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_MINUSEQ:
+                     if (is_constant(right, 0)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_STAREQ:
+                     if (is_constant(right, 1)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 case Token::Kind::TK_SLASHEQ:
+                     if (is_constant(right, 1)) {
+                         Analysis::UpdateRefKind(&left, RefKind::kRead);
+                         delete_right(&b, iter, optimizationContext);
+                     }
+                     break;
+                 default:
+                     break;
+             }
+             break;
+         }
+         case Expression::Kind::kConstructor: {
+             // Find constructors embedded inside constructors and flatten them out where possible.
+             //   -  float4(float2(1, 2), 3, 4)                -->  float4(1, 2, 3, 4)
+             //   -  float4(w, float3(sin(x), cos(y), tan(z))) -->  float4(w, sin(x), cos(y), tan(z))
+             // Leave single-argument constructors alone, though. These might be casts or splats.
+             Constructor& c = expr->as<Constructor>();
+             if (c.type().columns() > 1) {
+                 // Inspect each constructor argument to see if it's a candidate for flattening.
+                 // Remember matched arguments in a bitfield, "argsToOptimize".
+                 int argsToOptimize = 0;
+                 int currBit = 1;
+                 for (const std::unique_ptr<Expression>& arg : c.arguments()) {
+                     if (arg->is<Constructor>()) {
+                         Constructor& inner = arg->as<Constructor>();
+                         if (inner.arguments().size() > 1 &&
+                             inner.type().componentType() == c.type().componentType()) {
+                             argsToOptimize |= currBit;
+                         }
+                     }
+                     currBit <<= 1;
+                 }
+                 if (argsToOptimize) {
+                     // We found at least one argument that could be flattened out. Re-walk the
+                     // constructor args and flatten the candidates we found during our initial pass.
+                     ExpressionArray flattened;
+                     flattened.reserve_back(c.type().columns());
+                     currBit = 1;
+                     for (const std::unique_ptr<Expression>& arg : c.arguments()) {
+                         if (argsToOptimize & currBit) {
+                             Constructor& inner = arg->as<Constructor>();
+                             for (const std::unique_ptr<Expression>& innerArg : inner.arguments()) {
+                                 flattened.push_back(innerArg->clone());
+                             }
+                         } else {
+                             flattened.push_back(arg->clone());
+                         }
+                         currBit <<= 1;
+                     }
+                     auto optimized = std::unique_ptr<Expression>(
+                             new Constructor(c.fOffset, &c.type(), std::move(flattened)));
+                     // No fUsage change; no references have been added or removed anywhere.
+                     optimizationContext->fUpdated = true;
+                     if (!try_replace_expression(&b, iter, &optimized)) {
+                         optimizationContext->fNeedsRescan = true;
+                         return;
+                     }
+                     SkASSERT((*iter)->isExpression());
+                     break;
+                 }
+             }
+             break;
+         }
+         case Expression::Kind::kSwizzle: {
+             Swizzle& s = expr->as<Swizzle>();
+             // Detect identity swizzles like `foo.rgba`.
+             if ((int) s.components().size() == s.base()->type().columns()) {
+                 bool identity = true;
+                 for (int i = 0; i < (int) s.components().size(); ++i) {
+                     if (s.components()[i] != i) {
+                         identity = false;
+                         break;
+                     }
+                 }
+                 if (identity) {
+                     optimizationContext->fUpdated = true;
+                     // No fUsage change: foo.rgba and foo have equivalent reference counts
+                     if (!try_replace_expression(&b, iter, &s.base())) {
+                         optimizationContext->fNeedsRescan = true;
+                         return;
+                     }
+                     SkASSERT((*iter)->isExpression());
+                     break;
+                 }
+             }
+             // Detect swizzles of swizzles, e.g. replace `foo.argb.r000` with `foo.a000`.
+             if (s.base()->is<Swizzle>()) {
+                 Swizzle& base = s.base()->as<Swizzle>();
+                 ComponentArray final;
+                 for (int c : s.components()) {
+                     final.push_back(base.components()[c]);
+                 }
+                 std::unique_ptr<Expression> replacement(new Swizzle(*fContext, base.base()->clone(),
+                                                                     final));
+                 // We're replacing an expression with a cloned version; we'll need a rescan.
+                 // No fUsage change: `foo.gbr.gbr` and `foo.brg` have equivalent reference counts
+                 try_replace_expression(&b, iter, &replacement);
+                 optimizationContext->fUpdated = true;
+                 optimizationContext->fNeedsRescan = true;
+                 break;
+             }
+             // Optimize swizzles of constructors.
+             if (s.base()->is<Constructor>()) {
+                 Constructor& base = s.base()->as<Constructor>();
+                 std::unique_ptr<Expression> replacement;
+                 const Type& componentType = base.type().componentType();
+                 int swizzleSize = s.components().size();
+ 
+                 // The IR generator has already converted any zero/one swizzle components into
+                 // constructors containing zero/one args. Confirm that this is true by checking that
+                 // our swizzle components are all `xyzw` (values 0 through 3).
+                 SkASSERT(std::all_of(s.components().begin(), s.components().end(),
+                                      [](int8_t c) { return c >= 0 && c <= 3; }));
+ 
+                 if (base.arguments().size() == 1 && base.arguments().front()->type().isScalar()) {
+                     // `half4(scalar).zyy` can be optimized to `half3(scalar)`. The swizzle
+                     // components don't actually matter since all fields are the same.
+                     const Expression& argument = *base.arguments().front();
+                     const Type& constructorType = componentType.toCompound(*fContext, swizzleSize,
+                                                                            /*rows=*/1);
+                     replacement = Constructor::SimplifyConversion(constructorType, argument);
+                     if (!replacement) {
+                         ExpressionArray newArgs;
+                         newArgs.push_back(argument.clone());
+                         replacement = std::make_unique<Constructor>(base.fOffset, &constructorType,
+                                                                     std::move(newArgs));
+                     }
+ 
+                     // We're replacing an expression with a cloned version; we'll need a rescan.
+                     // There's no fUsage change: `half4(foo).xy` and `half2(foo)` have equivalent
+                     // reference counts.
+                     try_replace_expression(&b, iter, &replacement);
+                     optimizationContext->fUpdated = true;
+                     optimizationContext->fNeedsRescan = true;
+                     break;
+                 }
+ 
+                 // Swizzles can duplicate some elements and discard others, e.g.
+                 // `half4(1, 2, 3, 4).xxz` --> `half3(1, 1, 3)`. However, there are constraints:
+                 // - Expressions with side effects need to occur exactly once, even if they
+                 //   would otherwise be swizzle-eliminated
+                 // - Non-trivial expressions should not be repeated, but elimination is OK.
+                 //
+                 // Look up the argument for the constructor at each index. This is typically simple
+                 // but for weird cases like `half4(bar.yz, half2(foo))`, it can be harder than it
+                 // seems. This example would result in:
+                 //     argMap[0] = {.fArgIndex = 0, .fComponent = 0}   (bar.yz     .x)
+                 //     argMap[1] = {.fArgIndex = 0, .fComponent = 1}   (bar.yz     .y)
+                 //     argMap[2] = {.fArgIndex = 1, .fComponent = 0}   (half2(foo) .x)
+                 //     argMap[3] = {.fArgIndex = 1, .fComponent = 1}   (half2(foo) .y)
+                 struct ConstructorArgMap {
+                     int8_t fArgIndex;
+                     int8_t fComponent;
+                 };
+ 
+                 int numConstructorArgs = base.type().columns();
+                 ConstructorArgMap argMap[4] = {};
+                 int writeIdx = 0;
+                 for (int argIdx = 0; argIdx < (int) base.arguments().size(); ++argIdx) {
+                     const Expression& expr = *base.arguments()[argIdx];
+                     int argWidth = expr.type().columns();
+                     for (int componentIdx = 0; componentIdx < argWidth; ++componentIdx) {
+                         argMap[writeIdx].fArgIndex = argIdx;
+                         argMap[writeIdx].fComponent = componentIdx;
+                         ++writeIdx;
+                     }
+                 }
+                 SkASSERT(writeIdx == numConstructorArgs);
+ 
+                 // Count up the number of times each constructor argument is used by the
+                 // swizzle.
+                 //    `half4(bar.yz, half2(foo)).xwxy` -> { 3, 1 }
+                 // - bar.yz    is referenced 3 times, by `.x_xy`
+                 // - half(foo) is referenced 1 time,  by `._w__`
+                 int8_t exprUsed[4] = {};
+                 for (int c : s.components()) {
+                     exprUsed[argMap[c].fArgIndex]++;
+                 }
+ 
+                 bool safeToOptimize = true;
+                 for (int index = 0; index < numConstructorArgs; ++index) {
+                     int8_t constructorArgIndex = argMap[index].fArgIndex;
+                     const Expression& baseArg = *base.arguments()[constructorArgIndex];
+ 
+                     // Check that non-trivial expressions are not swizzled in more than once.
+                     if (exprUsed[constructorArgIndex] > 1 &&
+                             !Analysis::IsTrivialExpression(baseArg)) {
+                         safeToOptimize = false;
+                         break;
+                     }
+                     // Check that side-effect-bearing expressions are swizzled in exactly once.
+                     if (exprUsed[constructorArgIndex] != 1 && baseArg.hasSideEffects()) {
+                         safeToOptimize = false;
+                         break;
+                     }
+                 }
+ 
+                 if (safeToOptimize) {
+                     struct ReorderedArgument {
+                         int8_t fArgIndex;
+                         ComponentArray fComponents;
+                     };
+                     SkSTArray<4, ReorderedArgument> reorderedArgs;
+                     for (int c : s.components()) {
+                         const ConstructorArgMap& argument = argMap[c];
+                         const Expression& baseArg = *base.arguments()[argument.fArgIndex];
+ 
+                         if (baseArg.type().isScalar()) {
+                             // This argument is a scalar; add it to the list as-is.
+                             SkASSERT(argument.fComponent == 0);
+                             reorderedArgs.push_back({argument.fArgIndex,
+                                                      ComponentArray{}});
+                         } else {
+                             // This argument is a component from a vector.
+                             SkASSERT(argument.fComponent < baseArg.type().columns());
+                             if (reorderedArgs.empty() ||
+                                 reorderedArgs.back().fArgIndex != argument.fArgIndex) {
+                                 // This can't be combined with the previous argument. Add a new one.
+                                 reorderedArgs.push_back({argument.fArgIndex,
+                                                          ComponentArray{argument.fComponent}});
+                             } else {
+                                 // Since we know this argument uses components, it should already
+                                 // have at least one component set.
+                                 SkASSERT(!reorderedArgs.back().fComponents.empty());
+                                 // Build up the current argument with one more component.
+                                 reorderedArgs.back().fComponents.push_back(argument.fComponent);
+                             }
+                         }
+                     }
+ 
+                     // Convert our reordered argument list to an actual array of expressions, with
+                     // the new order and any new inner swizzles that need to be applied. Note that
+                     // we expect followup passes to clean up the inner swizzles.
+                     ExpressionArray newArgs;
+                     newArgs.reserve_back(swizzleSize);
+                     for (const ReorderedArgument& reorderedArg : reorderedArgs) {
+                         const Expression& baseArg = *base.arguments()[reorderedArg.fArgIndex];
+                         if (reorderedArg.fComponents.empty()) {
+                             newArgs.push_back(baseArg.clone());
+                         } else {
+                             newArgs.push_back(std::make_unique<Swizzle>(*fContext, baseArg.clone(),
+                                                                         reorderedArg.fComponents));
+                         }
+                     }
+ 
+                     // Create a new constructor.
+                     replacement = std::make_unique<Constructor>(
+                             base.fOffset,
+                             &componentType.toCompound(*fContext, swizzleSize, /*rows=*/1),
+                             std::move(newArgs));
+ 
+                     // Remove references within 'expr', add references within 'replacement.'
+                     optimizationContext->fUsage->replace(expr, replacement.get());
+ 
+                     // We're replacing an expression with a cloned version; we'll need a rescan.
+                     try_replace_expression(&b, iter, &replacement);
+                     optimizationContext->fUpdated = true;
+                     optimizationContext->fNeedsRescan = true;
+                 }
+                 break;
+             }
+             break;
+         }
+         default:
+             break;
+     }
+ }
+ 
+ // Returns true if this statement could potentially execute a break at the current level. We ignore
+ // nested loops and switches, since any breaks inside of them will merely break the loop / switch.
+diff --git a/tests/SkSLTest.cpp b/tests/SkSLTest.cpp
+index b20de0ff66..214d52e7ed 100644
+--- a/tests/SkSLTest.cpp
++++ b/tests/SkSLTest.cpp
+@@ -130,6 +130,7 @@ SKSL_TEST(SkSLBoolFolding,                     "folding/BoolFolding.sksl")
+ SKSL_TEST(SkSLIntFoldingES2,                   "folding/IntFoldingES2.sksl")
+ SKSL_TEST(SkSLFloatFolding,                    "folding/FloatFolding.sksl")
+ SKSL_TEST(SkSLMatrixFoldingES2,                "folding/MatrixFoldingES2.sksl")
++SKSL_TEST_CPU(SkSLSelfAssignment,              "folding/SelfAssignment.sksl")
+ SKSL_TEST(SkSLShortCircuitBoolFolding,         "folding/ShortCircuitBoolFolding.sksl")
+ SKSL_TEST(SkSLVectorScalarFolding,             "folding/VectorScalarFolding.sksl")
+ SKSL_TEST(SkSLVectorVectorFolding,             "folding/VectorVectorFolding.sksl")
+@@ -187,12 +188,13 @@ SKSL_TEST(SkSLVectorConstructors,              "shared/VectorConstructors.sksl")
+ /*
+ // Incompatible with Runtime Effects because calling a function before its definition is disallowed.
+ // (This was done to prevent recursion, as required by ES2.)
+-SKSL_TEST(SkSLFunctionPrototype,       "shared/FunctionPrototype.sksl")
++SKSL_TEST(SkSLFunctionPrototype,               "shared/FunctionPrototype.sksl")
+ */
+ 
+ /*
+ TODO(skia:10939): enable this test when Runtime Effects supports structs in function signatures
+-SKSL_TEST(SkSLStructsInFunctions,      "shared/StructsInFunctions.sksl")
++SKSL_TEST(SkSLSelfAssignment,                  "folding/SelfAssignment.sksl")
++SKSL_TEST(SkSLStructsInFunctions,              "shared/StructsInFunctions.sksl")
+ */
+ 
+ /*
+diff --git a/tests/sksl/folding/FloatFolding.glsl b/tests/sksl/folding/FloatFolding.glsl
+index f272bc3fc3..b2748b4cc0 100644
+--- a/tests/sksl/folding/FloatFolding.glsl
++++ b/tests/sksl/folding/FloatFolding.glsl
+@@ -5,70 +5,67 @@ uniform vec4 colorGreen;
+ vec4 main() {
+     bool _1_ok = true;
+     float _2_x = 34.0;
+     _1_ok = true;
+     _2_x = 30.0;
+     _1_ok = true;
+     _2_x = 64.0;
+     _1_ok = true;
+     _2_x = 16.0;
+     _1_ok = true;
+     _2_x = 19.0;
+     _1_ok = true;
+     _2_x = 1.0;
+     _1_ok = true;
+     _2_x = -2.0;
+     _1_ok = true;
+     _2_x = 3.0;
+     _1_ok = true;
+     _2_x = -4.0;
+     _1_ok = true;
+     _2_x = 5.0;
+     _1_ok = true;
+     _2_x = -6.0;
+     _1_ok = true;
+     _2_x = 7.0;
+     _1_ok = true;
+     _2_x = -8.0;
+     _1_ok = true;
+     _2_x = 9.0;
+     _1_ok = true;
+     _2_x = -10.0;
+     _1_ok = true;
+     _2_x = 11.0;
+     _1_ok = true;
+     _2_x = -12.0;
+     _1_ok = true;
+     float _3_unknown = sqrt(4.0);
+     _2_x = _3_unknown;
+     _1_ok = _2_x == _3_unknown;
+     _2_x = _3_unknown;
+     _1_ok = _1_ok && _2_x == _3_unknown;
+     _2_x = _3_unknown;
+     _1_ok = _1_ok && _2_x == _3_unknown;
+     _2_x = 0.0;
+-    _1_ok = _1_ok;
+     _2_x = _3_unknown;
+     _1_ok = _1_ok && _2_x == _3_unknown;
+     _2_x = _3_unknown;
+     _1_ok = _1_ok && _2_x == _3_unknown;
+     _2_x = 0.0;
+-    _1_ok = _1_ok;
+     _2_x = _3_unknown;
+     _1_ok = _1_ok && _2_x == _3_unknown;
+     _2_x = 0.0;
+-    _1_ok = _1_ok;
+     _2_x += 1.0;
+     _1_ok = _1_ok && _2_x == 1.0;
+     _1_ok = _1_ok && _2_x == 1.0;
+     _2_x -= 2.0;
+     _1_ok = _1_ok && _2_x == -1.0;
+     _1_ok = _1_ok && _2_x == -1.0;
+     _1_ok = _1_ok && _2_x == -1.0;
+     _2_x *= 2.0;
+     _1_ok = _1_ok && _2_x == -2.0;
+     _1_ok = _1_ok && _2_x == -2.0;
+     _2_x /= 2.0;
+     _1_ok = _1_ok && _2_x == -1.0;
+     return _1_ok ? colorGreen : colorRed;
+ 
+ }
+diff --git a/tests/sksl/folding/IntFoldingES2.glsl b/tests/sksl/folding/IntFoldingES2.glsl
+index 708a1bf598..67ea8cf3c3 100644
+--- a/tests/sksl/folding/IntFoldingES2.glsl
++++ b/tests/sksl/folding/IntFoldingES2.glsl
+@@ -6,68 +6,65 @@ uniform float unknownInput;
+ vec4 main() {
+     int _1_unknown = int(unknownInput);
+     bool _2_ok = true;
+     int _3_x = 34;
+     _2_ok = true;
+     _3_x = 30;
+     _2_ok = true;
+     _3_x = 64;
+     _2_ok = true;
+     _3_x = 16;
+     _2_ok = true;
+     _3_x = 1;
+     _2_ok = true;
+     _3_x = -2;
+     _2_ok = true;
+     _3_x = 3;
+     _2_ok = true;
+     _3_x = -4;
+     _2_ok = true;
+     _3_x = 5;
+     _2_ok = true;
+     _3_x = -6;
+     _2_ok = true;
+     _3_x = 7;
+     _2_ok = true;
+     _3_x = -8;
+     _2_ok = true;
+     _3_x = 9;
+     _2_ok = true;
+     _3_x = -10;
+     _2_ok = true;
+     _3_x = 11;
+     _2_ok = true;
+     _3_x = -12;
+     _2_ok = true;
+     _3_x = _1_unknown;
+     _2_ok = _3_x == _1_unknown;
+     _3_x = _1_unknown;
+     _2_ok = _2_ok && _3_x == _1_unknown;
+     _3_x = _1_unknown;
+     _2_ok = _2_ok && _3_x == _1_unknown;
+     _3_x = 0;
+-    _2_ok = _2_ok;
+     _3_x = _1_unknown;
+     _2_ok = _2_ok && _3_x == _1_unknown;
+     _3_x = _1_unknown;
+     _2_ok = _2_ok && _3_x == _1_unknown;
+     _3_x = 0;
+-    _2_ok = _2_ok;
+     _3_x = _1_unknown;
+     _2_ok = _2_ok && _3_x == _1_unknown;
+     _3_x = 0;
+-    _2_ok = _2_ok;
+     _3_x += 1;
+     _2_ok = _2_ok && _3_x == 1;
+     _2_ok = _2_ok && _3_x == 1;
+     _3_x -= 2;
+     _2_ok = _2_ok && _3_x == -1;
+     _2_ok = _2_ok && _3_x == -1;
+     _2_ok = _2_ok && _3_x == -1;
+     _3_x *= 2;
+     _2_ok = _2_ok && _3_x == -2;
+     _2_ok = _2_ok && _3_x == -2;
+     _3_x /= 2;
+     _2_ok = _2_ok && _3_x == -1;
+     return _2_ok ? colorGreen : colorRed;
+ 
+ }
+diff --git a/tests/sksl/folding/SelfAssignment.glsl b/tests/sksl/folding/SelfAssignment.glsl
+new file mode 100644
+index 0000000000..83596316d0
+--- /dev/null
++++ b/tests/sksl/folding/SelfAssignment.glsl
+@@ -0,0 +1,22 @@
++
++out vec4 sk_FragColor;
++uniform vec4 colorRed;
++uniform vec4 colorGreen;
++struct S {
++    float i;
++    float j;
++};
++vec4 main() {
++    vec4 x = vec4(3.0, 2.0, 1.0, 0.0);
++    x.xyz = vec3(1.0, 2.0, 3.0);
++    S s;
++    s.i = 2.0;
++    s.j = 2.0;
++    s.i = s.j;
++    s.j = s.i;
++    float a[2];
++    a[0] = 0.0;
++    a[1] = 1.0;
++    a[1] = a[0];
++    return vec4(x.w, s.i / s.j, a[0], a[1]);
++}
+diff --git a/tests/sksl/folding/VectorScalarFolding.glsl b/tests/sksl/folding/VectorScalarFolding.glsl
+index 6edbc261e0..c91861cdf8 100644
+--- a/tests/sksl/folding/VectorScalarFolding.glsl
++++ b/tests/sksl/folding/VectorScalarFolding.glsl
+@@ -6,151 +6,121 @@ uniform float unknownInput;
+ bool test_int() {
+     bool ok = true;
+     ivec4 x = ivec4(6, 6, 7, 8);
+     ok = true;
+     x = ivec4(7, 9, 9, 9);
+     ok = true;
+     x = ivec4(9, 9, 10, 10);
+     ok = true;
+     x.xyz = ivec3(6, 6, 6);
+     ok = x == ivec4(6, 6, 6, 10);
+     x.xy = ivec2(3, 3);
+     ok = ok && x == ivec4(3, 3, 6, 10);
+     x = ivec4(6, 6, 6, 6);
+-    ok = ok;
+     x = ivec4(6, 6, 7, 8);
+-    ok = ok;
+     x = ivec4(-7, -9, -9, -9);
+-    ok = ok;
+     x = ivec4(9, 9, 10, 10);
+-    ok = ok;
+     x.xyz = ivec3(6, 6, 6);
+     ok = ok && x == ivec4(6, 6, 6, 10);
+     x.xy = ivec2(8, 8);
+     ok = ok && x == ivec4(8, 8, 6, 10);
+     x = ivec4(200, 100, 50, 25);
+-    ok = ok;
+     x = ivec4(6, 6, 6, 6);
+-    ok = ok;
+     int unknown = int(unknownInput);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(0);
+-    ok = ok;
+     x = ivec4(0);
+-    ok = ok;
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(0);
+-    ok = ok;
+     x = ivec4(0);
+-    ok = ok;
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(0);
+-    ok = ok;
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     x += 1;
+     x -= 1;
+     ok = ok && x == ivec4(unknown);
+     x = ivec4(unknown);
+     x = x + 1;
+-    x = x;
+     x = x - 1;
+-    x = x;
+-    x = x;
+-    x = x;
+     ok = ok && x == ivec4(unknown);
+     return ok;
+ }
+ vec4 main() {
+     bool _1_ok = true;
+     vec4 _2_x = vec4(6.0, 6.0, 7.0, 8.0);
+     _1_ok = true;
+     _2_x = vec4(7.0, 9.0, 9.0, 9.0);
+     _1_ok = true;
+     _2_x = vec4(9.0, 9.0, 10.0, 10.0);
+     _1_ok = true;
+     _2_x.xyz = vec3(6.0, 6.0, 6.0);
+     _1_ok = _2_x == vec4(6.0, 6.0, 6.0, 10.0);
+     _2_x.xy = vec2(3.0, 3.0);
+     _1_ok = _1_ok && _2_x == vec4(3.0, 3.0, 6.0, 10.0);
+     _2_x = vec4(6.0, 6.0, 6.0, 6.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(6.0, 6.0, 7.0, 8.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(-7.0, -9.0, -9.0, -9.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(9.0, 9.0, 10.0, 10.0);
+-    _1_ok = _1_ok;
+     _2_x.xyz = vec3(6.0, 6.0, 6.0);
+     _1_ok = _1_ok && _2_x == vec4(6.0, 6.0, 6.0, 10.0);
+     _2_x.xy = vec2(8.0, 8.0);
+     _1_ok = _1_ok && _2_x == vec4(8.0, 8.0, 6.0, 10.0);
+     _2_x = vec4(2.0, 1.0, 0.5, 0.25);
+-    _1_ok = _1_ok;
+     _2_x = vec4(6.0, 6.0, 6.0, 6.0);
+-    _1_ok = _1_ok;
+     float _3_unknown = unknownInput;
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(0.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(0.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(0.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(0.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(0.0);
+-    _1_ok = _1_ok;
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _2_x += 1.0;
+     _2_x -= 1.0;
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     _2_x = vec4(_3_unknown);
+     _2_x = _2_x + 1.0;
+-    _2_x = _2_x;
+     _2_x = _2_x - 1.0;
+-    _2_x = _2_x;
+-    _2_x = _2_x;
+-    _2_x = _2_x;
+     _1_ok = _1_ok && _2_x == vec4(_3_unknown);
+     return _1_ok && test_int() ? colorGreen : colorRed;
+ 
+ }
+diff --git a/tests/sksl/folding/VectorVectorFolding.glsl b/tests/sksl/folding/VectorVectorFolding.glsl
+index eec8c86bd0..abe72e020a 100644
+--- a/tests/sksl/folding/VectorVectorFolding.glsl
++++ b/tests/sksl/folding/VectorVectorFolding.glsl
+@@ -6,111 +6,97 @@ uniform vec4 colorGreen;
+ bool test_int() {
+     int unknown = int(unknownInput);
+     bool ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = true;
+     ok = ivec4(unknown) == ivec4(unknown);
+     ok = ok && ivec4(unknown) == ivec4(unknown);
+-    ok = ok;
+-    ok = ok;
+-    ok = ok;
+     ok = ok && ivec4(unknown) == ivec4(unknown);
+     ok = ok && ivec4(unknown) == ivec4(unknown);
+     ok = ok && ivec4(unknown) == ivec4(unknown);
+     ivec4 val = ivec4(unknown);
+     val += ivec4(1);
+     val -= ivec4(1);
+     val = val + ivec4(1);
+-    val = val;
+     val = val - ivec4(1);
+-    val = val;
+     ok = ok && val == ivec4(unknown);
+     val *= ivec4(2);
+     val /= ivec4(2);
+-    val = val;
+     val = val * ivec4(2);
+-    val = val;
+     val = val / ivec4(2);
+     ok = ok && val == ivec4(unknown);
+     return ok;
+ }
+ vec4 main() {
+     float _1_unknown = unknownInput;
+     bool _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = true;
+     _2_ok = vec4(_1_unknown) == vec4(_1_unknown);
+     _2_ok = _2_ok && vec4(_1_unknown) == vec4(_1_unknown);
+-    _2_ok = _2_ok;
+-    _2_ok = _2_ok;
+-    _2_ok = _2_ok;
+     _2_ok = _2_ok && vec4(_1_unknown) == vec4(_1_unknown);
+     _2_ok = _2_ok && vec4(_1_unknown) == vec4(_1_unknown);
+     _2_ok = _2_ok && vec4(_1_unknown) == vec4(_1_unknown);
+     vec4 _3_val = vec4(_1_unknown);
+     _3_val += vec4(1.0);
+     _3_val -= vec4(1.0);
+     _3_val = _3_val + vec4(1.0);
+-    _3_val = _3_val;
+     _3_val = _3_val - vec4(1.0);
+-    _3_val = _3_val;
+     _2_ok = _2_ok && _3_val == vec4(_1_unknown);
+     _3_val *= vec4(2.0);
+     _3_val /= vec4(2.0);
+-    _3_val = _3_val;
+     _3_val = _3_val * vec4(2.0);
+-    _3_val = _3_val;
+     _3_val = _3_val / vec4(2.0);
+     _2_ok = _2_ok && _3_val == vec4(_1_unknown);
+     return _2_ok && test_int() ? colorGreen : colorRed;
+ 
+ }
+diff --git a/tests/sksl/shared/SwizzleConstants.asm.frag b/tests/sksl/shared/SwizzleConstants.asm.frag
+index d1d26ec9ae..94e48c3f00 100644
+--- a/tests/sksl/shared/SwizzleConstants.asm.frag
++++ b/tests/sksl/shared/SwizzleConstants.asm.frag
+@@ -40,54 +40,53 @@ OpDecorate %64 RelaxedPrecision
+ OpDecorate %69 RelaxedPrecision
+ OpDecorate %72 RelaxedPrecision
+ OpDecorate %75 RelaxedPrecision
+-OpDecorate %76 RelaxedPrecision
+-OpDecorate %82 RelaxedPrecision
+-OpDecorate %86 RelaxedPrecision
+-OpDecorate %89 RelaxedPrecision
+-OpDecorate %94 RelaxedPrecision
+-OpDecorate %96 RelaxedPrecision
+-OpDecorate %101 RelaxedPrecision
+-OpDecorate %103 RelaxedPrecision
+-OpDecorate %106 RelaxedPrecision
+-OpDecorate %108 RelaxedPrecision
+-OpDecorate %111 RelaxedPrecision
+-OpDecorate %114 RelaxedPrecision
+-OpDecorate %120 RelaxedPrecision
+-OpDecorate %125 RelaxedPrecision
+-OpDecorate %127 RelaxedPrecision
+-OpDecorate %130 RelaxedPrecision
+-OpDecorate %133 RelaxedPrecision
+-OpDecorate %138 RelaxedPrecision
+-OpDecorate %141 RelaxedPrecision
+-OpDecorate %144 RelaxedPrecision
+-OpDecorate %155 RelaxedPrecision
++OpDecorate %81 RelaxedPrecision
++OpDecorate %85 RelaxedPrecision
++OpDecorate %88 RelaxedPrecision
++OpDecorate %93 RelaxedPrecision
++OpDecorate %95 RelaxedPrecision
++OpDecorate %100 RelaxedPrecision
++OpDecorate %102 RelaxedPrecision
++OpDecorate %105 RelaxedPrecision
++OpDecorate %107 RelaxedPrecision
++OpDecorate %110 RelaxedPrecision
++OpDecorate %113 RelaxedPrecision
++OpDecorate %119 RelaxedPrecision
++OpDecorate %124 RelaxedPrecision
++OpDecorate %126 RelaxedPrecision
++OpDecorate %129 RelaxedPrecision
++OpDecorate %132 RelaxedPrecision
++OpDecorate %137 RelaxedPrecision
++OpDecorate %140 RelaxedPrecision
++OpDecorate %143 RelaxedPrecision
++OpDecorate %154 RelaxedPrecision
++OpDecorate %157 RelaxedPrecision
+ OpDecorate %158 RelaxedPrecision
+-OpDecorate %159 RelaxedPrecision
+ %float = OpTypeFloat 32
+ %v4float = OpTypeVector %float 4
+ %_ptr_Output_v4float = OpTypePointer Output %v4float
+ %sk_FragColor = OpVariable %_ptr_Output_v4float Output
+ %bool = OpTypeBool
+ %_ptr_Input_bool = OpTypePointer Input %bool
+ %sk_Clockwise = OpVariable %_ptr_Input_bool Input
+ %_UniformBuffer = OpTypeStruct %v4float %v4float %v4float
+ %_ptr_Uniform__UniformBuffer = OpTypePointer Uniform %_UniformBuffer
+ %10 = OpVariable %_ptr_Uniform__UniformBuffer Uniform
+ %void = OpTypeVoid
+ %15 = OpTypeFunction %void
+ %18 = OpTypeFunction %v4float
+ %_ptr_Function_v4float = OpTypePointer Function %v4float
+ %_ptr_Uniform_v4float = OpTypePointer Uniform %v4float
+ %int = OpTypeInt 32 1
+ %int_0 = OpConstant %int 0
+ %float_1 = OpConstant %float 1
+ %v2float = OpTypeVector %float 2
+ %float_0 = OpConstant %float 0
+ %v3float = OpTypeVector %float 3
+-%145 = OpConstantComposite %v4float %float_0 %float_1 %float_1 %float_1
++%144 = OpConstantComposite %v4float %float_0 %float_1 %float_1 %float_1
+ %v4bool = OpTypeVector %bool 4
+ %int_1 = OpConstant %int 1
+ %int_2 = OpConstant %int 2
+ %_entrypoint = OpFunction %void None %15
+ %16 = OpLabel
+ %17 = OpFunctionCall %v4float %main
+@@ -96,8 +95,8 @@ OpReturn
+ OpFunctionEnd
+ %main = OpFunction %v4float None %18
+ %19 = OpLabel
+ %v = OpVariable %_ptr_Function_v4float Function
+-%149 = OpVariable %_ptr_Function_v4float Function
++%148 = OpVariable %_ptr_Function_v4float Function
+ %22 = OpAccessChain %_ptr_Uniform_v4float %10 %int_0
+ %26 = OpLoad %v4float %22
+ OpStore %v %26
+@@ -157,105 +156,103 @@ OpStore %v %71
+ %74 = OpCompositeConstruct %v4float %float_1 %float_1 %73 %float_1
+ OpStore %v %74
+ %75 = OpLoad %v4float %v
+-OpStore %v %75
+-%76 = OpLoad %v4float %v
+-%77 = OpVectorShuffle %v3float %76 %76 0 1 2
+-%78 = OpCompositeExtract %float %77 0
+-%79 = OpCompositeExtract %float %77 1
+-%80 = OpCompositeExtract %float %77 2
+-%81 = OpCompositeConstruct %v4float %78 %79 %80 %float_1
+-OpStore %v %81
+-%82 = OpLoad %v4float %v
+-%83 = OpVectorShuffle %v2float %82 %82 0 1
+-%84 = OpCompositeExtract %float %83 0
+-%85 = OpCompositeExtract %float %83 1
+-%86 = OpLoad %v4float %v
+-%87 = OpCompositeExtract %float %86 3
+-%88 = OpCompositeConstruct %v4float %84 %85 %float_0 %87
+-OpStore %v %88
+-%89 = OpLoad %v4float %v
+-%90 = OpVectorShuffle %v2float %89 %89 0 1
+-%91 = OpCompositeExtract %float %90 0
+-%92 = OpCompositeExtract %float %90 1
+-%93 = OpCompositeConstruct %v4float %91 %92 %float_1 %float_0
+-OpStore %v %93
+-%94 = OpLoad %v4float %v
+-%95 = OpCompositeExtract %float %94 0
+-%96 = OpLoad %v4float %v
+-%97 = OpVectorShuffle %v2float %96 %96 2 3
+-%98 = OpCompositeExtract %float %97 0
+-%99 = OpCompositeExtract %float %97 1
+-%100 = OpCompositeConstruct %v4float %95 %float_1 %98 %99
+-OpStore %v %100
+-%101 = OpLoad %v4float %v
+-%102 = OpCompositeExtract %float %101 0
+-%103 = OpLoad %v4float %v
+-%104 = OpCompositeExtract %float %103 2
+-%105 = OpCompositeConstruct %v4float %102 %float_0 %104 %float_1
+-OpStore %v %105
+-%106 = OpLoad %v4float %v
+-%107 = OpCompositeExtract %float %106 0
+-%108 = OpLoad %v4float %v
+-%109 = OpCompositeExtract %float %108 3
+-%110 = OpCompositeConstruct %v4float %107 %float_1 %float_1 %109
+-OpStore %v %110
+-%111 = OpLoad %v4float %v
+-%112 = OpCompositeExtract %float %111 0
+-%113 = OpCompositeConstruct %v4float %112 %float_1 %float_0 %float_1
+-OpStore %v %113
+-%114 = OpLoad %v4float %v
+-%115 = OpVectorShuffle %v3float %114 %114 1 2 3
+-%116 = OpCompositeExtract %float %115 0
+-%117 = OpCompositeExtract %float %115 1
+-%118 = OpCompositeExtract %float %115 2
+-%119 = OpCompositeConstruct %v4float %float_1 %116 %117 %118
+-OpStore %v %119
+-%120 = OpLoad %v4float %v
+-%121 = OpVectorShuffle %v2float %120 %120 1 2
+-%122 = OpCompositeExtract %float %121 0
+-%123 = OpCompositeExtract %float %121 1
+-%124 = OpCompositeConstruct %v4float %float_0 %122 %123 %float_1
+-OpStore %v %124
+-%125 = OpLoad %v4float %v
+-%126 = OpCompositeExtract %float %125 1
+-%127 = OpLoad %v4float %v
+-%128 = OpCompositeExtract %float %127 3
+-%129 = OpCompositeConstruct %v4float %float_0 %126 %float_1 %128
+-OpStore %v %129
+-%130 = OpLoad %v4float %v
+-%131 = OpCompositeExtract %float %130 1
+-%132 = OpCompositeConstruct %v4float %float_1 %131 %float_1 %float_1
+-OpStore %v %132
+-%133 = OpLoad %v4float %v
+-%134 = OpVectorShuffle %v2float %133 %133 2 3
+-%135 = OpCompositeExtract %float %134 0
+-%136 = OpCompositeExtract %float %134 1
+-%137 = OpCompositeConstruct %v4float %float_0 %float_0 %135 %136
+-OpStore %v %137
+-%138 = OpLoad %v4float %v
+-%139 = OpCompositeExtract %float %138 2
+-%140 = OpCompositeConstruct %v4float %float_0 %float_0 %139 %float_1
+-OpStore %v %140
+-%141 = OpLoad %v4float %v
+-%142 = OpCompositeExtract %float %141 3
+-%143 = OpCompositeConstruct %v4float %float_0 %float_1 %float_1 %142
+-OpStore %v %143
+-%144 = OpLoad %v4float %v
+-%146 = OpFOrdEqual %v4bool %144 %145
+-%148 = OpAll %bool %146
+-OpSelectionMerge %152 None
+-OpBranchConditional %148 %150 %151
++%76 = OpVectorShuffle %v3float %75 %75 0 1 2
++%77 = OpCompositeExtract %float %76 0
++%78 = OpCompositeExtract %float %76 1
++%79 = OpCompositeExtract %float %76 2
++%80 = OpCompositeConstruct %v4float %77 %78 %79 %float_1
++OpStore %v %80
++%81 = OpLoad %v4float %v
++%82 = OpVectorShuffle %v2float %81 %81 0 1
++%83 = OpCompositeExtract %float %82 0
++%84 = OpCompositeExtract %float %82 1
++%85 = OpLoad %v4float %v
++%86 = OpCompositeExtract %float %85 3
++%87 = OpCompositeConstruct %v4float %83 %84 %float_0 %86
++OpStore %v %87
++%88 = OpLoad %v4float %v
++%89 = OpVectorShuffle %v2float %88 %88 0 1
++%90 = OpCompositeExtract %float %89 0
++%91 = OpCompositeExtract %float %89 1
++%92 = OpCompositeConstruct %v4float %90 %91 %float_1 %float_0
++OpStore %v %92
++%93 = OpLoad %v4float %v
++%94 = OpCompositeExtract %float %93 0
++%95 = OpLoad %v4float %v
++%96 = OpVectorShuffle %v2float %95 %95 2 3
++%97 = OpCompositeExtract %float %96 0
++%98 = OpCompositeExtract %float %96 1
++%99 = OpCompositeConstruct %v4float %94 %float_1 %97 %98
++OpStore %v %99
++%100 = OpLoad %v4float %v
++%101 = OpCompositeExtract %float %100 0
++%102 = OpLoad %v4float %v
++%103 = OpCompositeExtract %float %102 2
++%104 = OpCompositeConstruct %v4float %101 %float_0 %103 %float_1
++OpStore %v %104
++%105 = OpLoad %v4float %v
++%106 = OpCompositeExtract %float %105 0
++%107 = OpLoad %v4float %v
++%108 = OpCompositeExtract %float %107 3
++%109 = OpCompositeConstruct %v4float %106 %float_1 %float_1 %108
++OpStore %v %109
++%110 = OpLoad %v4float %v
++%111 = OpCompositeExtract %float %110 0
++%112 = OpCompositeConstruct %v4float %111 %float_1 %float_0 %float_1
++OpStore %v %112
++%113 = OpLoad %v4float %v
++%114 = OpVectorShuffle %v3float %113 %113 1 2 3
++%115 = OpCompositeExtract %float %114 0
++%116 = OpCompositeExtract %float %114 1
++%117 = OpCompositeExtract %float %114 2
++%118 = OpCompositeConstruct %v4float %float_1 %115 %116 %117
++OpStore %v %118
++%119 = OpLoad %v4float %v
++%120 = OpVectorShuffle %v2float %119 %119 1 2
++%121 = OpCompositeExtract %float %120 0
++%122 = OpCompositeExtract %float %120 1
++%123 = OpCompositeConstruct %v4float %float_0 %121 %122 %float_1
++OpStore %v %123
++%124 = OpLoad %v4float %v
++%125 = OpCompositeExtract %float %124 1
++%126 = OpLoad %v4float %v
++%127 = OpCompositeExtract %float %126 3
++%128 = OpCompositeConstruct %v4float %float_0 %125 %float_1 %127
++OpStore %v %128
++%129 = OpLoad %v4float %v
++%130 = OpCompositeExtract %float %129 1
++%131 = OpCompositeConstruct %v4float %float_1 %130 %float_1 %float_1
++OpStore %v %131
++%132 = OpLoad %v4float %v
++%133 = OpVectorShuffle %v2float %132 %132 2 3
++%134 = OpCompositeExtract %float %133 0
++%135 = OpCompositeExtract %float %133 1
++%136 = OpCompositeConstruct %v4float %float_0 %float_0 %134 %135
++OpStore %v %136
++%137 = OpLoad %v4float %v
++%138 = OpCompositeExtract %float %137 2
++%139 = OpCompositeConstruct %v4float %float_0 %float_0 %138 %float_1
++OpStore %v %139
++%140 = OpLoad %v4float %v
++%141 = OpCompositeExtract %float %140 3
++%142 = OpCompositeConstruct %v4float %float_0 %float_1 %float_1 %141
++OpStore %v %142
++%143 = OpLoad %v4float %v
++%145 = OpFOrdEqual %v4bool %143 %144
++%147 = OpAll %bool %145
++OpSelectionMerge %151 None
++OpBranchConditional %147 %149 %150
++%149 = OpLabel
++%152 = OpAccessChain %_ptr_Uniform_v4float %10 %int_1
++%154 = OpLoad %v4float %152
++OpStore %148 %154
++OpBranch %151
+ %150 = OpLabel
+-%153 = OpAccessChain %_ptr_Uniform_v4float %10 %int_1
+-%155 = OpLoad %v4float %153
+-OpStore %149 %155
+-OpBranch %152
++%155 = OpAccessChain %_ptr_Uniform_v4float %10 %int_2
++%157 = OpLoad %v4float %155
++OpStore %148 %157
++OpBranch %151
+ %151 = OpLabel
+-%156 = OpAccessChain %_ptr_Uniform_v4float %10 %int_2
+-%158 = OpLoad %v4float %156
+-OpStore %149 %158
+-OpBranch %152
+-%152 = OpLabel
+-%159 = OpLoad %v4float %149
+-OpReturnValue %159
++%158 = OpLoad %v4float %148
++OpReturnValue %158
+ OpFunctionEnd
+diff --git a/tests/sksl/shared/SwizzleConstants.glsl b/tests/sksl/shared/SwizzleConstants.glsl
+index e5638cf80e..2c000b4d0c 100644
+--- a/tests/sksl/shared/SwizzleConstants.glsl
++++ b/tests/sksl/shared/SwizzleConstants.glsl
+@@ -6,30 +6,29 @@ uniform vec4 colorRed;
+ vec4 main() {
+     vec4 v = testInputs;
+     v = vec4(v.x, 1.0, 1.0, 1.0);
+     v = vec4(v.xy, 1.0, 1.0);
+     v = vec4(v.x, 1.0, 1.0, 1.0);
+     v = vec4(0.0, v.y, 1.0, 1.0);
+     v = vec4(v.xyz, 1.0);
+     v = vec4(v.xy, 1.0, 1.0);
+     v = vec4(v.x, 0.0, v.z, 1.0);
+     v = vec4(v.x, 1.0, 0.0, 1.0);
+     v = vec4(1.0, v.yz, 1.0);
+     v = vec4(0.0, v.y, 1.0, 1.0);
+     v = vec4(1.0, 1.0, v.z, 1.0);
+-    v = v;
+     v = vec4(v.xyz, 1.0);
+     v = vec4(v.xy, 0.0, v.w);
+     v = vec4(v.xy, 1.0, 0.0);
+     v = vec4(v.x, 1.0, v.zw);
+     v = vec4(v.x, 0.0, v.z, 1.0);
+     v = vec4(v.x, 1.0, 1.0, v.w);
+     v = vec4(v.x, 1.0, 0.0, 1.0);
+     v = vec4(1.0, v.yzw);
+     v = vec4(0.0, v.yz, 1.0);
+     v = vec4(0.0, v.y, 1.0, v.w);
+     v = vec4(1.0, v.y, 1.0, 1.0);
+     v = vec4(0.0, 0.0, v.zw);
+     v = vec4(0.0, 0.0, v.z, 1.0);
+     v = vec4(0.0, 1.0, 1.0, v.w);
+     return v == vec4(0.0, 1.0, 1.0, 1.0) ? colorGreen : colorRed;
+ }
+diff --git a/tests/sksl/shared/SwizzleConstants.metal b/tests/sksl/shared/SwizzleConstants.metal
+index 25b1535e81..a160b145cf 100644
+--- a/tests/sksl/shared/SwizzleConstants.metal
++++ b/tests/sksl/shared/SwizzleConstants.metal
+@@ -17,33 +17,32 @@ struct Outputs {
+ fragment Outputs fragmentMain(Inputs _in [[stage_in]], constant Uniforms& _uniforms [[buffer(0)]], bool _frontFacing [[front_facing]], float4 _fragCoord [[position]]) {
+     Outputs _out;
+     (void)_out;
+     float4 v = _uniforms.testInputs;
+     v = float4(v.x, 1.0, 1.0, 1.0);
+     v = float4(v.xy, 1.0, 1.0);
+     v = float4(v.x, 1.0, 1.0, 1.0);
+     v = float4(0.0, v.y, 1.0, 1.0);
+     v = float4(v.xyz, 1.0);
+     v = float4(v.xy, 1.0, 1.0);
+     v = float4(v.x, 0.0, v.z, 1.0);
+     v = float4(v.x, 1.0, 0.0, 1.0);
+     v = float4(1.0, v.yz, 1.0);
+     v = float4(0.0, v.y, 1.0, 1.0);
+     v = float4(1.0, 1.0, v.z, 1.0);
+-    v = v;
+     v = float4(v.xyz, 1.0);
+     v = float4(v.xy, 0.0, v.w);
+     v = float4(v.xy, 1.0, 0.0);
+     v = float4(v.x, 1.0, v.zw);
+     v = float4(v.x, 0.0, v.z, 1.0);
+     v = float4(v.x, 1.0, 1.0, v.w);
+     v = float4(v.x, 1.0, 0.0, 1.0);
+     v = float4(1.0, v.yzw);
+     v = float4(0.0, v.yz, 1.0);
+     v = float4(0.0, v.y, 1.0, v.w);
+     v = float4(1.0, v.y, 1.0, 1.0);
+     v = float4(0.0, 0.0, v.zw);
+     v = float4(0.0, 0.0, v.z, 1.0);
+     v = float4(0.0, 1.0, 1.0, v.w);
+     _out.sk_FragColor = all(v == float4(0.0, 1.0, 1.0, 1.0)) ? _uniforms.colorGreen : _uniforms.colorRed;
+     return _out;
+ }
+diff --git a/tests/sksl/shared/SwizzleOpt.asm.frag b/tests/sksl/shared/SwizzleOpt.asm.frag
+index 4bbbaccd02..0b19aebb2e 100644
+--- a/tests/sksl/shared/SwizzleOpt.asm.frag
++++ b/tests/sksl/shared/SwizzleOpt.asm.frag
+@@ -30,67 +30,65 @@ OpDecorate %11 Binding 0
+ OpDecorate %11 DescriptorSet 0
+ OpDecorate %35 RelaxedPrecision
+ OpDecorate %44 RelaxedPrecision
+-OpDecorate %45 RelaxedPrecision
+-OpDecorate %47 RelaxedPrecision
+-OpDecorate %54 RelaxedPrecision
+-OpDecorate %61 RelaxedPrecision
+-OpDecorate %66 RelaxedPrecision
+-OpDecorate %71 RelaxedPrecision
+-OpDecorate %72 RelaxedPrecision
++OpDecorate %46 RelaxedPrecision
++OpDecorate %53 RelaxedPrecision
++OpDecorate %60 RelaxedPrecision
++OpDecorate %65 RelaxedPrecision
++OpDecorate %70 RelaxedPrecision
++OpDecorate %75 RelaxedPrecision
+ OpDecorate %77 RelaxedPrecision
+-OpDecorate %79 RelaxedPrecision
+-OpDecorate %86 RelaxedPrecision
+-OpDecorate %91 RelaxedPrecision
+-OpDecorate %95 RelaxedPrecision
+-OpDecorate %99 RelaxedPrecision
+-OpDecorate %104 RelaxedPrecision
+-OpDecorate %114 RelaxedPrecision
+-OpDecorate %121 RelaxedPrecision
+-OpDecorate %124 RelaxedPrecision
++OpDecorate %84 RelaxedPrecision
++OpDecorate %89 RelaxedPrecision
++OpDecorate %93 RelaxedPrecision
++OpDecorate %97 RelaxedPrecision
++OpDecorate %102 RelaxedPrecision
++OpDecorate %112 RelaxedPrecision
++OpDecorate %119 RelaxedPrecision
++OpDecorate %122 RelaxedPrecision
++OpDecorate %127 RelaxedPrecision
+ OpDecorate %129 RelaxedPrecision
+-OpDecorate %131 RelaxedPrecision
++OpDecorate %130 RelaxedPrecision
+ OpDecorate %132 RelaxedPrecision
+-OpDecorate %134 RelaxedPrecision
+-OpDecorate %135 RelaxedPrecision
+-OpDecorate %138 RelaxedPrecision
+-OpDecorate %139 RelaxedPrecision
+-OpDecorate %145 RelaxedPrecision
+-OpDecorate %146 RelaxedPrecision
++OpDecorate %133 RelaxedPrecision
++OpDecorate %136 RelaxedPrecision
++OpDecorate %137 RelaxedPrecision
++OpDecorate %143 RelaxedPrecision
++OpDecorate %144 RelaxedPrecision
++OpDecorate %154 RelaxedPrecision
+ OpDecorate %156 RelaxedPrecision
+-OpDecorate %158 RelaxedPrecision
+-OpDecorate %159 RelaxedPrecision
++OpDecorate %157 RelaxedPrecision
+ %float = OpTypeFloat 32
+ %v4float = OpTypeVector %float 4
+ %_ptr_Output_v4float = OpTypePointer Output %v4float
+ %sk_FragColor = OpVariable %_ptr_Output_v4float Output
+ %bool = OpTypeBool
+ %_ptr_Input_bool = OpTypePointer Input %bool
+ %sk_Clockwise = OpVariable %_ptr_Input_bool Input
+ %_UniformBuffer = OpTypeStruct %v4float %v4float %v4float
+ %_ptr_Uniform__UniformBuffer = OpTypePointer Uniform %_UniformBuffer
+ %11 = OpVariable %_ptr_Uniform__UniformBuffer Uniform
+ %void = OpTypeVoid
+ %16 = OpTypeFunction %void
+ %_ptr_Function_v4float = OpTypePointer Function %v4float
+ %19 = OpTypeFunction %float %_ptr_Function_v4float
+ %int = OpTypeInt 32 1
+ %_ptr_Function_int = OpTypePointer Function %int
+ %int_1 = OpConstant %int 1
+ %int_2 = OpConstant %int 2
+ %39 = OpTypeFunction %v4float
+ %_ptr_Uniform_v4float = OpTypePointer Uniform %v4float
+ %float_0 = OpConstant %float 0
+ %v3float = OpTypeVector %float 3
+ %v2float = OpTypeVector %float 2
+ %float_1 = OpConstant %float 1
+ %float_123 = OpConstant %float 123
+ %float_456 = OpConstant %float 456
+ %float_2 = OpConstant %float 2
+ %float_3 = OpConstant %float 3
+-%111 = OpConstantComposite %v4float %float_1 %float_1 %float_2 %float_3
++%109 = OpConstantComposite %v4float %float_1 %float_1 %float_2 %float_3
+ %int_0 = OpConstant %int 0
+-%147 = OpConstantComposite %v4float %float_1 %float_1 %float_1 %float_1
++%145 = OpConstantComposite %v4float %float_1 %float_1 %float_1 %float_1
+ %v4bool = OpTypeVector %bool 4
+ %_entrypoint = OpFunction %void None %16
+ %17 = OpLabel
+ %18 = OpFunctionCall %v4float %main
+@@ -124,145 +122,141 @@ OpUnreachable
+ OpFunctionEnd
+ %main = OpFunction %v4float None %39
+ %40 = OpLabel
+ %v = OpVariable %_ptr_Function_v4float Function
+-%80 = OpVariable %_ptr_Function_v4float Function
+-%87 = OpVariable %_ptr_Function_v4float Function
+-%92 = OpVariable %_ptr_Function_v4float Function
+-%96 = OpVariable %_ptr_Function_v4float Function
+-%100 = OpVariable %_ptr_Function_v4float Function
+-%105 = OpVariable %_ptr_Function_v4float Function
+-%151 = OpVariable %_ptr_Function_v4float Function
++%78 = OpVariable %_ptr_Function_v4float Function
++%85 = OpVariable %_ptr_Function_v4float Function
++%90 = OpVariable %_ptr_Function_v4float Function
++%94 = OpVariable %_ptr_Function_v4float Function
++%98 = OpVariable %_ptr_Function_v4float Function
++%103 = OpVariable %_ptr_Function_v4float Function
++%149 = OpVariable %_ptr_Function_v4float Function
+ %42 = OpAccessChain %_ptr_Uniform_v4float %11 %int_2
+ %44 = OpLoad %v4float %42
+ OpStore %v %44
+-%45 = OpLoad %v4float %v
+-OpStore %v %45
+-%47 = OpLoad %v4float %v
+-%48 = OpVectorShuffle %v3float %47 %47 2 1 0
+-%50 = OpCompositeExtract %float %48 0
+-%51 = OpCompositeExtract %float %48 1
+-%52 = OpCompositeExtract %float %48 2
+-%53 = OpCompositeConstruct %v4float %float_0 %50 %51 %52
+-OpStore %v %53
+-%54 = OpLoad %v4float %v
+-%55 = OpVectorShuffle %v2float %54 %54 0 3
+-%57 = OpCompositeExtract %float %55 0
+-%58 = OpCompositeExtract %float %55 1
+-%59 = OpCompositeConstruct %v4float %float_0 %float_0 %57 %58
+-OpStore %v %59
+-%61 = OpLoad %v4float %v
+-%62 = OpVectorShuffle %v2float %61 %61 3 0
+-%63 = OpCompositeExtract %float %62 0
+-%64 = OpCompositeExtract %float %62 1
+-%65 = OpCompositeConstruct %v4float %float_1 %float_1 %63 %64
+-OpStore %v %65
+-%66 = OpLoad %v4float %v
+-%67 = OpVectorShuffle %v2float %66 %66 2 1
+-%68 = OpCompositeExtract %float %67 0
+-%69 = OpCompositeExtract %float %67 1
+-%70 = OpCompositeConstruct %v4float %68 %69 %float_1 %float_1
+-OpStore %v %70
+-%71 = OpLoad %v4float %v
+-OpStore %v %71
+-%72 = OpLoad %v4float %v
+-%73 = OpVectorShuffle %v2float %72 %72 0 0
+-%74 = OpCompositeExtract %float %73 0
+-%75 = OpCompositeExtract %float %73 1
+-%76 = OpCompositeConstruct %v4float %74 %75 %float_1 %float_1
++%46 = OpLoad %v4float %v
++%47 = OpVectorShuffle %v3float %46 %46 2 1 0
++%49 = OpCompositeExtract %float %47 0
++%50 = OpCompositeExtract %float %47 1
++%51 = OpCompositeExtract %float %47 2
++%52 = OpCompositeConstruct %v4float %float_0 %49 %50 %51
++OpStore %v %52
++%53 = OpLoad %v4float %v
++%54 = OpVectorShuffle %v2float %53 %53 0 3
++%56 = OpCompositeExtract %float %54 0
++%57 = OpCompositeExtract %float %54 1
++%58 = OpCompositeConstruct %v4float %float_0 %float_0 %56 %57
++OpStore %v %58
++%60 = OpLoad %v4float %v
++%61 = OpVectorShuffle %v2float %60 %60 3 0
++%62 = OpCompositeExtract %float %61 0
++%63 = OpCompositeExtract %float %61 1
++%64 = OpCompositeConstruct %v4float %float_1 %float_1 %62 %63
++OpStore %v %64
++%65 = OpLoad %v4float %v
++%66 = OpVectorShuffle %v2float %65 %65 2 1
++%67 = OpCompositeExtract %float %66 0
++%68 = OpCompositeExtract %float %66 1
++%69 = OpCompositeConstruct %v4float %67 %68 %float_1 %float_1
++OpStore %v %69
++%70 = OpLoad %v4float %v
++%71 = OpVectorShuffle %v2float %70 %70 0 0
++%72 = OpCompositeExtract %float %71 0
++%73 = OpCompositeExtract %float %71 1
++%74 = OpCompositeConstruct %v4float %72 %73 %float_1 %float_1
++OpStore %v %74
++%75 = OpLoad %v4float %v
++%76 = OpVectorShuffle %v4float %75 %75 3 2 3 2
+ OpStore %v %76
+ %77 = OpLoad %v4float %v
+-%78 = OpVectorShuffle %v4float %77 %77 3 2 3 2
+-OpStore %v %78
+-%79 = OpLoad %v4float %v
+-OpStore %80 %79
+-%81 = OpFunctionCall %float %fn %80
+-%84 = OpCompositeConstruct %v3float %81 %float_123 %float_456
+-%85 = OpVectorShuffle %v4float %84 %84 1 1 2 2
+-OpStore %v %85
+-%86 = OpLoad %v4float %v
+-OpStore %87 %86
+-%88 = OpFunctionCall %float %fn %87
+-%89 = OpCompositeConstruct %v3float %88 %float_123 %float_456
+-%90 = OpVectorShuffle %v4float %89 %89 1 1 2 2
+-OpStore %v %90
+-%91 = OpLoad %v4float %v
+-OpStore %92 %91
+-%93 = OpFunctionCall %float %fn %92
+-%94 = OpCompositeConstruct %v4float %float_123 %float_456 %float_456 %93
+-OpStore %v %94
+-%95 = OpLoad %v4float %v
+-OpStore %96 %95
+-%97 = OpFunctionCall %float %fn %96
+-%98 = OpCompositeConstruct %v4float %float_123 %float_456 %float_456 %97
+-OpStore %v %98
+-%99 = OpLoad %v4float %v
+-OpStore %100 %99
+-%101 = OpFunctionCall %float %fn %100
+-%102 = OpCompositeConstruct %v3float %101 %float_123 %float_456
+-%103 = OpVectorShuffle %v4float %102 %102 1 0 0 2
+-OpStore %v %103
+-%104 = OpLoad %v4float %v
+-OpStore %105 %104
+-%106 = OpFunctionCall %float %fn %105
+-%107 = OpCompositeConstruct %v3float %106 %float_123 %float_456
+-%108 = OpVectorShuffle %v4float %107 %107 1 0 0 2
+-OpStore %v %108
+-OpStore %v %111
+-%112 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
+-%114 = OpLoad %v4float %112
+-%115 = OpVectorShuffle %v3float %114 %114 0 1 2
+-%116 = OpCompositeExtract %float %115 0
+-%117 = OpCompositeExtract %float %115 1
+-%118 = OpCompositeExtract %float %115 2
+-%119 = OpCompositeConstruct %v4float %116 %117 %118 %float_1
+-OpStore %v %119
+-%120 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
+-%121 = OpLoad %v4float %120
+-%122 = OpCompositeExtract %float %121 0
+-%123 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
+-%124 = OpLoad %v4float %123
+-%125 = OpVectorShuffle %v2float %124 %124 1 2
+-%126 = OpCompositeExtract %float %125 0
+-%127 = OpCompositeExtract %float %125 1
+-%128 = OpCompositeConstruct %v4float %122 %float_1 %126 %127
+-OpStore %v %128
+-%129 = OpLoad %v4float %v
++OpStore %78 %77
++%79 = OpFunctionCall %float %fn %78
++%82 = OpCompositeConstruct %v3float %79 %float_123 %float_456
++%83 = OpVectorShuffle %v4float %82 %82 1 1 2 2
++OpStore %v %83
++%84 = OpLoad %v4float %v
++OpStore %85 %84
++%86 = OpFunctionCall %float %fn %85
++%87 = OpCompositeConstruct %v3float %86 %float_123 %float_456
++%88 = OpVectorShuffle %v4float %87 %87 1 1 2 2
++OpStore %v %88
++%89 = OpLoad %v4float %v
++OpStore %90 %89
++%91 = OpFunctionCall %float %fn %90
++%92 = OpCompositeConstruct %v4float %float_123 %float_456 %float_456 %91
++OpStore %v %92
++%93 = OpLoad %v4float %v
++OpStore %94 %93
++%95 = OpFunctionCall %float %fn %94
++%96 = OpCompositeConstruct %v4float %float_123 %float_456 %float_456 %95
++OpStore %v %96
++%97 = OpLoad %v4float %v
++OpStore %98 %97
++%99 = OpFunctionCall %float %fn %98
++%100 = OpCompositeConstruct %v3float %99 %float_123 %float_456
++%101 = OpVectorShuffle %v4float %100 %100 1 0 0 2
++OpStore %v %101
++%102 = OpLoad %v4float %v
++OpStore %103 %102
++%104 = OpFunctionCall %float %fn %103
++%105 = OpCompositeConstruct %v3float %104 %float_123 %float_456
++%106 = OpVectorShuffle %v4float %105 %105 1 0 0 2
++OpStore %v %106
++OpStore %v %109
++%110 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
++%112 = OpLoad %v4float %110
++%113 = OpVectorShuffle %v3float %112 %112 0 1 2
++%114 = OpCompositeExtract %float %113 0
++%115 = OpCompositeExtract %float %113 1
++%116 = OpCompositeExtract %float %113 2
++%117 = OpCompositeConstruct %v4float %114 %115 %116 %float_1
++OpStore %v %117
++%118 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
++%119 = OpLoad %v4float %118
++%120 = OpCompositeExtract %float %119 0
++%121 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
++%122 = OpLoad %v4float %121
++%123 = OpVectorShuffle %v2float %122 %122 1 2
++%124 = OpCompositeExtract %float %123 0
++%125 = OpCompositeExtract %float %123 1
++%126 = OpCompositeConstruct %v4float %120 %float_1 %124 %125
++OpStore %v %126
++%127 = OpLoad %v4float %v
++%128 = OpLoad %v4float %v
++%129 = OpVectorShuffle %v4float %128 %127 4 5 6 7
++OpStore %v %129
+ %130 = OpLoad %v4float %v
+-%131 = OpVectorShuffle %v4float %130 %129 4 5 6 7
+-OpStore %v %131
+-%132 = OpLoad %v4float %v
++%131 = OpLoad %v4float %v
++%132 = OpVectorShuffle %v4float %131 %130 7 6 5 4
++OpStore %v %132
+ %133 = OpLoad %v4float %v
+-%134 = OpVectorShuffle %v4float %133 %132 7 6 5 4
+-OpStore %v %134
++%134 = OpVectorShuffle %v2float %133 %133 1 2
+ %135 = OpLoad %v4float %v
+-%136 = OpVectorShuffle %v2float %135 %135 1 2
++%136 = OpVectorShuffle %v4float %135 %134 4 1 2 5
++OpStore %v %136
+ %137 = OpLoad %v4float %v
+-%138 = OpVectorShuffle %v4float %137 %136 4 1 2 5
+-OpStore %v %138
+-%139 = OpLoad %v4float %v
+-%140 = OpVectorShuffle %v2float %139 %139 3 3
+-%141 = OpCompositeExtract %float %140 0
+-%142 = OpCompositeExtract %float %140 1
+-%143 = OpCompositeConstruct %v3float %141 %142 %float_1
++%138 = OpVectorShuffle %v2float %137 %137 3 3
++%139 = OpCompositeExtract %float %138 0
++%140 = OpCompositeExtract %float %138 1
++%141 = OpCompositeConstruct %v3float %139 %140 %float_1
++%142 = OpLoad %v4float %v
++%143 = OpVectorShuffle %v4float %142 %141 6 5 4 3
++OpStore %v %143
+ %144 = OpLoad %v4float %v
+-%145 = OpVectorShuffle %v4float %144 %143 6 5 4 3
+-OpStore %v %145
+-%146 = OpLoad %v4float %v
+-%148 = OpFOrdEqual %v4bool %146 %147
+-%150 = OpAll %bool %148
+-OpSelectionMerge %154 None
+-OpBranchConditional %150 %152 %153
+-%152 = OpLabel
+-%155 = OpAccessChain %_ptr_Uniform_v4float %11 %int_1
++%146 = OpFOrdEqual %v4bool %144 %145
++%148 = OpAll %bool %146
++OpSelectionMerge %152 None
++OpBranchConditional %148 %150 %151
++%150 = OpLabel
++%153 = OpAccessChain %_ptr_Uniform_v4float %11 %int_1
++%154 = OpLoad %v4float %153
++OpStore %149 %154
++OpBranch %152
++%151 = OpLabel
++%155 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
+ %156 = OpLoad %v4float %155
+-OpStore %151 %156
+-OpBranch %154
+-%153 = OpLabel
+-%157 = OpAccessChain %_ptr_Uniform_v4float %11 %int_0
+-%158 = OpLoad %v4float %157
+-OpStore %151 %158
+-OpBranch %154
+-%154 = OpLabel
+-%159 = OpLoad %v4float %151
+-OpReturnValue %159
++OpStore %149 %156
++OpBranch %152
++%152 = OpLabel
++%157 = OpLoad %v4float %149
++OpReturnValue %157
+ OpFunctionEnd
+diff --git a/tests/sksl/shared/SwizzleOpt.glsl b/tests/sksl/shared/SwizzleOpt.glsl
+index a2205d741b..895d35ba36 100644
+--- a/tests/sksl/shared/SwizzleOpt.glsl
++++ b/tests/sksl/shared/SwizzleOpt.glsl
+@@ -7,29 +7,27 @@ float fn(vec4 v) {
+     for (int x = 1;x <= 2; ++x) {
+         return v.x;
+     }
+ }
+ vec4 main() {
+     vec4 v = testInputs;
+-    v = v;
+     v = vec4(0.0, v.zyx);
+     v = vec4(0.0, 0.0, v.xw);
+     v = vec4(1.0, 1.0, v.wx);
+     v = vec4(v.zy, 1.0, 1.0);
+-    v = v;
+     v = vec4(v.xx, 1.0, 1.0);
+     v = v.wzwz;
+     v = vec3(fn(v), 123.0, 456.0).yyzz;
+     v = vec3(fn(v), 123.0, 456.0).yyzz;
+     v = vec4(123.0, 456.0, 456.0, fn(v));
+     v = vec4(123.0, 456.0, 456.0, fn(v));
+     v = vec3(fn(v), 123.0, 456.0).yxxz;
+     v = vec3(fn(v), 123.0, 456.0).yxxz;
+     v = vec4(1.0, 1.0, 2.0, 3.0);
+     v = vec4(colorRed.xyz, 1.0);
+     v = vec4(colorRed.x, 1.0, colorRed.yz);
+     v.xyzw = v;
+     v.wzyx = v;
+     v.xyzw.xw = v.yz;
+     v.wzyx.yzw = vec3(v.ww, 1.0);
+     return v == vec4(1.0) ? colorGreen : colorRed;
+ }
+diff --git a/tests/sksl/shared/SwizzleOpt.metal b/tests/sksl/shared/SwizzleOpt.metal
+index be4fe5c0f4..bf382c627c 100644
+--- a/tests/sksl/shared/SwizzleOpt.metal
++++ b/tests/sksl/shared/SwizzleOpt.metal
+@@ -18,32 +18,30 @@ float fn(float4 v) {
+     for (int x = 1;x <= 2; ++x) {
+         return v.x;
+     }
+ }
+ fragment Outputs fragmentMain(Inputs _in [[stage_in]], constant Uniforms& _uniforms [[buffer(0)]], bool _frontFacing [[front_facing]], float4 _fragCoord [[position]]) {
+     Outputs _out;
+     (void)_out;
+     float4 v = _uniforms.testInputs;
+-    v = v;
+     v = float4(0.0, v.zyx);
+     v = float4(0.0, 0.0, v.xw);
+     v = float4(1.0, 1.0, v.wx);
+     v = float4(v.zy, 1.0, 1.0);
+-    v = v;
+     v = float4(v.xx, 1.0, 1.0);
+     v = v.wzwz;
+     v = float3(fn(v), 123.0, 456.0).yyzz;
+     v = float3(fn(v), 123.0, 456.0).yyzz;
+     v = float4(123.0, 456.0, 456.0, fn(v));
+     v = float4(123.0, 456.0, 456.0, fn(v));
+     v = float3(fn(v), 123.0, 456.0).yxxz;
+     v = float3(fn(v), 123.0, 456.0).yxxz;
+     v = float4(1.0, 1.0, 2.0, 3.0);
+     v = float4(_uniforms.colorRed.xyz, 1.0);
+     v = float4(_uniforms.colorRed.x, 1.0, _uniforms.colorRed.yz);
+     v.xyzw = v;
+     v.wzyx = v;
+     v.xyzw.xw = v.yz;
+     v.wzyx.yzw = float3(v.ww, 1.0);
+     _out.sk_FragColor = all(v == float4(1.0)) ? _uniforms.colorGreen : _uniforms.colorRed;
+     return _out;
+ }
+diff --git a/tests/sksl/shared/UnaryPositiveNegative.asm.frag b/tests/sksl/shared/UnaryPositiveNegative.asm.frag
+index 9f75293be5..1ddbf9cf0d 100644
+--- a/tests/sksl/shared/UnaryPositiveNegative.asm.frag
++++ b/tests/sksl/shared/UnaryPositiveNegative.asm.frag
+@@ -27,37 +27,36 @@ OpDecorate %_UniformBuffer Block
+ OpDecorate %10 Binding 0
+ OpDecorate %10 DescriptorSet 0
+ OpDecorate %27 RelaxedPrecision
++OpDecorate %30 RelaxedPrecision
+ OpDecorate %29 RelaxedPrecision
+ OpDecorate %31 RelaxedPrecision
+-OpDecorate %30 RelaxedPrecision
+-OpDecorate %32 RelaxedPrecision
+-OpDecorate %45 RelaxedPrecision
++OpDecorate %44 RelaxedPrecision
++OpDecorate %47 RelaxedPrecision
+ OpDecorate %48 RelaxedPrecision
+-OpDecorate %49 RelaxedPrecision
+ %float = OpTypeFloat 32
+ %v4float = OpTypeVector %float 4
+ %_ptr_Output_v4float = OpTypePointer Output %v4float
+ %sk_FragColor = OpVariable %_ptr_Output_v4float Output
+ %bool = OpTypeBool
+ %_ptr_Input_bool = OpTypePointer Input %bool
+ %sk_Clockwise = OpVariable %_ptr_Input_bool Input
+ %_UniformBuffer = OpTypeStruct %v4float %v4float %v4float
+ %_ptr_Uniform__UniformBuffer = OpTypePointer Uniform %_UniformBuffer
+ %10 = OpVariable %_ptr_Uniform__UniformBuffer Uniform
+ %void = OpTypeVoid
+ %15 = OpTypeFunction %void
+ %18 = OpTypeFunction %v4float
+ %v2float = OpTypeVector %float 2
+ %_ptr_Function_v2float = OpTypePointer Function %v2float
+ %_ptr_Uniform_v4float = OpTypePointer Uniform %v4float
+ %int = OpTypeInt 32 1
+ %int_0 = OpConstant %int 0
+ %float_n1 = OpConstant %float -1
+-%34 = OpConstantComposite %v2float %float_n1 %float_n1
++%33 = OpConstantComposite %v2float %float_n1 %float_n1
+ %v2bool = OpTypeVector %bool 2
+ %_ptr_Function_v4float = OpTypePointer Function %v4float
+ %int_1 = OpConstant %int 1
+ %int_2 = OpConstant %int 2
+ %_entrypoint = OpFunction %void None %15
+ %16 = OpLabel
+ %17 = OpFunctionCall %v4float %main
+@@ -66,33 +65,31 @@ OpReturn
+ OpFunctionEnd
+ %main = OpFunction %v4float None %18
+ %19 = OpLabel
+ %x = OpVariable %_ptr_Function_v2float Function
+-%38 = OpVariable %_ptr_Function_v4float Function
++%37 = OpVariable %_ptr_Function_v4float Function
+ %23 = OpAccessChain %_ptr_Uniform_v4float %10 %int_0
+ %27 = OpLoad %v4float %23
+ %28 = OpVectorShuffle %v2float %27 %27 0 1
+ OpStore %x %28
+-%29 = OpLoad %v2float %x
++%30 = OpLoad %v2float %x
++%29 = OpFNegate %v2float %30
+ OpStore %x %29
+ %31 = OpLoad %v2float %x
+-%30 = OpFNegate %v2float %31
+-OpStore %x %30
+-%32 = OpLoad %v2float %x
+-%35 = OpFOrdEqual %v2bool %32 %34
+-%37 = OpAll %bool %35
+-OpSelectionMerge %42 None
+-OpBranchConditional %37 %40 %41
++%34 = OpFOrdEqual %v2bool %31 %33
++%36 = OpAll %bool %34
++OpSelectionMerge %41 None
++OpBranchConditional %36 %39 %40
++%39 = OpLabel
++%42 = OpAccessChain %_ptr_Uniform_v4float %10 %int_1
++%44 = OpLoad %v4float %42
++OpStore %37 %44
++OpBranch %41
+ %40 = OpLabel
+-%43 = OpAccessChain %_ptr_Uniform_v4float %10 %int_1
+-%45 = OpLoad %v4float %43
+-OpStore %38 %45
+-OpBranch %42
++%45 = OpAccessChain %_ptr_Uniform_v4float %10 %int_2
++%47 = OpLoad %v4float %45
++OpStore %37 %47
++OpBranch %41
+ %41 = OpLabel
+-%46 = OpAccessChain %_ptr_Uniform_v4float %10 %int_2
+-%48 = OpLoad %v4float %46
+-OpStore %38 %48
+-OpBranch %42
+-%42 = OpLabel
+-%49 = OpLoad %v4float %38
+-OpReturnValue %49
++%48 = OpLoad %v4float %37
++OpReturnValue %48
+ OpFunctionEnd
+diff --git a/tests/sksl/shared/UnaryPositiveNegative.glsl b/tests/sksl/shared/UnaryPositiveNegative.glsl
+index f3dcd894d4..776df28020 100644
+--- a/tests/sksl/shared/UnaryPositiveNegative.glsl
++++ b/tests/sksl/shared/UnaryPositiveNegative.glsl
+@@ -5,7 +5,6 @@ uniform vec4 colorGreen;
+ uniform vec4 colorRed;
+ vec4 main() {
+     vec2 x = colorWhite.xy;
+-    x = x;
+     x = -x;
+     return x == vec2(-1.0) ? colorGreen : colorRed;
+ }
+diff --git a/tests/sksl/shared/UnaryPositiveNegative.metal b/tests/sksl/shared/UnaryPositiveNegative.metal
+index 8cdaba4254..4b55a83da0 100644
+--- a/tests/sksl/shared/UnaryPositiveNegative.metal
++++ b/tests/sksl/shared/UnaryPositiveNegative.metal
+@@ -17,9 +17,8 @@ struct Outputs {
+ fragment Outputs fragmentMain(Inputs _in [[stage_in]], constant Uniforms& _uniforms [[buffer(0)]], bool _frontFacing [[front_facing]], float4 _fragCoord [[position]]) {
+     Outputs _out;
+     (void)_out;
+     float2 x = _uniforms.colorWhite.xy;
+-    x = x;
+     x = -x;
+     _out.sk_FragColor = all(x == float2(-1.0)) ? _uniforms.colorGreen : _uniforms.colorRed;
+     return _out;
+ }

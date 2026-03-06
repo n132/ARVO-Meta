@@ -1,0 +1,747 @@
+commit bfc67588eb3f60f1f24a4596e87edcdb7ec254ab
+Author: Luca Deri <deri@ntop.org>
+Date:   Wed Dec 27 21:01:30 2023 +0100
+
+    Added memory boundaries checks
+
+diff --git a/src/NetworkInterface.cpp b/src/NetworkInterface.cpp
+index 283d76248..4f1cdb200 100644
+--- a/src/NetworkInterface.cpp
++++ b/src/NetworkInterface.cpp
+@@ -2437,697 +2437,703 @@ u_int16_t NetworkInterface::guessEthType(const u_char *p, u_int len,
+ bool NetworkInterface::dissectPacket(int32_t if_index,
+ 				     u_int32_t bridge_iface_idx,
+ 				     int pcap_datalink_type,
+                                      bool ingressPacket, u_int8_t *sender_mac,
+                                      const struct pcap_pkthdr *h,
+                                      const u_char *packet,
+                                      u_int16_t *ndpiProtocol, Host **srcHost,
+                                      Host **dstHost, Flow **flow) {
+   struct ndpi_ethhdr *ethernet = NULL, dummy_ethernet;
+   u_int64_t time;
+   u_int16_t eth_type, ip_offset = 0, vlan_id = 0, eth_offset = 0,
+     encapsulation_overhead = 0;
+   u_int32_t null_type;
+   bool pass_verdict = true;
+   u_int32_t len_on_wire = h->len * getScalingFactor();
+   *flow = NULL;
+ 
+-  /* Note summy ethernet is always 0 unless sender_mac is set (Netfilter only)
+-   */
++  /* Note dummy ethernet is always 0 unless sender_mac is set (Netfilter only) */
+   memset(&dummy_ethernet, 0, sizeof(dummy_ethernet));
+ 
++  /* Periodic housekeeping activites put here to avoid locks during code execution */
+   pollQueuedeCompanionEvents();
+   bcast_domains->reloadBroadcastDomains();
+ 
+   /* Netfilter interfaces don't report MAC addresses on packets */
+   if (getIfType() == interface_type_NETFILTER)
+     len_on_wire += sizeof(struct ndpi_ethhdr);
+ 
+   if (h->len == 0) {
+     return (false);
+   } else if (h->len > ifMTU) {
+     if (!mtuWarningShown) {
+ #ifdef __linux__
+       ntop->getTrace()->traceEvent(TRACE_NORMAL,
+ 				   "Packets exceeding the expected max size have been received "
+ 				   "[%s][len: %u][max len: %u].",
+ 				   get_name(), h->len, ifMTU);
+ 
+       if (!read_from_pcap_dump()) {
+         ntop->getTrace()->traceEvent(TRACE_WARNING, "If TSO/GRO is enabled, please disable it for best accuracy");
+ 
+         if(strchr(ifname, ':') == NULL) {
+ 	  /* print ethtool command for standard interfaces only */
+ 	  ntop->getTrace()->traceEvent(TRACE_WARNING, "using: sudo ethtool -K %s gro off gso off tso off",
+ 				       (strchr(ifname, ',') == NULL) ? ifname : "<interface name>");
+ 	}
+       }
+ #endif
+       mtuWarningShown = true;
+     }
+   }
+ 
+   setTimeLastPktRcvd(h->ts.tv_sec);
+ 
+   if (last_purge_idle != (u_int32_t)h->ts.tv_sec) {
+     if (!read_from_pcap_dump()) purgeIdle(h->ts.tv_sec);
+     last_purge_idle = h->ts.tv_sec;
+   }
+ 
+   time = ((uint64_t)h->ts.tv_sec) * 1000 + h->ts.tv_usec / 1000;
+ 
+  datalink_check:
+   if (pcap_datalink_type == DLT_NULL) {
+     if (h->caplen < sizeof(u_int32_t))
+       return (false);
+ 
+     if((eth_offset + sizeof(u_int32_t)) <= h->caplen)
+       memcpy(&null_type, &packet[eth_offset], sizeof(u_int32_t));
+     else
+       return (false);
+ 
+     switch (null_type) {
+     case BSD_AF_INET:
+       eth_type = ETHERTYPE_IP;
+       break;
+     case BSD_AF_INET6_BSD:
+     case BSD_AF_INET6_FREEBSD:
+     case BSD_AF_INET6_DARWIN:
+       eth_type = ETHERTYPE_IPV6;
+       break;
+     default:
+       incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+ 	       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+       goto dissect_packet_end; /* Any other non IP protocol */
+     }
+ 
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ip_offset = 4 + eth_offset;
+   } else if (pcap_datalink_type == DLT_EN10MB) {
+     if (h->caplen < sizeof(ndpi_ethhdr))
+       return (false);
+ 
+     ethernet = (struct ndpi_ethhdr *)&packet[eth_offset];
+     ip_offset = sizeof(struct ndpi_ethhdr) + eth_offset;
+     eth_type = ntohs(ethernet->h_proto);
+   } else if (pcap_datalink_type == 113 /* Linux Cooked Capture */) {
+     if (h->caplen < 16)
+       return (false);
+ 
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     eth_type = (packet[eth_offset + 14] << 8) + packet[eth_offset + 15];
+     ip_offset = 16 + eth_offset;
+ #ifdef DLT_RAW
+   } else if (pcap_datalink_type == DLT_RAW /* Linux TUN/TAP device in TUN mode; Raw IP capture */
+              || pcap_datalink_type == 14 /* raw IP DLT_RAW on OpenBSD captures */) {
+     if (h->caplen < sizeof(u_int32_t))
+       return (false);
+ 
+     switch ((packet[eth_offset] & 0xf0) >> 4) {
+     case 4:
+       eth_type = ETHERTYPE_IP;
+       break;
+     case 6:
+       eth_type = ETHERTYPE_IPV6;
+       break;
+     default:
+       incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+ 	       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+       goto dissect_packet_end; /* Unknown IP protocol version */
+     }
+ 
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     ip_offset = eth_offset;
+ #endif /* DLT_RAW */
+   } else if (pcap_datalink_type == DLT_ENC) {
+     if (packet[0] == 2 /* IPv4 */) {
+       eth_type = ETHERTYPE_IP;
+       ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+       ip_offset = 12;
+     }
+     /* TODO support IPv6 encapsulation one day */
+   } else if (pcap_datalink_type == DLT_IPV4) {
+     eth_type = ETHERTYPE_IP;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     ip_offset = 0;
+   } else {
+     incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+              NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+     goto dissect_packet_end;
+   }
+ 
+   /*
+     Make sure this label is BEFORE detunneling of VLAN or MPLS traffic.
+     Otherwise, VLAN or MPLS traffic carried inside other tunnels, i.e.,
+     GRE or ERSPAN, won't be detunneled.
+   */
+  decode_packet_eth:
+ 
+   while (ip_offset < h->caplen) {
+     if((eth_type == 0x8100 /* VLAN */) && ((ip_offset + sizeof(Ether80211q)) < h->caplen)) {
+       Ether80211q *qType = (Ether80211q *)&packet[ip_offset];
+ 
+       vlan_id = ntohs(qType->vlanId) & 0xFFF;
+       eth_type = (packet[ip_offset + 2] << 8) + packet[ip_offset + 3];
+       ip_offset += 4;
+     } else if((eth_type == 0x8847 /* MPLS */) && ((unsigned int)(ip_offset + 2) <  h->caplen)) {
+       u_int8_t bos; /* bottom_of_stack */
+ 
+       bos = (((u_int8_t)packet[ip_offset + 2]) & 0x1), ip_offset += 4;
+       if (bos) {
+         u_int8_t is_ethernet;
+ 
+         eth_type = guessEthType((const u_char *)&packet[ip_offset],
+                                 h->caplen - ip_offset, &is_ethernet);
+ 
+         if (is_ethernet) ip_offset += sizeof(struct ndpi_ethhdr);
+         break;
+       }
+     } else
+       break;
+   }
+ 
+   /* Setting traffic direction based on MAC */
+   if (ethernet) {
+     if (isTrafficMirrored()) {
+       /* Mirror */
+       if (isGwMac(ethernet->h_dest)) ingressPacket = false;
+     } else if (!areTrafficDirectionsSupported()) {
+       /* Interface with no direction info */
+       if (isInterfaceMac(ethernet->h_source)) ingressPacket = false;
+     }
+   }
+ 
+   switch (eth_type) {
+   case ETHERTYPE_PPPoE:
+     ip_offset += 6 /* PPPoE */;
+     /* Now we need to skip the PPP header */
+     if (packet[ip_offset] == 0x0)
+       eth_type = packet[ip_offset + 1], ip_offset += 2; /* 2 Byte protocol */
+     else
+       eth_type = packet[ip_offset], ip_offset += 1; /* 1 Byte protocol */
+ 
+     switch (eth_type) {
+     case 0x21:
+       eth_type = ETHERTYPE_IP;
+       break;
+ 
+     case 0x57:
+       eth_type = ETHERTYPE_IPV6;
+       break;
+ 
+     default:
+       incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IP,
+ 	       NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+ 	       len_on_wire, 1);
+       goto dissect_packet_end;
+     }
+     goto decode_packet_eth;
+     break;
+ 
+   case ETHERTYPE_IP:
+     if (h->caplen >= ip_offset + sizeof(struct ndpi_iphdr)) {
+       u_int16_t frag_off;
+       struct ndpi_iphdr *iph = (struct ndpi_iphdr *)&packet[ip_offset];
+       u_short ip_len = ((u_short)iph->ihl * 4);
+       struct ndpi_ipv6hdr *ip6 = NULL;
+ 
+       if (iph->version != 4) {
+ 	/* This is not IPv4 */
+ 	incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IP,
+ 		 NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+ 		 len_on_wire, 1);
+ 	goto dissect_packet_end;
+       } else
+ 	frag_off = ntohs(iph->frag_off);
+ 
+       if (ntop->getGlobals()->decode_tunnels() &&
+ 	  (iph->protocol == IPPROTO_GRE) &&
+ 	  ((frag_off & 0x3FFF /* IP_MF | IP_OFFSET */) == 0) &&
+ 	  h->caplen >= ip_offset + ip_len + sizeof(struct grev1_header)) {
+ 	struct grev1_header gre;
+ 	u_int offset = ip_offset + ip_len + sizeof(struct grev1_header);
+ 
+ 	memcpy(&gre, &packet[ip_offset + ip_len],
+ 	       sizeof(struct grev1_header));
+ 	gre.flags_and_version = ntohs(gre.flags_and_version);
+ 	gre.proto = ntohs(gre.proto);
+ 
+ 	if (gre.flags_and_version &
+ 	    (GRE_HEADER_CHECKSUM | GRE_HEADER_ROUTING))
+ 	  offset += 4;
+ 	if (gre.flags_and_version & GRE_HEADER_KEY) offset += 4;
+ 	if (gre.flags_and_version & GRE_HEADER_SEQ_NUM) offset += 4;
+ 
+ 	if (h->caplen >= offset) {
+ 	  if (gre.proto == 0x6558 /* Transparent Ethernet Bridging */) {
+ 	    eth_offset = offset;
+ 	    goto datalink_check;
+ 	  } else if (gre.proto == ETHERTYPE_IP) {
+ 	    ip_offset = offset, encapsulation_overhead = offset;
+ 	    goto decode_packet_eth;
+ 	  } else if (gre.proto == ETHERTYPE_IPV6) {
+ 	    eth_type = ETHERTYPE_IPV6;
+ 	    ip_offset = offset, encapsulation_overhead = offset;
+ 	    goto decode_packet_eth;
+ 	  }
+ 	}
+ 
+ 	/* ERSPAN Type 2 has an 8-byte header
+ 	   https://tools.ietf.org/html/draft-foschiano-erspan-00 */
+ 	if (h->caplen >= offset + sizeof(struct ndpi_ethhdr) + 8) {
+ 	  if (gre.proto == ETH_P_ERSPAN /* ERSPAN type II */) {
+ 	    offset += 8;
+ 	    eth_offset = offset, encapsulation_overhead = offset;
+ 	    ethernet = (struct ndpi_ethhdr *)&packet[eth_offset];
+ 	    ip_offset = eth_offset + sizeof(struct ndpi_ethhdr);
+ 	    eth_type = ntohs(ethernet->h_proto);
+ 	    goto decode_packet_eth;
+ 	  } else if (gre.proto ==
+ 		     ETH_P_ERSPAN2 /* ERSPAN version 2 (type III) */) {
+ 	    if (h->caplen >= offset + sizeof(struct ndpi_ethhdr) + 20) {
+ 	      offset += 20;
+ 	      eth_offset = offset, encapsulation_overhead = offset;
+ 	      ethernet = (struct ndpi_ethhdr *)&packet[eth_offset];
+ 	      ip_offset = eth_offset + sizeof(struct ndpi_ethhdr);
+ 	      eth_type = ntohs(ethernet->h_proto);
+ 	      goto decode_packet_eth;
+ 	    }
+ 	  } else {
+ 	    /* Unknown encapsulation */
+ 	  }
+ 	}
+       } else if (ntop->getGlobals()->decode_tunnels() &&
+ 		 iph->protocol == IPPROTO_IPV6 &&
+ 		 h->caplen >=
+ 		 ip_offset + ip_len + sizeof(struct ndpi_ipv6hdr)) {
+ 	/* Detunnel 6in4 tunnel */
+ 	ip_offset += ip_len;
+ 	eth_type = ETHERTYPE_IPV6;
+ 	encapsulation_overhead = ip_offset;
+ 	goto decode_packet_eth;
+       } else if (ntop->getGlobals()->decode_tunnels() &&
+ 		 (iph->protocol == IPPROTO_UDP) &&
+ 		 ((frag_off & 0x3FFF /* IP_MF | IP_OFFSET */) == 0)) {
+ 
+ 	if(ip_offset + ip_len + sizeof(struct ndpi_udphdr) > h->caplen) {
+ 	  incStats(ingressPacket, h->ts.tv_sec, 0,
+ 		   NDPI_PROTOCOL_UNKNOWN,
+ 		   NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire,
+ 		   1);
+ 	  goto dissect_packet_end;
+         }
+ 
+ 	struct ndpi_udphdr *udp =
+ 	  (struct ndpi_udphdr *)&packet[ip_offset + ip_len];
+ 	u_int16_t sport = ntohs(udp->source), dport = ntohs(udp->dest);
+ 
+ 	if ((sport == GTP_U_V1_PORT) || (dport == GTP_U_V1_PORT)) {
+ 	  /* Check if it's GTPv1 */
+ 	  u_int offset =
+ 	    (u_int)(ip_offset + ip_len + sizeof(struct ndpi_udphdr));
+ 	  u_int8_t flags = packet[offset];
+ 	  u_int8_t message_type = packet[offset + 1];
+ 
+ 	  if ((((flags & 0xE0) >> 5) == 1 /* GTPv1 */) &&
+ 	      (message_type == 0xFF /* T-PDU */)) {
+ 	    ip_offset = ip_offset + ip_len + sizeof(struct ndpi_udphdr) +
+ 	      8 /* GTPv1 header len */;
+ 
+ 	    if (flags & 0x04) ip_offset += 1; /* next_ext_header is present */
+ 	    if (flags & 0x02)
+ 	      ip_offset += 4; /* sequence_number is present (it also includes
+ 				 next_ext_header and pdu_number) */
+ 	    if (flags & 0x01) ip_offset += 1; /* pdu_number is present */
+ 
+ 	    iph = (struct ndpi_iphdr *)&packet[ip_offset];
+ 
+ 	    if (iph->version != 4) {
+ 	      /* FIX - Add IPv6 support */
+ 	      incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IPV6,
+ 		       NDPI_PROTOCOL_UNKNOWN,
+ 		       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+ 	      goto dissect_packet_end;
+ 	    }
+ 	  }
+ 	} else if ((sport == EOIP_PORT) && (dport == EOIP_PORT)) {
+ 	  u_int offset = ip_offset + ip_len + sizeof(struct ndpi_udphdr) + 12;
+ 
+ 	  eth_offset = offset;
+ 	  goto datalink_check;
+ 	} else if ((sport == TZSP_PORT) || (dport == TZSP_PORT)) {
+ 	  /* https://en.wikipedia.org/wiki/TZSP */
+ 	  u_int offset = ip_offset + ip_len + sizeof(struct ndpi_udphdr);
+ 	  u_int8_t version = packet[offset];
+ 	  u_int8_t type = packet[offset + 1];
+ 	  u_int16_t encapsulates = ntohs(*((u_int16_t *)&packet[offset + 2]));
+ 
+ 	  if ((version == 1) && (type == 0) && (encapsulates == 1)) {
+ 	    u_int8_t stop = 0;
+ 
+ 	    offset += 4;
+ 
+ 	    while ((!stop) && (offset < h->caplen)) {
+ 	      u_int8_t tag_type = packet[offset];
+ 	      u_int8_t tag_len;
+ 
+ 	      switch (tag_type) {
+ 	      case 0: /* PADDING Tag */
+ 		tag_len = 1;
+ 		break;
+ 	      case 1: /* END Tag */
+ 		tag_len = 1, stop = 1;
+ 		break;
+ 	      default:
+ 		tag_len = packet[offset + 1];
+ 		break;
+ 	      }
+ 
+ 	      offset += tag_len;
+ 
+ 	      if (offset >= h->caplen) {
+ 		incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IPV6,
+ 			 NDPI_PROTOCOL_UNKNOWN,
+ 			 NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire,
+ 			 1);
+ 		goto dissect_packet_end;
+ 	      } else {
+ 		eth_offset = offset;
+ 		goto datalink_check;
+ 	      }
+ 	    }
+ 	  }
+ 	} else if (dport == VXLAN_PORT) {
+ 	  eth_offset = ip_offset + ip_len + sizeof(struct ndpi_udphdr) +
+ 	    sizeof(struct ndpi_vxlanhdr);
+ 	  goto datalink_check;
+ 	}
+ 
+ 	if ((sport == CAPWAP_DATA_PORT) || (dport == CAPWAP_DATA_PORT)) {
+ 	  /*
+ 	    Control And Provisioning of Wireless Access Points
+ 
+ 	    https://www.rfc-editor.org/rfc/rfc5415.txt
+ 
+ 	    CAPWAP Header          - variable length (5 MSB of byte 2 of
+ 	    header) IEEE 802.11 Data Flags - 24 bytes Logical-Link Control   -
+ 	    8  bytes
+ 
+ 	    Total = CAPWAP_header_length + 24 + 8
+ 	  */
+ 	  u_short eth_type;
+ 	  ip_offset = ip_offset + ip_len + sizeof(struct ndpi_udphdr);
+ 	  u_int8_t capwap_header_len =
+ 	    ((*(u_int8_t *)&packet[ip_offset + 1]) >> 3) * 4;
+ 	  ip_offset = ip_offset + capwap_header_len + 24 + 8;
+ 
+ 	  if (ip_offset >= h->len) {
+ 	    incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+ 		     NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+ 	    goto dissect_packet_end;
+ 	  }
+ 	  eth_type = ntohs(*(u_int16_t *)&packet[ip_offset - 2]);
+ 
+ 	  switch (eth_type) {
+ 	  case ETHERTYPE_IP:
+ 	    iph = (struct ndpi_iphdr *)&packet[ip_offset];
+ 	    break;
+ 	  case ETHERTYPE_IPV6:
+ 	    iph = NULL;
+ 	    ip6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+ 	    break;
+ 	  default:
+ 	    incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+ 		     NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+ 	    goto dissect_packet_end;
+ 	  }
+ 	}
+       } else if (ntop->getGlobals()->decode_tunnels() &&
+ 		 (iph->protocol == IPPROTO_IP_IN_IP)) {
+ 	u_short ip_len = ((u_short)iph->ihl * 4);
+ 
+ 	ip_offset += ip_len, eth_type = ETHERTYPE_IP;
+ 
+ 	if (ip_offset > h->caplen)
+ 	  goto dissect_packet_end;
+ 	else
+ 	  goto decode_packet_eth;
+       }
+ 
+       if (vlan_id && ntop->getPrefs()->do_ignore_vlans()) vlan_id = 0;
+       if ((vlan_id == 0) && ntop->getPrefs()->do_simulate_vlans())
+ 	vlan_id = (ip6 ? ip6->ip6_src.u6_addr.u6_addr8[15] +
+ 		   ip6->ip6_dst.u6_addr.u6_addr8[15]
+ 		   : iph->saddr + iph->daddr) &
+ 	  SIMULATE_VLANS_MAX_VALUE;
+ 
+       if (ntop->getPrefs()->do_ignore_macs())
+ 	ethernet = &dummy_ethernet;
+       else if (unlikely(ntop->getPrefs()->do_simulate_macs())) {
+ 	dummy_ethernet.h_source[0] = 0xb8, dummy_ethernet.h_source[1] = 0x27,
+           dummy_ethernet.h_source[2] = 0xeb, dummy_ethernet.h_source[3] = 0xfd,
+           dummy_ethernet.h_source[4] = 0x8e,
+           dummy_ethernet.h_source[5] = rand() % 8;
+ 	dummy_ethernet.h_dest[0] = 0xb8, dummy_ethernet.h_dest[1] = 0x27,
+           dummy_ethernet.h_dest[2] = 0xeb, dummy_ethernet.h_dest[3] = 0xfd,
+           dummy_ethernet.h_dest[4] = 0x8e,
+           dummy_ethernet.h_dest[5] = rand() % 8;
+ 	ethernet = &dummy_ethernet;
+       }
+ 
+       try {
+ 	pass_verdict = processPacket(if_index, bridge_iface_idx,
+ 				     pcap_datalink_type, ingressPacket, &h->ts, time, ethernet, vlan_id,
+ 				     iph, ip6, ip_offset, encapsulation_overhead, len_on_wire, h,
+ 				     packet, ndpiProtocol, srcHost, dstHost, flow);
+       } catch (std::bad_alloc &ba) {
+ 	static bool oom_warning_sent = false;
+ 
+ 	if (!oom_warning_sent) {
+ 	  ntop->getTrace()->traceEvent(TRACE_WARNING, "Not enough memory");
+ 	  oom_warning_sent = true;
+ 	}
+       }
+     }
+     break;
+ 
+   case ETHERTYPE_IPV6:
+     if (h->caplen >= ip_offset + sizeof(struct ndpi_ipv6hdr)) {
+       struct ndpi_iphdr *iph = NULL;
+       struct ndpi_ipv6hdr *ip6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+ 
+       if ((ntohl(ip6->ip6_hdr.ip6_un1_flow) & 0xF0000000) != 0x60000000) {
+ 	/* This is not IPv6 */
+ 	incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IPV6,
+ 		 NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+ 		 len_on_wire, 1);
+ 	goto dissect_packet_end;
+       } else {
+ 	u_int ipv6_shift = sizeof(const struct ndpi_ipv6hdr);
+ 	u_int8_t l4_proto = ip6->ip6_hdr.ip6_un1_nxt;
+ 
+ 	if (l4_proto == 0x3C /* IPv6 destination option */) {
+ 	  u_int8_t *options = (u_int8_t *)ip6 + ipv6_shift;
+ 	  l4_proto = options[0];
+ 	  ipv6_shift = 8 * (options[1] + 1);
+ 	}
+ 
+ 	if (ntop->getGlobals()->decode_tunnels() &&
+ 	    (l4_proto == IPPROTO_GRE) &&
+ 	    h->caplen >=
+ 	    ip_offset + ipv6_shift + sizeof(struct grev1_header)) {
+ 	  struct grev1_header gre;
+ 	  u_int offset = ip_offset + ipv6_shift + sizeof(struct grev1_header);
+ 
+ 	  memcpy(&gre, &packet[ip_offset + ipv6_shift],
+ 		 sizeof(struct grev1_header));
+ 	  gre.flags_and_version = ntohs(gre.flags_and_version);
+ 	  gre.proto = ntohs(gre.proto);
+ 
+ 	  if (gre.flags_and_version &
+ 	      (GRE_HEADER_CHECKSUM | GRE_HEADER_ROUTING))
+ 	    offset += 4;
+ 	  if (gre.flags_and_version & GRE_HEADER_KEY) offset += 4;
+ 	  if (gre.flags_and_version & GRE_HEADER_SEQ_NUM) offset += 4;
+ 
+ 	  if (h->caplen >= offset) {
+ 	    if (gre.proto == ETHERTYPE_IP) {
+ 	      eth_type = ETHERTYPE_IP;
+ 	      ip_offset = offset, encapsulation_overhead = offset;
+ 	      goto decode_packet_eth;
+ 	    } else if (gre.proto == ETHERTYPE_IPV6) {
+ 	      ip_offset = offset, encapsulation_overhead = offset;
+ 	      goto decode_packet_eth;
+ 	    }
+ 	  }
+ 
+ 	  if (h->caplen >= offset + sizeof(struct ndpi_ethhdr) +
+ 	      8 /* ERSPAN Type 2 header */) {
+ 	    if (gre.proto == ETH_P_ERSPAN) {
+ 	      offset += 8;
+ 	      eth_offset = offset, encapsulation_overhead = offset;
+ 	      ethernet = (struct ndpi_ethhdr *)&packet[eth_offset];
+ 	      ip_offset = eth_offset + sizeof(struct ndpi_ethhdr);
+ 	      eth_type = ntohs(ethernet->h_proto);
+ 	      goto decode_packet_eth;
+ 	    } else if (gre.proto == ETH_P_ERSPAN2) {
+ 	      ; /* TODO: support ERSPAN Type 3 */
+ 	    } else {
+ 	      /* Unknown encapsulation */
+ 	    }
+ 	  }
+ 	} else if (ntop->getGlobals()->decode_tunnels() &&
+ 		   (l4_proto == IPPROTO_UDP)) {
+-	  // ip_offset += ipv6_shift;
+-	  if ((ip_offset + ipv6_shift) >= h->len) {
++	  struct ndpi_udphdr *udp;
++	  u_int16_t sport, dport;
++	  
++	  if ((ip_offset + ipv6_shift + sizeof(struct ndpi_udphdr)) > h->caplen) {
+ 	    incStats(ingressPacket, h->ts.tv_sec, ETHERTYPE_IPV6,
+ 		     NDPI_PROTOCOL_UNKNOWN,
+ 		     NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+ 	    goto dissect_packet_end;
+ 	  }
+ 
+-	  struct ndpi_udphdr *udp =
+-	    (struct ndpi_udphdr *)&packet[ip_offset + ipv6_shift];
+-	  u_int16_t sport = udp->source, dport = udp->dest;
++	  udp = (struct ndpi_udphdr *)&packet[ip_offset + ipv6_shift];
++	  sport = udp->source, dport = udp->dest;
+ 
+ 	  if ((sport == CAPWAP_DATA_PORT) || (dport == CAPWAP_DATA_PORT)) {
+ 	    /*
+ 	      Control And Provisioning of Wireless Access Points
+ 
+ 	      https://www.rfc-editor.org/rfc/rfc5415.txt
+ 
+ 	      CAPWAP Header          - variable length (5 MSB of byte 2 of
+ 	      header) IEEE 802.11 Data Flags - 24 bytes Logical-Link Control
+ 	      - 8  bytes
+ 
+ 	      Total = CAPWAP_header_length + 24 + 8
+ 	    */
+-
+ 	    u_short eth_type;
++	    u_int8_t capwap_header_len;
++
+ 	    ip_offset = ip_offset + ipv6_shift + sizeof(struct ndpi_udphdr);
+-	    u_int8_t capwap_header_len =
+-	      ((*(u_int8_t *)&packet[ip_offset + 1]) >> 3) * 4;
+-	    ip_offset = ip_offset + capwap_header_len + 24 + 8;
+ 
+-	    if (ip_offset >= h->len) {
+-	      incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+-		       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+-	      goto dissect_packet_end;
+-	    }
+-	    eth_type = ntohs(*(u_int16_t *)&packet[ip_offset - 2]);
+-
+-	    switch (eth_type) {
+-	    case ETHERTYPE_IP:
+-	      iph = (struct ndpi_iphdr *)&packet[ip_offset];
+-	      ip6 = NULL;
+-	      break;
+-	    case ETHERTYPE_IPV6:
+-	      ip6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+-	      break;
+-	    default:
+-	      incStats(
+-		       ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+-		       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+-	      goto dissect_packet_end;
++	    if((ip_offset + 1) < h->caplen) {
++	      capwap_header_len = ((*(u_int8_t *)&packet[ip_offset + 1]) >> 3) * 4;
++	      ip_offset = ip_offset + capwap_header_len + 24 + 8;
++
++	      if (ip_offset >= h->caplen) {
++		incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
++			 NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
++		goto dissect_packet_end;
++	      }
++
++	      eth_type = ntohs(*(u_int16_t *)&packet[ip_offset - 2]);
++
++	      switch (eth_type) {
++	      case ETHERTYPE_IP:
++		iph = (struct ndpi_iphdr *)&packet[ip_offset];
++		ip6 = NULL;
++		break;
++		
++	      case ETHERTYPE_IPV6:
++		ip6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
++		break;
++		
++	      default:
++		incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
++			 NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
++		goto dissect_packet_end;
++	      }
+ 	    }
+ 	  }
+-	} else if (ntop->getGlobals()->decode_tunnels() &&
+-		   (l4_proto == IPPROTO_IP_IN_IP)) {
++	} else if (ntop->getGlobals()->decode_tunnels()
++		   && (l4_proto == IPPROTO_IP_IN_IP)) {
+ 	  eth_type = ETHERTYPE_IP;
+ 	  ip_offset += sizeof(struct ndpi_ipv6hdr);
+ 	  encapsulation_overhead = ip_offset;
+ 	  goto decode_packet_eth;
+ 	}
+ 
+ 	if (vlan_id && ntop->getPrefs()->do_ignore_vlans()) vlan_id = 0;
+ 	if ((vlan_id == 0) && ntop->getPrefs()->do_simulate_vlans())
+ 	  vlan_id = (ip6 ? ip6->ip6_src.u6_addr.u6_addr8[15] +
+ 		     ip6->ip6_dst.u6_addr.u6_addr8[15]
+ 		     : iph->saddr + iph->daddr) %
+ 	    SIMULATE_VLANS_MAX_VALUE;
+ 
+ 	if (ntop->getPrefs()->do_ignore_macs()) ethernet = &dummy_ethernet;
+ 
+ 	try {
+ 	  pass_verdict = processPacket(if_index, bridge_iface_idx, pcap_datalink_type,
+ 				       ingressPacket, &h->ts, time, ethernet,
+ 				       vlan_id, iph, ip6, ip_offset, encapsulation_overhead,
+ 				       len_on_wire, h, packet, ndpiProtocol, srcHost, dstHost, flow);
+ 	} catch (std::bad_alloc &ba) {
+ 	  static bool oom_warning_sent = false;
+ 
+ 	  if (!oom_warning_sent) {
+ 	    ntop->getTrace()->traceEvent(TRACE_WARNING, "Not enough memory");
+ 	    oom_warning_sent = true;
+ 	  }
+ 	}
+       }
+     }
+     break;
+ 
+   default: /* No IPv4 nor IPv6 */
+     if (ntop->getPrefs()->do_ignore_macs()) ethernet = &dummy_ethernet;
+ 
+     if (ethernet == NULL) {
+       incStats(ingressPacket, h->ts.tv_sec, eth_type, NDPI_PROTOCOL_UNKNOWN,
+ 	       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+       goto dissect_packet_end;
+     }
+ 
+     Mac *srcMac = getMac(ethernet->h_source, true /* Create if missing */,
+ 			 true /* Inline call */);
+     Mac *dstMac = getMac(ethernet->h_dest, true /* Create if missing */,
+ 			 true /* Inline call */);
+ 
+     /* NOTE: in nEdge, stats are updated into Flow::update_hosts_stats */
+ #ifndef HAVE_NEDGE
+     if (srcMac) srcMac->incSentStats(h->ts.tv_sec, 1, len_on_wire);
+     if (dstMac) dstMac->incRcvdStats(h->ts.tv_sec, 1, len_on_wire);
+ #endif
+ 
+     if ((eth_type == ETHERTYPE_ARP) &&
+ 	(h->caplen >= (sizeof(arp_header) + sizeof(struct ndpi_ethhdr)))) {
+       struct arp_header *arpp = (struct arp_header *)&packet[ip_offset];
+       u_int16_t arp_opcode = ntohs(arpp->ar_op);
+ 
+       /* Updates interface broadcast domains, according to what is seen in
+        * this ARP that glues together L2 and L3 */
+       updateBroadcastDomains(vlan_id, ethernet->h_source, ethernet->h_dest,
+ 			     ntohl(arpp->arp_spa), ntohl(arpp->arp_tpa));
+ 
+       if (srcMac && dstMac && (!srcMac->isNull() || !dstMac->isNull())) {
+ 	setSeenMacAddresses();
+ 	srcMac->setSourceMac();
+ 
+ 	if (arp_opcode == 0x1 /* ARP request */) {
+ 	  arp_requests++;
+ 	  srcMac->incSentArpRequests();
+ 	  dstMac->incRcvdArpRequests();
+ 	} else if (arp_opcode == 0x2 /* ARP reply */) {
+ 	  arp_replies++;
+ 	  srcMac->incSentArpReplies();
+ 	  dstMac->incRcvdArpReplies();
+ 
+ 	  checkMacIPAssociation(true, arpp->arp_sha, arpp->arp_spa, srcMac);
+ 	  checkMacIPAssociation(true, arpp->arp_tha, arpp->arp_tpa, dstMac);
+ 	}
+       }
+     }
+ 
+     incStats(ingressPacket, h->ts.tv_sec, eth_type, NDPI_PROTOCOL_UNKNOWN,
+ 	     NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+     break;
+   }
+ 
+  dissect_packet_end:
+ 
+   /* Live packet dump to mongoose */
+   if (num_live_captures > 0) deliverLiveCapture(h, packet, *flow);
+ 
+   return (pass_verdict);
+ }
+ 
+ /* **************************************************** */

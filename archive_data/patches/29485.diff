@@ -1,0 +1,349 @@
+commit b3dfb4d6a522fff042bea03b9b8f6516e4e86354
+Merge: 371234038 4d379cb12
+Author: Richard Cordovano <rcordovano@basistech.com>
+Date:   Thu Apr 22 14:36:13 2021 -0400
+
+    Merge pull request #2335 from joachimmetz/fix_int_wrap
+    
+    Fixed integer wrap around
+
+diff --git a/tsk/fs/ntfs.c b/tsk/fs/ntfs.c
+index 631fe2ff3..d225e5c99 100755
+--- a/tsk/fs/ntfs.c
++++ b/tsk/fs/ntfs.c
+@@ -132,319 +132,329 @@ TSK_RETVAL_ENUM
+ ntfs_dinode_lookup(NTFS_INFO * a_ntfs, char *a_buf, TSK_INUM_T a_mftnum)
+ {
+     TSK_OFF_T mftaddr_b, mftaddr2_b, offset;
+     size_t mftaddr_len = 0;
+     int i;
+     TSK_FS_INFO *fs = (TSK_FS_INFO *) & a_ntfs->fs_info;
+     TSK_FS_ATTR_RUN *data_run;
+     ntfs_upd *upd;
+     uint16_t sig_seq;
+     ntfs_mft *mft;
+ 
+ 
+     /* sanity checks */
+     if (!a_buf) {
+         tsk_error_reset();
+         tsk_error_set_errno(TSK_ERR_FS_ARG);
+         tsk_error_set_errstr("mft_lookup: null mft buffer");
+         return TSK_ERR;
+     }
+ 
+     if (a_mftnum < fs->first_inum) {
+         tsk_error_reset();
+         tsk_error_set_errno(TSK_ERR_FS_ARG);
+         tsk_error_set_errstr("mft_lookup: inode number is too small (%"
+             PRIuINUM ")", a_mftnum);
+         return TSK_ERR;
+     }
+ 
+     /* Because this code reads teh actual MFT, we need to make sure we
+      * decrement the last_inum because the last value is a special value
+      * for the ORPHANS directory */
+     if (a_mftnum > fs->last_inum - 1) {
+         tsk_error_reset();
+         tsk_error_set_errno(TSK_ERR_FS_ARG);
+         tsk_error_set_errstr("mft_lookup: inode number is too large (%"
+             PRIuINUM ")", a_mftnum);
+         return TSK_ERR;
+     }
+ 
+ 
+     if (tsk_verbose)
+         tsk_fprintf(stderr,
+             "ntfs_dinode_lookup: Processing MFT %" PRIuINUM "\n",
+             a_mftnum);
+ 
+     /* If mft_data (the cached $Data attribute of $MFT) is not there yet,
+      * then we have not started to load $MFT yet.  In that case, we will
+      * 'cheat' and calculate where it goes.  This should only be for
+      * $MFT itself, in which case the calculation is easy
+      */
+     if (!a_ntfs->mft_data) {
+ 
+         /* This is just a random check with the assumption being that
+          * we don't want to just do a guess calculation for a very large
+          * MFT entry
+          */
+         if (a_mftnum > NTFS_LAST_DEFAULT_INO) {
+             tsk_error_reset();
+             tsk_error_set_errno(TSK_ERR_FS_ARG);
+             tsk_error_set_errstr
+                 ("Error trying to load a high MFT entry when the MFT itself has not been loaded (%"
+                 PRIuINUM ")", a_mftnum);
+             return TSK_ERR;
+         }
+ 
+         mftaddr_b = a_ntfs->root_mft_addr + a_mftnum * a_ntfs->mft_rsize_b;
+         mftaddr2_b = 0;
+     }
+     else {
+         /* The MFT may not be in consecutive clusters, so we need to use its
+          * data attribute run list to find out what address to read
+          *
+          * This is why we cached it
+          */
+ 
+         // will be set to the address of the MFT entry
+         mftaddr_b = mftaddr2_b = 0;
+ 
+         /* The byte offset within the $Data stream */
+         offset = a_mftnum * a_ntfs->mft_rsize_b;
+ 
+         /* NOTE: data_run values are in clusters
+          *
+          * cycle through the runs in $Data and identify which
+          * has the MFT entry that we want
+          */
+         for (data_run = a_ntfs->mft_data->nrd.run;
+             data_run != NULL; data_run = data_run->next) {
+ 
+             /* Test for possible overflows / error conditions */
+             if ((offset < 0) || (data_run->len >= (TSK_DADDR_T)(LLONG_MAX / a_ntfs->csize_b))){
+                 tsk_error_reset();
+                 tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+                 tsk_error_set_errstr
+                 ("ntfs_dinode_lookup: Overflow when calculating run length");
+                 return TSK_COR;
+             }
+ 
+             /* The length of this specific run */
+             TSK_OFF_T run_len = data_run->len * a_ntfs->csize_b;
+ 
+             /* Is our MFT entry is in this run somewhere ? */
+             if (offset < run_len) {
+ 
+                 if (tsk_verbose)
+                     tsk_fprintf(stderr,
+                         "ntfs_dinode_lookup: Found in offset: %"
+                         PRIuDADDR "  size: %" PRIuDADDR " at offset: %"
+ 						PRIdOFF "\n", data_run->addr, data_run->len,
+                         offset);
+ 
+                 /* special case where the MFT entry crosses
+                  * a run (only happens when cluster size is 512-bytes
+                  * and there are an odd number of clusters in the run)
+                  */
+                 if (run_len < offset + a_ntfs->mft_rsize_b) {
+ 
+                     if (tsk_verbose)
+                         tsk_fprintf(stderr,
+                             "ntfs_dinode_lookup: Entry crosses run border\n");
+ 
+                     if (data_run->next == NULL) {
+                         tsk_error_reset();
+                         tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+                         tsk_error_set_errstr
+                             ("mft_lookup: MFT entry crosses a cluster and there are no more clusters!");
+                         return TSK_COR;
+                     }
+ 
+                     /* Assign address where the remainder of the entry is */
+                     mftaddr2_b = data_run->next->addr * a_ntfs->csize_b;
+                     /* this should always be 512, but just in case */
+                     mftaddr_len = (size_t) (run_len - offset);
+                 }
+ 
+                 /* Assign address of where the MFT entry starts */
+                 mftaddr_b = data_run->addr * a_ntfs->csize_b + offset;
+                 if (tsk_verbose)
+                     tsk_fprintf(stderr,
+                         "ntfs_dinode_lookup: Entry address at: %"
+ 						PRIdOFF "\n", mftaddr_b);
+                 break;
+             }
+ 
+             /* decrement the offset we are looking for */
+             offset -= run_len;
+         }
+ 
+         /* Did we find it? */
+         if (!mftaddr_b) {
+             tsk_error_reset();
+             tsk_error_set_errno(TSK_ERR_FS_INODE_NUM);
+             tsk_error_set_errstr("mft_lookup: Error finding MFT entry %"
+                 PRIuINUM " in $MFT", a_mftnum);
+             return TSK_ERR;
+         }
+     }
+ 
+ 
+     /* can we do just one read or do we need multiple? */
+     if (mftaddr2_b) {
+         ssize_t cnt;
+         /* read the first part into mft */
+         cnt = tsk_fs_read(&a_ntfs->fs_info, mftaddr_b, a_buf, mftaddr_len);
+         if (cnt != (ssize_t)mftaddr_len) {
+             if (cnt >= 0) {
+                 tsk_error_reset();
+                 tsk_error_set_errno(TSK_ERR_FS_READ);
+             }
+             tsk_error_set_errstr2
+                 ("ntfs_dinode_lookup: Error reading MFT Entry (part 1) at %"
+ 					PRIdOFF, mftaddr_b);
+             return TSK_ERR;
+         }
+ 
+         /* read the second part into mft */
+         cnt = tsk_fs_read
+             (&a_ntfs->fs_info, mftaddr2_b,
+             (char *) ((uintptr_t) a_buf + (uintptr_t) mftaddr_len),
+             a_ntfs->mft_rsize_b - mftaddr_len);
+         if (cnt != (ssize_t)(a_ntfs->mft_rsize_b - mftaddr_len)) {
+             if (cnt >= 0) {
+                 tsk_error_reset();
+                 tsk_error_set_errno(TSK_ERR_FS_READ);
+             }
+             tsk_error_set_errstr2
+                 ("ntfs_dinode_lookup: Error reading MFT Entry (part 2) at %"
+ 					PRIdOFF, mftaddr2_b);
+             return TSK_ERR;
+         }
+     }
+     else {
+         ssize_t cnt;
+         /* read the raw entry into mft */
+         cnt =
+             tsk_fs_read(&a_ntfs->fs_info, mftaddr_b, a_buf,
+             a_ntfs->mft_rsize_b);
+         if (cnt != a_ntfs->mft_rsize_b) {
+             if (cnt >= 0) {
+                 tsk_error_reset();
+                 tsk_error_set_errno(TSK_ERR_FS_READ);
+             }
+             tsk_error_set_errstr2
+                 ("ntfs_dinode_lookup: Error reading MFT Entry at %"
+ 					PRIdOFF, mftaddr_b);
+             return TSK_ERR;
+         }
+     }
+ 
+     /* Sanity Check */
+ #if 0
+     /* This is no longer applied because it caused too many problems
+      * with images that had 0 and 1 etc. as values.  Testing shows that
+      * even Windows XP doesn't care if entries have an invalid entry, so
+      * this is no longer checked.  The update sequence check should find
+      * corrupt entries
+      * */
+     if ((tsk_getu32(fs->endian, mft->magic) != NTFS_MFT_MAGIC)
+         && (tsk_getu32(fs->endian, mft->magic) != NTFS_MFT_MAGIC_BAAD)
+         && (tsk_getu32(fs->endian, mft->magic) != NTFS_MFT_MAGIC_ZERO)) {
+         tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+         tsk_error_set_errstr("entry %d has an invalid MFT magic: %x",
+             mftnum, tsk_getu32(fs->endian, mft->magic));
+         return 1;
+     }
+ #endif
+     /* The MFT entries have error and integrity checks in them
+      * called update sequences.  They must be checked and removed
+      * so that later functions can process the data as normal.
+      * They are located in the last 2 bytes of each 512-bytes of data.
+      *
+      * We first verify that the the 2-byte value is a give value and
+      * then replace it with what should be there
+      */
+     /* sanity check so we don't run over in the next loop */
+     mft = (ntfs_mft *) a_buf;
+     if ((tsk_getu16(fs->endian, mft->upd_cnt) > 0) &&
+         (((uint32_t) (tsk_getu16(fs->endian,
+                         mft->upd_cnt) - 1) * NTFS_UPDATE_SEQ_STRIDE) >
+             a_ntfs->mft_rsize_b)) {
+         tsk_error_reset();
+         tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+         tsk_error_set_errstr
+             ("dinode_lookup: More Update Sequence Entries than MFT size");
+         return TSK_COR;
+     }
+-    if (tsk_getu16(fs->endian, mft->upd_off) + 
+-            sizeof(ntfs_upd) + 
+-            2*(tsk_getu16(fs->endian, mft->upd_cnt) - 1) > a_ntfs->mft_rsize_b) {
++    uint16_t upd_cnt = tsk_getu16(fs->endian, mft->upd_cnt);
++    uint16_t upd_off = tsk_getu16(fs->endian, mft->upd_off);
++
++    // Make sure upd_cnt > 0 to prevent an integer wrap around.
++    if ((upd_cnt == 0) || (upd_cnt > (((a_ntfs->mft_rsize_b) / 2) + 1))) {
++        tsk_error_reset();
++        tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
++        tsk_error_set_errstr
++            ("dinode_lookup: Invalid update count value out of bounds");
++        return TSK_COR;
++    }
++    size_t mft_rsize_b = ((size_t) upd_cnt - 1) * 2;
++
++    if ((size_t) upd_off + sizeof(ntfs_upd) > (a_ntfs->mft_rsize_b - mft_rsize_b)) {
+         tsk_error_reset();
+         tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+         tsk_error_set_errstr
+             ("dinode_lookup: Update sequence would read past MFT size");
+         return TSK_COR;
+     }
+ 
+     /* Apply the update sequence structure template */
+-    upd =
+-        (ntfs_upd *) ((uintptr_t) a_buf + tsk_getu16(fs->endian,
+-            mft->upd_off));
++
++    upd = (ntfs_upd *) ((uintptr_t) a_buf + upd_off);
+     /* Get the sequence value that each 16-bit value should be */
+     sig_seq = tsk_getu16(fs->endian, upd->upd_val);
+     /* cycle through each sector */
+     for (i = 1; i < tsk_getu16(fs->endian, mft->upd_cnt); i++) {
+         uint8_t *new_val, *old_val;
+         /* The offset into the buffer of the value to analyze */
+         size_t offset = i * NTFS_UPDATE_SEQ_STRIDE - 2;
+ 
+         /* Check that there is room in the buffer to read the current sequence value */
+         if (offset + 2 > a_ntfs->mft_rsize_b) {
+             tsk_error_reset();
+             tsk_error_set_errno(TSK_ERR_FS_INODE_COR);
+             tsk_error_set_errstr
+             ("dinode_lookup: Ran out of data while parsing update sequence values");
+             return TSK_COR;
+         }
+ 
+         /* get the current sequence value */
+         uint16_t cur_seq =
+             tsk_getu16(fs->endian, (uintptr_t) a_buf + offset);
+         if (cur_seq != sig_seq) {
+             /* get the replacement value */
+             uint16_t cur_repl =
+                 tsk_getu16(fs->endian, &upd->upd_seq + (i - 1) * 2);
+             tsk_error_reset();
+             tsk_error_set_errno(TSK_ERR_FS_GENFS);
+ 
+             tsk_error_set_errstr
+                 ("Incorrect update sequence value in MFT entry\nSignature Value: 0x%"
+                 PRIx16 " Actual Value: 0x%" PRIx16
+                 " Replacement Value: 0x%" PRIx16
+                 "\nThis is typically because of a corrupted entry",
+                 sig_seq, cur_seq, cur_repl);
+             return TSK_COR;
+         }
+ 
+         new_val = &upd->upd_seq + (i - 1) * 2;
+         old_val = (uint8_t *) ((uintptr_t) a_buf + offset);
+         /*
+            if (tsk_verbose)
+            tsk_fprintf(stderr,
+            "ntfs_dinode_lookup: upd_seq %i   Replacing: %.4"
+            PRIx16 "   With: %.4" PRIx16 "\n", i,
+            tsk_getu16(fs->endian, old_val), tsk_getu16(fs->endian,
+            new_val));
+          */
+         *old_val++ = *new_val++;
+         *old_val = *new_val;
+     }
+ 
+     return TSK_OK;
+ }
+ 
+ 
+ 
+ /*
+  * given a cluster, return the allocation status or
+  * -1 if an error occurs
+  */

@@ -1,0 +1,1234 @@
+commit c31daeb2c48dd653aad4e69ee0aaf2b5f115bc2e
+Author: Evan Miller <emmiller@gmail.com>
+Date:   Thu Jan 7 19:59:45 2021 -0500
+
+    Improved bounds and return value checking (oss-fuzz/29329)
+
+diff --git a/src/libmdb/backend.c b/src/libmdb/backend.c
+index 39e1bb0..dae0ab6 100644
+--- a/src/libmdb/backend.c
++++ b/src/libmdb/backend.c
+@@ -639,129 +639,131 @@ static char *
+ mdb_get_relationships(MdbHandle *mdb, const gchar *dbnamespace, const char* tablename)
+ {
+ 	unsigned int i;
+ 	gchar *text = NULL;  /* String to be returned */
+ 	char **bound = mdb->relationships_values;  /* Bound values */
+ 	int backend = 0;
+ 	char *quoted_table_1, *quoted_column_1,
+ 	     *quoted_table_2, *quoted_column_2,
+ 	     *constraint_name, *quoted_constraint_name;
+ 	long grbit;
+ 
+ 	if (!strcmp(mdb->backend_name, "oracle")) {
+ 		backend = MDB_BACKEND_ORACLE;
+ 	} else if (!strcmp(mdb->backend_name, "postgres")) {
+ 		backend = MDB_BACKEND_POSTGRES;
+ 	} else if (!mdb->relationships_table) {
+ 		return NULL;
+ 	}
+ 
+ 	if (!mdb->relationships_table) {
+ 		mdb->relationships_table = mdb_read_table_by_name(mdb, "MSysRelationships", MDB_TABLE);
+ 		if (!mdb->relationships_table || !mdb->relationships_table->num_rows) {
+ 			fprintf(stderr, "No MSysRelationships\n");
+ 			return NULL;
+ 		}
+-
+-		mdb_read_columns(mdb->relationships_table);
++		if (!mdb_read_columns(mdb->relationships_table)) {
++			fprintf(stderr, "Unable to read columns of MSysRelationships\n");
++			return NULL;
++		}
+ 		for (i=0;i<5;i++) {
+ 			bound[i] = g_malloc0(mdb->bind_size);
+ 		}
+ 		mdb_bind_column_by_name(mdb->relationships_table, "szColumn", bound[0], NULL);
+ 		mdb_bind_column_by_name(mdb->relationships_table, "szObject", bound[1], NULL);
+ 		mdb_bind_column_by_name(mdb->relationships_table, "szReferencedColumn", bound[2], NULL);
+ 		mdb_bind_column_by_name(mdb->relationships_table, "szReferencedObject", bound[3], NULL);
+ 		mdb_bind_column_by_name(mdb->relationships_table, "grbit", bound[4], NULL);
+ 		mdb_rewind_table(mdb->relationships_table);
+ 	}
+     if (mdb->relationships_table->cur_row >= mdb->relationships_table->num_rows) {  /* past the last row */
+         for (i=0;i<5;i++)
+             g_free(bound[i]);
+         mdb->relationships_table = NULL;
+         return NULL;
+     }
+ 
+ 	while (1) {
+ 		if (!mdb_fetch_row(mdb->relationships_table)) {
+ 			for (i=0;i<5;i++)
+ 				g_free(bound[i]);
+ 			mdb->relationships_table = NULL;
+ 			return NULL;
+ 		}
+ 		if (!tablename || !strcmp(bound[1], tablename))
+ 			break;
+ 	}
+ 
+ 	quoted_table_1 = mdb->default_backend->quote_schema_name(dbnamespace, bound[1]);
+ 	quoted_table_2 = mdb->default_backend->quote_schema_name(dbnamespace, bound[3]);
+ 	grbit = atoi(bound[4]);
+ 	constraint_name = g_strconcat(bound[1], "_", bound[0], "_fk", NULL);
+ 
+ 	switch (backend) {
+ 		case MDB_BACKEND_POSTGRES:
+ 			/* PostgreSQL index and constraint names are
+ 			 * never namespaced in DDL (they are always
+ 			 * created in same namespace as table), so
+ 			 * omit namespace.  Nor should column names
+                          * be namespaced.
+ 			 */
+ 			quoted_constraint_name = mdb->default_backend->quote_schema_name(NULL, constraint_name);
+ 			quoted_column_1 = mdb->default_backend->quote_schema_name(NULL, bound[0]);
+ 			quoted_column_2 = mdb->default_backend->quote_schema_name(NULL, bound[2]);
+ 			break;
+ 
+ 		default:
+ 			/* Other databases, namespace constraint and
+ 			 * column names.
+ 			 */
+ 			quoted_constraint_name = mdb->default_backend->quote_schema_name(dbnamespace, constraint_name);
+ 			quoted_column_1 = mdb->default_backend->quote_schema_name(dbnamespace, bound[0]);
+ 			quoted_column_2 = mdb->default_backend->quote_schema_name(dbnamespace, bound[2]);
+ 			break;
+ 	}
+ 	g_free(constraint_name);
+ 
+ 	if (grbit & 0x00000002) {
+ 		text = g_strconcat(
+ 			"-- Relationship from ", quoted_table_1,
+ 			" (", quoted_column_1, ")"
+ 			" to ", quoted_table_2, "(", quoted_column_2, ")",
+ 			" does not enforce integrity.\n", NULL);
+ 	} else {
+ 		switch (backend) {
+ 		  case MDB_BACKEND_ORACLE:
+                         text = g_strconcat(
+                                 "ALTER TABLE ", quoted_table_1,
+                                 " ADD CONSTRAINT ", quoted_constraint_name,
+                                 " FOREIGN KEY (", quoted_column_1, ")"
+                                 " REFERENCES ", quoted_table_2, "(", quoted_column_2, ")",
+                                 (grbit & 0x00001000) ? " ON DELETE CASCADE" : "",
+                                 ";\n", NULL);
+ 
+                         break;
+ 		  case MDB_BACKEND_POSTGRES:
+ 			text = g_strconcat(
+ 				"ALTER TABLE ", quoted_table_1,
+ 				" ADD CONSTRAINT ", quoted_constraint_name,
+ 				" FOREIGN KEY (", quoted_column_1, ")"
+ 				" REFERENCES ", quoted_table_2, "(", quoted_column_2, ")",
+ 				(grbit & 0x00000100) ? " ON UPDATE CASCADE" : "",
+ 				(grbit & 0x00001000) ? " ON DELETE CASCADE" : "",
+ 				/* On some databases (eg PostgreSQL) we also want to set
+ 				 * the constraints to be optionally deferrable, to
+ 				 * facilitate out of order bulk loading.
+ 				 */
+ 				" DEFERRABLE",
+ 				" INITIALLY IMMEDIATE",
+ 				";\n", NULL);
+ 
+ 			break;
+ 		}
+ 	}
+ 	g_free(quoted_table_1);
+ 	g_free(quoted_column_1);
+ 	g_free(quoted_table_2);
+ 	g_free(quoted_column_2);
+ 	g_free(quoted_constraint_name);
+ 
+ 	return (char *)text;
+ }
+@@ -770,176 +772,176 @@ static void
+ generate_table_schema(FILE *outfile, MdbCatalogEntry *entry, char *dbnamespace, guint32 export_options)
+ {
+ 	MdbTableDef *table;
+ 	MdbHandle *mdb = entry->mdb;
+ 	MdbColumn *col;
+ 	unsigned int i;
+ 	char* quoted_table_name;
+ 	char* quoted_name;
+ 	MdbProperties *props;
+ 	const char *prop_value;
+ 
+ 	quoted_table_name = mdb->default_backend->quote_schema_name(dbnamespace, entry->object_name);
+ 
+ 	/* drop the table if it exists */
+ 	if (export_options & MDB_SHEXP_DROPTABLE)
+ 		fprintf (outfile, mdb->default_backend->drop_statement, quoted_table_name);
+ 
+ 	/* create the table */
+ 	fprintf (outfile, "CREATE TABLE %s\n", quoted_table_name);
+ 	fprintf (outfile, " (\n");
+ 
+ 	table = mdb_read_table (entry);
+ 
+ 	/* get the columns */
+-	mdb_read_columns (table);
++	mdb_read_columns(table);
+ 
+ 	/* loop over the columns, dumping the names and types */
+ 	for (i = 0; i < table->num_cols; i++) {
+ 		col = g_ptr_array_index (table->columns, i);
+ 
+ 		quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+ 		fprintf (outfile, "\t%s\t\t\t%s", quoted_name,
+ 			mdb_get_colbacktype_string (col));
+ 		g_free(quoted_name);
+ 
+ 		if (mdb_colbacktype_takes_length(col)) {
+ 			/* more portable version from DW patch */
+ 			if (col->col_size == 0)
+ 				fputs(" (255)", outfile);
+ 			else if (col->col_scale != 0)
+ 				fprintf(outfile, " (%d, %d)", col->col_scale, col->col_prec);
+ 			else
+ 				fprintf(outfile, " (%d)", col->col_size);
+ 		}
+ 
+ 		if (mdb->default_backend->per_column_comment_statement && export_options & MDB_SHEXP_COMMENTS) {
+ 			prop_value = mdb_col_get_prop(col, "Description");
+ 			if (prop_value) {
+ 				char *comment = quote_with_squotes(prop_value);
+ 				fputs(" ", outfile);
+ 				fprintf(outfile,
+ 					mdb->default_backend->per_column_comment_statement,
+ 					comment);
+ 				free(comment);
+ 			}
+ 		}
+ 
+ 		if (export_options & MDB_SHEXP_CST_NOTNULL) {
+ 			if (col->col_type == MDB_BOOL) {
+ 				/* access booleans are never null */
+ 				fputs(" NOT NULL", outfile);
+ 			} else {
+ 				const gchar *not_null = mdb_col_get_prop(col, "Required");
+ 				if (not_null && not_null[0]=='y')
+ 					fputs(" NOT NULL", outfile);
+ 			}
+ 		}
+ 
+ 		if (export_options & MDB_SHEXP_DEFVALUES) {
+ 			int done = 0;
+ 			if (col->props) {
+ 				gchar *defval = g_hash_table_lookup(col->props->hash, "DefaultValue");
+ 				if (defval) {
+ 					size_t def_len = strlen(defval);
+ 					fputs(" DEFAULT ", outfile);
+ 					/* ugly hack to detect the type */
+ 					if (defval[0]=='"' && defval[def_len-1]=='"') {
+ 						/* this is a string */
+ 						gchar *output_default = malloc(def_len-1);
+ 						gchar *output_default_escaped;
+ 						memcpy(output_default, defval+1, def_len-2);
+ 						output_default[def_len-2] = 0;
+ 						output_default_escaped = quote_with_squotes(output_default);
+ 						fputs(output_default_escaped, outfile);
+ 						g_free(output_default_escaped);
+ 						free(output_default);
+ 					} else if (!strcmp(defval, "Yes"))
+ 						fputs("TRUE", outfile);
+ 					else if (!strcmp(defval, "No"))
+ 						fputs("FALSE", outfile);
+ 					else if (!g_ascii_strcasecmp(defval, "date()")) {
+ 						if (mdb_col_is_shortdate(col))
+ 							fputs(mdb->default_backend->short_now, outfile);
+ 						else
+ 							fputs(mdb->default_backend->long_now, outfile);
+ 					}
+ 					else
+ 						fputs(defval, outfile);
+ 					done = 1;
+ 				}
+ 			}
+ 			if (!done && col->col_type == MDB_BOOL)
+ 				/* access booleans are false by default */
+ 				fputs(" DEFAULT FALSE", outfile);
+ 		}
+ 		if (i < table->num_cols - 1)
+ 			fputs(", \n", outfile);
+ 		else
+ 			fputs("\n", outfile);
+ 	} /* for */
+ 
+ 	fputs(")", outfile);
+ 	if (mdb->default_backend->per_table_comment_statement && export_options & MDB_SHEXP_COMMENTS) {
+ 		prop_value = mdb_table_get_prop(table, "Description");
+ 		if (prop_value) {
+ 			char *comment = quote_with_squotes(prop_value);
+ 			fputs(" ", outfile);
+ 			fprintf(outfile, mdb->default_backend->per_table_comment_statement, comment);
+ 			free(comment);
+ 		}
+ 	}
+ 	fputs(";\n", outfile);
+ 
+ 	/* Add the constraints on columns */
+ 	for (i = 0; i < table->num_cols; i++) {
+ 		col = g_ptr_array_index (table->columns, i);
+ 		props = col->props;
+ 		if (!props)
+ 			continue;
+ 
+ 		quoted_name = mdb->default_backend->quote_schema_name(NULL, col->name);
+ 
+ 		if (export_options & MDB_SHEXP_CST_NOTEMPTY) {
+ 			prop_value = mdb_col_get_prop(col, "AllowZeroLength");
+ 			if (prop_value && prop_value[0]=='n')
+ 					fprintf(outfile,
+ 						mdb->default_backend->constaint_not_empty_statement,
+ 						quoted_table_name, quoted_name);
+ 		}
+ 
+ 		if (mdb->default_backend->column_comment_statement && export_options & MDB_SHEXP_COMMENTS) {
+ 			prop_value = mdb_col_get_prop(col, "Description");
+ 			if (prop_value) {
+ 				char *comment = quote_with_squotes(prop_value);
+ 				fprintf(outfile,
+ 					mdb->default_backend->column_comment_statement,
+ 					quoted_table_name, quoted_name, comment);
+ 				g_free(comment);
+ 			}
+ 		}
+ 
+ 		g_free(quoted_name);
+ 	}
+ 
+ 	/* Add the constraints on table */
+ 	if (mdb->default_backend->table_comment_statement && export_options & MDB_SHEXP_COMMENTS) {
+ 		prop_value = mdb_table_get_prop(table, "Description");
+ 		if (prop_value) {
+ 			char *comment = quote_with_squotes(prop_value);
+ 			fprintf(outfile,
+ 				mdb->default_backend->table_comment_statement,
+ 				quoted_table_name, comment);
+ 			g_free(comment);
+ 		}
+ 	}
+ 	fputc('\n', outfile);
+ 
+ 
+ 	if (export_options & MDB_SHEXP_INDEXES)
+ 		// prints all the indexes of that table
+ 		mdb_print_indexes(outfile, table, dbnamespace);
+ 
+ 	g_free(quoted_table_name);
+ 
+ 	mdb_free_tabledef (table);
+ }
+diff --git a/src/libmdb/catalog.c b/src/libmdb/catalog.c
+index 2f050e7..b9cfdfa 100644
+--- a/src/libmdb/catalog.c
++++ b/src/libmdb/catalog.c
+@@ -66,84 +66,88 @@ void mdb_free_catalog(MdbHandle *mdb)
+ GPtrArray *mdb_read_catalog (MdbHandle *mdb, int objtype)
+ {
+ 	MdbCatalogEntry *entry, msysobj;
+ 	MdbTableDef *table;
+ 	char *obj_id = NULL;
+ 	char *obj_name = NULL;
+ 	char *obj_type = NULL;
+ 	char *obj_flags = NULL;
+ 	char *obj_props = NULL;
+ 	int type;
+ 	int i;
+ 	MdbColumn *col_props;
+ 	int kkd_size_ole;
+ 
+ 	if (!mdb) return NULL;
+ 	if (mdb->catalog) mdb_free_catalog(mdb);
+ 	mdb->catalog = g_ptr_array_new();
+ 	mdb->num_catalog = 0;
+ 
+ 	obj_id = malloc(mdb->bind_size);
+ 	obj_name = malloc(mdb->bind_size);
+ 	obj_type = malloc(mdb->bind_size);
+ 	obj_flags = malloc(mdb->bind_size);
+ 	obj_props = malloc(mdb->bind_size);
+ 
+ 	/* dummy up a catalog entry so we may read the table def */
+ 	memset(&msysobj, 0, sizeof(MdbCatalogEntry));
+ 	msysobj.mdb = mdb;
+ 	msysobj.object_type = MDB_TABLE;
+ 	msysobj.table_pg = 2;
+ 	snprintf(msysobj.object_name, sizeof(msysobj.object_name), "%s", "MSysObjects");
+ 
+ 	/* mdb_table_dump(&msysobj); */
+ 
+ 	table = mdb_read_table(&msysobj);
+     if (!table) {
+         fprintf(stderr, "Unable to read table %s\n", msysobj.object_name);
+         mdb_free_catalog(mdb);
+         goto cleanup;
+     }
+ 
+-	mdb_read_columns(table);
++	if (!mdb_read_columns(table)) {
++		fprintf(stderr, "Unable to read columns of table %s\n", msysobj.object_name);
++		mdb_free_catalog(mdb);
++		goto cleanup;
++	}
+ 
+     if (mdb_bind_column_by_name(table, "Id", obj_id, NULL) == -1 ||
+         mdb_bind_column_by_name(table, "Name", obj_name, NULL) == -1 ||
+         mdb_bind_column_by_name(table, "Type", obj_type, NULL) == -1 ||
+         mdb_bind_column_by_name(table, "Flags", obj_flags, NULL) == -1) {
+         fprintf(stderr, "Unable to bind columns from table %s (%d columns found)\n",
+                 msysobj.object_name, table->num_cols);
+         mdb_free_catalog(mdb);
+         goto cleanup;
+     }
+     if ((i = mdb_bind_column_by_name(table, "LvProp", obj_props, &kkd_size_ole)) == -1) {
+         fprintf(stderr, "Unable to bind column %s from table %s\n", "LvProp", msysobj.object_name);
+         mdb_free_catalog(mdb);
+         goto cleanup;
+     }
+ 	col_props = g_ptr_array_index(table->columns, i-1);
+ 
+ 	mdb_rewind_table(table);
+ 
+ 	while (mdb_fetch_row(table)) {
+ 		type = atoi(obj_type);
+ 		if (objtype==MDB_ANY || type == objtype) {
+ 			//fprintf(stderr, "obj_id: %10ld objtype: %-3d (0x%04x) obj_name: %s\n",
+ 			//	(atol(obj_id) & 0x00FFFFFF), type, type, obj_name);
+ 			entry = g_malloc0(sizeof(MdbCatalogEntry));
+ 			entry->mdb = mdb;
+ 			snprintf(entry->object_name, sizeof(entry->object_name), "%s", obj_name);
+ 			entry->object_type = (type & 0x7F);
+ 			entry->table_pg = atol(obj_id) & 0x00FFFFFF;
+ 			entry->flags = atol(obj_flags);
+ 			mdb->num_catalog++;
+ 			g_ptr_array_add(mdb->catalog, entry);
+ 			if (kkd_size_ole) {
+ 				size_t kkd_len;
+ 				void *kkd = mdb_ole_read_full(mdb, col_props, &kkd_len);
+ 				//mdb_buffer_dump(kkd, 0, kkd_len);
+ 				entry->props = mdb_kkd_to_props(mdb, kkd, kkd_len);
+ 				free(kkd);
+ 			}
+ 		}
+ 	}
+ 	//mdb_dump_catalog(mdb, MDB_TABLE);
+diff --git a/src/libmdb/data.c b/src/libmdb/data.c
+index d58668b..bbc404d 100644
+--- a/src/libmdb/data.c
++++ b/src/libmdb/data.c
+@@ -76,24 +76,26 @@ void mdb_set_boolean_fmt_words(MdbHandle *mdb)
+ int mdb_bind_column(MdbTableDef *table, int col_num, void *bind_ptr, int *len_ptr)
+ {
+ 	MdbColumn *col = NULL;
+ 
++	if (!table->columns)
++		return -1;
+ 	/* 
+ 	** the column arrary is 0 based, so decrement to get 1 based parameter 
+ 	*/
+ 	col_num--;
+ 
+ 	if (col_num >= 0 && col_num < (int)table->num_cols) {
+ 		col=g_ptr_array_index(table->columns, col_num);
+ 
+ 		if (col) {
+ 			if (bind_ptr)
+ 				col->bind_ptr = bind_ptr;
+ 			if (len_ptr)
+ 				col->len_ptr = len_ptr;
+ 
+ 			return col_num + 1;
+ 		}
+ 	}
+ 
+ 	return -1;
+ }
+@@ -102,31 +104,34 @@ int
+ mdb_bind_column_by_name(MdbTableDef *table, gchar *col_name, void *bind_ptr, int *len_ptr)
+ {
+ 	unsigned int i;
+ 	int col_num = -1;
+ 	MdbColumn *col;
++
++	if (!table->columns)
++		return -1;
+ 	
+ 	for (i=0;i<table->num_cols;i++) {
+ 		col=g_ptr_array_index(table->columns,i);
+ 		if (!g_ascii_strcasecmp(col->name,col_name)) {
+ 			col_num = i + 1;
+ 			if (bind_ptr)
+ 				col->bind_ptr = bind_ptr;
+ 			if (len_ptr)
+ 				col->len_ptr = len_ptr;
+ 			break;
+ 		}
+ 	}
+ 
+ 	return col_num;
+ }
+ 
+ /**
+  * mdb_find_pg_row
+  * @mdb: Database file handle
+  * @pg_row: Lower byte contains the row number, the upper three contain page
+  * @buf: Pointer for returning a pointer to the page
+  * @off: Pointer for returning an offset to the row
+  * @len: Pointer for returning the length of the row
+  * 
+  * Returns: 0 on success. -1 on failure.
+  */
+@@ -258,104 +263,104 @@ int ret;
+ 	//if (!strcmp("Name",col->name)) {
+ 		//printf("start %d %d\n",start, len);
+ 	//}
+ 	if (len) {
+ 		col->cur_value_start = start;
+ 		col->cur_value_len = len;
+ 	} else {
+ 		col->cur_value_start = 0;
+ 		col->cur_value_len = 0;
+ 	}
+ 	if (col->bind_ptr) {
+ 		if (!len) {
+ 			strcpy(col->bind_ptr, "");
+ 		} else {
+ 			//fprintf(stdout,"len %d size %d\n",len, col->col_size);
+ 			char *str;
+ 			if (col->col_type == MDB_NUMERIC) {
+ 				str = mdb_numeric_to_string(mdb, start, col->col_scale, col->col_prec);
+ 			} else if (col->col_type == MDB_DATETIME) {
+ 				if (mdb_col_is_shortdate(col)) {
+ 					str = mdb_date_to_string(mdb, mdb->shortdate_fmt, mdb->pg_buf, start);
+ 				} else {
+ 					str = mdb_date_to_string(mdb, mdb->date_fmt, mdb->pg_buf, start);
+ 				}
+ 			} else {
+ 				str = mdb_col_to_string(mdb, mdb->pg_buf, start, col->col_type, len);
+ 			}
+ 			snprintf(col->bind_ptr, mdb->bind_size, "%s", str);
+ 			g_free(str);
+ 		}
+ 		ret = strlen(col->bind_ptr);
+ 		if (col->len_ptr) {
+ 			*col->len_ptr = ret;
+ 		}
+ 		return ret;
+ 	}
+ 	return 0;
+ }
+ int mdb_read_row(MdbTableDef *table, unsigned int row)
+ {
+ 	MdbHandle *mdb = table->entry->mdb;
+ 	MdbColumn *col;
+ 	unsigned int i;
+ 	int row_start;
+ 	size_t row_size = 0;
+ 	int delflag, lookupflag;
+ 	MdbField *fields;
+ 	int num_fields;
+ 
+-	if (table->num_cols == 0)
++	if (table->num_cols == 0 || !table->columns)
+ 		return 0;
+ 
+ 	if (mdb_find_row(mdb, row, &row_start, &row_size) == -1 || row_size == 0) {
+ 		/* Emitting a warning here isn't especially helpful. The row metadata
+ 		 * could be bogus for a number of reasons, so just skip to the next one
+ 		 * without comment. */
+ 		// fprintf(stderr, "warning: mdb_find_row failed.\n");
+ 		// fprintf(stderr, "warning: row_size = 0.\n");
+ 		return 0;
+ 	}
+ 
+ 	delflag = lookupflag = 0;
+ 	if (row_start & 0x8000) lookupflag++;
+ 	if (row_start & 0x4000) delflag++;
+ 	row_start &= OFFSET_MASK; /* remove flags */
+ #if MDB_DEBUG
+ 	fprintf(stdout,"Row %d bytes %d to %d %s %s\n", 
+ 		row, row_start, row_start + row_size - 1,
+ 		lookupflag ? "[lookup]" : "",
+ 		delflag ? "[delflag]" : "");
+ #endif	
+ 
+ 	if (!table->noskip_del && delflag) {
+ 		return 0;
+ 	}
+ 
+ 	fields = malloc(sizeof(MdbField) * table->num_cols);
+ 
+ 	num_fields = mdb_crack_row(table, row_start, row_size, fields);
+ 	if (num_fields < 0 || !mdb_test_sargs(table, fields, num_fields)) {
+ 		free(fields);
+ 		return 0;
+ 	}
+ 	
+ #if MDB_DEBUG
+ 	fprintf(stdout,"sarg test passed row %d \n", row);
+ #endif 
+ 
+ #if MDB_DEBUG
+ 	mdb_buffer_dump(mdb->pg_buf, row_start, row_size);
+ #endif
+ 
+ 	/* take advantage of mdb_crack_row() to clean up binding */
+ 	/* use num_cols instead of num_fields -- bsb 03/04/02 */
+ 	for (i = 0; i < table->num_cols; i++) {
+ 		col = g_ptr_array_index(table->columns,fields[i].colnum);
+ 		_mdb_attempt_bind(mdb, col, fields[i].is_null,
+ 			fields[i].start, fields[i].siz);
+ 	}
+ 
+ 	free(fields);
+ 
+ 	return 1;
+ }
+diff --git a/src/libmdb/index.c b/src/libmdb/index.c
+index 049fb82..65b614b 100644
+--- a/src/libmdb/index.c
++++ b/src/libmdb/index.c
+@@ -207,169 +207,173 @@ GPtrArray *
+ mdb_read_indices(MdbTableDef *table)
+ {
+ 	MdbCatalogEntry *entry = table->entry;
+ 	MdbHandle *mdb = entry->mdb;
+ 	MdbFormatConstants *fmt = mdb->fmt;
+ 	MdbIndex *pidx;
+ 	unsigned int i, j, k;
+ 	int key_num, col_num, cleaned_col_num;
+ 	int cur_pos, name_sz, idx2_sz, type_offset;
+ 	int index_start_pg = mdb->cur_pg;
+ 	gchar *tmpbuf;
+ 
+ 	table->indices = g_ptr_array_new();
+ 
+ 	if (IS_JET3(mdb)) {
+ 		cur_pos = table->index_start + 39 * table->num_real_idxs;
+ 		idx2_sz = 20;
+ 		type_offset = 19;
+ 	} else {
+ 		cur_pos = table->index_start + 52 * table->num_real_idxs;
+ 		idx2_sz = 28;
+ 		type_offset = 23;
+ 	}
+ 
+ 	/* Read in the definitions of table indexes, into table->indices */
+ 
+ 	/* num_real_idxs should be the number of indexes other than type 2.
+ 	 * It's not always the case. Happens on Northwind Orders table.
+ 	 */
+ 	//fprintf(stderr, "num_idxs:%d num_real_idxs:%d\n", table->num_idxs, table->num_real_idxs);
+ 
+ 	table->num_real_idxs = 0;
+ 	tmpbuf = g_malloc(idx2_sz);
+ 	for (i=0;i<table->num_idxs;i++) {
+-		read_pg_if_n(mdb, tmpbuf, &cur_pos, idx2_sz);
++		if (!read_pg_if_n(mdb, tmpbuf, &cur_pos, idx2_sz)) {
++			g_free(tmpbuf);
++			mdb_free_indices(table->indices);
++			return table->indices = NULL;
++		}
+                 //fprintf(stderr, "Index defn: ");
+                 //hexdump((unsigned char *)tmpbuf, idx2_sz);
+ 		pidx = g_malloc0(sizeof(MdbIndex));
+ 		pidx->table = table;
+ 		pidx->index_num = mdb_get_int16(tmpbuf, 4);
+ 		pidx->index_type = tmpbuf[type_offset];
+ 		g_ptr_array_add(table->indices, pidx);
+ 		/*
+ 		{
+ 			gint32 idx_marker = mdb_get_int32(tmpbuf, 0);
+ 		        gint32 index_col_def_num = mdb_get_int16(tmpbuf, 8);
+ 			gint8 rel_idx_type = tmpbuf[0x0c];
+ 			gint32 rel_idx_number = mdb_get_int32(tmpbuf, 0x0d);
+ 			gint32 rel_idx_page = mdb_get_int32(tmpbuf, 0x11);
+ 			gint8 update_action_flags = tmpbuf[0x15];
+ 			gint8 delete_action_flags = tmpbuf[0x16];
+ 			fprintf(stderr, "idx #%d: num2:%d num3:%d type:%d\n", i, pidx->index_num, index_col_def_num, pidx->index_type);
+ 			fprintf(stderr, "idx #%d: %d %d %d %d %d/%d\n", i, idx_marker, rel_idx_type, rel_idx_number, rel_idx_page, update_action_flags, delete_action_flags);
+ 		}*/
+ 		if (pidx->index_type!=2)
+ 			table->num_real_idxs++;
+ 	}
+ 	//fprintf(stderr, "num_idxs:%d num_real_idxs:%d\n", table->num_idxs, table->num_real_idxs);
+ 	g_free(tmpbuf);
+ 
+ 	/* Pick up the names of each index */
+ 	for (i=0;i<table->num_idxs;i++) {
+ 		pidx = g_ptr_array_index (table->indices, i);
+ 		if (IS_JET3(mdb)) {
+ 			name_sz=read_pg_if_8(mdb, &cur_pos);
+ 		} else {
+ 			name_sz=read_pg_if_16(mdb, &cur_pos);
+ 		}
+ 		tmpbuf = g_malloc(name_sz);
+-		read_pg_if_n(mdb, tmpbuf, &cur_pos, name_sz);
+-		mdb_unicode2ascii(mdb, tmpbuf, name_sz, pidx->name, sizeof(pidx->name));
++		if (read_pg_if_n(mdb, tmpbuf, &cur_pos, name_sz))
++			mdb_unicode2ascii(mdb, tmpbuf, name_sz, pidx->name, sizeof(pidx->name));
+ 		g_free(tmpbuf);
+ 		//fprintf(stderr, "index %d type %d name %s\n", pidx->index_num, pidx->index_type, pidx->name);
+ 	}
+ 
+ 	/* Pick up the column definitions for normal/primary key indexes */
+ 	/* NOTE: Match should possibly be by index_col_def_num, rather
+          * than index_num; but in files encountered both seem to be the
+          * same (so left with index_num until a counter example is found).
+          */
+ 	mdb_read_alt_pg(mdb, entry->table_pg);
+ 	mdb_read_pg(mdb, index_start_pg);
+ 	cur_pos = table->index_start;
+ 	for (i=0;i<table->num_real_idxs;i++) {
+ 		/*	Debugging print out, commented out
+ 		{
+ 			gchar *tmpbuf = (gchar *) g_malloc(0x34);
+ 			int now_pos = cur_pos;
+ 			read_pg_if_n(mdb, tmpbuf, &now_pos, 0x34);
+ 			fprintf(stderr, "Index defn: ");
+ 			hexdump((unsigned char *)tmpbuf, 0x34);
+ 			g_free(tmpbuf);
+ 		}*/
+ 
+ 		if (!IS_JET3(mdb)) cur_pos += 4;
+ 		/* look for index number i */
+ 		for (j=0; j<table->num_idxs; ++j) {
+ 			pidx = g_ptr_array_index (table->indices, j);
+ 			if (pidx->index_type!=2 && (unsigned int)pidx->index_num==i)
+ 				break;
+ 		}
+ 		if (j==table->num_idxs) {
+ 			fprintf(stderr, "ERROR: can't find index #%d.\n", i);
+ 			continue;
+ 		}
+ 		//fprintf(stderr, "index %d #%d (%s) index_type:%d\n", i, pidx->index_num, pidx->name, pidx->index_type);
+ 
+ 		pidx->num_rows = mdb_get_int32(mdb->alt_pg_buf, 
+ 				fmt->tab_cols_start_offset +
+ 				(pidx->index_num*fmt->tab_ridx_entry_size));
+ 		/*
+ 		fprintf(stderr, "ridx block1 i:%d data1:0x%08x data2:0x%08x\n",
+ 			i,
+ 			(unsigned int)mdb_get_int32(mdb->pg_buf,
+ 				fmt->tab_cols_start_offset + pidx->index_num * fmt->tab_ridx_entry_size),
+ 			(unsigned int)mdb_get_int32(mdb->pg_buf,
+ 				fmt->tab_cols_start_offset + pidx->index_num * fmt->tab_ridx_entry_size +4));
+ 		fprintf(stderr, "pidx->num_rows:%d\n", pidx->num_rows);*/
+ 
+ 		/* Read columns in each index */
+ 		key_num=0;
+ 		for (j=0;j<MDB_MAX_IDX_COLS;j++) {
+ 			col_num=read_pg_if_16(mdb,&cur_pos);
+ 			if (col_num == 0xFFFF) {
+ 				cur_pos++;
+ 				continue;
+ 			}
+ 			/* here we have the internal column number that does not
+ 			 * always match the table columns because of deletions */
+ 			cleaned_col_num = -1;
+ 			for (k=0; k<table->num_cols; k++) {
+ 				MdbColumn *col = g_ptr_array_index(table->columns,k);
+ 				if (col->col_num == col_num) {
+ 					cleaned_col_num = k;
+ 					break;
+ 				}
+ 			}
+ 			if (cleaned_col_num==-1) {
+ 				fprintf(stderr, "CRITICAL: can't find column with internal id %d in index %s\n",
+ 					col_num, pidx->name);
+ 				cur_pos++;
+ 				continue;
+ 			}
+ 			/* set column number to a 1 based column number and store */
+ 			pidx->key_col_num[key_num] = cleaned_col_num + 1;
+ 			pidx->key_col_order[key_num] =
+ 				(read_pg_if_8(mdb, &cur_pos)) ? MDB_ASC : MDB_DESC;
+ 			//fprintf(stderr, "component %d using column #%d (internally %d)\n", j, cleaned_col_num,  col_num);
+ 			key_num++;
+ 		}
+ 		pidx->num_keys = key_num;
+ 
+ 		if (0)  // DEBUGGING ONLY
+ 		{
+ 			gint32 usage_map = read_pg_if_32(mdb, &cur_pos);
+ 			fprintf(stderr, "pidx->unknown_pre_first_pg:0x%08x\n", usage_map);
+ 		} else {
+ 			cur_pos += 4;    // Skip Usage map information
+ 		}
+ 		pidx->first_pg = read_pg_if_32(mdb, &cur_pos);
+ 
+ 		if (!IS_JET3(mdb)) cur_pos += 4;
+ 
+ 		pidx->flags = read_pg_if_8(mdb, &cur_pos);
+ 		//fprintf(stderr, "pidx->first_pg:%d pidx->flags:0x%02x\n",	pidx->first_pg, pidx->flags);
+ 		if (!IS_JET3(mdb)) cur_pos += 5;
+ 	}
+ 	return NULL;
+ }
+diff --git a/src/libmdb/table.c b/src/libmdb/table.c
+index ad01da3..f318f75 100644
+--- a/src/libmdb/table.c
++++ b/src/libmdb/table.c
+@@ -169,27 +169,37 @@ void *
+ read_pg_if_n(MdbHandle *mdb, void *buf, int *cur_pos, size_t len)
+ {
+ 	char* _buf = buf;
++	char* _end = buf ? buf + len : NULL;
++
++	if (*cur_pos < 0)
++		return NULL;
+ 
+ 	/* Advance to page which contains the first byte */
+ 	while (*cur_pos >= mdb->fmt->pg_size) {
+-		mdb_read_pg(mdb, mdb_get_int32(mdb->pg_buf,4));
++		if (!mdb_read_pg(mdb, mdb_get_int32(mdb->pg_buf,4)))
++			return NULL;
+ 		*cur_pos -= (mdb->fmt->pg_size - 8);
+ 	}
+ 	/* Copy pages into buffer */
+ 	while (*cur_pos + len >= (size_t)mdb->fmt->pg_size) {
+-		int piece_len = mdb->fmt->pg_size - *cur_pos;
++		size_t piece_len = mdb->fmt->pg_size - *cur_pos;
+ 		if (_buf) {
++			if (_buf + piece_len > _end)
++				return NULL;
+ 			memcpy(_buf, mdb->pg_buf + *cur_pos, piece_len);
+ 			_buf += piece_len;
+ 		}
+ 		len -= piece_len;
+-		mdb_read_pg(mdb, mdb_get_int32(mdb->pg_buf,4));
++		if (!mdb_read_pg(mdb, mdb_get_int32(mdb->pg_buf,4)))
++			return NULL;
+ 		*cur_pos = 8;
+ 	}
+ 	/* Copy into buffer from final page */
+ 	if (len && _buf) {
++		if (_buf + len > _end)
++			return NULL;
+ 		memcpy(_buf, mdb->pg_buf + *cur_pos, len);
+ 	}
+ 	*cur_pos += len;
+ 	return _buf;
+ }
+@@ -207,125 +217,129 @@ void mdb_free_columns(GPtrArray *columns)
+ 	if (!columns) return;
+ 	for (i=0; i<columns->len; i++) {
+ 		col = (MdbColumn *) g_ptr_array_index(columns, i);
+ 		if (col->sargs) {
+ 			for (j=0; j<col->sargs->len; j++) {
+ 				g_free( g_ptr_array_index(col->sargs, j));
+ 			}
+ 			g_ptr_array_free(col->sargs, TRUE);
+ 		}
+ 		g_free(col);
+ 	}
+ 	g_ptr_array_free(columns, TRUE);
+ }
+ GPtrArray *mdb_read_columns(MdbTableDef *table)
+ {
+ 	MdbHandle *mdb = table->entry->mdb;
+ 	MdbFormatConstants *fmt = mdb->fmt;
+ 	MdbColumn *pcol;
+ 	unsigned char *col;
+ 	unsigned int i;
+ 	guint j;
+ 	int cur_pos;
+ 	size_t name_sz;
+ 	GPtrArray *allprops;
+ 	
+ 	table->columns = g_ptr_array_new();
+ 
+ 	col = g_malloc(fmt->tab_col_entry_size);
+ 
+ 	cur_pos = fmt->tab_cols_start_offset + 
+ 		(table->num_real_idxs * fmt->tab_ridx_entry_size);
+ 
+ 	/* new code based on patch submitted by Tim Nelson 2000.09.27 */
+ 
+ 	/* 
+ 	** column attributes 
+ 	*/
+ 	for (i=0;i<table->num_cols;i++) {
+ #ifdef MDB_DEBUG
+ 	/* printf("column %d\n", i);
+ 	mdb_buffer_dump(mdb->pg_buf, cur_pos, fmt->tab_col_entry_size); */
+ #endif
+-		read_pg_if_n(mdb, col, &cur_pos, fmt->tab_col_entry_size);
++		if (!read_pg_if_n(mdb, col, &cur_pos, fmt->tab_col_entry_size)) {
++			g_free(col);
++			mdb_free_columns(table->columns);
++			return table->columns = NULL;
++		}
+ 		pcol = g_malloc0(sizeof(MdbColumn));
+ 
+ 		pcol->table = table;
+ 
+ 		pcol->col_type = col[0];
+ 
+ 		// col_num_offset == 1 or 5
+ 		pcol->col_num = col[fmt->col_num_offset];
+ 
+ 		//fprintf(stdout,"----- column %d -----\n",pcol->col_num);
+ 		// col_var == 3 or 7
+ 		pcol->var_col_num = mdb_get_int16(col, fmt->tab_col_offset_var);
+ 		//fprintf(stdout,"var column pos %d\n",pcol->var_col_num);
+ 
+ 		// col_var == 5 or 9
+ 		pcol->row_col_num = mdb_get_int16(col, fmt->tab_row_col_num_offset);
+ 		//fprintf(stdout,"row column num %d\n",pcol->row_col_num);
+ 
+ 		/* FIXME: can this be right in Jet3 and Jet4? */
+ 		if (pcol->col_type == MDB_NUMERIC) {
+ 			pcol->col_scale = col[11];
+ 			pcol->col_prec = col[12];
+ 		}
+ 
+ 		// col_flags_offset == 13 or 15
+ 		pcol->is_fixed = col[fmt->col_flags_offset] & 0x01 ? 1 : 0;
+ 		pcol->is_long_auto = col[fmt->col_flags_offset] & 0x04 ? 1 : 0;
+ 		pcol->is_uuid_auto = col[fmt->col_flags_offset] & 0x40 ? 1 : 0;
+ 
+ 		// tab_col_offset_fixed == 14 or 21
+ 		pcol->fixed_offset = mdb_get_int16(col, fmt->tab_col_offset_fixed);
+ 		//fprintf(stdout,"fixed column offset %d\n",pcol->fixed_offset);
+ 		//fprintf(stdout,"col type %s\n",pcol->is_fixed ? "fixed" : "variable");
+ 
+ 		if (pcol->col_type != MDB_BOOL) {
+ 			// col_size_offset == 16 or 23
+ 			pcol->col_size = mdb_get_int16(col, fmt->col_size_offset);
+ 		} else {
+ 			pcol->col_size=0;
+ 		}
+ 		
+ 		g_ptr_array_add(table->columns, pcol);
+ 	}
+ 
+ 	g_free (col);
+ 
+ 	/* 
+ 	** column names - ordered the same as the column attributes table
+ 	*/
+ 	for (i=0;i<table->num_cols;i++) {
+ 		char *tmp_buf;
+ 		pcol = g_ptr_array_index(table->columns, i);
+ 
+ 		if (IS_JET3(mdb))
+ 			name_sz = read_pg_if_8(mdb, &cur_pos);
+ 		else
+ 			name_sz = read_pg_if_16(mdb, &cur_pos);
+ 		tmp_buf = g_malloc(name_sz);
+-		read_pg_if_n(mdb, tmp_buf, &cur_pos, name_sz);
+-		mdb_unicode2ascii(mdb, tmp_buf, name_sz, pcol->name, sizeof(pcol->name));
++		if (read_pg_if_n(mdb, tmp_buf, &cur_pos, name_sz))
++			mdb_unicode2ascii(mdb, tmp_buf, name_sz, pcol->name, sizeof(pcol->name));
+ 		g_free(tmp_buf);
+ 	}
+ 
+ 	/* Sort the columns by col_num */
+ 	g_ptr_array_sort(table->columns, (GCompareFunc)mdb_col_comparer);
+ 
+ 	allprops = table->entry->props;
+ 	if (allprops)
+ 		for (i=0;i<table->num_cols;i++) {
+ 			pcol = g_ptr_array_index(table->columns, i);
+ 			for (j=0; j<allprops->len; ++j) {
+ 				MdbProperties *props = g_ptr_array_index(allprops, j);
+ 				if (props->name && !strcmp(props->name, pcol->name)) {
+ 					pcol->props = props;
+ 					break;
+ 				}
+ 
+ 			}
+ 		}
+ 	table->index_start = cur_pos;
+ 	return table->columns;
+ }
+diff --git a/src/odbc/odbc.c b/src/odbc/odbc.c
+index aa3e6ee..dafad52 100644
+--- a/src/odbc/odbc.c
++++ b/src/odbc/odbc.c
+@@ -1280,105 +1280,108 @@ SQLRETURN SQL_API SQLSetParam(            /*      Use SQLBindParameter */
+ SQLRETURN SQL_API SQLColumns(
+     SQLHSTMT           hstmt,
+     SQLCHAR           *szCatalogName,
+     SQLSMALLINT        cbCatalogName,
+     SQLCHAR           *szSchemaName,
+     SQLSMALLINT        cbSchemaName,
+     SQLCHAR           *szTableName,
+     SQLSMALLINT        cbTableName,
+     SQLCHAR           *szColumnName,
+     SQLSMALLINT        cbColumnName)
+ {
+ 	struct _hstmt *stmt = (struct _hstmt *) hstmt;
+ 	MdbSQL *sql = stmt->sql;
+ 	MdbHandle *mdb = sql->mdb;
+ 	MdbTableDef *ttable;
+ 	MdbField fields[18];
+ 	unsigned char row_buffer[MDB_PGSIZE];
+ 	int row_size;
+ 	unsigned int i, j, k;
+ 	MdbCatalogEntry *entry;
+ 	MdbTableDef *table;
+ 	MdbColumn *col;
+ 	unsigned int ts2, ts3, ts5;
+ 	unsigned char t2[MDB_BIND_SIZE],
+ 	              t3[MDB_BIND_SIZE],
+ 	              t5[MDB_BIND_SIZE];
+ 	SQLSMALLINT nullable;  /* SQL_NULLABLE or SQL_NO_NULLS */
+ 	SQLSMALLINT datatype;  /* For datetime, use concise data type */
+ 	SQLSMALLINT sqldatatype;  /* For datetime, use nonconcise data type */
+ 	SQLINTEGER ordinal;
+ 
+ 	TRACE("SQLColumns");
+ 
+ 	mdb_read_catalog(mdb, MDB_ANY);
+ 
+ 	ttable = mdb_create_temp_table(mdb, "#columns");
+ 	mdb_sql_add_temp_col(sql, ttable, 0, "TABLE_CAT", MDB_TEXT, 128, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 1, "TABLE_SCHEM", MDB_TEXT, 128, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 2, "TABLE_NAME", MDB_TEXT, 128, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 3, "COLUMN_NAME", MDB_TEXT, 128, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 4, "DATA_TYPE", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 5, "TYPE_NAME", MDB_TEXT, 128, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 6, "COLUMN_SIZE", MDB_LONGINT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 7, "BUFFER_LENGTH", MDB_LONGINT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 8, "DECIMAL_DIGITS", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 9, "NUM_PREC_RADIX", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 10, "NULLABLE", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 11, "REMARKS", MDB_TEXT, 254, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 12, "COLUMN_DEF", MDB_TEXT, 254, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 13, "SQL_DATA_TYPE", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 14, "SQL_DATETIME_SUB", MDB_INT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 15, "CHAR_OCTET_LENGTH", MDB_LONGINT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 16, "ORDINAL_POSITION", MDB_LONGINT, 0, 1);
+ 	mdb_sql_add_temp_col(sql, ttable, 17, "IS_NULLABLE", MDB_TEXT, 254, 0);
+ 	mdb_temp_columns_end(ttable);
+ 
+ 	for (i=0; i<mdb->num_catalog; i++) {
+      		entry = g_ptr_array_index(mdb->catalog, i);
+ 		/* TODO: Do more advanced matching */
+ 		if (entry->object_type != MDB_TABLE || g_ascii_strcasecmp((char*)szTableName, entry->object_name) != 0)
+ 			continue;
+ 		table = mdb_read_table(entry);
+ 		if ( !table )
+ 		{
+ 			LogStatementError(stmt, "Could not read table '%s'", szTableName);
+ 			return SQL_ERROR;
+ 		}
+-		mdb_read_columns(table);
++		if (!mdb_read_columns(table)) {
++			LogStatementError(stmt, "Could not read columns of table '%s'", szTableName);
++			return SQL_ERROR;
++		}
+ 		for (j=0; j<table->num_cols; j++) {
+ 			col = g_ptr_array_index(table->columns, j);
+ 
+ 			ts2 = mdb_ascii2unicode(mdb, table->name, 0, (char*)t2, sizeof(t2));
+ 			ts3 = mdb_ascii2unicode(mdb, col->name, 0, (char*)t3, sizeof(t3));
+ 			ts5 = mdb_ascii2unicode(mdb, _odbc_get_client_type_name(col), 0,  (char*)t5, sizeof(t5));
+ 
+ 			nullable = SQL_NO_NULLS;
+ 			datatype = _odbc_get_client_type(col);
+ 			sqldatatype = _odbc_get_client_type(col);
+ 			ordinal = j+1;
+ 
+ 			/* Set all fields to NULL */
+ 			for (k=0; k<18; k++) {
+ 				FILL_FIELD(&fields[k], NULL, 0);
+ 			}
+ 
+ 			FILL_FIELD(&fields[2], t2, ts2);
+ 			FILL_FIELD(&fields[3], t3, ts3);
+ 			FILL_FIELD(&fields[4], &datatype, 0);
+ 			FILL_FIELD(&fields[5], t5, ts5);
+ 			FILL_FIELD(&fields[10], &nullable, 0);
+ 			FILL_FIELD(&fields[13], &sqldatatype, 0);
+ 			FILL_FIELD(&fields[16], &ordinal, 0);
+ 
+ 			row_size = mdb_pack_row(ttable, row_buffer, 18, fields);
+ 			mdb_add_row_to_pg(ttable, row_buffer, row_size);
+ 			ttable->num_rows++;
+ 		}
+ 		mdb_free_tabledef(table);
+ 	}
+ 	sql->cur_table = ttable;
+ 
+ 	return SQL_SUCCESS;
+ }
+ 
+ #ifdef ENABLE_ODBC_W
+diff --git a/src/sql/mdbsql.c b/src/sql/mdbsql.c
+index 4849aa7..9bacd3c 100644
+--- a/src/sql/mdbsql.c
++++ b/src/sql/mdbsql.c
+@@ -668,62 +668,67 @@ mdb_sql_add_temp_col(MdbSQL *sql, MdbTableDef *ttable, int col_num, char *name,
+ 	return 0;
+ }
+ void mdb_sql_describe_table(MdbSQL *sql)
+ {
+ 	MdbTableDef *ttable, *table = NULL;
+ 	MdbSQLTable *sql_tab;
+ 	MdbHandle *mdb = sql->mdb;
+ 	MdbColumn *col;
+ 	unsigned int i;
+ 	MdbField fields[3];
+ 	char tmpstr[256];
+ 	unsigned char row_buffer[MDB_PGSIZE];
+ 	int row_size;
+ 	gchar col_name[100], col_type[100], col_size[100];
+ 	int tmpsiz;
+ 
+ 	if (!mdb) {
+ 		mdb_sql_error(sql, "You must connect to a database first");
+ 		return;
+ 	}
+ 
+ 	sql_tab = g_ptr_array_index(sql->tables,0);
+ 
+ 	table = mdb_read_table_by_name(mdb, sql_tab->name, MDB_TABLE);
+ 	if (!table) {
+ 		mdb_sql_error(sql, "%s is not a table in this database", sql_tab->name);
+ 		/* the column and table names are no good now */
+ 		mdb_sql_reset(sql);
+ 		return;
+ 	}
+ 
+-	mdb_read_columns(table);
++	if (!mdb_read_columns(table)) {
++		mdb_sql_error(sql, "Could not read columns of table %s", sql_tab->name);
++		/* the column and table names are no good now */
++		mdb_sql_reset(sql);
++		return;
++    }
+ 
+ 	ttable = mdb_create_temp_table(mdb, "#describe");
+ 
+ 	mdb_sql_add_temp_col(sql, ttable, 0, "Column Name", MDB_TEXT, 30, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 1, "Type", MDB_TEXT, 20, 0);
+ 	mdb_sql_add_temp_col(sql, ttable, 2, "Size", MDB_TEXT, 10, 0);
+ 
+ 	for (i=0;i<table->num_cols;i++) {
+ 
+ 		col = g_ptr_array_index(table->columns,i);
+ 		tmpsiz = mdb_ascii2unicode(mdb, col->name, 0, col_name, sizeof(col_name));
+ 		mdb_fill_temp_field(&fields[0],col_name, tmpsiz, 0,0,0,0);
+ 
+ 		snprintf(tmpstr, sizeof(tmpstr), "%s", mdb_get_colbacktype_string(col));
+ 		tmpsiz = mdb_ascii2unicode(mdb, tmpstr, 0, col_type, sizeof(col_type));
+ 		mdb_fill_temp_field(&fields[1],col_type, tmpsiz, 0,0,0,1);
+ 
+ 		snprintf(tmpstr, sizeof(tmpstr), "%d", col->col_size);
+ 		tmpsiz = mdb_ascii2unicode(mdb, tmpstr, 0, col_size, sizeof(col_size));
+ 		mdb_fill_temp_field(&fields[2],col_size, tmpsiz, 0,0,0,2);
+ 
+ 		row_size = mdb_pack_row(ttable, row_buffer, 3, fields);
+ 		mdb_add_row_to_pg(ttable,row_buffer, row_size);
+ 		ttable->num_rows++;
+ 	}
+ 
+ 	/* the column and table names are no good now */
+ 	//mdb_sql_reset(sql);
+ 	sql->cur_table = ttable;
+ }
+@@ -780,93 +785,98 @@ MdbSQLColumn *sqlcol;
+ int found = 0;
+ 
+ 	if (!mdb) {
+ 		mdb_sql_error(sql, "You must connect to a database first");
+ 		return;
+ 	}
+ 
+ 	if (!sql->num_tables) return;
+ 	sql_tab = g_ptr_array_index(sql->tables,0);
+ 
+ 	table = mdb_read_table_by_name(mdb, sql_tab->name, MDB_TABLE);
+ 	if (!table) {
+ 		mdb_sql_error(sql, "%s is not a table in this database", sql_tab->name);
+ 		/* the column and table names are no good now */
+ 		mdb_sql_reset(sql);
+ 		return;
+ 	}
+-	mdb_read_columns(table);
++	if (!mdb_read_columns(table)) {
++		mdb_sql_error(sql, "Could not read columns of table %s", sql_tab->name);
++		/* the column and table names are no good now */
++		mdb_sql_reset(sql);
++		return;
++    }
+ 
+ 	if (sql->sel_count && !sql->sarg_tree) {
+ 		MdbTableDef *ttable = mdb_create_temp_table(mdb, "#count");
+ 		char tmpstr[32];
+ 		gchar row_cnt[32];
+ 		unsigned char row_buffer[MDB_PGSIZE];
+ 		MdbField fields[1];
+ 		int row_size, tmpsiz;
+ 
+ 		mdb_sql_add_temp_col(sql, ttable, 0, "count", MDB_TEXT, 30, 0);
+ 		snprintf(tmpstr, sizeof(tmpstr), "%d", table->num_rows);
+ 		tmpsiz = mdb_ascii2unicode(mdb, tmpstr, 0, row_cnt, sizeof(row_cnt));
+ 		mdb_fill_temp_field(&fields[0],row_cnt, tmpsiz, 0,0,0,0);
+ 		row_size = mdb_pack_row(ttable, row_buffer, 1, fields);
+ 		mdb_add_row_to_pg(ttable,row_buffer, row_size);
+ 		ttable->num_rows++;
+ 		sql->cur_table = ttable;
+ 		mdb_free_tabledef(table);
+ 		return;
+ 	}
+ 
+ 	mdb_read_indices(table);
+ 	mdb_rewind_table(table);
+ 
+ 	if (sql->all_columns) {
+ 		for (i=0;i<table->num_cols;i++) {
+ 			col = g_ptr_array_index(table->columns,i);
+ 			mdb_sql_add_column(sql, col->name);
+ 		}
+ 	}
+ 	/* verify all specified columns exist in this table */
+ 	for (i=0;i<sql->num_columns;i++) {
+ 		sqlcol = g_ptr_array_index(sql->columns,i);
+ 		found=0;
+ 		for (j=0;j<table->num_cols;j++) {
+ 			col=g_ptr_array_index(table->columns,j);
+ 			if (!g_ascii_strcasecmp(sqlcol->name, col->name)) {
+ 				sqlcol->disp_size = mdb_col_disp_size(col);
+ 				found=1;
+ 				break;
+ 			}
+ 		}
+ 		if (!found) {
+ 			mdb_sql_error(sql, "Column %s not found",sqlcol->name);
+ 			mdb_index_scan_free(table);
+ 			mdb_free_tabledef(table);
+ 			mdb_sql_reset(sql);
+ 			return;
+ 		}
+ 	}
+ 
+ 	/* 
+ 	 * resolve column names to MdbColumn structs
+ 	 */
+ 	if (sql->sarg_tree) {
+ 		mdb_sql_walk_tree(sql->sarg_tree, mdb_sql_find_sargcol, table);
+ 		mdb_sql_walk_tree(sql->sarg_tree, mdb_find_indexable_sargs, NULL);
+ 	}
+ 	/* 
+ 	 * move the sarg_tree.  
+ 	 * XXX - this won't work when we implement joins 
+ 	 */
+ 	table->sarg_tree = sql->sarg_tree;
+ 	sql->sarg_tree = NULL;
+ 
+ 	sql->cur_table = table;
+ 	mdb_index_scan_init(mdb, table);
+ 
+ 	/* We know how many rows there are, so convert limit percentage
+ 	 * to an row count */
+ 	if (sql->limit != -1 && sql->limit_percent) {
+ 		sql->limit = (int)((double)table->num_rows / 100 * sql->limit);
+ 		sql->limit_percent = 0;
+ 	}
+ }

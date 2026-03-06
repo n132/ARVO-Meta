@@ -1,0 +1,133 @@
+commit a27d3e37d8a07af333d7626f0d75cc8b49a12428
+Author: Roman Lebedev <lebedev.ri@gmail.com>
+Date:   Tue Nov 22 02:53:01 2022 +0300
+
+    Cr2Decompressor: do check that tiles cover the entire image
+
+diff --git a/src/librawspeed/decompressors/Cr2DecompressorImpl.h b/src/librawspeed/decompressors/Cr2DecompressorImpl.h
+index d7103f04..66edf2a2 100644
+--- a/src/librawspeed/decompressors/Cr2DecompressorImpl.h
++++ b/src/librawspeed/decompressors/Cr2DecompressorImpl.h
+@@ -1,42 +1,43 @@
+ /*
+     RawSpeed - RAW file decoder.
+ 
+     Copyright (C) 2009-2014 Klaus Post
+     Copyright (C) 2017 Axel Waggershauser
+     Copyright (C) 2017-2018 Roman Lebedev
+ 
+     This library is free software; you can redistribute it and/or
+     modify it under the terms of the GNU Lesser General Public
+     License as published by the Free Software Foundation; either
+     version 2 of the License, or (at your option) any later version.
+ 
+     This library is distributed in the hope that it will be useful,
+     but WITHOUT ANY WARRANTY; without even the implied warranty of
+     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+     Lesser General Public License for more details.
+ 
+     You should have received a copy of the GNU Lesser General Public
+     License along with this library; if not, write to the Free Software
+     Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+ 
+ #include "common/Array2DRef.h"               // for Array2DRef
+ #include "common/Point.h"                    // for iPoint2D, iPoint2D::area_...
+ #include "common/RawImage.h"                 // for RawImage, RawImageData
+ #include "common/iterator_range.h"           // for iterator_range
+ #include "decoders/RawDecoderException.h"    // for ThrowException, ThrowRDE
+ #include "decompressors/Cr2Decompressor.h"   // for Cr2Decompressor, Cr2Slicing
+ #include "decompressors/DummyHuffmanTable.h" // for DummyHuffmanTable
+ #include "decompressors/HuffmanTableLUT.h"   // for HuffmanTableLUT
+ #include "io/BitPumpJPEG.h"                  // for BitPumpJPEG, BitStream<>:...
+ #include "io/ByteStream.h"                   // for ByteStream
+ #include <algorithm>                         // for min, transform
+ #include <array>                             // for array
+ #include <cassert>                           // for assert
+ #include <cstddef>                           // for size_t
+ #include <cstdint>                           // for uint16_t
+ #include <functional>                        // for cref, reference_wrapper
+ #include <initializer_list>                  // for initializer_list
++#include <optional>                          // for optional
+ #include <tuple>                             // for make_tuple, operator==, get
+ #include <utility>                           // for move, index_sequence, mak...
+ #include <vector>                            // for vector
+@@ -130,73 +131,78 @@ template <typename HuffmanTable>
+ Cr2Decompressor<HuffmanTable>::Cr2Decompressor(
+     const RawImage& mRaw_,
+     std::tuple<int /*N_COMP*/, int /*X_S_F*/, int /*Y_S_F*/> format_,
+     iPoint2D frame_, Cr2Slicing slicing_, std::vector<PerComponentRecipe> rec_,
+     ByteStream input_)
+     : mRaw(mRaw_), format(std::move(format_)), frame(frame_), slicing(slicing_),
+       rec(std::move(rec_)), input(std::move(input_)) {
+   if (mRaw->getDataType() != RawImageType::UINT16)
+     ThrowRDE("Unexpected data type");
+ 
+   if (mRaw->getCpp() != 1 || mRaw->getBpp() != sizeof(uint16_t))
+     ThrowRDE("Unexpected cpp: %u", mRaw->getCpp());
+ 
+   if (!((std::make_tuple(3, 2, 2) == format) ||
+         (std::make_tuple(3, 2, 1) == format) ||
+         (std::make_tuple(2, 1, 1) == format) ||
+         (std::make_tuple(4, 1, 1) == format)))
+     ThrowRDE("Unknown format <%i,%i,%i>", std::get<0>(format),
+              std::get<1>(format), std::get<2>(format));
+ 
+   const Dsc dsc(format);
+ 
+   dim = mRaw->dim;
+   if (!dim.hasPositiveArea() || dim.x % dsc.groupSize != 0)
+     ThrowRDE("Unexpected image dimension multiplicity");
+   dim.x /= dsc.groupSize;
+ 
+   if (!frame.hasPositiveArea() || frame.x % dsc.X_S_F != 0 ||
+       frame.y % dsc.Y_S_F != 0)
+     ThrowRDE("Unexpected LJpeg frame dimension multiplicity");
+   frame.x /= dsc.X_S_F;
+   frame.y /= dsc.Y_S_F;
+ 
+   if (mRaw->dim.x > 19440 || mRaw->dim.y > 5920) {
+     ThrowRDE("Unexpected image dimensions found: (%u; %u)", mRaw->dim.x,
+              mRaw->dim.y);
+   }
+ 
+   for (auto sliceId = 0; sliceId < slicing.numSlices; sliceId++) {
+     const auto sliceWidth = slicing.widthOfSlice(sliceId);
+     if (sliceWidth <= 0)
+       ThrowRDE("Bad slice width: %i", sliceWidth);
+   }
+ 
+   if (dsc.subSampled == mRaw->isCFA)
+     ThrowRDE("Cannot decode subsampled image to CFA data or vice versa");
+ 
+   if (static_cast<int>(rec.size()) != dsc.N_COMP)
+     ThrowRDE("HT/Initial predictor count does not match component count");
+ 
+   for (const auto& recip : rec) {
+     if (!recip.ht.isFullDecode())
+       ThrowRDE("Huffman table is not of a full decoding variety");
+   }
+ 
+   for (auto* width : {&slicing.sliceWidth, &slicing.lastSliceWidth}) {
+     if (*width % dsc.sliceColStep != 0) {
+       ThrowRDE("Slice width (%u) should be multiple of pixel group size (%u)",
+                *width, dsc.sliceColStep);
+     }
+     *width /= dsc.sliceColStep;
+   }
+ 
+   const iRectangle2D fullImage({0, 0}, dim);
++  std::optional<iRectangle2D> lastTile;
+   for (iRectangle2D output : getOutputTiles()) {
+     if (output.getLeft() == dim.x)
+       break;
++    lastTile = output;
+     if (!output.isThisInside(fullImage))
+       ThrowRDE("Output tile not inside of the image");
+   }
++  assert(lastTile && "No tiles?");
++  if (lastTile->getBottomRight() != fullImage.getBottomRight())
++    ThrowRDE("Tiles do not cover the entire image area.");
+ }
+ 
+ template <typename HuffmanTable>

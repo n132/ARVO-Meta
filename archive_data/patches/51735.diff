@@ -1,0 +1,509 @@
+commit ea92d2f0fcceb54a70910fa32e9a0d7a5afc3583
+Author: Greg Hudson <ghudson@mit.edu>
+Date:   Mon Oct 17 20:25:11 2022 -0400
+
+    Fix integer overflows in PAC parsing
+    
+    In krb5_parse_pac(), check for buffer counts large enough to threaten
+    integer overflow in the header length and memory length calculations.
+    Avoid potential integer overflows when checking the length of each
+    buffer.  Credit to OSS-Fuzz for discovering one of the issues.
+    
+    CVE-2022-42898:
+    
+    In MIT krb5 releases 1.8 and later, an authenticated attacker may be
+    able to cause a KDC or kadmind process to crash by reading beyond the
+    bounds of allocated memory, creating a denial of service.  A
+    privileged attacker may similarly be able to cause a Kerberos or GSS
+    application service to crash.  On 32-bit platforms, an attacker can
+    also cause insufficient memory to be allocated for the result,
+    potentially leading to remote code execution in a KDC, kadmind, or GSS
+    or Kerberos application server process.  An attacker with the
+    privileges of a cross-realm KDC may be able to extract secrets from a
+    KDC process's memory by having them copied into the PAC of a new
+    ticket.
+    
+    ticket: 9074 (new)
+    tags: pullup
+    target_version: 1.20-next
+    target_version: 1.19-next
+
+diff --git a/src/lib/krb5/krb/pac.c b/src/lib/krb5/krb/pac.c
+index 2f1df8d42..f6c4373de 100644
+--- a/src/lib/krb5/krb/pac.c
++++ b/src/lib/krb5/krb/pac.c
+@@ -1,35 +1,37 @@
+ /* -*- mode: c; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+ /* lib/krb5/krb/pac.c */
+ /*
+  * Copyright 2008 by the Massachusetts Institute of Technology.
+  * All Rights Reserved.
+  *
+  * Export of this software from the United States of America may
+  *   require a specific license from the United States Government.
+  *   It is the responsibility of any person or organization contemplating
+  *   export to obtain such a license before exporting.
+  *
+  * WITHIN THAT CONSTRAINT, permission to use, copy, modify, and
+  * distribute this software and its documentation for any purpose and
+  * without fee is hereby granted, provided that the above copyright
+  * notice appear in all copies and that both that copyright notice and
+  * this permission notice appear in supporting documentation, and that
+  * the name of M.I.T. not be used in advertising or publicity pertaining
+  * to distribution of the software without specific, written prior
+  * permission.  Furthermore if you modify this software you must label
+  * your software as modified software and not distribute it in such a
+  * fashion that it might be confused with the original M.I.T. software.
+  * M.I.T. makes no representations about the suitability of
+  * this software for any purpose.  It is provided "as is" without express
+  * or implied warranty.
+  */
+ 
+ #include "k5-int.h"
+ #include "int-proto.h"
+ #include "authdata.h"
+ 
++#define MAX_BUFFERS 4096
++
+ /* draft-brezak-win2k-krb-authz-00 */
+ 
+ /*
+  * Add a buffer to the provided PAC and update header.
+  */
+@@ -295,77 +297,80 @@ krb5_error_code KRB5_CALLCONV
+ krb5_pac_parse(krb5_context context,
+                const void *ptr,
+                size_t len,
+                krb5_pac *ppac)
+ {
+     krb5_error_code ret;
+     size_t i;
+     const unsigned char *p = (const unsigned char *)ptr;
+     krb5_pac pac;
+     size_t header_len;
+     krb5_ui_4 cbuffers, version;
+ 
+     *ppac = NULL;
+ 
+     if (len < PACTYPE_LENGTH)
+         return ERANGE;
+ 
+     cbuffers = load_32_le(p);
+     p += 4;
+     version = load_32_le(p);
+     p += 4;
+ 
+     if (version != 0)
+         return EINVAL;
+ 
++    if (cbuffers < 1 || cbuffers > MAX_BUFFERS)
++        return ERANGE;
++
+     header_len = PACTYPE_LENGTH + (cbuffers * PAC_INFO_BUFFER_LENGTH);
+     if (len < header_len)
+         return ERANGE;
+ 
+     ret = krb5_pac_init(context, &pac);
+     if (ret != 0)
+         return ret;
+ 
+     pac->pac = (PACTYPE *)realloc(pac->pac,
+                                   sizeof(PACTYPE) + ((cbuffers - 1) * sizeof(PAC_INFO_BUFFER)));
+     if (pac->pac == NULL) {
+         krb5_pac_free(context, pac);
+         return ENOMEM;
+     }
+ 
+     pac->pac->cBuffers = cbuffers;
+     pac->pac->Version = version;
+ 
+     for (i = 0; i < pac->pac->cBuffers; i++) {
+         PAC_INFO_BUFFER *buffer = &pac->pac->Buffers[i];
+ 
+         buffer->ulType = load_32_le(p);
+         p += 4;
+         buffer->cbBufferSize = load_32_le(p);
+         p += 4;
+         buffer->Offset = load_64_le(p);
+         p += 8;
+ 
+         if (buffer->Offset % PAC_ALIGNMENT) {
+             krb5_pac_free(context, pac);
+             return EINVAL;
+         }
+-        if (buffer->Offset < header_len ||
+-            buffer->Offset + buffer->cbBufferSize > len) {
++        if (buffer->Offset < header_len || buffer->Offset > len ||
++            buffer->cbBufferSize > len - buffer->Offset) {
+             krb5_pac_free(context, pac);
+             return ERANGE;
+         }
+     }
+ 
+     pac->data.data = realloc(pac->data.data, len);
+     if (pac->data.data == NULL) {
+         krb5_pac_free(context, pac);
+         return ENOMEM;
+     }
+     memcpy(pac->data.data, ptr, len);
+ 
+     pac->data.length = len;
+ 
+     *ppac = pac;
+ 
+     return 0;
+ }
+diff --git a/src/lib/krb5/krb/t_pac.c b/src/lib/krb5/krb/t_pac.c
+index 0b1b1f056..173bde7ba 100644
+--- a/src/lib/krb5/krb/t_pac.c
++++ b/src/lib/krb5/krb/t_pac.c
+@@ -431,6 +431,16 @@ static const unsigned char s4u_pac_ent_xrealm[] = {
+     0x8a, 0x81, 0x9c, 0x9c, 0x00, 0x00, 0x00, 0x00
+ };
+ 
++static const unsigned char fuzz1[] = {
++    0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
++    0x06, 0xff, 0xff, 0xff, 0x00, 0x00, 0xf5
++};
++
++static const unsigned char fuzz2[] = {
++    0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00,
++    0x20, 0x20
++};
++
+ static const char *s4u_principal = "w2k8u@ACME.COM";
+ static const char *s4u_enterprise = "w2k8u@abc@ACME.COM";
+ 
+@@ -779,324 +789,332 @@ int
+ main(int argc, char **argv)
+ {
+     krb5_error_code ret;
+     krb5_context context;
+     krb5_pac pac;
+     krb5_data data;
+     krb5_principal p;
+ 
+     ret = krb5_init_context(&context);
+     if (ret)
+         err(NULL, 0, "krb5_init_contex");
+ 
+     test_pac_ticket_signature(context);
+ 
+     ret = krb5_set_default_realm(context, "WIN2K3.THINKER.LOCAL");
+     if (ret)
+         err(context, ret, "krb5_set_default_realm");
+ 
+     ret = krb5_parse_name(context, user, &p);
+     if (ret)
+         err(context, ret, "krb5_parse_name");
+ 
+     /* Check a pre-saved PAC. */
+     check_pac(context, -1, saved_pac, sizeof(saved_pac), authtime, p,
+               type_1_length, 0, &member_keyblock, &kdc_keyblock);
+ 
+     /* Check S4U2Self PACs. */
+     {
+         krb5_principal sp;
+         krb5_principal sep;
+         const struct pac_and_info *pi;
+ 
+         ret = krb5_parse_name(context, s4u_principal, &sp);
+         if (ret)
+             err(context, ret, "krb5_parse_name");
+ 
+         ret = krb5_parse_name_flags(context, s4u_enterprise,
+                                     KRB5_PRINCIPAL_PARSE_ENTERPRISE, &sep);
+         if (ret)
+             err(context, ret, "krb5_parse_name_flags");
+ 
+         for (pi = s4u_pacs; pi->data != NULL; pi++) {
+             check_pac(context, pi - s4u_pacs, pi->data, pi->length,
+                       pi->authtime, pi->is_enterprise ? sep : sp,
+                       s4u_logon_info_buffer_len, pi->is_xrealm,
+                       pi->is_xrealm ? &s4u_tgt_srv_key : &s4u_srv_key, NULL);
+         }
+ 
+         krb5_free_principal(context, sp);
+         krb5_free_principal(context, sep);
+     }
+ 
++    /* Check problematic PACs found by fuzzing. */
++    ret = krb5_pac_parse(context, fuzz1, sizeof(fuzz1), &pac);
++    if (!ret)
++        err(context, ret, "krb5_pac_parse should have failed");
++    ret = krb5_pac_parse(context, fuzz2, sizeof(fuzz2), &pac);
++    if (!ret)
++        err(context, ret, "krb5_pac_parse should have failed");
++
+     /*
+      * Test empty free
+      */
+ 
+     ret = krb5_pac_init(context, &pac);
+     if (ret)
+         err(context, ret, "krb5_pac_init");
+     krb5_pac_free(context, pac);
+ 
+     /*
+      * Test add remove buffer
+      */
+ 
+     ret = krb5_pac_init(context, &pac);
+     if (ret)
+         err(context, ret, "krb5_pac_init");
+ 
+     {
+         const krb5_data cdata = { 0, 2, "\x00\x01" } ;
+ 
+         ret = krb5_pac_add_buffer(context, pac, 1, &cdata);
+         if (ret)
+             err(context, ret, "krb5_pac_add_buffer");
+     }
+     {
+         ret = krb5_pac_get_buffer(context, pac, 1, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_get_buffer");
+         if (data.length != 2 || memcmp(data.data, "\x00\x01", 2) != 0)
+             err(context, 0, "krb5_pac_get_buffer data not the same");
+         krb5_free_data_contents(context, &data);
+     }
+ 
+     {
+         const krb5_data cdata = { 0, 2, "\x02\x00" } ;
+ 
+         ret = krb5_pac_add_buffer(context, pac, 2, &cdata);
+         if (ret)
+             err(context, ret, "krb5_pac_add_buffer");
+     }
+     {
+         ret = krb5_pac_get_buffer(context, pac, 1, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_get_buffer");
+         if (data.length != 2 || memcmp(data.data, "\x00\x01", 2) != 0)
+             err(context, 0, "krb5_pac_get_buffer data not the same");
+         krb5_free_data_contents(context, &data);
+         /* */
+         ret = krb5_pac_get_buffer(context, pac, 2, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_get_buffer");
+         if (data.length != 2 || memcmp(data.data, "\x02\x00", 2) != 0)
+             err(context, 0, "krb5_pac_get_buffer data not the same");
+         krb5_free_data_contents(context, &data);
+     }
+ 
+     ret = krb5_pac_sign(context, pac, authtime, p,
+                         &member_keyblock, &kdc_keyblock, &data);
+     if (ret)
+         err(context, ret, "krb5_pac_sign");
+ 
+     krb5_pac_free(context, pac);
+ 
+     ret = krb5_pac_parse(context, data.data, data.length, &pac);
+     krb5_free_data_contents(context, &data);
+     if (ret)
+         err(context, ret, "krb5_pac_parse 3");
+ 
+     ret = krb5_pac_verify(context, pac, authtime, p,
+                           &member_keyblock, &kdc_keyblock);
+     if (ret)
+         err(context, ret, "krb5_pac_verify 3");
+ 
+     {
+         uint32_t *list;
+         size_t len;
+ 
+         /* our two user buffer plus the three "system" buffers */
+         ret = krb5_pac_get_types(context, pac, &len, &list);
+         if (ret)
+             err(context, ret, "krb5_pac_get_types");
+         if (len != 5)
+             err(context, 0, "list wrong length");
+         free(list);
+     }
+ 
+     {
+         krb5_principal ep, np;
+ 
+         ret = krb5_parse_name_flags(context, user,
+                                     KRB5_PRINCIPAL_PARSE_ENTERPRISE, &ep);
+         if (ret)
+             err(context, ret, "krb5_parse_name_flags");
+ 
+         ret = krb5_copy_principal(context, ep, &np);
+         if (ret)
+             err(context, ret, "krb5_copy_principal");
+         np->type = KRB5_NT_MS_PRINCIPAL;
+ 
+         /* Try to verify as enterprise. */
+         ret = krb5_pac_verify(context, pac, authtime, ep, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         ret = krb5_pac_sign(context, pac, authtime, ep, &member_keyblock,
+                             &kdc_keyblock, &data);
+         if (!ret)
+             err(context, ret, "krb5_pac_sign should have failed");
+ 
+         /* Try to verify with realm. */
+         ret = krb5_pac_verify_ext(context, pac, authtime, p, &member_keyblock,
+                                   &kdc_keyblock, TRUE);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify_ext with realm should fail");
+ 
+         /* Currently we can't re-sign the PAC with realm (although that could
+          * be useful), only sign a new one. */
+         ret = krb5_pac_sign_ext(context, pac, authtime, p, &member_keyblock,
+                                 &kdc_keyblock, TRUE, &data);
+         if (!ret)
+             err(context, ret, "krb5_pac_sign_ext with realm should fail");
+ 
+         krb5_pac_free(context, pac);
+ 
+         /* Test enterprise. */
+         ret = krb5_pac_init(context, &pac);
+         if (ret)
+             err(context, ret, "krb5_pac_init");
+ 
+         ret = krb5_pac_sign(context, pac, authtime, ep, &member_keyblock,
+                             &kdc_keyblock, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_sign enterprise failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         ret = krb5_pac_parse(context, data.data, data.length, &pac);
+         krb5_free_data_contents(context, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_parse failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, ep, &member_keyblock,
+                               &kdc_keyblock);
+         if (ret)
+             err(context, ret, "krb5_pac_verify enterprise failed");
+ 
+         /* Also verify enterprise as KRB5_NT_MS_PRINCIPAL. */
+         ret = krb5_pac_verify(context, pac, authtime, np, &member_keyblock,
+                               &kdc_keyblock);
+         if (ret)
+             err(context, ret, "krb5_pac_verify enterprise as nt-ms failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, p, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         /* Test nt-ms-principal. */
+         ret = krb5_pac_init(context, &pac);
+         if (ret)
+             err(context, ret, "krb5_pac_init");
+ 
+         ret = krb5_pac_sign(context, pac, authtime, np, &member_keyblock,
+                             &kdc_keyblock, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_sign enterprise failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         ret = krb5_pac_parse(context, data.data, data.length, &pac);
+         krb5_free_data_contents(context, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_parse failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, np, &member_keyblock,
+                               &kdc_keyblock);
+         if (ret)
+             err(context, ret, "krb5_pac_verify enterprise failed");
+ 
+         /* Also verify as enterprise principal. */
+         ret = krb5_pac_verify(context, pac, authtime, ep, &member_keyblock,
+                               &kdc_keyblock);
+         if (ret)
+             err(context, ret, "krb5_pac_verify nt-ms as enterprise failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, p, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         /* Test with realm. */
+         ret = krb5_pac_init(context, &pac);
+         if (ret)
+             err(context, ret, "krb5_pac_init");
+ 
+         ret = krb5_pac_sign_ext(context, pac, authtime, p, &member_keyblock,
+                                 &kdc_keyblock, TRUE, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_sign_ext with realm failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         ret = krb5_pac_parse(context, data.data, data.length, &pac);
+         krb5_free_data_contents(context, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_parse failed");
+ 
+         ret = krb5_pac_verify_ext(context, pac, authtime, p, &member_keyblock,
+                                   &kdc_keyblock, TRUE);
+         if (ret)
+             err(context, ret, "krb5_pac_verify_ext with realm failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, p, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         /* Test enterprise with realm. */
+         ret = krb5_pac_init(context, &pac);
+         if (ret)
+             err(context, ret, "krb5_pac_init");
+ 
+         ret = krb5_pac_sign_ext(context, pac, authtime, ep, &member_keyblock,
+                                 &kdc_keyblock, TRUE, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_sign_ext ent with realm failed");
+ 
+         krb5_pac_free(context, pac);
+ 
+         ret = krb5_pac_parse(context, data.data, data.length, &pac);
+         krb5_free_data_contents(context, &data);
+         if (ret)
+             err(context, ret, "krb5_pac_parse failed");
+ 
+         ret = krb5_pac_verify_ext(context, pac, authtime, ep, &member_keyblock,
+                                   &kdc_keyblock, TRUE);
+         if (ret)
+             err(context, ret, "krb5_pac_verify_ext ent with realm failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, p, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         ret = krb5_pac_verify(context, pac, authtime, ep, &member_keyblock,
+                               &kdc_keyblock);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify should have failed");
+ 
+         ret = krb5_pac_verify_ext(context, pac, authtime, p, &member_keyblock,
+                                   &kdc_keyblock, TRUE);
+         if (!ret)
+             err(context, ret, "krb5_pac_verify_ext should have failed");
+ 
+         krb5_free_principal(context, ep);
+         krb5_free_principal(context, np);
+     }
+ 
+     krb5_pac_free(context, pac);
+ 
+     krb5_free_principal(context, p);
+     krb5_free_context(context);
+ 
+     return 0;
+ }

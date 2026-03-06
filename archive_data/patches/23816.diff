@@ -1,0 +1,430 @@
+commit b43fb9cbfb033132e970f8b587d709c582dee1a0
+Author: Philip Withnall <pwithnall@endlessos.org>
+Date:   Wed Sep 30 18:52:18 2020 +0100
+
+    guri: Fix URI scope parsing
+    
+    The previous parsing code could read off the end of a URI if it had an
+    incorrect %-escaped character in.
+    
+    Fix that, and more closely implement parsing for the syntax defined in
+    RFC 6874, which is the amendment to RFC 3986 which specifies zone ID
+    syntax.
+    
+    This requires reworking some network-address tests, which were
+    previously treating zone IDs incorrectly.
+    
+    oss-fuzz#23816
+    
+    Signed-off-by: Philip Withnall <pwithnall@endlessos.org>
+
+diff --git a/gio/tests/network-address.c b/gio/tests/network-address.c
+index f06cd755b..cbebb6c9f 100644
+--- a/gio/tests/network-address.c
++++ b/gio/tests/network-address.c
+@@ -37,13 +37,13 @@ typedef struct {
+ static ParseTest uri_tests[] = {
+   { "http://www.gnome.org:2020/start", "http", "www.gnome.org", 2020, -1 },
+   { "ftp://joe~:(*)%46@ftp.gnome.org:2020/start", "ftp", "ftp.gnome.org", 2020, -1 },
+   { "ftp://[fec0::abcd]/start", "ftp", "fec0::abcd", 8080, -1 },
+   { "ftp://[fec0::abcd]:999/start", "ftp", "fec0::abcd", 999, -1 },
+   { "ftp://joe%x-@ftp.gnome.org:2020/start", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+-  { "http://[fec0::abcd%em1]/start", "http", "fec0::abcd%em1", 8080, -1 },
++  { "http://[fec0::abcd%em1]/start", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+   { "http://[fec0::abcd%25em1]/start", "http", "fec0::abcd%em1", 8080, -1 },
+-  { "http://[fec0::abcd%10]/start", "http", "fec0::abcd%10", 8080, -1 },
+-  { "http://[fec0::abcd%25em%31]/start", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
++  { "http://[fec0::abcd%10]/start", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
++  { "http://[fec0::abcd%25em%31]/start", "http", "fec0::abcd%em1", 8080, -1 },
+   { "ftp://ftp.gnome.org/start?foo=bar@baz", "ftp", "ftp.gnome.org", 8080, -1 }
+ };
+ 
+@@ -76,13 +76,14 @@ test_parse_uri (gconstpointer d)
+ static ParseTest host_tests[] =
+ {
+   { "www.gnome.org", NULL, "www.gnome.org", 1234, -1 },
+   { "www.gnome.org:8080", NULL, "www.gnome.org", 8080, -1 },
+   { "[2001:db8::1]", NULL, "2001:db8::1", 1234, -1 },
+   { "[2001:db8::1]:888", NULL, "2001:db8::1", 888, -1 },
+   { "[2001:db8::1%em1]", NULL, "2001:db8::1%em1", 1234, -1 },
++  { "[2001:db8::1%25em1]", NULL, "2001:db8::1%25em1", 1234, -1 },
+   { "[hostname", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+   { "[hostnam]e", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+   { "hostname:", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+   { "hostname:-1", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT },
+   { "hostname:9999999", NULL, NULL, 0, G_IO_ERROR_INVALID_ARGUMENT }
+ };
+@@ -326,30 +327,29 @@ static void
+ test_uri_scope_id (void)
+ {
+   GSocketConnectable *addr;
+   char *uri;
+   GError *error = NULL;
+ 
+   find_ifname_and_index ();
+ 
+   uri = g_strdup_printf ("http://[%s%%%s]:%d/foo",
+                          SCOPE_ID_TEST_ADDR,
+                          SCOPE_ID_TEST_IFNAME,
+                          SCOPE_ID_TEST_PORT);
+   addr = g_network_address_parse_uri (uri, 0, &error);
+   g_free (uri);
+-  g_assert_no_error (error);
+-
+-  test_scope_id (addr);
+-  g_object_unref (addr);
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
++  g_assert_null (addr);
++  g_clear_error (&error);
+ 
+   uri = g_strdup_printf ("http://[%s%%25%s]:%d/foo",
+                          SCOPE_ID_TEST_ADDR,
+                          SCOPE_ID_TEST_IFNAME,
+                          SCOPE_ID_TEST_PORT);
+   addr = g_network_address_parse_uri (uri, 0, &error);
+   g_free (uri);
+   g_assert_no_error (error);
+ 
+   test_scope_id (addr);
+   g_object_unref (addr);
+ }
+diff --git a/glib/guri.c b/glib/guri.c
+index 056b86a2e..e337c9e24 100644
+--- a/glib/guri.c
++++ b/glib/guri.c
+@@ -411,97 +411,127 @@ void
+ _uri_encoder (GString      *out,
+               const guchar *start,
+               gsize         length,
+               const gchar  *reserved_chars_allowed,
+               gboolean      allow_utf8)
+ {
+   static const gchar hex[16] = "0123456789ABCDEF";
+   const guchar *p = start;
+   const guchar *end = p + length;
+ 
+   while (p < end)
+     {
+       if (allow_utf8 && *p >= 0x80 &&
+           g_utf8_get_char_validated ((gchar *)p, end - p) > 0)
+         {
+           gint len = g_utf8_skip [*p];
+           g_string_append_len (out, (gchar *)p, len);
+           p += len;
+         }
+       else if (is_valid (*p, reserved_chars_allowed))
+         {
+           g_string_append_c (out, *p);
+           p++;
+         }
+       else
+         {
+           g_string_append_c (out, '%');
+           g_string_append_c (out, hex[*p >> 4]);
+           g_string_append_c (out, hex[*p & 0xf]);
+           p++;
+         }
+     }
+ }
+ 
+ /* Parse the IP-literal construction from RFC 6874 (which extends RFC 3986 to
+  * support IPv6 zone identifiers.
+  *
+- * Rules:
++ * Currently, IP versions beyond 6 (i.e. the IPvFuture rule) are unsupported.
++ * There’s no point supporting them until (a) they exist and (b) the rest of the
++ * stack (notably, sockets) supports them.
+  *
+- * IP-literal = "[" ( IPv6address / IPvFuture  ) "]"
++ * Rules:
+  *
+  * IP-literal = "[" ( IPv6address / IPv6addrz / IPvFuture  ) "]"
+  *
+  * ZoneID = 1*( unreserved / pct-encoded )
+  *
+  * IPv6addrz = IPv6address "%25" ZoneID
++ *
++ * If %G_URI_FLAGS_PARSE_RELAXED is specified, this function also accepts:
++ *
++ * IPv6addrz = IPv6address "%" ZoneID
+  */
+ static gboolean
+ parse_ip_literal (const gchar  *start,
+                   gsize         length,
+                   GUriFlags     flags,
+                   gchar       **out,
+                   GError      **error)
+ {
+-  gchar *pct;
++  gchar *pct, *zone_id = NULL;
+   gchar *addr = NULL;
++  gsize addr_length = 0;
++  gsize zone_id_length = 0;
++  gchar *decoded_zone_id = NULL;
+ 
+   if (start[length - 1] != ']')
+     goto bad_ipv6_literal;
+ 
++  /* Drop the square brackets */
+   addr = g_strndup (start + 1, length - 2);
++  addr_length = length - 2;
+ 
+-  /* If there's an IPv6 scope id, ignore it for the moment. */
++  /* If there's an IPv6 scope ID, split out the zone. */
+   pct = strchr (addr, '%');
+-  if (pct)
+-    *pct = '\0';
++  if (pct != NULL)
++    {
++      *pct = '\0';
++
++      if (addr_length - (pct - addr) >= 4 &&
++          *(pct + 1) == '2' && *(pct + 2) == '5')
++        {
++          zone_id = pct + 3;
++          zone_id_length = addr_length - (zone_id - addr);
++        }
++      else if (flags & G_URI_FLAGS_PARSE_RELAXED &&
++               addr_length - (pct - addr) >= 2)
++        {
++          zone_id = pct + 1;
++          zone_id_length = addr_length - (zone_id - addr);
++        }
++      else
++        goto bad_ipv6_literal;
++
++      g_assert (zone_id_length >= 1);
++    }
+ 
+   /* addr must be an IPv6 address */
+   if (!g_hostname_is_ip_address (addr) || !strchr (addr, ':'))
+     goto bad_ipv6_literal;
+ 
+-  if (pct)
+-    {
+-      *pct = '%';
+-      if (strchr (pct + 1, '%'))
+-        goto bad_ipv6_literal;
+-      /* If the '%' is encoded as '%25' (which it should be), decode it */
+-      if (pct[1] == '2' && pct[2] == '5' && pct[3])
+-        memmove (pct + 1, pct + 3, strlen (pct + 3) + 1);
+-    }
++  /* Zone ID must be valid. It can contain %-encoded characters. */
++  if (zone_id != NULL &&
++      !uri_decode (&decoded_zone_id, NULL, zone_id, zone_id_length, FALSE,
++                   flags, G_URI_ERROR_BAD_HOST, NULL))
++    goto bad_ipv6_literal;
+ 
+   /* Success */
+-  if (out != NULL)
++  if (out != NULL && decoded_zone_id != NULL)
++    *out = g_strconcat (addr, "%", decoded_zone_id, NULL);
++  else if (out != NULL)
+     *out = g_steal_pointer (&addr);
+ 
+   g_free (addr);
++  g_free (decoded_zone_id);
+ 
+   return TRUE;
+ 
+ bad_ipv6_literal:
+   g_free (addr);
++  g_free (decoded_zone_id);
+   g_set_error (error, G_URI_ERROR, G_URI_ERROR_BAD_HOST,
+                _("Invalid IPv6 address ‘%.*s’ in URI"),
+                (gint)length, start);
+ 
+   return FALSE;
+ }
+diff --git a/glib/tests/uri.c b/glib/tests/uri.c
+index 2be492f2f..839aeeff6 100644
+--- a/glib/tests/uri.c
++++ b/glib/tests/uri.c
+@@ -526,184 +526,184 @@ typedef struct {
+ static const UriAbsoluteTest absolute_tests[] = {
+   { "foo:", G_URI_FLAGS_NONE,
+     { "foo", NULL, NULL, -1, "", NULL, NULL }
+   },
+   { "file:/dev/null", G_URI_FLAGS_NONE,
+     { "file", NULL, NULL, -1, "/dev/null", NULL, NULL }
+   },
+   { "file:///dev/null", G_URI_FLAGS_NONE,
+     { "file", NULL, "", -1, "/dev/null", NULL, NULL }
+   },
+   { "ftp://user@host/path", G_URI_FLAGS_NONE,
+     { "ftp", "user", "host", -1, "/path", NULL, NULL }
+   },
+   { "ftp://user@host:9999/path", G_URI_FLAGS_NONE,
+     { "ftp", "user", "host", 9999, "/path", NULL, NULL }
+   },
+   { "ftp://user:password@host/path", G_URI_FLAGS_NONE,
+     { "ftp", "user:password", "host", -1, "/path", NULL, NULL }
+   },
+   { "ftp://user:password@host:9999/path", G_URI_FLAGS_NONE,
+     { "ftp", "user:password", "host", 9999, "/path", NULL, NULL }
+   },
+   { "ftp://user:password@host", G_URI_FLAGS_NONE,
+     { "ftp", "user:password", "host", -1, "", NULL, NULL }
+   },
+   { "http://us%65r@host", G_URI_FLAGS_NONE,
+     { "http", "user", "host", -1, "", NULL, NULL }
+   },
+   { "http://us%40r@host", G_URI_FLAGS_NONE,
+     { "http", "us@r", "host", -1, "", NULL, NULL }
+   },
+   { "http://us%3ar@host", G_URI_FLAGS_NONE,
+     { "http", "us:r", "host", -1, "", NULL, NULL }
+   },
+   { "http://us%2fr@host", G_URI_FLAGS_NONE,
+     { "http", "us/r", "host", -1, "", NULL, NULL }
+   },
+   { "http://us%3fr@host", G_URI_FLAGS_NONE,
+     { "http", "us?r", "host", -1, "", NULL, NULL }
+   },
+   { "http://host?query", G_URI_FLAGS_NONE,
+     { "http", NULL, "host", -1, "", "query", NULL }
+   },
+   { "http://host/path?query=http%3A%2F%2Fhost%2Fpath%3Fchildparam%3Dchildvalue&param=value", G_URI_FLAGS_NONE,
+     { "http", NULL, "host", -1, "/path", "query=http://host/path?childparam=childvalue&param=value", NULL }
+   },
+   { "http://control-chars/%01%02%03%04%05%06%07%08%09%0A%0B%0C%0D%0E%0F%10%11%12%13%14%15%16%17%18%19%1A%1B%1C%1D%1E%1F%7F", G_URI_FLAGS_NONE,
+     { "http", NULL, "control-chars", -1, "/\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F\x7F", NULL, NULL }
+   },
+   { "http://space/%20", G_URI_FLAGS_NONE,
+     { "http", NULL, "space", -1, "/ ", NULL, NULL }
+   },
+   { "http://delims/%3C%3E%23%25%22", G_URI_FLAGS_NONE,
+     { "http", NULL, "delims", -1, "/<>#%\"", NULL, NULL }
+   },
+   { "http://unwise-chars/%7B%7D%7C%5C%5E%5B%5D%60", G_URI_FLAGS_NONE,
+     { "http", NULL, "unwise-chars", -1, "/{}|\\^[]`", NULL, NULL }
+   },
+ 
+   /* From RFC 2732 */
+   { "http://[FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:80/index.html", G_URI_FLAGS_NONE,
+     { "http", NULL, "FEDC:BA98:7654:3210:FEDC:BA98:7654:3210", 80, "/index.html", NULL, NULL }
+   },
+   { "http://[1080:0:0:0:8:800:200C:417A]/index.html", G_URI_FLAGS_NONE,
+     { "http", NULL, "1080:0:0:0:8:800:200C:417A", -1, "/index.html", NULL, NULL }
+   },
+   { "http://[3ffe:2a00:100:7031::1]", G_URI_FLAGS_NONE,
+     { "http", NULL, "3ffe:2a00:100:7031::1", -1, "", NULL, NULL }
+   },
+   { "http://[1080::8:800:200C:417A]/foo", G_URI_FLAGS_NONE,
+     { "http", NULL, "1080::8:800:200C:417A", -1, "/foo", NULL, NULL }
+   },
+   { "http://[::192.9.5.5]/ipng", G_URI_FLAGS_NONE,
+     { "http", NULL, "::192.9.5.5", -1, "/ipng", NULL, NULL }
+   },
+   { "http://[::FFFF:129.144.52.38]:80/index.html", G_URI_FLAGS_NONE,
+     { "http", NULL, "::FFFF:129.144.52.38", 80, "/index.html", NULL, NULL }
+   },
+   { "http://[2010:836B:4179::836B:4179]", G_URI_FLAGS_NONE,
+     { "http", NULL, "2010:836B:4179::836B:4179", -1, "", NULL, NULL }
+   },
+ 
+   /* some problematic URIs that are handled differently in libsoup */
+   { "http://host/path with spaces", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path with spaces", NULL, NULL }
+   },
+   { "  http://host/path", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path", NULL, NULL }
+   },
+   { "http://host/path  ", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path", NULL, NULL }
+   },
+   { "http://host  ", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "", NULL, NULL }
+   },
+   { "http://host:999  ", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", 999, "", NULL, NULL }
+   },
+   { "http://host/pa\nth", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path", NULL, NULL }
+   },
+   { "http:\r\n//host/path", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path", NULL, NULL }
+   },
+   { "http://\thost/path", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path", NULL, NULL }
+   },
+ 
+   /* Bug 594405; 0-length is different from not-present */
+   { "http://host/path?", G_URI_FLAGS_NONE,
+     { "http", NULL, "host", -1, "/path", "", NULL }
+   },
+   { "http://host/path#", G_URI_FLAGS_NONE,
+     { "http", NULL, "host", -1, "/path", NULL, "" },
+   },
+ 
+   /* Bug 590524; ignore bad %-encoding */
+   { "http://host/path%", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%", NULL, NULL }
+   },
+   { "http://h%ost/path", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "h%ost", -1, "/path", NULL, NULL }
+   },
+   { "http://host/path%%", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%%", NULL, NULL }
+   },
+   { "http://host/path%%%", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%%%", NULL, NULL }
+   },
+   { "http://host/path%/x/", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%/x/", NULL, NULL }
+   },
+   { "http://host/path%0x/", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%0x/", NULL, NULL }
+   },
+   { "http://host/path%ax", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "host", -1, "/path%ax", NULL, NULL }
+   },
+ 
+   /* GUri doesn't %-encode non-ASCII characters */
+   { "http://host/p\xc3\xa4th/", G_URI_FLAGS_NONE,
+     { "http", NULL, "host", -1, "/p\xc3\xa4th/", NULL, NULL }
+   },
+ 
+   { "HTTP:////////////////", G_URI_FLAGS_NONE,
+     { "http", NULL, "", -1, "//////////////", NULL, NULL }
+   },
+ 
+   { "http://@host", G_URI_FLAGS_NONE,
+     { "http", "", "host", -1, "", NULL, NULL }
+   },
+   { "http://:@host", G_URI_FLAGS_NONE,
+     { "http", ":", "host", -1, "", NULL, NULL }
+   },
+   { "scheme://foo%3Abar._webdav._tcp.local", G_URI_FLAGS_NONE,
+     { "scheme", NULL, "foo:bar._webdav._tcp.local", -1, "", NULL, NULL}
+   },
+ 
+   /* ".." past top */
+   { "http://example.com/..", G_URI_FLAGS_NONE,
+     { "http", NULL, "example.com", -1, "/..", NULL, NULL }
+   },
+ 
+   /* scheme parsing */
+   { "foo0://host/path", G_URI_FLAGS_NONE,
+     { "foo0", NULL, "host", -1, "/path", NULL, NULL } },
+   { "f0.o://host/path", G_URI_FLAGS_NONE,
+     { "f0.o", NULL, "host", -1, "/path", NULL, NULL } },
+   { "http++://host/path", G_URI_FLAGS_NONE,
+     { "http++", NULL, "host", -1, "/path", NULL, NULL } },
+   { "http-ish://host/path", G_URI_FLAGS_NONE,
+     { "http-ish", NULL, "host", -1, "/path", NULL, NULL } },
+ 
+   /* IPv6 scope ID parsing (both correct and incorrect) */
+-  { "http://[fe80::dead:beef%em1]/", G_URI_FLAGS_NONE,
++  { "http://[fe80::dead:beef%em1]/", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "fe80::dead:beef%em1", -1, "/", NULL, NULL } },
+   { "http://[fe80::dead:beef%25em1]/", G_URI_FLAGS_NONE,
+     { "http", NULL, "fe80::dead:beef%em1", -1, "/", NULL, NULL } },
+-  { "http://[fe80::dead:beef%10]/", G_URI_FLAGS_NONE,
++  { "http://[fe80::dead:beef%10]/", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "fe80::dead:beef%10", -1, "/", NULL, NULL } },
+-  { "http://[fe80::dead:beef%25]/", G_URI_FLAGS_NONE,
++  { "http://[fe80::dead:beef%25]/", G_URI_FLAGS_PARSE_RELAXED,
+     { "http", NULL, "fe80::dead:beef%25", -1, "/", NULL, NULL } },
+ };
+ static int num_absolute_tests = G_N_ELEMENTS (absolute_tests);

@@ -1,0 +1,217 @@
+commit 32bd447fd7d0933c5aecac75cc1823b3ee897f11
+Author: Thomas Weißschuh <thomas@t-8ch.de>
+Date:   Thu Nov 10 19:48:20 2022 +0100
+
+    libblkid: iso9660: allocate enough space for UTF16 decoding
+    
+    When merge_utf16be_ascii() encounters high-codepoint surrogate pairs it
+    emits four bytes of output for one byte of ascii input.
+    In addition with the remaining ascii characters from the second loop we
+    need up to 5 * sizeof(input) / 2 bytes as output buffer.
+    
+    As we decode up to 128 ascii characters with merge_utf16be_ascii() we
+    need 320 bytes of buffer available.
+    
+    Furthermore adapt merge_utf16be_ascii() to not write paste the output
+    buffer end.
+    
+    Fix OSS-Fuzz issue 53149 ( #1887 )
+
+diff --git a/libblkid/src/superblocks/iso9660.c b/libblkid/src/superblocks/iso9660.c
+index 503126c00..1172f9c25 100644
+--- a/libblkid/src/superblocks/iso9660.c
++++ b/libblkid/src/superblocks/iso9660.c
+@@ -56,20 +56,22 @@ struct iso_volume_descriptor {
+ /* Boot Record */
+ struct boot_record {
+ 	unsigned char	vd_type;
+ 	unsigned char	vd_id[5];
+ 	unsigned char	vd_version;
+ 	unsigned char	boot_system_id[32];
+ 	unsigned char	boot_id[32];
+ 	unsigned char	unused[1];
+ } __attribute__((packed));
+ 
+ #define ISO_SUPERBLOCK_OFFSET		0x8000
+ #define ISO_SECTOR_SIZE			0x800
+ #define ISO_VD_BOOT_RECORD		0x0
+ #define ISO_VD_PRIMARY			0x1
+ #define ISO_VD_SUPPLEMENTARY		0x2
+ #define ISO_VD_END			0xff
+ #define ISO_VD_MAX			16
++/* maximal string field size used anywhere in ISO; update if necessary */
++#define ISO_MAX_FIELDSIZ  sizeof(((struct iso_volume_descriptor  *)0)->volume_set_id)
+ 
+ struct high_sierra_volume_descriptor {
+ 	unsigned char	foo[8];
+@@ -169,155 +171,156 @@ static int is_utf16be_str_empty(unsigned char *utf16, size_t len)
+ /* if @utf16 is prefix of @ascii (ignoring non-representable characters and upper-case conversion)
+  * then reconstruct prefix from @utf16 and @ascii, append suffix from @ascii, fill it into @out
+  * and returns length of bytes written into @out; otherwise returns zero */
+-static size_t merge_utf16be_ascii(unsigned char *out, const unsigned char *utf16, const unsigned char *ascii, size_t len)
++static size_t merge_utf16be_ascii(unsigned char *out, size_t out_len, const unsigned char *utf16, const unsigned char *ascii, size_t len)
+ {
+ 	size_t o, a, u;
+ 
+-	for (o = 0, a = 0, u = 0; u + 1 < len && a < len; o += 2, a++, u += 2) {
++	for (o = 0, a = 0, u = 0; u + 1 < len && a < len && o + 1 < out_len; o += 2, a++, u += 2) {
+ 		/* Surrogate pair with code point above U+FFFF */
+ 		if (utf16[u] >= 0xD8 && utf16[u] <= 0xDB && u + 3 < len &&
+ 		    utf16[u + 2] >= 0xDC && utf16[u + 2] <= 0xDF) {
+ 			out[o++] = utf16[u++];
+ 			out[o++] = utf16[u++];
+ 		}
+ 		/* Value '_' is replacement for non-representable character */
+ 		if (ascii[a] == '_') {
+ 			out[o] = utf16[u];
+ 			out[o + 1] = utf16[u + 1];
+ 		} else if (utf16[u] == 0x00 && utf16[u + 1] == '_') {
+ 			out[o] = 0x00;
+ 			out[o + 1] = ascii[a];
+ 		} else if (utf16[u] == 0x00 && c_toupper(ascii[a]) == c_toupper(utf16[u + 1])) {
+ 			out[o] = 0x00;
+ 			out[o + 1] = c_isupper(ascii[a]) ? utf16[u + 1] : ascii[a];
+ 		} else {
+ 			return 0;
+ 		}
+ 	}
+ 
+-	for (; a < len; o += 2, a++) {
++	for (; a < len && o + 1 < out_len; o += 2, a++) {
+ 		out[o] = 0x00;
+ 		out[o + 1] = ascii[a];
+ 	}
+ 
+ 	return o;
+ }
+ 
+ /* iso9660 [+ Microsoft Joliet Extension] */
+ static int probe_iso9660(blkid_probe pr, const struct blkid_idmag *mag)
+ {
+ 	struct boot_record *boot = NULL;
+ 	struct iso_volume_descriptor *pvd = NULL;
+ 	struct iso_volume_descriptor *joliet = NULL;
+-	unsigned char buf[256];
++	/* space for merge_utf16be_ascii(ISO_ID_BUFSIZ bytes) */
++	unsigned char buf[ISO_MAX_FIELDSIZ * 5 / 2];
+ 	size_t len;
+ 	int is_unicode_empty;
+ 	int is_ascii_empty;
+ 	int i;
+ 	uint64_t off;
+ 
+ 	if (blkid_probe_get_hint(pr, mag->hoff, &off) < 0)
+ 		off = 0;
+ 
+ 	if (off % ISO_SECTOR_SIZE)
+ 		return 1;
+ 
+ 	if (strcmp(mag->magic, "CDROM") == 0)
+ 		return probe_iso9660_hsfs(pr, mag);
+ 
+ 	for (i = 0, off += ISO_SUPERBLOCK_OFFSET; i < ISO_VD_MAX && (!boot || !pvd || !joliet); i++, off += ISO_SECTOR_SIZE) {
+ 		unsigned char *desc =
+ 			blkid_probe_get_buffer(pr,
+ 					off,
+ 					max(sizeof(struct boot_record),
+ 					    sizeof(struct iso_volume_descriptor)));
+ 
+ 		if (desc == NULL || desc[0] == ISO_VD_END)
+ 			break;
+ 		else if (!boot && desc[0] == ISO_VD_BOOT_RECORD)
+ 			boot = (struct boot_record *)desc;
+ 		else if (!pvd && desc[0] == ISO_VD_PRIMARY)
+ 			pvd = (struct iso_volume_descriptor *)desc;
+ 		else if (!joliet && desc[0] == ISO_VD_SUPPLEMENTARY) {
+ 			joliet = (struct iso_volume_descriptor *)desc;
+ 			if (memcmp(joliet->escape_sequences, "%/@", 3) != 0 &&
+ 			    memcmp(joliet->escape_sequences, "%/C", 3) != 0 &&
+ 			    memcmp(joliet->escape_sequences, "%/E", 3) != 0)
+ 				joliet = NULL;
+ 		}
+ 	}
+ 
+ 	if (!pvd)
+ 		return errno ? -errno : 1;
+ 
+ 	blkid_probe_set_fsblocksize(pr, ISO_SECTOR_SIZE);
+ 	blkid_probe_set_block_size(pr, ISO_SECTOR_SIZE);
+ 
+-	if (joliet && (len = merge_utf16be_ascii(buf, joliet->system_id, pvd->system_id, sizeof(pvd->system_id))) != 0)
++	if (joliet && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->system_id, pvd->system_id, sizeof(pvd->system_id))) != 0)
+ 		blkid_probe_set_utf8_id_label(pr, "SYSTEM_ID", buf, len, UL_ENCODE_UTF16BE);
+ 	else if (joliet)
+ 		blkid_probe_set_utf8_id_label(pr, "SYSTEM_ID", joliet->system_id, sizeof(joliet->system_id), UL_ENCODE_UTF16BE);
+ 	else
+ 		blkid_probe_set_id_label(pr, "SYSTEM_ID", pvd->system_id, sizeof(pvd->system_id));
+ 
+-	if (joliet && (len = merge_utf16be_ascii(buf, joliet->volume_set_id, pvd->volume_set_id, sizeof(pvd->volume_set_id))) != 0)
++	if (joliet && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->volume_set_id, pvd->volume_set_id, sizeof(pvd->volume_set_id))) != 0)
+ 		blkid_probe_set_utf8_id_label(pr, "VOLUME_SET_ID", buf, len, UL_ENCODE_UTF16BE);
+ 	else if (joliet)
+ 		blkid_probe_set_utf8_id_label(pr, "VOLUME_SET_ID", joliet->volume_set_id, sizeof(joliet->volume_set_id), UL_ENCODE_UTF16BE);
+ 	else
+ 		blkid_probe_set_id_label(pr, "VOLUME_SET_ID", pvd->volume_set_id, sizeof(pvd->volume_set_id));
+ 
+ 	is_ascii_empty = (is_str_empty(pvd->publisher_id, sizeof(pvd->publisher_id)) || pvd->publisher_id[0] == '_');
+ 	is_unicode_empty = (!joliet || is_utf16be_str_empty(joliet->publisher_id, sizeof(joliet->publisher_id)) || (joliet->publisher_id[0] == 0x00 && joliet->publisher_id[1] == '_'));
+-	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, joliet->publisher_id, pvd->publisher_id, sizeof(pvd->publisher_id))) != 0)
++	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->publisher_id, pvd->publisher_id, sizeof(pvd->publisher_id))) != 0)
+ 		blkid_probe_set_utf8_id_label(pr, "PUBLISHER_ID", buf, len, UL_ENCODE_UTF16BE);
+ 	else if (!is_unicode_empty)
+ 		blkid_probe_set_utf8_id_label(pr, "PUBLISHER_ID", joliet->publisher_id, sizeof(joliet->publisher_id), UL_ENCODE_UTF16BE);
+ 	else if (!is_ascii_empty)
+ 		blkid_probe_set_id_label(pr, "PUBLISHER_ID", pvd->publisher_id, sizeof(pvd->publisher_id));
+ 
+ 	is_ascii_empty = (is_str_empty(pvd->data_preparer_id, sizeof(pvd->data_preparer_id)) || pvd->data_preparer_id[0] == '_');
+ 	is_unicode_empty = (!joliet || is_utf16be_str_empty(joliet->data_preparer_id, sizeof(joliet->data_preparer_id)) || (joliet->data_preparer_id[0] == 0x00 && joliet->data_preparer_id[1] == '_'));
+-	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, joliet->data_preparer_id, pvd->data_preparer_id, sizeof(pvd->data_preparer_id))) != 0)
++	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->data_preparer_id, pvd->data_preparer_id, sizeof(pvd->data_preparer_id))) != 0)
+ 		blkid_probe_set_utf8_id_label(pr, "DATA_PREPARER_ID", buf, len, UL_ENCODE_UTF16BE);
+ 	else if (!is_unicode_empty)
+ 		blkid_probe_set_utf8_id_label(pr, "DATA_PREPARER_ID", joliet->data_preparer_id, sizeof(joliet->data_preparer_id), UL_ENCODE_UTF16BE);
+ 	else if (!is_ascii_empty)
+ 		blkid_probe_set_id_label(pr, "DATA_PREPARER_ID", pvd->data_preparer_id, sizeof(pvd->data_preparer_id));
+ 
+ 	is_ascii_empty = (is_str_empty(pvd->application_id, sizeof(pvd->application_id)) || pvd->application_id[0] == '_');
+ 	is_unicode_empty = (!joliet || is_utf16be_str_empty(joliet->application_id, sizeof(joliet->application_id)) || (joliet->application_id[0] == 0x00 && joliet->application_id[1] == '_'));
+-	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, joliet->application_id, pvd->application_id, sizeof(pvd->application_id))) != 0)
++	if (!is_unicode_empty && !is_ascii_empty && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->application_id, pvd->application_id, sizeof(pvd->application_id))) != 0)
+ 		blkid_probe_set_utf8_id_label(pr, "APPLICATION_ID", buf, len, UL_ENCODE_UTF16BE);
+ 	else if (!is_unicode_empty)
+ 		blkid_probe_set_utf8_id_label(pr, "APPLICATION_ID", joliet->application_id, sizeof(joliet->application_id), UL_ENCODE_UTF16BE);
+ 	else if (!is_ascii_empty)
+ 		blkid_probe_set_id_label(pr, "APPLICATION_ID", pvd->application_id, sizeof(pvd->application_id));
+ 
+ 	/* create an UUID using the modified/created date */
+ 	if (! probe_iso9660_set_uuid(pr, &pvd->modified))
+ 		probe_iso9660_set_uuid(pr, &pvd->created);
+ 
+ 	if (boot)
+ 		blkid_probe_set_id_label(pr, "BOOT_SYSTEM_ID",
+ 					boot->boot_system_id,
+ 					sizeof(boot->boot_system_id));
+ 
+ 	if (joliet)
+ 		blkid_probe_set_version(pr, "Joliet Extension");
+ 
+ 	/* Label in Joliet is UNICODE (UTF16BE) but can contain only 16 characters. Label in PVD is
+ 	 * subset of ASCII but can contain up to the 32 characters. Non-representable characters are
+ 	 * stored as replacement character '_'. Label in Joliet is in most cases trimmed but UNICODE
+ 	 * version of label in PVD. Based on these facts try to reconstruct original label if label
+ 	 * in Joliet is prefix of the label in PVD (ignoring non-representable characters).
+ 	 */
+-	if (joliet && (len = merge_utf16be_ascii(buf, joliet->volume_id, pvd->volume_id, sizeof(pvd->volume_id))) != 0)
++	if (joliet && (len = merge_utf16be_ascii(buf, sizeof(buf), joliet->volume_id, pvd->volume_id, sizeof(pvd->volume_id))) != 0)
+ 		blkid_probe_set_utf8label(pr, buf, len, UL_ENCODE_UTF16BE);
+ 	else if (joliet)
+ 		blkid_probe_set_utf8label(pr, joliet->volume_id, sizeof(joliet->volume_id), UL_ENCODE_UTF16BE);
+ 	else
+ 		blkid_probe_set_label(pr, pvd->volume_id, sizeof(pvd->volume_id));
+ 
+ 	return 0;
+ }
+diff --git a/tests/ts/fuzzers/test_blkid_fuzz_files/oss-fuzz-53149 b/tests/ts/fuzzers/test_blkid_fuzz_files/oss-fuzz-53149
+new file mode 100644
+index 000000000..f1c6c3cf3
+Binary files /dev/null and b/tests/ts/fuzzers/test_blkid_fuzz_files/oss-fuzz-53149 differ

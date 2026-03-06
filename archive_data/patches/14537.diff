@@ -1,0 +1,438 @@
+commit 69bb9bcf6cef43b744e5baa101a8a3a78db0b00d
+Author: Grzegorz Antoniak <ga@anadoxin.org>
+Date:   Fri May 3 08:31:28 2019 +0200
+
+    RAR5 reader: fix invalid type used for dictionary size mask.
+    
+    This commit fixes places where the window_mask variable, which is needed
+    to perform operations on the dictionary circular buffer, was casted to
+    an int variable.
+    
+    In files that declare dictionary buffer size of 4GB, window_mask has a
+    value of 0xFFFFFFFF. If this value will be assigned to an int variable,
+    this will effectively make the variable to contain value of -1. This
+    means, that any cast to a 64-bit value will bit-extend the int variable
+    to 0xFFFFFFFFFFFFFFFF. This was happening during a read operation from
+    the dictionary. Such invalid window_mask variable was not guarding
+    against buffer underflow.
+    
+    This commit should fix the OSSFuzz issue #14537.
+    
+    The commit also contains a test case for this issue.
+
+diff --git a/libarchive/archive_read_support_format_rar5.c b/libarchive/archive_read_support_format_rar5.c
+index e3c3b62d..9f6dc643 100644
+--- a/libarchive/archive_read_support_format_rar5.c
++++ b/libarchive/archive_read_support_format_rar5.c
+@@ -505,18 +505,18 @@ static void write_filter_data(struct rar5* rar, uint32_t offset,
+     archive_le32enc(&rar->cstate.filtered_buf[offset], value);
+ }
+ 
+-static void circular_memcpy(uint8_t* dst, uint8_t* window, const int mask,
++static void circular_memcpy(uint8_t* dst, uint8_t* window, const uint64_t mask,
+         int64_t start, int64_t end)
+ {
+     if((start & mask) > (end & mask)) {
+         ssize_t len1 = mask + 1 - (start & mask);
+         ssize_t len2 = end & mask;
+ 
+         memcpy(dst, &window[start & mask], len1);
+         memcpy(dst + len1, window, len2);
+     } else {
+         memcpy(dst, &window[start & mask], (size_t) (end - start));
+     }
+ }
+ 
+ /* Allocates a new filter descriptor and adds it to the filter array. */
+@@ -559,44 +559,43 @@ static int run_delta_filter(struct rar5* rar, struct filter_info* flt) {
+ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt,
+         int extended)
+ {
+     const uint32_t file_size = 0x1000000;
+     ssize_t i;
+ 
+-    const int mask = (int)rar->cstate.window_mask;
+     circular_memcpy(rar->cstate.filtered_buf,
+         rar->cstate.window_buf,
+-        mask,
++        rar->cstate.window_mask,
+         rar->cstate.solid_offset + flt->block_start,
+         rar->cstate.solid_offset + flt->block_start + flt->block_length);
+ 
+     for(i = 0; i < flt->block_length - 4;) {
+         uint8_t b = rar->cstate.window_buf[(rar->cstate.solid_offset +
+-                flt->block_start + i++) & mask];
++                flt->block_start + i++) & rar->cstate.window_mask];
+ 
+         /* 0xE8 = x86's call <relative_addr_uint32> (function call)
+          * 0xE9 = x86's jmp <relative_addr_uint32> (unconditional jump) */
+         if(b == 0xE8 || (extended && b == 0xE9)) {
+ 
+             uint32_t addr;
+             uint32_t offset = (i + flt->block_start) % file_size;
+ 
+             addr = read_filter_data(rar, (uint32_t)(rar->cstate.solid_offset +
+                         flt->block_start + i) & rar->cstate.window_mask);
+ 
+             if(addr & 0x80000000) {
+                 if(((addr + offset) & 0x80000000) == 0) {
+                     write_filter_data(rar, (uint32_t)i, addr + file_size);
+                 }
+             } else {
+                 if((addr - file_size) & 0x80000000) {
+                     uint32_t naddr = addr - offset;
+                     write_filter_data(rar, (uint32_t)i, naddr);
+                 }
+             }
+ 
+             i += 4;
+         }
+     }
+ 
+     return ARCHIVE_OK;
+ }
+@@ -604,28 +603,27 @@ static int run_e8e9_filter(struct rar5* rar, struct filter_info* flt,
+ static int run_arm_filter(struct rar5* rar, struct filter_info* flt) {
+     ssize_t i = 0;
+     uint32_t offset;
+-    const int mask = (int)rar->cstate.window_mask;
+ 
+     circular_memcpy(rar->cstate.filtered_buf,
+         rar->cstate.window_buf,
+-        mask,
++        rar->cstate.window_mask,
+         rar->cstate.solid_offset + flt->block_start,
+         rar->cstate.solid_offset + flt->block_start + flt->block_length);
+ 
+     for(i = 0; i < flt->block_length - 3; i += 4) {
+         uint8_t* b = &rar->cstate.window_buf[(rar->cstate.solid_offset +
+-                flt->block_start + i) & mask];
++                flt->block_start + i) & rar->cstate.window_mask];
+ 
+         if(b[3] == 0xEB) {
+             /* 0xEB = ARM's BL (branch + link) instruction. */
+             offset = read_filter_data(rar, (rar->cstate.solid_offset +
+-                        flt->block_start + i) & mask) & 0x00ffffff;
++                        flt->block_start + i) & rar->cstate.window_mask) & 0x00ffffff;
+ 
+             offset -= (uint32_t) ((i + flt->block_start) / 4);
+             offset = (offset & 0x00ffffff) | 0xeb000000;
+             write_filter_data(rar, (uint32_t)i, offset);
+         }
+     }
+ 
+     return ARCHIVE_OK;
+ }
+@@ -685,47 +683,47 @@ static int run_filter(struct archive_read* a, struct filter_info* flt) {
+ /* The `push_data` function submits the selected data range to the user.
+  * Next call of `use_data` will use the pointer, size and offset arguments
+  * that are specified here. These arguments are pushed to the FIFO stack here,
+  * and popped from the stack by the `use_data` function. */
+ static void push_data(struct archive_read* a, struct rar5* rar,
+         const uint8_t* buf, int64_t idx_begin, int64_t idx_end)
+ {
+-    const int wmask = (int)rar->cstate.window_mask;
++    const uint64_t wmask = rar->cstate.window_mask;
+     const ssize_t solid_write_ptr = (rar->cstate.solid_offset +
+         rar->cstate.last_write_ptr) & wmask;
+ 
+     idx_begin += rar->cstate.solid_offset;
+     idx_end += rar->cstate.solid_offset;
+ 
+     /* Check if our unpacked data is wrapped inside the window circular buffer.
+      * If it's not wrapped, it can be copied out by using a single memcpy,
+      * but when it's wrapped, we need to copy the first part with one
+      * memcpy, and the second part with another memcpy. */
+ 
+     if((idx_begin & wmask) > (idx_end & wmask)) {
+         /* The data is wrapped (begin offset sis bigger than end offset). */
+         const ssize_t frag1_size = rar->cstate.window_size - (idx_begin & wmask);
+         const ssize_t frag2_size = idx_end & wmask;
+ 
+         /* Copy the first part of the buffer first. */
+         push_data_ready(a, rar, buf + solid_write_ptr, frag1_size,
+             rar->cstate.last_write_ptr);
+ 
+         /* Copy the second part of the buffer. */
+         push_data_ready(a, rar, buf, frag2_size,
+             rar->cstate.last_write_ptr + frag1_size);
+ 
+         rar->cstate.last_write_ptr += frag1_size + frag2_size;
+     } else {
+         /* Data is not wrapped, so we can just use one call to copy the
+          * data. */
+         push_data_ready(a, rar,
+             buf + solid_write_ptr,
+             (idx_end - idx_begin) & wmask,
+             rar->cstate.last_write_ptr);
+ 
+         rar->cstate.last_write_ptr += idx_end - idx_begin;
+     }
+ }
+ 
+ /* Convenience function that submits the data to the user. It uses the
+  * unpack window buffer as a source location. */
+@@ -2660,23 +2658,23 @@ static int decode_code_length(struct rar5* rar, const uint8_t* p,
+ 
+ static int copy_string(struct archive_read* a, int len, int dist) {
+     struct rar5* rar = get_context(a);
+-    const int cmask = (int)rar->cstate.window_mask;
+-    const int64_t write_ptr = rar->cstate.write_ptr + rar->cstate.solid_offset;
++    const uint64_t cmask = rar->cstate.window_mask;
++    const uint64_t write_ptr = rar->cstate.write_ptr + rar->cstate.solid_offset;
+     int i;
+ 
+     /* The unpacker spends most of the time in this function. It would be
+      * a good idea to introduce some optimizations here.
+      *
+      * Just remember that this loop treats buffers that overlap differently
+      * than buffers that do not overlap. This is why a simple memcpy(3) call
+      * will not be enough. */
+ 
+     for(i = 0; i < len; i++) {
+         const ssize_t write_idx = (write_ptr + i) & cmask;
+         const ssize_t read_idx = (write_ptr + i - dist) & cmask;
+         rar->cstate.window_buf[write_idx] = rar->cstate.window_buf[read_idx];
+     }
+ 
+     rar->cstate.write_ptr += len;
+     return ARCHIVE_OK;
+ }
+@@ -2684,197 +2682,197 @@ static int copy_string(struct archive_read* a, int len, int dist) {
+ static int do_uncompress_block(struct archive_read* a, const uint8_t* p) {
+     struct rar5* rar = get_context(a);
+     uint16_t num;
+     int ret;
+ 
+-    const int cmask = (int)rar->cstate.window_mask;
++    const uint64_t cmask = rar->cstate.window_mask;
+     const struct compressed_block_header* hdr = &rar->last_block_hdr;
+     const uint8_t bit_size = 1 + bf_bit_size(hdr);
+ 
+     while(1) {
+         if(rar->cstate.write_ptr - rar->cstate.last_write_ptr >
+                 (rar->cstate.window_size >> 1)) {
+ 
+             /* Don't allow growing data by more than half of the window size
+              * at a time. In such case, break the loop; next call to this
+              * function will continue processing from this moment. */
+ 
+             break;
+         }
+ 
+         if(rar->bits.in_addr > rar->cstate.cur_block_size - 1 ||
+                 (rar->bits.in_addr == rar->cstate.cur_block_size - 1 &&
+                  rar->bits.bit_addr >= bit_size))
+         {
+             /* If the program counter is here, it means the function has
+              * finished processing the block. */
+             rar->cstate.block_parsing_finished = 1;
+             break;
+         }
+ 
+         /* Decode the next literal. */
+         if(ARCHIVE_OK != decode_number(a, &rar->cstate.ld, p, &num)) {
+             return ARCHIVE_EOF;
+         }
+ 
+         /* Num holds a decompression literal, or 'command code'.
+          *
+          * - Values lower than 256 are just bytes. Those codes can be stored
+          *   in the output buffer directly.
+          *
+          * - Code 256 defines a new filter, which is later used to transform
+          *   the data block accordingly to the filter type. The data block
+          *   needs to be fully uncompressed first.
+          *
+          * - Code bigger than 257 and smaller than 262 define a repetition
+          *   pattern that should be copied from an already uncompressed chunk
+          *   of data.
+          */
+ 
+         if(num < 256) {
+             /* Directly store the byte. */
+ 
+             int64_t write_idx = rar->cstate.solid_offset +
+                 rar->cstate.write_ptr++;
+ 
+             rar->cstate.window_buf[write_idx & cmask] = (uint8_t) num;
+             continue;
+         } else if(num >= 262) {
+             uint16_t dist_slot;
+             int len = decode_code_length(rar, p, num - 262),
+                 dbits,
+                 dist = 1;
+ 
+             if(len == -1) {
+                 archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                     "Failed to decode the code length");
+ 
+                 return ARCHIVE_FATAL;
+             }
+ 
+             if(ARCHIVE_OK != decode_number(a, &rar->cstate.dd, p, &dist_slot))
+             {
+                 archive_set_error(&a->archive, ARCHIVE_ERRNO_PROGRAMMER,
+                     "Failed to decode the distance slot");
+ 
+                 return ARCHIVE_FATAL;
+             }
+ 
+             if(dist_slot < 4) {
+                 dbits = 0;
+                 dist += dist_slot;
+             } else {
+                 dbits = dist_slot / 2 - 1;
+ 
+                 /* Cast to uint32_t will make sure the shift left operation
+                  * won't produce undefined result. Then, the uint32_t type will
+                  * be implicitly casted to int. */
+                 dist += (uint32_t) (2 | (dist_slot & 1)) << dbits;
+             }
+ 
+             if(dbits > 0) {
+                 if(dbits >= 4) {
+                     uint32_t add = 0;
+                     uint16_t low_dist;
+ 
+                     if(dbits > 4) {
+                         if(ARCHIVE_OK != read_bits_32(rar, p, &add)) {
+                             /* Return EOF if we can't read more data. */
+                             return ARCHIVE_EOF;
+                         }
+ 
+                         skip_bits(rar, dbits - 4);
+                         add = (add >> (36 - dbits)) << 4;
+                         dist += add;
+                     }
+ 
+                     if(ARCHIVE_OK != decode_number(a, &rar->cstate.ldd, p,
+                                 &low_dist))
+                     {
+                         archive_set_error(&a->archive,
+                                 ARCHIVE_ERRNO_PROGRAMMER,
+                                 "Failed to decode the distance slot");
+ 
+                         return ARCHIVE_FATAL;
+                     }
+ 
+                     dist += low_dist;
+                 } else {
+                     /* dbits is one of [0,1,2,3] */
+                     int add;
+ 
+                     if(ARCHIVE_OK != read_consume_bits(rar, p, dbits, &add)) {
+                         /* Return EOF if we can't read more data. */
+                         return ARCHIVE_EOF;
+                     }
+ 
+                     dist += add;
+                 }
+             }
+ 
+             if(dist > 0x100) {
+                 len++;
+ 
+                 if(dist > 0x2000) {
+                     len++;
+ 
+                     if(dist > 0x40000) {
+                         len++;
+                     }
+                 }
+             }
+ 
+             dist_cache_push(rar, dist);
+             rar->cstate.last_len = len;
+ 
+             if(ARCHIVE_OK != copy_string(a, len, dist))
+                 return ARCHIVE_FATAL;
+ 
+             continue;
+         } else if(num == 256) {
+             /* Create a filter. */
+             ret = parse_filter(a, p);
+             if(ret != ARCHIVE_OK)
+                 return ret;
+ 
+             continue;
+         } else if(num == 257) {
+             if(rar->cstate.last_len != 0) {
+                 if(ARCHIVE_OK != copy_string(a, rar->cstate.last_len,
+                             rar->cstate.dist_cache[0]))
+                 {
+                     return ARCHIVE_FATAL;
+                 }
+             }
+ 
+             continue;
+         } else if(num < 262) {
+             const int idx = num - 258;
+             const int dist = dist_cache_touch(rar, idx);
+ 
+             uint16_t len_slot;
+             int len;
+ 
+             if(ARCHIVE_OK != decode_number(a, &rar->cstate.rd, p, &len_slot)) {
+                 return ARCHIVE_FATAL;
+             }
+ 
+             len = decode_code_length(rar, p, len_slot);
+             rar->cstate.last_len = len;
+ 
+             if(ARCHIVE_OK != copy_string(a, len, dist))
+                 return ARCHIVE_FATAL;
+ 
+             continue;
+         }
+ 
+         /* The program counter shouldn't reach here. */
+         archive_set_error(&a->archive, ARCHIVE_ERRNO_FILE_FORMAT,
+                 "Unsupported block code: 0x%x", num);
+ 
+         return ARCHIVE_FATAL;
+     }
+ 
+     return ARCHIVE_OK;
+ }
+ 
+ /* Binary search for the RARv5 signature. */
+diff --git a/libarchive/test/test_read_format_rar5.c b/libarchive/test/test_read_format_rar5.c
+index cc1c4b89..e53cf061 100644
+--- a/libarchive/test/test_read_format_rar5.c
++++ b/libarchive/test/test_read_format_rar5.c
+@@ -1010,3 +1010,18 @@ DEFINE_TEST(test_read_format_rar5_truncated_huff)
+ 
+     EPILOGUE();
+ }
++
++DEFINE_TEST(test_read_format_rar5_invalid_dict_reference)
++{
++    uint8_t buf[16];
++
++    PROLOGUE("test_read_format_rar5_invalid_dict_reference.rar");
++
++    assertA(0 == archive_read_next_header(a, &ae));
++    /* This archive is invalid. However, processing it shouldn't cause any
++     * errors related to buffer underflow when using -fsanitize. */
++    assertA(ARCHIVE_FATAL == archive_read_data(a, buf, sizeof(buf)));
++    assertA(ARCHIVE_EOF == archive_read_next_header(a, &ae));
++
++    EPILOGUE();
++}
+\ No newline at end of file
+diff --git a/libarchive/test/test_read_format_rar5_invalid_dict_reference.rar.uu b/libarchive/test/test_read_format_rar5_invalid_dict_reference.rar.uu
+new file mode 100644
+index 00000000..9b78c9b3
+--- /dev/null
++++ b/libarchive/test/test_read_format_rar5_invalid_dict_reference.rar.uu
+@@ -0,0 +1,9 @@
++begin 644 test_read_format_rar5_invalid_dict_reference.rar
++M4F%R(1H'`0"-[P+2``+#!QR`!P`F^P#_^_O[^_O[^R4``B$<`0(`#@```0``
++M`"#2````_____QH(`/__^P#_W5)04(#_`(:&;;%DS+?,L0```````````+%D
++MS+*RLK*R/@``____Y`"R````XP```````!4``````.X`````````````````
++M%5<M;&@W;3$W"2!S;'$2C5L`_____@D0````$"('``"8F)@+````/__?````
++M@```2$A(2$A(2$A(2$A(2$A(2$A(2$A(2$A(2$A(2$A(2$@S2(``2$A(2$A(
++>2$A(2$A(2$A(2$A(2$A(2$Q(2$A(2$A(2$A(2)](
++`
++end

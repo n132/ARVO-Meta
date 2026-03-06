@@ -1,0 +1,117 @@
+commit fa441346b69ed1064aac39409731740c228319c0
+Author: Antoine Pitrou <antoine@python.org>
+Date:   Thu Oct 1 09:02:43 2020 -0700
+
+    ARROW-10150: [C++] Fix crashes on invalid Parquet file
+    
+    Found by OSS-Fuzz. Should fix the following issues:
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=26064
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=26065
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=26067
+    
+    Closes #8318 from pitrou/ARROW-10150-parquet-fuzz
+    
+    Authored-by: Antoine Pitrou <antoine@python.org>
+    Signed-off-by: Micah Kornfield <emkornfield@gmail.com>
+
+diff --git a/cpp/src/parquet/arrow/schema.cc b/cpp/src/parquet/arrow/schema.cc
+index 16d0e1f3d..3f7ff9223 100644
+--- a/cpp/src/parquet/arrow/schema.cc
++++ b/cpp/src/parquet/arrow/schema.cc
+@@ -692,49 +692,51 @@ Status GetOriginSchema(const std::shared_ptr<const KeyValueMetadata>& metadata,
+ Status ApplyOriginalStorageMetadata(const Field& origin_field, SchemaField* inferred) {
+   auto origin_type = origin_field.type();
+   auto inferred_type = inferred->field->type();
+ 
+-  if (inferred_type->id() == ::arrow::Type::TIMESTAMP) {
++  if (origin_type->id() == ::arrow::Type::TIMESTAMP &&
++      inferred_type->id() == ::arrow::Type::TIMESTAMP) {
+     // Restore time zone, if any
+-    const auto& ts_type = static_cast<const ::arrow::TimestampType&>(*inferred_type);
+-    const auto& ts_origin_type = static_cast<const ::arrow::TimestampType&>(*origin_type);
++    const auto& ts_type = checked_cast<const ::arrow::TimestampType&>(*inferred_type);
++    const auto& ts_origin_type =
++        checked_cast<const ::arrow::TimestampType&>(*origin_type);
+ 
+     // If the unit is the same and the data is tz-aware, then set the original
+     // time zone, since Parquet has no native storage for timezones
+     if (ts_type.unit() == ts_origin_type.unit() && ts_type.timezone() == "UTC" &&
+         ts_origin_type.timezone() != "") {
+       inferred->field = inferred->field->WithType(origin_type);
+     }
+   }
+ 
+   if (origin_type->id() == ::arrow::Type::DICTIONARY &&
+       inferred_type->id() != ::arrow::Type::DICTIONARY &&
+       IsDictionaryReadSupported(*inferred_type)) {
+     const auto& dict_origin_type =
+-        static_cast<const ::arrow::DictionaryType&>(*origin_type);
++        checked_cast<const ::arrow::DictionaryType&>(*origin_type);
+     inferred->field = inferred->field->WithType(
+         ::arrow::dictionary(::arrow::int32(), inferred_type, dict_origin_type.ordered()));
+   }
+ 
+   // Restore field metadata
+   std::shared_ptr<const KeyValueMetadata> field_metadata = origin_field.metadata();
+   if (field_metadata != nullptr) {
+     if (inferred->field->metadata()) {
+       // Prefer the metadata keys (like field_id) from the current metadata
+       field_metadata = field_metadata->Merge(*inferred->field->metadata());
+     }
+     inferred->field = inferred->field->WithMetadata(field_metadata);
+   }
+ 
+   if (origin_type->id() == ::arrow::Type::EXTENSION) {
+     // Restore extension type, if the storage type is as read from Parquet
+     const auto& ex_type = checked_cast<const ::arrow::ExtensionType&>(*origin_type);
+     if (ex_type.storage_type()->Equals(*inferred_type)) {
+       inferred->field = inferred->field->WithType(origin_type);
+     }
+   }
+ 
+   // TODO Should apply metadata recursively to children, but for that we need
+   // to move metadata application inside NodeToSchemaField (ARROW-9943)
+ 
+   return Status::OK();
+ }
+diff --git a/cpp/src/parquet/column_reader.cc b/cpp/src/parquet/column_reader.cc
+index 44a6dcf68..3cdc05255 100644
+--- a/cpp/src/parquet/column_reader.cc
++++ b/cpp/src/parquet/column_reader.cc
+@@ -460,25 +460,29 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
+ std::shared_ptr<Buffer> SerializedPageReader::DecompressIfNeeded(
+     std::shared_ptr<Buffer> page_buffer, int compressed_len, int uncompressed_len,
+     int levels_byte_len) {
+   if (decompressor_ == nullptr) {
+     return page_buffer;
+   }
++  if (compressed_len < levels_byte_len || uncompressed_len < levels_byte_len) {
++    throw ParquetException("Invalid page header");
++  }
++
+   // Grow the uncompressed buffer if we need to.
+   if (uncompressed_len > static_cast<int>(decompression_buffer_->size())) {
+     PARQUET_THROW_NOT_OK(decompression_buffer_->Resize(uncompressed_len, false));
+   }
+ 
+   if (levels_byte_len > 0) {
+     // First copy the levels as-is
+     uint8_t* decompressed = decompression_buffer_->mutable_data();
+     memcpy(decompressed, page_buffer->data(), levels_byte_len);
+   }
+ 
+   // Decompress the values
+   PARQUET_THROW_NOT_OK(decompressor_->Decompress(
+       compressed_len - levels_byte_len, page_buffer->data() + levels_byte_len,
+       uncompressed_len - levels_byte_len,
+       decompression_buffer_->mutable_data() + levels_byte_len));
+ 
+   return decompression_buffer_;
+ }
+diff --git a/testing b/testing
+index ec74f0349..860376d4e 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit ec74f03496ba100fd8497ad660909bb0261a3405
++Subproject commit 860376d4e586a3ac34ec93089889da624ead6c2a

@@ -1,0 +1,244 @@
+commit 461bdeda2b54e478cc77f13c96991949a286af30
+Author: Ben Wiederhake <BenWiederhake.GitHub@gmx.de>
+Date:   Tue Dec 1 22:01:15 2020 +0100
+
+    LibGfx: Fix heap-overflow in BMP RLE
+    
+    The field previously named 'data_size' apparently was misunderstood.
+
+diff --git a/Libraries/LibGfx/BMPLoader.cpp b/Libraries/LibGfx/BMPLoader.cpp
+index b1e66e43ff..2e37c840a6 100644
+--- a/Libraries/LibGfx/BMPLoader.cpp
++++ b/Libraries/LibGfx/BMPLoader.cpp
+@@ -925,230 +925,230 @@ struct RLEState {
+ static bool uncompress_bmp_rle_data(BMPLoadingContext& context, ByteBuffer& buffer)
+ {
+     // RLE-compressed images cannot be stored top-down
+     if (context.dib.core.height < 0) {
+         IF_BMP_DEBUG(dbg() << "BMP is top-down and RLE compressed");
+         context.state = BMPLoadingContext::State::Error;
+         return false;
+     }
+ 
+-    Streamer streamer(context.file_bytes + context.data_offset, context.file_size);
++    Streamer streamer(context.file_bytes + context.data_offset, context.file_size - context.data_offset);
+ 
+     auto compression = context.dib.info.compression;
+ 
+     u32 total_rows = static_cast<u32>(context.dib.core.height);
+     u32 total_columns = round_up_to_power_of_two(static_cast<u32>(context.dib.core.width), 4);
+     u32 column = 0;
+     u32 row = 0;
+     auto currently_consuming = RLEState::PixelCount;
+     i16 pixel_count = 0;
+ 
+     // ByteBuffer asserts that allocating the memory never fails.
+     // FIXME: ByteBuffer should return either RefPtr<> or Optional<>.
+     // Decoding the RLE data on-the-fly might actually be faster, and avoids this topic entirely.
+     u32 buffer_size;
+     if (compression == Compression::RLE24) {
+         buffer_size = total_rows * round_up_to_power_of_two(total_columns, 4) * 4;
+     } else {
+         buffer_size = total_rows * round_up_to_power_of_two(total_columns, 4);
+     }
+     if (buffer_size > 300 * MiB) {
+         IF_BMP_DEBUG(dbg() << "Suspiciously large amount of RLE data");
+         return false;
+     }
+     buffer = ByteBuffer::create_zeroed(buffer_size);
+ 
+     // Avoid as many if statements as possible by pulling out
+     // compression-dependent actions into separate lambdas
+     Function<u32()> get_buffer_index;
+     Function<bool(u32, bool)> set_byte;
+     Function<Optional<u32>()> read_byte;
+ 
+     if (compression == Compression::RLE8) {
+         get_buffer_index = [&]() -> u32 { return row * total_columns + column; };
+     } else if (compression == Compression::RLE4) {
+         get_buffer_index = [&]() -> u32 { return (row * total_columns + column) / 2; };
+     } else {
+         get_buffer_index = [&]() -> u32 { return (row * total_columns + column) * 3; };
+     }
+ 
+     if (compression == Compression::RLE8) {
+         set_byte = [&](u32 color, bool) -> bool {
+             if (column >= total_columns) {
+                 column = 0;
+                 row++;
+             }
+             auto index = get_buffer_index();
+             if (index >= buffer.size()) {
+                 IF_BMP_DEBUG(dbg() << "BMP has badly-formatted RLE data");
+                 return false;
+             }
+             buffer[index] = color;
+             column++;
+             return true;
+         };
+     } else if (compression == Compression::RLE24) {
+         set_byte = [&](u32 color, bool) -> bool {
+             if (column >= total_columns) {
+                 column = 0;
+                 row++;
+             }
+             auto index = get_buffer_index();
+             if (index + 3 >= buffer.size()) {
+                 IF_BMP_DEBUG(dbg() << "BMP has badly-formatted RLE data");
+                 return false;
+             }
+             ((u32&)buffer[index]) = color;
+             column++;
+             return true;
+         };
+     } else {
+         set_byte = [&](u32 byte, bool rle4_set_second_nibble) -> bool {
+             if (column >= total_columns) {
+                 column = 0;
+                 row++;
+             }
+ 
+             u32 index = get_buffer_index();
+             if (index >= buffer.size() || (rle4_set_second_nibble && index + 1 >= buffer.size())) {
+                 IF_BMP_DEBUG(dbg() << "BMP has badly-formatted RLE data");
+                 return false;
+             }
+ 
+             if (column % 2) {
+                 buffer[index] |= byte >> 4;
+                 if (rle4_set_second_nibble) {
+                     buffer[index + 1] |= byte << 4;
+                     column++;
+                 }
+             } else {
+                 if (rle4_set_second_nibble) {
+                     buffer[index] = byte;
+                     column++;
+                 } else {
+                     buffer[index] |= byte & 0xf0;
+                 }
+             }
+ 
+             column++;
+             return true;
+         };
+     }
+ 
+     if (compression == Compression::RLE24) {
+         read_byte = [&]() -> Optional<u32> {
+             if (!streamer.has_u24()) {
+                 IF_BMP_DEBUG(dbg() << "BMP has badly-formatted RLE data");
+                 return {};
+             }
+             return streamer.read_u24();
+         };
+     } else {
+         read_byte = [&]() -> Optional<u32> {
+             if (!streamer.has_u8()) {
+                 IF_BMP_DEBUG(dbg() << "BMP has badly-formatted RLE data");
+                 return {};
+             }
+             return streamer.read_u8();
+         };
+     }
+ 
+     while (true) {
+         u32 byte;
+ 
+         switch (currently_consuming) {
+         case RLEState::PixelCount:
+             if (!streamer.has_u8())
+                 return false;
+             byte = streamer.read_u8();
+             if (!byte) {
+                 currently_consuming = RLEState::Meta;
+             } else {
+                 pixel_count = byte;
+                 currently_consuming = RLEState::PixelValue;
+             }
+             break;
+         case RLEState::PixelValue: {
+             auto result = read_byte();
+             if (!result.has_value())
+                 return false;
+             byte = result.value();
+             for (u8 i = 0; i < pixel_count; ++i) {
+                 if (compression != Compression::RLE4) {
+                     if (!set_byte(byte, true))
+                         return false;
+                 } else {
+                     if (!set_byte(byte, i != pixel_count - 1))
+                         return false;
+                     i++;
+                 }
+             }
+ 
+             currently_consuming = RLEState::PixelCount;
+             break;
+         }
+         case RLEState::Meta:
+             if (!streamer.has_u8())
+                 return false;
+             byte = streamer.read_u8();
+             if (!byte) {
+                 column = 0;
+                 row++;
+                 currently_consuming = RLEState::PixelCount;
+                 continue;
+             }
+             if (byte == 1)
+                 return true;
+             if (byte == 2) {
+                 if (!streamer.has_u8())
+                     return false;
+                 u8 offset_x = streamer.read_u8();
+                 if (!streamer.has_u8())
+                     return false;
+                 u8 offset_y = streamer.read_u8();
+                 column += offset_x;
+                 if (column >= total_columns) {
+                     column -= total_columns;
+                     row++;
+                 }
+                 row += offset_y;
+                 currently_consuming = RLEState::PixelCount;
+                 continue;
+             }
+ 
+             // Consume literal bytes
+             pixel_count = byte;
+             i16 i = byte;
+ 
+             while (i >= 1) {
+                 auto result = read_byte();
+                 if (!result.has_value())
+                     return false;
+                 byte = result.value();
+                 if (!set_byte(byte, i != 1))
+                     return false;
+                 i--;
+                 if (compression == Compression::RLE4)
+                     i--;
+             }
+ 
+             // Optionally consume a padding byte
+             if (compression != Compression::RLE4) {
+                 if (pixel_count % 2) {
+                     if (!streamer.has_u8())
+                         return false;
+                     byte = streamer.read_u8();
+                 }
+             } else {
+                 if (((pixel_count + 1) / 2) % 2) {
+                     if (!streamer.has_u8())
+                         return false;
+                     byte = streamer.read_u8();
+                 }
+             }
+             currently_consuming = RLEState::PixelCount;
+             break;
+         }
+     }
+ 
+     ASSERT_NOT_REACHED();
+ }

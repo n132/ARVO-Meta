@@ -1,0 +1,149 @@
+commit a8b33acf7ba5158af434ae4dfa8003c1ddbc7e18
+Author: Alex Hultman <alexhultman@gmail.com>
+Date:   Tue Dec 1 04:37:43 2020 +0100
+
+    Fix Http regression from warnings fix
+
+diff --git a/Makefile b/Makefile
+index 662bee4..7f6edaa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ EXAMPLE_FILES := HelloWorld ServerName EchoServer BroadcastingEchoServer UpgradeSync UpgradeAsync
+ THREADED_EXAMPLE_FILES := HelloWorldThreaded EchoServerThreaded
+-override CXXFLAGS += -lpthread -Wextra -std=c++17 -Isrc -IuSockets/src
++override CXXFLAGS += -lpthread -Wpedantic -Wall -Wextra -std=c++2a -Isrc -IuSockets/src
+ override LDFLAGS += uSockets/*.o -lz
+ 
+ DESTDIR ?=
+diff --git a/src/HttpParser.h b/src/HttpParser.h
+index 5b69b70..53dc07c 100644
+--- a/src/HttpParser.h
++++ b/src/HttpParser.h
+@@ -146,125 +146,125 @@ struct HttpParser {
+ private:
+     std::string fallback;
+     unsigned int remainingStreamingBytes = 0;
+ 
+     const size_t MAX_FALLBACK_SIZE = 1024 * 4;
+ 
+     static unsigned int toUnsignedInteger(std::string_view str) {
+         unsigned int unsignedIntegerValue = 0;
+         for (char c : str) {
+             unsignedIntegerValue = unsignedIntegerValue * 10 + ((unsigned char) c - '0');
+         }
+         return unsignedIntegerValue;
+     }
+ 
+     static unsigned int getHeaders(char *postPaddedBuffer, char *end, struct HttpRequest::Header *headers) {
+         char *preliminaryKey, *preliminaryValue, *start = postPaddedBuffer;
+ 
+         for (unsigned int i = 0; i < HttpRequest::MAX_HEADERS; i++) {
+             for (preliminaryKey = postPaddedBuffer; (*postPaddedBuffer != ':') & (*postPaddedBuffer > 32); *(postPaddedBuffer++) |= 32);
+             if (*postPaddedBuffer == '\r') {
+                 if ((postPaddedBuffer != end) & (postPaddedBuffer[1] == '\n') & (i > 0)) {
+                     headers->key = std::string_view(nullptr, 0);
+                     return (unsigned int) ((postPaddedBuffer + 2) - start);
+                 } else {
+                     return 0;
+                 }
+             } else {
+                 headers->key = std::string_view(preliminaryKey, (size_t) (postPaddedBuffer - preliminaryKey));
+                 for (postPaddedBuffer++; (*postPaddedBuffer == ':' || *postPaddedBuffer < 33) && *postPaddedBuffer != '\r'; postPaddedBuffer++);
+                 preliminaryValue = postPaddedBuffer;
+                 postPaddedBuffer = (char *) memchr(postPaddedBuffer, '\r', (size_t) (end - postPaddedBuffer));
+                 if (postPaddedBuffer && postPaddedBuffer[1] == '\n') {
+                     headers->value = std::string_view(preliminaryValue, (size_t) (postPaddedBuffer - preliminaryValue));
+                     postPaddedBuffer += 2;
+                     headers++;
+                 } else {
+                     return 0;
+                 }
+             }
+         }
+         return 0;
+     }
+ 
+     // the only caller of getHeaders
+     template <int CONSUME_MINIMALLY>
+     std::pair<int, void *> fenceAndConsumePostPadded(char *data, unsigned int length, void *user, void *reserved, HttpRequest *req, fu2::unique_function<void *(void *, HttpRequest *)> &requestHandler, fu2::unique_function<void *(void *, std::string_view, bool)> &dataHandler) {
+ 
+         /* How much data we CONSUMED (to throw away) */
+         unsigned int consumedTotal = 0;
+ 
+ #ifdef UWS_WITH_PROXY
+         /* ProxyParser is passed as reserved parameter */
+         ProxyParser *pp = (ProxyParser *) reserved;
+ 
+         /* Parse PROXY protocol */
+         auto [done, offset] = pp->parse({data, /*(unsigned int)*/ length});
+         if (!done) {
+             return {0, user};
+         } else {
+             /* We have consumed this data so skip it */
+             data += offset;
+             length -= offset;
+             consumedTotal += offset;
+         }
+ #else
+         /* This one is unused */
+         (void) reserved;
+ #endif
+ 
+         /* Fence one byte past end of our buffer (buffer has post padded margins) */
+         data[length] = '\r';
+ 
+         for (unsigned int consumed; length && (consumed = getHeaders(data, data + length, req->headers)); ) {
+             data += consumed;
+             length -= consumed;
+             consumedTotal += consumed;
+ 
+             /* Strip away tail of first "header value" aka URL */
+-            req->headers->value = std::string_view(req->headers->value.data(), std::max<size_t>(0, req->headers->value.length() - 9));
++            req->headers->value = std::string_view(req->headers->value.data(), (size_t) std::max<int>(0, (int) req->headers->value.length() - 9));
+ 
+             /* Add all headers to bloom filter */
+             req->bf.reset();
+             for (HttpRequest::Header *h = req->headers; (++h)->key.length(); ) {
+                 req->bf.add(h->key);
+             }
+ 
+             /* Parse query */
+             const char *querySeparatorPtr = (const char *) memchr(req->headers->value.data(), '?', req->headers->value.length());
+             req->querySeparator = (unsigned int) ((querySeparatorPtr ? querySeparatorPtr : req->headers->value.data() + req->headers->value.length()) - req->headers->value.data());
+ 
+             /* If returned socket is not what we put in we need
+              * to break here as we either have upgraded to
+              * WebSockets or otherwise closed the socket. */
+             void *returnedUser = requestHandler(user, req);
+             if (returnedUser != user) {
+                 /* We are upgraded to WebSocket or otherwise broken */
+                 return {consumedTotal, returnedUser};
+             }
+ 
+             // todo: do not check this for GET (get should not have a body)
+             // todo: also support reading chunked streams
+             std::string_view contentLengthString = req->getHeader("content-length");
+             if (contentLengthString.length()) {
+                 remainingStreamingBytes = toUnsignedInteger(contentLengthString);
+ 
+                 if (!CONSUME_MINIMALLY) {
+                     unsigned int emittable = std::min<unsigned int>(remainingStreamingBytes, length);
+                     dataHandler(user, std::string_view(data, emittable), emittable == remainingStreamingBytes);
+                     remainingStreamingBytes -= emittable;
+ 
+                     data += emittable;
+                     length -= emittable;
+                     consumedTotal += emittable;
+                 }
+             } else {
+                 /* Still emit an empty data chunk to signal no data */
+                 dataHandler(user, {}, true);
+             }
+ 
+             if (CONSUME_MINIMALLY) {
+                 break;
+             }
+         }
+         return {consumedTotal, user};
+     }

@@ -1,0 +1,661 @@
+commit 665c743174b04d58fe8abb601ca959a1e5c5ecf8
+Author: Matteo Biscosi <biscosi@ntop.org>
+Date:   Thu Dec 21 11:05:03 2023 +0000
+
+    Added switch between normal and per minute traffic ts
+
+diff --git a/scripts/lua/modules/timeseries/ts_data.lua b/scripts/lua/modules/timeseries/ts_data.lua
+index 50613a2da..9638f8e06 100644
+--- a/scripts/lua/modules/timeseries/ts_data.lua
++++ b/scripts/lua/modules/timeseries/ts_data.lua
+@@ -78,91 +78,97 @@ end
+ function ts_data.get_timeseries(http_context)
+     local graph_utils = require "graph_utils"
+ 
+     local ts_schema = http_context.ts_schema
+     local compare_backward = http_context.ts_compare
+     local extended_times = http_context.extended
+     local ts_aggregation = http_context.ts_aggregation
+ 
+     local options = {
+         min_num_points = 2,
+         max_num_points = tonumber(http_context.limit) or 60,
+         initial_point = toboolean(http_context.initial_point),
+         epoch_begin = tonumber(http_context.epoch_begin) or (os.time() - 3600),
+         epoch_end = tonumber(http_context.epoch_end) or os.time(),
+         with_series = true,
+         target_aggregation = ts_aggregation or "raw",
+         keep_nan = true,
+         keep_total = false,
+         tags = http_context.tags,
+         schema = ts_schema
+     }
+ 
+     if options.tags.ifid then
+         interface.select(options.tags.ifid)
+     end
+ 
++    if options.schema == 'snmp_if:traffic_min' and options.tags.port then
++        options.tags.if_index = options.tags.port
++        options.tags.ifid = getSystemInterfaceId()
++        options.tags.port = nil
++    end
++
+     if http_context.tskey then
+         -- This can contain a MAC address for local broadcast domain hosts
+         local tskey = http_context.tskey
+ 
+         -- Setting host_ip (check that the provided IP matches the provided
+         -- mac address as safety check and to avoid security issues)
+         if (options.schema == "top:snmp_if:packets") or (options.schema == "top:snmp_if:traffic") or (options.schema == "top:flowdev_port:traffic") then
+             -- NOTE: the host here is not required, if added return an empty serie
+             tskey = 0
+             options.tags.host = nil
+         end
+ 
+         if options.tags.host then
+             options.tags = addHostInfo(options.tags)
+         end
+     end
+ 
+     if ((options.schema == "top:flow_check:duration") or (options.schema == "top:elem_check:duration")) then
+         -- NOTE: Temporary fix for top checks page
+         options.tags.check = nil
+     end
+ 
+     local res = {}
+ 
+     -- if Mac address ts is requested, check if the serialize by mac is enabled and if no data is found, use the host timeseries. 
+     -- if (table.len(res) == 0) or (res.statistics) and (res.statistics.total == 0) then
+     local serialize_by_mac = ntop.getPref(string.format("ntopng.prefs.ifid_" .. options.tags.ifid ..
+                                                             ".serialize_local_broadcast_hosts_as_macs")) == "1"
+     local tmp = split(options.schema, ":")
+ 
+     if (serialize_by_mac) and (options.tags.mac) then
+         options.schema = "host:" .. tmp[2]
+         options.tags.host = options.tags.mac .. "_v4"
+     end
+ 
+     res = performQuery(options) or {}
+     
+     -- No result found
+     if res == nil then
+         local ts_utils = require("ts_utils")
+         res = {}
+ 
+         if ts_utils.getLastError() then
+             local rest_utils = require "rest_utils"
+ 
+             -- Return an error in case of no result
+             res["tsLastError"] = ts_utils.getLastError()
+             res["error"] = ts_utils.getLastErrorMessage()
+             rest_utils.answer(rest_utils.consts.err.internal_error, res)
+         end
+ 
+         -- Jump to the end
+         return res
+     end
+ 
+     -- Add metadata other metadata
+     if not res.metadata then
+         res.metadata = {}
+     end
+ 
+     if not isEmptyString(compare_backward) and (res.metadata.epoch_step) then
+         res = compareBackward(compare_backward, res, options)
+     end
+ 
+     return res
+diff --git a/scripts/lua/modules/timeseries/ts_schema.lua b/scripts/lua/modules/timeseries/ts_schema.lua
+index fe609c2b0..e5b795ff4 100644
+--- a/scripts/lua/modules/timeseries/ts_schema.lua
++++ b/scripts/lua/modules/timeseries/ts_schema.lua
+@@ -145,21 +145,22 @@ end
+ function ts_schema:verifyTags(tags)
+   local actual_tags = {}
+ 
+   local all_defined, missing_tag = self:allTagsDefined(tags)
+ 
+   if not all_defined then
++    tprint(debug.traceback())
+     traceError(TRACE_ERROR, TRACE_CONSOLE, "missing tag '" .. missing_tag .. "' in schema " .. self.name)
+     return nil
+   end
+ 
+   for tag in pairs(tags) do
+     if self.tags[tag] == nil then
+       -- NOTE: just ignore the additional tags
+       --traceError(TRACE_ERROR, TRACE_CONSOLE, "unknown tag '" .. tag .. "' in schema " .. self.name)
+       --return false
+     else
+       actual_tags[tag] = tags[tag]
+     end
+   end
+ 
+   return actual_tags
+diff --git a/scripts/lua/modules/timeseries_info.lua b/scripts/lua/modules/timeseries_info.lua
+index ac9486d73..90c7d8495 100644
+--- a/scripts/lua/modules/timeseries_info.lua
++++ b/scripts/lua/modules/timeseries_info.lua
+@@ -2077,38 +2077,38 @@ end
+ local function add_top_blacklist_hits_timeseries(tags, timeseries)
+     local series = ts_utils.listSeries("blacklist:hits", table.clone(tags), tags.epoch_begin) or {}
+     local tmp_tags = table.clone(tags)
+ 
+     if table.empty(series) then
+         return;
+     end
+     for _, serie in pairs(series or {}) do
+         tmp_tags.blacklist_name = serie.blacklist_name
+         local tot = 0
+         local tot_serie = ts_utils.queryTotal("blacklist:hits", tags.epoch_begin, tags.epoch_end, tmp_tags)
+         for _, value in pairs(tot_serie or {}) do
+             tot = tot + tonumber(value)
+         end
+         -- Uncomment to return only timeseries with values
+         -- if tot <= 0 then
+         --     return
+         -- end
+         timeseries[#timeseries + 1] = {
+             schema = "top:blacklist:hits",
+             id = timeseries_id.blacklist,
+             group = i18n("graphs.metric_labels.blacklist_num_hits"),
+             priority = 0,
+             query = "blacklist_name:" .. serie.blacklist_name,
+             label = serie.blacklist_name:gsub("_", " "),
+             measure_unit = "hitss",
+-            
++
+             scale = i18n('graphs.metric_labels.blacklist_hits'),
+             timeseries = {
+                 hits = {
+-                   use_serie_name = true,
++                    use_serie_name = true,
+                     label = i18n('graphs.metric_labels.blacklist_num_hits'),
+                     color = timeseries_info.get_timeseries_color('')
+                 }
+             }
+         }
+     end
+     return timeseries
+@@ -2827,47 +2827,169 @@ end
+ 
+ -- #################################
+ 
++local function choose_traffic_serie(tags, timeseries)
++    local tot = 0
++    local tot_serie = ts_utils.queryTotal("snmp_if:traffic_min", tags.epoch_begin, tags.epoch_end, tags)
++    for _, value in pairs(tot_serie or {}) do
++        tot = tot + tonumber(value)
++    end
++
++    --if (tot > 0) then
++        timeseries[#timeseries + 1] = {
++            schema = "snmp_if:traffic_min",
++            id = timeseries_id.snmp_interface,
++            label = i18n("graphs.traffic_rxtx"),
++            priority = 2,
++            measure_unit = "bps",
++            scale = i18n("graphs.metric_labels.traffic"),
++            timeseries = {
++                bytes_sent = {
++                    label = i18n('graphs.metric_labels.out_bytes'),
++                    color = timeseries_info.get_timeseries_color('bytes_sent')
++                },
++                bytes_rcvd = {
++                    invert_direction = true,
++                    label = i18n('graphs.metric_labels.in_bytes'),
++                    color = timeseries_info.get_timeseries_color('bytes_rcvd')
++                }
++            },
++            alwais_visibile = true,
++            default_visible = true
++        }
++    --else
++        timeseries[#timeseries + 1] = {
++            schema = "snmp_if:traffic",
++            id = timeseries_id.snmp_interface,
++            label = i18n("graphs.traffic_per_minute"), --i18n("graphs.traffic_rxtx")
++            priority = 2,
++            measure_unit = "bps",
++            scale = i18n("graphs.metric_labels.traffic"),
++            timeseries = {
++                bytes_sent = {
++                    label = i18n('graphs.metric_labels.out_bytes'),
++                    color = timeseries_info.get_timeseries_color('bytes_sent')
++                },
++                bytes_rcvd = {
++                    invert_direction = true,
++                    label = i18n('graphs.metric_labels.in_bytes'),
++                    color = timeseries_info.get_timeseries_color('bytes_rcvd')
++                }
++            },
++            alwais_visibile = true,
++            default_visible = true
++        }
++    --end
++
++    return timeseries
++end
++
++-- #################################
++
+ local function add_top_flow_port_timeseries(tags, timeseries)
++    local add_standard_traffic = true
+     local top_protocols_pref = ntop.getPref("ntopng.prefs.interface_ndpi_timeseries_creation")
+ 
+     -- Top l7 Protocols
+     if top_protocols_pref == 'both' or top_protocols_pref == 'per_protocol' then
+         local series = ts_utils.listSeries("flowdev_port:ndpi", table.clone(tags), tags.epoch_begin) or {}
+         local tmp_tags = table.clone(tags)
+ 
+         if not table.empty(series) then
+             for _, serie in pairs(series or {}) do
+                 local tot = 0
+                 tmp_tags.protocol = serie.protocol
+                 local tot_serie = ts_utils.queryTotal("flowdev_port:ndpi", tags.epoch_begin, tags.epoch_end, tmp_tags)
+                 -- Remove serie with no data
+                 for _, value in pairs(tot_serie or {}) do
+                     tot = tot + tonumber(value)
+                 end
+ 
+                 if (tot > 0) then
+                     timeseries[#timeseries + 1] = {
+                         schema = "top:flowdev_port:ndpi",
+                         group = i18n("graphs.l7_proto"),
+                         priority = 2,
+                         query = "protocol:" .. serie.protocol,
+                         label = serie.protocol,
+                         measure_unit = "bps",
+                         scale = i18n("graphs.metric_labels.traffic"),
+                         timeseries = {
+                             bytes_sent = {
+                                 label = serie.protocol .. " " .. i18n('graphs.metric_labels.sent'),
+                                 color = timeseries_info.get_timeseries_color('bytes')
+                             },
+                             bytes_rcvd = {
+                                 label = serie.protocol .. " " .. i18n('graphs.metric_labels.rcvd'),
+                                 color = timeseries_info.get_timeseries_color('bytes')
+                             }
+                         }
+                     }
+                 end
+             end
+         end
++
++        if ntop.getPref("ntopng.prefs.snmp_devices_rrd_creation") == "1" then
++            tmp_tags.if_index = tags.port
++            tmp_tags.ifid = getSystemInterfaceId()
++            tmp_tags.port = nil
++            tmp_tags.protocol = nil
++            local tot = 0
++            local tot_serie = ts_utils.queryTotal("snmp_if:traffic_min", tags.epoch_begin, tags.epoch_end, tmp_tags)
++            for _, value in pairs(tot_serie or {}) do
++                tot = tot + tonumber(value)
++            end
++
++            if (tot > 0) then
++                add_standard_traffic = false
++                -- Add this unique serie if snmp timeseries are enabled
++                timeseries[#timeseries + 1] = {
++                    schema = "snmp_if:traffic_min",
++                    id = timeseries_id.flow_port,
++                    label = i18n("graphs.traffic_per_minute"),--i18n("graphs.traffic_rxtx")
++                    priority = 2,
++                    measure_unit = "bps",
++                    scale = i18n("graphs.metric_labels.traffic"),
++                    timeseries = {
++                        bytes_sent = {
++                            label = i18n('graphs.metric_labels.out_bytes'),
++                            color = timeseries_info.get_timeseries_color('bytes_sent')
++                        },
++                        bytes_rcvd = {
++                            invert_direction = true,
++                            label = i18n('graphs.metric_labels.in_bytes'),
++                            color = timeseries_info.get_timeseries_color('bytes_rcvd')
++                        }
++                    },
++                    alwais_visibile = true,
++                    default_visible = true
++                }
++            end
++        end
++
++        if true --[[add_standard_traffic]] then
++            -- Flow Port: --
++            timeseries[#timeseries + 1] = {
++                schema = "flowdev_port:traffic",
++                id = timeseries_id.flow_port,
++                label = i18n("graphs.traffic_rxtx"),
++                priority = 2,
++                measure_unit = "bps",
++                scale = i18n("graphs.metric_labels.traffic"),
++                timeseries = {
++                    bytes_sent = {
++                        label = i18n('graphs.metric_labels.out_bytes'),
++                        color = timeseries_info.get_timeseries_color('bytes_sent')
++                    },
++                    bytes_rcvd = {
++                        invert_direction = true,
++                        label = i18n('graphs.metric_labels.in_bytes'),
++                        color = timeseries_info.get_timeseries_color('bytes_rcvd')
++                    }
++                },
++                alwais_visibile = true,
++                default_visible = true
++            }
++        end
+     end
+ 
+     return timeseries
+@@ -2878,44 +3000,46 @@ end
+ local function add_top_timeseries(tags, prefix, timeseries)
+     if prefix == 'iface' then
+         -- Add the top interface timeseries
+         timeseries = add_top_interface_timeseries(tags, timeseries)
+     elseif prefix == 'host' then
+         -- Add the top host timeseries
+         timeseries = add_top_host_timeseries(tags, timeseries)
+     elseif prefix == 'asn' then
+         -- Add the top asn timeseries
+         timeseries = add_top_asn_timeseries(tags, timeseries)
+     elseif prefix == 'host_pool' then
+         -- Add the top host pool timeseries
+         timeseries = add_top_host_pool_timeseries(tags, timeseries)
+     elseif prefix == 'vlan' then
+         -- Add the top vlan timeseries
+         timeseries = add_top_vlan_timeseries(tags, timeseries)
+     elseif prefix == 'mac' then
+         -- Add the top mac timeseries
+         timeseries = add_top_mac_timeseries(tags, timeseries)
+     elseif prefix == 'am' then
+         -- Add the active monitoring timeseries
+         timeseries = add_active_monitoring_timeseries(tags, timeseries)
+     elseif prefix == 'subnet' then
+         -- Add the active monitoring timeseries
+         timeseries = add_top_network_timeseries(tags, timeseries)
+     elseif prefix == timeseries_id.observation_point then
+         -- Add top observation points timeseries
+         timeseries = add_top_obs_point_timeseries(tags, timeseries)
++    elseif prefix == timeseries_id.snmp_interface then
++        timeseries = choose_traffic_serie(tags, timeseries)
+     elseif prefix == timeseries_id.snmp_device then
+         -- Add the interfaces timeseries
+         timeseries = add_snmp_interfaces_timeseries(tags, timeseries)
+     elseif prefix == timeseries_id.flow_dev then
+         -- Add the interfaces timeseries
+         timeseries = add_flowdev_interfaces_timeseries(tags, timeseries)
+     elseif prefix == timeseries_id.flow_port then
+         -- Add the top interface timeseries
+         timeseries = add_top_flow_port_timeseries(tags, timeseries)
+     elseif prefix == timeseries_id.blacklist then
+         -- Add the top interface timeseries
+         timeseries = add_top_blacklist_hits_timeseries(tags, timeseries)
+     end
+     if timeseries ~= nil then
+     end
+     return timeseries
+@@ -2980,262 +3104,262 @@ end
+ function timeseries_info.get_host_rules_schema(rule_type)
+     if rule_type == "host" then
+         local host_ts_enabled = ntop.getCache("ntopng.prefs.host_ndpi_timeseries_creation")
+         local has_top_protocols = host_ts_enabled == "both" or host_ts_enabled == "per_protocol" or host_ts_enabled ~=
+                                       "0"
+         local has_top_categories = host_ts_enabled == "both" or host_ts_enabled == "per_category"
+ 
+         local metric_list = {{
+             title = i18n('graphs.traffic_rxtx'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_rxtx'),
+             id = 'host:traffic' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('graphs.traffic_rcvd'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_rcvd'),
+             id = 'host:traffic-RX' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('graphs.traffic_sent'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_sent'),
+             id = 'host:traffic-TX' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('score'),
+             group = i18n('generic_data'),
+             label = i18n('score'),
+             id = 'host:score' --[[ here the ID is the schema ]] ,
+             show_volume = false
+         }}
+ 
+         if has_top_protocols then
+             local application_list = interface.getnDPIProtocols()
+             for application, _ in pairsByKeys(application_list or {}, asc) do
+                 metric_list[#metric_list + 1] = {
+                     label = application,
+                     group = i18n('applications_long'),
+                     title = application,
+                     id = 'top:host:ndpi',
+                     extra_metric = 'protocol:' .. application --[[ here the schema is the ID ]] ,
+                     show_volume = true
+                 }
+             end
+         end
+ 
+         if has_top_categories then
+             local category_list = interface.getnDPICategories()
+             for category, _ in pairsByKeys(category_list or {}, asc) do
+                 metric_list[#metric_list + 1] = {
+                     label = category,
+                     group = i18n('categories'),
+                     title = category,
+                     id = 'top:host:ndpi_categories',
+                     extra_metric = 'category:' .. category --[[ here the schema is the ID ]] ,
+                     show_volume = true
+                 }
+             end
+         end
+ 
+         return metric_list
+     elseif rule_type == "interface" then
+         local ifname_ts_enabled = ntop.getCache("ntopng.prefs.ifname_ndpi_timeseries_creation")
+         local has_top_protocols = ifname_ts_enabled == "both" or ifname_ts_enabled == "per_protocol" or
+                                       ifname_ts_enabled ~= "0"
+         local has_top_categories = ifname_ts_enabled == "both" or ifname_ts_enabled == "per_category"
+ 
+         local metric_list = {{
+             title = i18n('graphs.traffic_rxtx'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_rxtx'),
+             id = 'iface:traffic_rxtx' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('graphs.traffic_rcvd'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_rcvd'),
+             id = 'iface:traffic_rxtx-rx' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('graphs.traffic_sent'),
+             group = i18n('generic_data'),
+             label = i18n('graphs.traffic_sent'),
+             id = 'iface:traffic_rxtx-tx' --[[ here the ID is the schema ]] ,
+             show_volume = true
+         }, {
+             title = i18n('score'),
+             group = i18n('generic_data'),
+             label = i18n('score'),
+             id = 'iface:score' --[[ here the ID is the schema ]] ,
+             show_volume = false
+         }}
+ 
+         if has_top_protocols then
+             local application_list = interface.getnDPIProtocols()
+             for application, _ in pairsByKeys(application_list or {}, asc) do
+                 metric_list[#metric_list + 1] = {
+                     label = application,
+                     group = i18n('applications_long'),
+                     title = application,
+                     id = 'top:iface:ndpi',
+                     extra_metric = 'protocol:' .. application --[[ here the schema is the ID ]] ,
+                     show_volume = true
+                 }
+             end
+         end
+ 
+         if has_top_categories then
+             local category_list = interface.getnDPICategories()
+             for category, _ in pairsByKeys(category_list or {}, asc) do
+                 metric_list[#metric_list + 1] = {
+                     label = category,
+                     group = i18n('categories'),
+                     title = category,
+                     id = 'top:iface:ndpi_categories',
+                     extra_metric = 'category:' .. category --[[ here the schema is the ID ]] ,
+                     show_volume = true
+                 }
+             end
+         end
+ 
+         return metric_list
+     elseif rule_type == "exporter" then
+         local metric_list = {{
+             title = i18n('traffic'),
+             group = i18n('generic_data'),
+             label = i18n('traffic'),
+-            show_volume = true,
++            show_volume = true
+         }, {
+             title = i18n("graphs.usage"),
+             group = i18n('generic_data'),
+             label = i18n("graphs.usage"),
+             id = 'flowdev_port:usage' --[[ here the ID is the schema ]] ,
+             show_volume = false,
+             type = 'flowdev_port'
+         }}
+ 
+         return metric_list
+     elseif rule_type == "host_pool" then
+         local metric_list = {}
+         for _, item in ipairs(community_timeseries) do
+             if (item.id == timeseries_id.host_pool) then
+ 
+                 metric_list[#metric_list + 1] = item
+             end
+         end
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.traffic_rcvd'),
+             -- group = i18n('generic_data'),
+             measure_unit = "bps",
+             label = i18n('graphs.traffic_rcvd'),
+             id = 'host_pool:traffic-RX' --[[ here the ID is the schema ]] ,
+             schema = 'host_pool:traffic-RX',
+             show_volume = true
+ 
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.traffic_sent'),
+             -- group = i18n('generic_data'),
+             label = i18n('graphs.traffic_sent'),
+             measure_unit = "bps",
+             id = 'host_pool:traffic-TX' --[[ here the ID is the schema ]] ,
+             schema = 'host_pool:traffic-TX',
+             show_volume = true
+ 
+         }
+ 
+         return metric_list
+     elseif rule_type == "CIDR" then
+         local metric_list = {}
+         for _, item in ipairs(community_timeseries) do
+ 
+             if (item.schema == "subnet:traffic") then
+                 item.label = i18n("graphs.network_traffic.total")
+             end
+             if (item.schema == "subnet:broadcast_traffic") then
+                 item.label = i18n("graphs.network_broadcast_traffic.total")
+             end
+             if (item.id == timeseries_id.network) then
+ 
+                 metric_list[#metric_list + 1] = item
+             end
+         end
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_traffic.ingress'),
+             -- group = i18n('generic_data'),
+             measure_unit = "bps",
+             label = i18n('graphs.network_traffic.ingress'),
+             id = 'subnet:traffic-ingress' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:traffic-ingress',
+             show_volume = true
+ 
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_traffic.egress'),
+             -- group = i18n('generic_data'),
+             label = i18n('graphs.network_traffic.egress'),
+             measure_unit = "bps",
+             id = 'subnet:traffic-egress' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:traffic-egress',
+             show_volume = true
+ 
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_traffic.inner'),
+             -- group = i18n('generic_data'),
+             label = i18n('graphs.network_traffic.inner'),
+             measure_unit = "bps",
+             id = 'subnet:traffic-inner' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:traffic-inner',
+             show_volume = true
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_broadcast_traffic.ingress'),
+             -- group = i18n('generic_data'),
+             measure_unit = "bps",
+             label = i18n('graphs.network_broadcast_traffic.ingress'),
+             id = 'subnet:broadcast_traffic-ingress' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:broadcast_traffic-ingress',
+             show_volume = true
+ 
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_broadcast_traffic.egress'),
+             -- group = i18n('generic_data'),
+             label = i18n('graphs.network_broadcast_traffic.egress'),
+             measure_unit = "bps",
+             id = 'subnet:broadcast_traffic-egress' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:broadcast_traffic-egress',
+             show_volume = true
+ 
+         }
+ 
+         metric_list[#metric_list + 1] = {
+ 
+             title = i18n('graphs.network_broadcast_traffic.inner'),
+             -- group = i18n('generic_data'),
+             label = i18n('graphs.network_broadcast_traffic.inner'),
+             measure_unit = "bps",
+             id = 'subnet:broadcast_traffic-inner' --[[ here the ID is the schema ]] ,
+             schema = 'subnet:broadcast_traffic-inner',
+             show_volume = true
+ 
+         }
+         return metric_list
+ 
+     end

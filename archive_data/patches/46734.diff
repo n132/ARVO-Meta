@@ -1,0 +1,497 @@
+commit 479649281467ca84a220873d51c7a461b5a78104
+Author: Chris Liddell <chris.liddell@artifex.com>
+Date:   Tue Apr 19 10:32:43 2022 +0100
+
+    Bug 705221(redux): "Reverse" original fix
+    
+    Original fix was to make the chunk freeing code to identify single object
+    chunks match the allocating code - i.e. both using the "padded" size.
+    
+    This appears to cause confusion with other areas in the code, leading to
+    potential segfaults.
+    
+    This reverses that change, so both the allocating and freeing code use the
+    unpadded size.
+    
+    This still solves the memory explosion bug, but doesn't cause the issues
+    identified by oss-fuzz 46830 and 46734.
+    
+    Ultimately it may be preferable to revise the rest of the code to avoid the
+    confusion, but this avoids a flood of issues from oss-fuzz.
+
+diff --git a/base/gsmchunk.c b/base/gsmchunk.c
+index 28b1cc355..5d3dbebe1 100644
+--- a/base/gsmchunk.c
++++ b/base/gsmchunk.c
+@@ -774,215 +774,215 @@ static byte *
+ chunk_obj_alloc(gs_memory_t *mem, size_t size, gs_memory_type_ptr_t type, client_name_t cname)
+ {
+     gs_memory_chunk_t  *cmem = (gs_memory_chunk_t *)mem;
+     chunk_free_node_t **ap, **okp;
+     chunk_free_node_t  *a, *b, *c;
+     size_t newsize;
+     chunk_obj_node_t *obj = NULL;
+ 
+     newsize = round_up_to_align(size + SIZEOF_ROUND_ALIGN(chunk_obj_node_t));	/* space we will need */
+     /* When we free this block it might have to go in free - so it had
+      * better be large enough to accommodate a complete free node! */
+     if (newsize < SIZEOF_ROUND_ALIGN(chunk_free_node_t))
+         newsize = SIZEOF_ROUND_ALIGN(chunk_free_node_t);
+     /* Protect against overflow */
+     if (newsize < size)
+         return NULL;
+ 
+ #ifdef DEBUG_SEQ
+     cmem->sequence++;
+ #endif
+ 
+ #ifdef DEBUG_CHUNK_PRINT
+ #ifdef DEBUG_SEQ
+     dmlprintf4(mem, "Event %x: malloc(chunk="PRI_INTPTR", size=%"PRIxSIZE", cname=%s)\n",
+                cmem->sequence, (intptr_t)cmem, newsize, cname);
+ #else
+     dmlprintf3(mem, "malloc(chunk="PRI_INTPTR", size=%"PRIxSIZE", cname=%s)\n",
+                (intptr_t)cmem, newsize, cname);
+ #endif
+ #endif
+ 
+     /* Large blocks are allocated directly */
+-    if (SINGLE_OBJECT_CHUNK(newsize)) {
++    if (SINGLE_OBJECT_CHUNK(size)) {
+         obj = (chunk_obj_node_t *)gs_alloc_bytes_immovable(cmem->target, newsize, cname);
+         if (obj == NULL)
+             return NULL;
+     } else {
+         /* Find the smallest free block that's large enough */
+         /* okp points to the parent pointer to the block we pick */
+         ap = &cmem->free_size;
+         okp = NULL;
+         while ((a = *ap) != NULL) {
+             if (a->size >= newsize) {
+                 b = a->left_size;
+                 if (b == NULL) {
+                     okp = ap; /* a will do */
+                     break; /* Stop searching */
+                 }
+                 if (b->size >= newsize) {
+                     c = b->left_size;
+                     if (c == NULL) {
+                         okp = &a->left_size; /* b is as good as we're going to get */
+                         break;
+                     }
+                     /* Splay:        a             c
+                      *            b     Z   =>  W     b
+                      *          c   Y               X   a
+                      *         W X                     Y Z
+                      */
+                     *ap = c;
+                     a->left_size  = b->right_size;
+                     b->left_size  = c->right_size;
+                     b->right_size = a;
+                     c->right_size = b;
+                     if (c->size >= newsize) {
+                         okp = ap; /* c is the best so far */
+                         ap = &c->left_size;
+                     } else {
+                         okp = &c->right_size; /* b is the best so far */
+                         ap = &b->left_size;
+                     }
+                 } else {
+                     c = b->right_size;
+                     if (c == NULL) {
+                         okp = ap; /* a is as good as we are going to get */
+                         break;
+                     }
+                     /* Splay:         a             c
+                      *            b       Z  =>   b   a
+                      *          W   c            W X Y Z
+                      *             X Y
+                      */
+                     *ap = c;
+                     a->left_size  = c->right_size;
+                     b->right_size = c->left_size;
+                     c->left_size  = b;
+                     c->right_size = a;
+                     if (c->size >= newsize) {
+                         okp = ap; /* c is the best so far */
+                         ap = &b->right_size;
+                     } else {
+                         okp = &c->right_size; /* a is the best so far */
+                         ap = &a->left_size;
+                     }
+                 }
+             } else {
+                 b = a->right_size;
+                 if (b == NULL)
+                     break; /* No better match to be found */
+                 if (b->size >= newsize) {
+                     c = b->left_size;
+                     if (c == NULL) {
+                         okp = &a->right_size; /* b is as good as we're going to get */
+                         break;
+                     }
+                     /* Splay:      a                c
+                      *         W       b    =>    a   b
+                      *               c   Z       W X Y Z
+                      *              X Y
+                      */
+                     *ap = c;
+                     a->right_size = c->left_size;
+                     b->left_size  = c->right_size;
+                     c->left_size  = a;
+                     c->right_size = b;
+                     if (c->size >= newsize) {
+                         okp = ap; /* c is the best so far */
+                         ap = &a->right_size;
+                     } else {
+                         okp = &c->right_size; /* b is the best so far */
+                         ap = &b->left_size;
+                     }
+                 } else {
+                     c = b->right_size;
+                     if (c == NULL)
+                         break; /* No better match to be found */
+                     /* Splay:    a                   c
+                      *        W     b      =>     b     Z
+                      *            X   c         a   Y
+                      *               Y Z       W X
+                      */
+                     *ap = c;
+                     a->right_size = b->left_size;
+                     b->right_size = c->left_size;
+                     b->left_size  = a;
+                     c->left_size  = b;
+                     if (c->size >= newsize) {
+                         okp = ap; /* c is the best so far */
+                         ap = &b->right_size;
+                     } else
+                         ap = &c->right_size;
+                 }
+             }
+         }
+ 
+         /* So *okp points to the most appropriate free tree entry. */
+ 
+         if (okp == NULL) {
+             /* No appropriate free space slot. We need to allocate a new slab. */
+             chunk_slab_t *slab;
+             uint slab_size = newsize + SIZEOF_ROUND_ALIGN(chunk_slab_t);
+ 
+             if (slab_size <= (CHUNK_SIZE>>1))
+                 slab_size = CHUNK_SIZE;
+             slab = (chunk_slab_t *)gs_alloc_bytes_immovable(cmem->target, slab_size, cname);
+             if (slab == NULL)
+                 return NULL;
+             slab->next = cmem->slabs;
+             cmem->slabs = slab;
+ 
+             obj = (chunk_obj_node_t *)(((byte *)slab) + SIZEOF_ROUND_ALIGN(chunk_slab_t));
+             if (slab_size != newsize + SIZEOF_ROUND_ALIGN(chunk_slab_t)) {
+                 insert_free(cmem, (chunk_free_node_t *)(((byte *)obj)+newsize), slab_size - newsize - SIZEOF_ROUND_ALIGN(chunk_slab_t));
+                 cmem->total_free += slab_size - newsize - SIZEOF_ROUND_ALIGN(chunk_slab_t);
+             }
+         } else {
+             chunk_free_node_t *ok = *okp;
+             obj = (chunk_obj_node_t *)(void *)ok;
+             if (ok->size >= newsize + SIZEOF_ROUND_ALIGN(chunk_free_node_t)) {
+                 chunk_free_node_t *tail = (chunk_free_node_t *)(((byte *)ok) + newsize);
+                 uint tail_size = ok->size - newsize;
+                 remove_free_size_fast(cmem, okp);
+                 remove_free_loc(cmem, ok);
+                 insert_free(cmem, tail, tail_size);
+             } else {
+                 newsize = ok->size;
+                 remove_free_size_fast(cmem, okp);
+                 remove_free_loc(cmem, ok);
+             }
+             cmem->total_free -= newsize;
+         }
+     }
+ 
+     if (gs_alloc_debug) {
+         memset((byte *)(obj) + SIZEOF_ROUND_ALIGN(chunk_obj_node_t), 0xa1, newsize - SIZEOF_ROUND_ALIGN(chunk_obj_node_t));
+         memset((byte *)(obj) + SIZEOF_ROUND_ALIGN(chunk_obj_node_t), 0xac, size);
+     }
+ 
+     cmem->used += newsize;
+     obj->size = newsize; /* actual size */
+     obj->padding = newsize - size; /* actual size - client requested size */
+     obj->type = type;    /* and client desired type */
+     obj->defer_next = NULL;
+ 
+ #ifdef DEBUG_SEQ
+     obj->sequence = cmem->sequence;
+ #endif
+     if (gs_debug_c('A'))
+         dmlprintf3(mem, "[a+]chunk_obj_alloc (%s)(%"PRIuSIZE") = "PRI_INTPTR": OK.\n",
+                    client_name_string(cname), size, (intptr_t) obj);
+ #ifdef DEBUG_CHUNK_PRINT
+ #ifdef DEBUG_SEQ
+     dmlprintf5(mem, "Event %x: malloced(chunk="PRI_INTPTR", addr="PRI_INTPTR", size=%"PRIxSIZE", cname=%s)\n",
+                obj->sequence, (intptr_t)cmem, (intptr_t)obj, obj->size, cname);
+ #else
+     dmlprintf4(mem, "malloced(chunk="PRI_INTPTR", addr="PRI_INTPTR", size=%"PRIxSIZE", cname=%s)\n",
+                (intptr_t)cmem, (intptr_t)obj, obj->size, cname);
+ #endif
+ #endif
+ #ifdef DEBUG_CHUNK
+     gs_memory_chunk_dump_memory(cmem);
+ #endif
+ 
+     return (byte *)Memento_label((byte *)(obj) + SIZEOF_ROUND_ALIGN(chunk_obj_node_t), cname);
+ }
+@@ -1074,253 +1074,253 @@ static void
+ chunk_free_object(gs_memory_t *mem, void *ptr, client_name_t cname)
+ {
+     gs_memory_chunk_t * const cmem = (gs_memory_chunk_t *)mem;
+     size_t obj_node_size;
+     chunk_obj_node_t *obj;
+     struct_proc_finalize((*finalize));
+     chunk_free_node_t **ap, **gtp, **ltp;
+     chunk_free_node_t *a, *b, *c;
+ 
+     if (ptr == NULL)
+         return;
+ 
+     /* back up to obj header */
+     obj_node_size = SIZEOF_ROUND_ALIGN(chunk_obj_node_t);
+     obj = (chunk_obj_node_t *)(((byte *)ptr) - obj_node_size);
+ 
+     if (cmem->deferring) {
+         if (obj->defer_next == NULL) {
+             obj->defer_next = cmem->defer_finalize_list;
+             cmem->defer_finalize_list = obj;
+         }
+         return;
+     }
+ 
+ #ifdef DEBUG_CHUNK_PRINT
+ #ifdef DEBUG_SEQ
+     cmem->sequence++;
+     dmlprintf6(cmem->target, "Event %x: free(chunk="PRI_INTPTR", addr="PRI_INTPTR", size=%x, num=%x, cname=%s)\n",
+                cmem->sequence, (intptr_t)cmem, (intptr_t)obj, obj->size, obj->sequence, cname);
+ #else
+     dmlprintf4(cmem->target, "free(chunk="PRI_INTPTR", addr="PRI_INTPTR", size=%x, cname=%s)\n",
+                (intptr_t)cmem, (intptr_t)obj, obj->size, cname);
+ #endif
+ #endif
+ 
+     if (obj->type) {
+         finalize = obj->type->finalize;
+         if (finalize != NULL)
+             finalize(mem, ptr);
+     }
+     /* finalize may change the head_**_chunk doing free of stuff */
+ 
+     if_debug3m('A', cmem->target, "[a-]chunk_free_object(%s) "PRI_INTPTR"(%"PRIuSIZE")\n",
+                client_name_string(cname), (intptr_t)ptr, obj->size);
+ 
+     cmem->used -= obj->size;
+ 
+-    if (SINGLE_OBJECT_CHUNK(obj->size)) {
++    if (SINGLE_OBJECT_CHUNK(obj->size - obj->padding)) {
+         gs_free_object(cmem->target, obj, "chunk_free_object(single object)");
+ #ifdef DEBUG_CHUNK
+         gs_memory_chunk_dump_memory(cmem);
+ #endif
+         return;
+     }
+ 
+     /* We want to find where to insert this free entry into our free tree. We need to know
+      * both the point to the left of it, and the point to the right of it, in order to see
+      * if we can merge the free entries. Accordingly, we search from the top of the tree
+      * and keep pointers to the nodes that we pass that are greater than it, and less than
+      * it. */
+     gtp = NULL; /* gtp is set to the address of the pointer to the node where we last stepped left */
+     ltp = NULL; /* ltp is set to the address of the pointer to the node where we last stepped right */
+     ap = &cmem->free_loc;
+     while ((a = *ap) != NULL) {
+         if ((void *)a > (void *)obj) {
+             b = a->left_loc; /* Try to step left from a */
+             if (b == NULL) {
+                 gtp = ap; /* a is greater than us */
+                 break;
+             }
+             if ((void *)b > (void *)obj) {
+                 c = b->left_loc; /* Try to step left from b */
+                 if (c == NULL) {
+                     gtp = &a->left_loc; /* b is greater than us */
+                     break;
+                 }
+                 /* Splay:        a             c
+                  *            b     Z   =>  W     b
+                  *          c   Y               X   a
+                  *         W X                     Y Z
+                  */
+                 *ap = c;
+                 a->left_loc  = b->right_loc;
+                 b->left_loc  = c->right_loc;
+                 b->right_loc = a;
+                 c->right_loc = b;
+                 if ((void *)c > (void *)obj) { /* W */
+                     gtp = ap; /* c is greater than us */
+                     ap = &c->left_loc;
+                 } else { /* X */
+                     gtp = &c->right_loc; /* b is greater than us */
+                     ltp = ap; /* c is less than us */
+                     ap = &b->left_loc;
+                 }
+             } else {
+                 c = b->right_loc; /* Try to step right from b */
+                 if (c == NULL) {
+                     gtp = ap; /* a is greater than us */
+                     ltp = &a->left_loc; /* b is less than us */
+                     break;
+                 }
+                 /* Splay:         a             c
+                  *            b       Z  =>   b   a
+                  *          W   c            W X Y Z
+                  *             X Y
+                  */
+                 *ap = c;
+                 a->left_loc  = c->right_loc;
+                 b->right_loc = c->left_loc;
+                 c->left_loc  = b;
+                 c->right_loc = a;
+                 if ((void *)c > (void *)obj) { /* X */
+                     gtp = ap; /* c is greater than us */
+                     ltp = &c->left_loc; /* b is less than us */
+                     ap = &b->right_loc;
+                 } else { /* Y */
+                     gtp = &c->right_loc; /* a is greater than us */
+                     ltp = ap; /* c is less than us */
+                     ap = &a->left_loc;
+                 }
+             }
+         } else {
+             b = a->right_loc; /* Try to step right from a */
+             if (b == NULL) {
+                 ltp = ap; /* a is less than us */
+                 break;
+             }
+             if ((void *)b > (void *)obj) {
+                 c = b->left_loc;
+                 if (c == NULL) {
+                     gtp = &a->right_loc; /* b is greater than us */
+                     ltp = ap; /* a is less than us */
+                     break;
+                 }
+                 /* Splay:      a                c
+                  *         W       b    =>    a   b
+                  *               c   Z       W X Y Z
+                  *              X Y
+                  */
+                 *ap = c;
+                 a->right_loc = c->left_loc;
+                 b->left_loc  = c->right_loc;
+                 c->left_loc  = a;
+                 c->right_loc = b;
+                 if ((void *)c > (void *)obj) { /* X */
+                     gtp = ap; /* c is greater than us */
+                     ltp = &c->left_loc; /* a is less than us */
+                     ap = &a->right_loc;
+                 } else { /* Y */
+                     gtp = &c->right_loc; /* b is greater than us */
+                     ltp = ap; /* c is less than than us */
+                     ap = &b->left_loc;
+                 }
+             } else {
+                 c = b->right_loc;
+                 if (c == NULL) {
+                     ltp = &a->right_loc; /* b is greater than us */
+                     break;
+                 }
+                 /* Splay:    a                   c
+                  *        W     b      =>     b     Z
+                  *            X   c         a   Y
+                  *               Y Z       W X
+                  */
+                 *ap = c;
+                 a->right_loc = b->left_loc;
+                 b->right_loc = c->left_loc;
+                 b->left_loc  = a;
+                 c->left_loc  = b;
+                 if ((void *)c > (void *)obj) { /* Y */
+                     gtp = ap; /* c is greater than us */
+                     ltp = &c->left_loc; /* b is less than us */
+                     ap = &b->right_loc;
+                 } else { /* Z */
+                     ltp = ap; /* c is less than than us */
+                     ap = &c->right_loc;
+                 }
+             }
+         }
+     }
+ 
+     if (ltp) {
+         /* There is at least 1 node smaller than us - check for merging */
+         chunk_free_node_t *ltfree = (chunk_free_node_t *)(*ltp);
+         if ((((byte *)ltfree) + ltfree->size) == (byte *)(void *)obj) {
+             /* Merge! */
+             cmem->total_free += obj->size;
+             remove_free_size(cmem, ltfree);
+             ltfree->size += obj->size;
+             if (gtp) {
+                 /* There is at least 1 node greater than us - check for merging */
+                 chunk_free_node_t *gtfree = (chunk_free_node_t *)(*gtp);
+                 if ((((byte *)obj) + obj->size) == (byte *)(void *)gtfree) {
+                     /* Double merge! */
+                     ltfree->size += gtfree->size;
+                     remove_free(cmem, gtfree);
+                 }
+                 gtp = NULL;
+             }
+             insert_free_size(cmem, ltfree);
+             if (gs_alloc_debug)
+                 memset(((byte *)ltfree) + SIZEOF_ROUND_ALIGN(chunk_free_node_t), 0x69, ltfree->size - SIZEOF_ROUND_ALIGN(chunk_free_node_t));
+             obj = NULL;
+         }
+     }
+     if (gtp && obj) {
+         /* There is at least 1 node greater than us - check for merging */
+         chunk_free_node_t *gtfree = (chunk_free_node_t *)(*gtp);
+         if ((((byte *)obj) + obj->size) == (byte *)(void *)gtfree) {
+             /* Merge! */
+             chunk_free_node_t *objfree = (chunk_free_node_t *)(void *)obj;
+             uint obj_size = obj->size;
+             cmem->total_free += obj_size;
+             remove_free_size(cmem, gtfree);
+             *objfree = *gtfree;
+             objfree->size += obj_size;
+             *gtp = objfree;
+             insert_free_size(cmem, objfree);
+             if (gs_alloc_debug)
+                 memset(((byte *)objfree) + SIZEOF_ROUND_ALIGN(chunk_free_node_t), 0x96, objfree->size - SIZEOF_ROUND_ALIGN(chunk_free_node_t));
+             obj = NULL;
+         }
+     }
+ 
+     if (obj) {
+         /* Insert new one */
+         chunk_free_node_t *objfree = (chunk_free_node_t *)(void *)obj;
+         cmem->total_free += obj->size;
+         objfree->size = obj->size;
+         objfree->left_loc = NULL;
+         objfree->right_loc = NULL;
+         if (gtp) {
+             ap = &(*gtp)->left_loc;
+             while (*ap) {
+                 ap = &(*ap)->right_loc;
+             }
+         } else if (ltp) {
+             ap = &(*ltp)->right_loc;
+             while (*ap) {
+                 ap = &(*ap)->left_loc;
+             }
+         } else
+             ap = &cmem->free_loc;
+         *ap = objfree;
+         insert_free_size(cmem, objfree);
+         if (gs_alloc_debug)
+             memset(((byte *)objfree) + SIZEOF_ROUND_ALIGN(chunk_free_node_t), 0x9b, objfree->size - SIZEOF_ROUND_ALIGN(chunk_free_node_t));
+     }
+ 
+ #ifdef DEBUG_CHUNK
+     gs_memory_chunk_dump_memory(cmem);
+ #endif
+ }

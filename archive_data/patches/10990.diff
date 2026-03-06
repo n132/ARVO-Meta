@@ -1,0 +1,185 @@
+commit 0f85edb7781f4d5ec2de676979be75a0f6559d80
+Author: Behdad Esfahbod <behdad@behdad.org>
+Date:   Mon Oct 15 11:15:54 2018 -0700
+
+    [morx] Another end-of-text corner case
+    
+    Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=10990
+
+diff --git a/src/hb-aat-layout-morx-table.hh b/src/hb-aat-layout-morx-table.hh
+index 8446a862a..c88e7a720 100644
+--- a/src/hb-aat-layout-morx-table.hh
++++ b/src/hb-aat-layout-morx-table.hh
+@@ -320,170 +320,172 @@ struct ContextualSubtable
+ struct LigatureSubtable
+ {
+   struct EntryData
+   {
+     HBUINT16	ligActionIndex;	/* Index to the first ligActionTable entry
+ 				 * for processing this group, if indicated
+ 				 * by the flags. */
+     public:
+     DEFINE_SIZE_STATIC (2);
+   };
+ 
+   struct driver_context_t
+   {
+     static const bool in_place = false;
+     enum Flags
+     {
+       SetComponent	= 0x8000,	/* Push this glyph onto the component stack for
+ 					 * eventual processing. */
+       DontAdvance	= 0x4000,	/* Leave the glyph pointer at this glyph for the
+ 					   next iteration. */
+       PerformAction	= 0x2000,	/* Use the ligActionIndex to process a ligature
+ 					 * group. */
+       Reserved		= 0x1FFF,	/* These bits are reserved and should be set to 0. */
+     };
+     enum LigActionFlags
+     {
+       LigActionLast	= 0x80000000,	/* This is the last action in the list. This also
+ 					 * implies storage. */
+       LigActionStore	= 0x40000000,	/* Store the ligature at the current cumulated index
+ 					 * in the ligature table in place of the marked
+ 					 * (i.e. currently-popped) glyph. */
+       LigActionOffset	= 0x3FFFFFFF,	/* A 30-bit value which is sign-extended to 32-bits
+ 					 * and added to the glyph ID, resulting in an index
+ 					 * into the component table. */
+     };
+ 
+     inline driver_context_t (const LigatureSubtable *table,
+ 			     hb_aat_apply_context_t *c_) :
+ 	ret (false),
+ 	c (c_),
+ 	ligAction (table+table->ligAction),
+ 	component (table+table->component),
+ 	ligature (table+table->ligature),
+ 	match_length (0) {}
+ 
+     inline bool is_actionable (StateTableDriver<EntryData> *driver,
+ 			       const Entry<EntryData> *entry)
+     {
+       return entry->flags & PerformAction;
+     }
+     inline bool transition (StateTableDriver<EntryData> *driver,
+ 			    const Entry<EntryData> *entry)
+     {
+       hb_buffer_t *buffer = driver->buffer;
+       unsigned int flags = entry->flags;
+ 
+       if (flags & SetComponent)
+       {
+         if (unlikely (match_length >= ARRAY_LENGTH (match_positions)))
+ 	  return false;
+ 
+ 	/* Never mark same index twice, in case DontAdvance was used... */
+ 	if (match_length && match_positions[match_length - 1] == buffer->out_len)
+ 	  match_length--;
+ 
+ 	match_positions[match_length++] = buffer->out_len;
+       }
+ 
+       if (flags & PerformAction)
+       {
+ 	unsigned int end = buffer->out_len;
+ 	unsigned int action_idx = entry->data.ligActionIndex;
+ 	unsigned int action;
+ 	unsigned int ligature_idx = 0;
+ 
+ 	if (unlikely (!match_length))
+ 	  return false;
+ 
+ 	buffer->merge_out_clusters (match_positions[0], buffer->out_len);
+ 
+         do
+ 	{
+ 	  if (unlikely (!match_length))
+ 	    return false;
+ 
+ 	  buffer->move_to (match_positions[--match_length]);
+ 
+ 	  const HBUINT32 &actionData = ligAction[action_idx];
+ 	  if (unlikely (!actionData.sanitize (&c->sanitizer))) return false;
+ 	  action = actionData;
+ 
+ 	  uint32_t uoffset = action & LigActionOffset;
+ 	  if (uoffset & 0x20000000)
+ 	    uoffset += 0xC0000000;
+ 	  int32_t offset = (int32_t) uoffset;
++	  if (buffer->idx >= buffer->len)
++	    return false; // TODO Work on previous instead?
+ 	  unsigned int component_idx = buffer->cur().codepoint + offset;
+ 
+ 	  const HBUINT16 &componentData = component[component_idx];
+ 	  if (unlikely (!componentData.sanitize (&c->sanitizer))) return false;
+ 	  ligature_idx += componentData;
+ 
+ 	  if (action & (LigActionStore | LigActionLast))
+ 	  {
+ 	    const GlyphID &ligatureData = ligature[ligature_idx];
+ 	    if (unlikely (!ligatureData.sanitize (&c->sanitizer))) return false;
+ 	    hb_codepoint_t lig = ligatureData;
+ 
+ 	    match_positions[match_length++] = buffer->out_len;
+ 	    buffer->replace_glyph (lig);
+ 
+ 	    //ligature_idx = 0; // XXX Yes or no?
+ 	  }
+ 	  else
+ 	  {
+ 	    buffer->skip_glyph ();
+ 	    end--;
+ 	  }
+ 
+ 	  action_idx++;
+ 	}
+ 	while (!(action & LigActionLast));
+ 	buffer->move_to (end);
+       }
+ 
+       return true;
+     }
+ 
+     public:
+     bool ret;
+     private:
+     hb_aat_apply_context_t *c;
+     const UnsizedArrayOf<HBUINT32> &ligAction;
+     const UnsizedArrayOf<HBUINT16> &component;
+     const UnsizedArrayOf<GlyphID> &ligature;
+     unsigned int match_length;
+     unsigned int match_positions[HB_MAX_CONTEXT_LENGTH];
+   };
+ 
+   inline bool apply (hb_aat_apply_context_t *c) const
+   {
+     TRACE_APPLY (this);
+ 
+     driver_context_t dc (this, c);
+ 
+     StateTableDriver<EntryData> driver (machine, c->buffer, c->face);
+     driver.drive (&dc);
+ 
+     return_trace (dc.ret);
+   }
+ 
+   inline bool sanitize (hb_sanitize_context_t *c) const
+   {
+     TRACE_SANITIZE (this);
+     /* The rest of array sanitizations are done at run-time. */
+     return_trace (c->check_struct (this) && machine.sanitize (c) &&
+ 		  ligAction && component && ligature);
+   }
+ 
+   protected:
+   StateTable<EntryData>
+ 		machine;
+   LOffsetTo<UnsizedArrayOf<HBUINT32>, false>
+ 		ligAction;	/* Offset to the ligature action table. */
+   LOffsetTo<UnsizedArrayOf<HBUINT16>, false>
+ 		component;	/* Offset to the component table. */
+   LOffsetTo<UnsizedArrayOf<GlyphID>, false>
+ 		ligature;	/* Offset to the actual ligature lists. */
+   public:
+   DEFINE_SIZE_STATIC (28);
+ };

@@ -1,0 +1,453 @@
+commit b609c25f7f881bea4b10c8e1b9b950b635437320
+Author: Chris Liddell <chris.liddell@artifex.com>
+Date:   Tue Jun 28 13:23:02 2022 +0100
+
+    oss-fuzz 48305: Use ref counting for subclass child device
+    
+    The .currentoutputdevice (custom) operator leaves the chance that PS VM still
+    has a reference to the "child" of a subclassed device. In normal operation,
+    this isn't a problem, but on an error, that PS reference may persist until
+    after the unsubclass operation, meaning the "child" is freed while there is
+    still an active reference to it.
+    
+    Change the code to use reference counting to ensure that works. This means
+    considerable fiddling to ensure that, after subclassing, anything sent to the
+    (now moribund) child device doesn't end up affecting the parent.
+
+diff --git a/base/gdevdflt.c b/base/gdevdflt.c
+index 72a43ff17..616052cdb 100644
+--- a/base/gdevdflt.c
++++ b/base/gdevdflt.c
+@@ -1296,132 +1296,135 @@ int gx_copy_device_procs(gx_device *dest, const gx_device *src, const gx_device
+ int gx_device_subclass(gx_device *dev_to_subclass, gx_device *new_prototype, unsigned int private_data_size)
+ {
+     gx_device *child_dev;
+     void *psubclass_data;
+     gs_memory_struct_type_t *a_std, *b_std = NULL;
+     int dynamic = dev_to_subclass->stype_is_dynamic;
+     char *ptr, *ptr1;
+ 
+     /* If this happens we are stuffed, as there is no way to get hold
+      * of the original device's stype structure, which means we cannot
+      * allocate a replacement structure. Abort if so.
+      * Also abort if the new_prototype device struct is too large.
+      */
+     if (!dev_to_subclass->stype ||
+         dev_to_subclass->stype->ssize < new_prototype->params_size)
+         return_error(gs_error_VMerror);
+ 
+     /* We make a 'stype' structure for our new device, and copy the old stype into it
+      * This means our new device will always have the 'stype_is_dynamic' flag set
+      */
+     a_std = (gs_memory_struct_type_t *)
+         gs_alloc_bytes_immovable(dev_to_subclass->memory->non_gc_memory, sizeof(*a_std),
+                                  "gs_device_subclass(stype)");
+     if (!a_std)
+         return_error(gs_error_VMerror);
+     *a_std = *dev_to_subclass->stype;
+     a_std->ssize = dev_to_subclass->params_size;
+ 
+     if (!dynamic) {
+         b_std = (gs_memory_struct_type_t *)
+             gs_alloc_bytes_immovable(dev_to_subclass->memory->non_gc_memory, sizeof(*b_std),
+                                      "gs_device_subclass(stype)");
+         if (!b_std)
+             return_error(gs_error_VMerror);
+     }
+ 
+     /* Allocate a device structure for the new child device */
+     child_dev = gs_alloc_struct_immovable(dev_to_subclass->memory->stable_memory, gx_device, a_std,
+                                         "gs_device_subclass(device)");
+     if (child_dev == 0) {
+         gs_free_const_object(dev_to_subclass->memory->non_gc_memory, a_std, "gs_device_subclass(stype)");
+         gs_free_const_object(dev_to_subclass->memory->non_gc_memory, b_std, "gs_device_subclass(stype)");
+         return_error(gs_error_VMerror);
+     }
+ 
+     /* Make sure all methods are filled in, note this won't work for a forwarding device
+      * so forwarding devices will have to be filled in before being subclassed. This doesn't fill
+      * in the fill_rectangle proc, that gets done in the ultimate device's open proc.
+      */
+     gx_device_fill_in_procs(dev_to_subclass);
+     memcpy(child_dev, dev_to_subclass, dev_to_subclass->stype->ssize);
+     child_dev->stype = a_std;
+     child_dev->stype_is_dynamic = 1;
+ 
++    /* At this point, the only counted reference to the child is from its parent, and we need it to use the right allocator */
++    rc_init(child_dev, dev_to_subclass->memory->stable_memory, 1);
++
+     psubclass_data = (void *)gs_alloc_bytes(dev_to_subclass->memory->non_gc_memory, private_data_size, "subclass memory for subclassing device");
+     if (psubclass_data == 0){
+         gs_free_const_object(dev_to_subclass->memory->non_gc_memory, b_std, "gs_device_subclass(stype)");
+         /* We *don't* want to run the finalize routine. This would free the stype and
+          * properly handle the icc_struct and PageList, but for devices with a custom
+          * finalize (eg psdcmyk) it might also free memory it had allocated, and we're
+          * still pointing at that memory in the parent.
+          */
+         a_std->finalize = NULL;
+         gs_set_object_type(dev_to_subclass->memory->stable_memory, child_dev, a_std);
+         gs_free_object(dev_to_subclass->memory->stable_memory, child_dev, "free subclass memory for subclassing device");
+         gs_free_const_object(dev_to_subclass->memory->non_gc_memory, a_std, "gs_device_subclass(stype)");
+         return_error(gs_error_VMerror);
+     }
+     memset(psubclass_data, 0x00, private_data_size);
+ 
+     gx_copy_device_procs(dev_to_subclass, child_dev, new_prototype);
+     dev_to_subclass->finalize = new_prototype->finalize;
+     dev_to_subclass->dname = new_prototype->dname;
+     if (dev_to_subclass->icc_struct)
+         rc_increment(dev_to_subclass->icc_struct);
+     if (dev_to_subclass->PageList)
+         rc_increment(dev_to_subclass->PageList);
+     if (dev_to_subclass->NupControl)
+         rc_increment(dev_to_subclass->NupControl);
+ 
+     dev_to_subclass->page_procs = new_prototype->page_procs;
+     gx_subclass_fill_in_page_procs(dev_to_subclass);
+ 
+     /* In case the new device we're creating has already been initialised, copy
+      * its additional data.
+      */
+     ptr = ((char *)dev_to_subclass) + sizeof(gx_device);
+     ptr1 = ((char *)new_prototype) + sizeof(gx_device);
+     memcpy(ptr, ptr1, new_prototype->params_size - sizeof(gx_device));
+ 
+     /* If the original device's stype structure was dynamically allocated, we need
+      * to 'fixup' the contents, it's procs need to point to the new device's procs
+      * for instance.
+      */
+     if (dynamic) {
+         if (new_prototype->stype) {
+             b_std = (gs_memory_struct_type_t *)dev_to_subclass->stype;
+             *b_std = *new_prototype->stype;
+             b_std->ssize = a_std->ssize;
+             dev_to_subclass->stype_is_dynamic = 1;
+         } else {
+             gs_free_const_object(child_dev->memory->non_gc_memory, dev_to_subclass->stype,
+                              "unsubclass");
+             dev_to_subclass->stype = NULL;
+             b_std = (gs_memory_struct_type_t *)new_prototype->stype;
+             dev_to_subclass->stype_is_dynamic = 0;
+         }
+     }
+     else {
+         *b_std = *new_prototype->stype;
+         b_std->ssize = a_std->ssize;
+         dev_to_subclass->stype_is_dynamic = 1;
+     }
+     dev_to_subclass->stype = b_std;
+     /* We have to patch up the "type" parameters that the memory manage/garbage
+      * collector will use, as well.
+      */
+     gs_set_object_type(child_dev->memory, dev_to_subclass, b_std);
+ 
+     dev_to_subclass->subclass_data = psubclass_data;
+     dev_to_subclass->child = child_dev;
+     if (child_dev->parent) {
+         dev_to_subclass->parent = child_dev->parent;
+         child_dev->parent->child = dev_to_subclass;
+     }
+     if (child_dev->child) {
+         child_dev->child->parent = child_dev;
+     }
+     child_dev->parent = dev_to_subclass;
+ 
+     return 0;
+ }
+@@ -1429,133 +1432,135 @@ int gx_device_subclass(gx_device *dev_to_subclass, gx_device *new_prototype, uns
+ void gx_device_unsubclass(gx_device *dev)
+ {
+     generic_subclass_data *psubclass_data;
+     gx_device *parent, *child;
+     gs_memory_struct_type_t *a_std = 0, *b_std = 0;
+     int dynamic, ref_count;
++    gs_memory_t *rcmem;
+ 
+     /* This should not happen... */
+     if (!dev)
+         return;
+ 
+     ref_count = dev->rc.ref_count;
++    rcmem = dev->rc.memory;
++
+     child = dev->child;
+     psubclass_data = (generic_subclass_data *)dev->subclass_data;
+     parent = dev->parent;
+     dynamic = dev->stype_is_dynamic;
+ 
+     /* We need to account for the fact that we are removing ourselves from
+      * the device chain after a clist device has been pushed, due to a
+      * compositor action. Since we patched the clist 'composite'
+      * method (and target device) when it was pushed.
+      * A point to note; we *don't* want to change the forwarding device's
+      * 'target', because when we copy the child up to replace 'this' device
+      * we do still want the forwarding device to point here. NB its the *child*
+      * device that goes away.
+      */
+     if (psubclass_data != NULL && psubclass_data->forwarding_dev != NULL && psubclass_data->saved_compositor_method)
+         psubclass_data->forwarding_dev->procs.composite = psubclass_data->saved_compositor_method;
+ 
+     /* If ths device's stype is dynamically allocated, keep a copy of it
+      * in case we might need it.
+      */
+     if (dynamic) {
+         a_std = (gs_memory_struct_type_t *)dev->stype;
+         if (child)
+             *a_std = *child->stype;
+     }
+ 
+     /* If ths device has any private storage, free it now */
+     if (psubclass_data)
+         gs_free_object(dev->memory->non_gc_memory, psubclass_data, "gx_device_unsubclass");
+ 
+     /* Copy the child device into ths device's memory */
+     if (child) {
+         b_std = (gs_memory_struct_type_t *)dev->stype;
+         rc_decrement(dev->icc_struct, "unsubclass device");
+         rc_increment(child->icc_struct);
+         memcpy(dev, child, child->stype->ssize);
+         /* Patch back the 'stype' in the memory manager */
+         gs_set_object_type(child->memory, dev, b_std);
+ 
+         dev->stype = b_std;
+         /* The reference count of the subclassing device may have been
+          * changed (eg graphics states pointing to it) after we subclassed
+          * the device. We need to ensure that we do not overwrite this
+          * when we copy back the subclassed device.
+          */
+         dev->rc.ref_count = ref_count;
++        dev->rc.memory = rcmem;
+ 
+         /* If we have a chain of devices, make sure the chain beyond the
+          * device we're unsubclassing doesn't get broken, we need to
+          * detach the lower chain and reattach it at the new highest level.
+          */
+         if (child->child)
+             child->child->parent = dev;
+         child->parent->child = child->child;
+     }
+ 
+     /* How can we have a subclass device with no child ? Simples; when we
+      * hit the end of job restore, the devices are not freed in device
+      * chain order. To make sure we don't end up following stale pointers,
+      * when a device is freed we remove it from the chain and update
+      * any dangling pointers to NULL. When we later free the remaining
+      * devices it's possible that their child pointer can then be NULL.
+      */
+     if (child) {
+-        if (child->icc_struct)
+-            rc_decrement(child->icc_struct, "gx_device_unsubclass, icc_struct");
+-        if (child->PageList)
+-            rc_decrement(child->PageList, "gx_device_unsubclass, PageList");
+-        if (child->NupControl)
+-            rc_decrement(child->NupControl, "gx_device_unsubclass, NupControl");
+         /* We cannot afford to free the child device if its stype is not
+          * dynamic because we can't 'null' the finalise routine, and we
+          * cannot permit the device to be finalised because we have copied
+          * it up one level, not discarded it. (This shouldn't happen! Child
+          * devices are always created with a dynamic stype.) If this ever
+          * happens garbage collecton will eventually clean up the memory.
+          */
+         if (child->stype_is_dynamic) {
+             /* Make sure that nothing will try to follow the device chain,
+              * just security here. */
+             child->parent = NULL;
+             child->child = NULL;
+-            /* Make certain the memory will be freed, zap the reference count */
+-            child->rc.ref_count = 0;
++
+             /* We *don't* want to run the finalize routine. This would free
+              * the stype and properly handle the icc_struct and PageList,
+              * but for devices with a custom finalize (eg psdcmyk) it might
+              * also free memory it had allocated, and we're still pointing
+              * at that memory in the parent. The indirection through a
+              * variable is just to get rid of const warnings.
+              */
+             b_std = (gs_memory_struct_type_t *)child->stype;
+-            b_std->finalize = NULL;
+-            /* Having patched the stype, we need to make sure the memory
++            gs_free_const_object(dev->memory->non_gc_memory, b_std, "gs_device_unsubclass(stype)");
++            /* Make this into a generic device */
++            child->stype = &st_device;
++            child->stype_is_dynamic = false;
++
++            /* We can't simply discard the child device, because there may be references to it elsewhere,
++               but equally, we really don't want it doing anything, so set the procs so actions are just discarded.
++             */
++            gx_copy_device_procs(child, (gx_device *)&gs_null_device, (gx_device *)&gs_null_device);
++
++            /* Having changed the stype, we need to make sure the memory
+              * manager uses it. It keeps a copy in its own data structure,
+              * and would use that copy, which would mean it would call the
+              * finalize routine that we just patched out.
+              */
+-            gs_set_object_type(dev->memory->stable_memory, child, b_std);
++            gs_set_object_type(dev->memory->stable_memory, child, child->stype);
++            child->finalize = NULL;
+             /* Now (finally) free the child memory */
+-            gs_free_object(dev->memory->stable_memory, child, "gx_device_unsubclass(device)");
+-            /* And the stype for it */
+-            gs_free_const_object(dev->memory->non_gc_memory, b_std, "gs_device_unsubclass(stype)");
+-            child = 0;
++            rc_decrement(child, "gx_device_unsubclass(device)");
+         }
+     }
+-    if(child)
+-        child->parent = dev;
+     dev->parent = parent;
+ 
+     /* If this device has a dynamic stype, we wnt to keep using it, but we copied
+      * the stype pointer from the child when we copied the rest of the device. So
+      * we update the stype pointer with the saved pointer to this device's stype.
+      */
+     if (dynamic) {
+         dev->stype = a_std;
+         dev->stype_is_dynamic = 1;
+     } else {
+         dev->stype_is_dynamic = 0;
+     }
+ }
+diff --git a/base/gdevsclass.c b/base/gdevsclass.c
+index 85a6d2d24..15a2f1971 100644
+--- a/base/gdevsclass.c
++++ b/base/gdevsclass.c
+@@ -867,32 +867,31 @@ int default_subclass_transform_pixel_region(gx_device *dev, transform_pixel_regi
+ void default_subclass_finalize(const gs_memory_t *cmem, void *vptr)
+ {
+     gx_device * const dev = (gx_device *)vptr;
+     generic_subclass_data *psubclass_data = (generic_subclass_data *)dev->subclass_data;
+     (void)cmem; /* unused */
+ 
+     discard(gs_closedevice(dev));
+ 
+     if (dev->finalize)
+         dev->finalize(dev);
+ 
+-    if (dev->child) {
+-        gs_free_object(dev->memory->stable_memory, dev->child, "free child device memory for subclassing device");
+-    }
++    rc_decrement(dev->child, "de-reference child device");
++
+     if (psubclass_data) {
+         gs_free_object(dev->memory->non_gc_memory, psubclass_data, "gx_epo_finalize(suclass data)");
+         dev->subclass_data = NULL;
+     }
+     if (dev->stype_is_dynamic)
+         gs_free_const_object(dev->memory->non_gc_memory, dev->stype,
+                              "default_subclass_finalize");
+     if (dev->parent)
+         dev->parent->child = dev->child;
+     if (dev->child)
+         dev->child->parent = dev->parent;
+     if (dev->icc_struct)
+         rc_decrement(dev->icc_struct, "finalize subclass device");
+     if (dev->PageList)
+         rc_decrement(dev->PageList, "finalize subclass device");
+     if (dev->NupControl)
+         rc_decrement(dev->NupControl, "finalize subclass device");
+ }
+diff --git a/psi/zdevice.c b/psi/zdevice.c
+index 99beaff7f..7e9779f7e 100644
+--- a/psi/zdevice.c
++++ b/psi/zdevice.c
+@@ -42,11 +42,11 @@ static
+ ENUM_PTRS_WITH(psi_device_ref_enum_ptrs, psi_device_ref *devref)
+       {
+           return 0;
+       }
+     case 0:
+       {
+-          if (devref->device->memory != NULL) {
++          if (devref->device != NULL && devref->device->memory != NULL) {
+               ENUM_RETURN(gx_device_enum_ptr(devref->device));
+           }
+           return 0;
+       }
+@@ -54,7 +54,7 @@ ENUM_PTRS_END
+ 
+ static
+ RELOC_PTRS_WITH(psi_device_ref_reloc_ptrs, psi_device_ref *devref)
+-    if (devref->device->memory != NULL) {
++    if (devref->device != NULL && devref->device->memory != NULL) {
+         devref->device = gx_device_reloc_ptr(devref->device, gcst);
+     }
+ RELOC_PTRS_END
+@@ -66,15 +66,15 @@ void
+ psi_device_ref_finalize(const gs_memory_t *cmem, void *vptr)
+ {
+     psi_device_ref *pdref = (psi_device_ref *)vptr;
+     (void)cmem;
+ 
+     /* pdref->device->memory == NULL indicates either a device prototype
+        or a device allocated on the stack rather than the heap
+      */
+-    if (pdref->device->memory != NULL)
++    if (pdref->device != NULL && pdref->device->memory != NULL)
+         rc_decrement(pdref->device, "psi_device_ref_finalize");
+ 
+     pdref->device = NULL;
+ }
+ 
+ /* <device> <keep_open> .copydevice2 <newdevice> */
+@@ -407,60 +407,61 @@ static int
+ zmakewordimagedevice(i_ctx_t *i_ctx_p)
+ {
+     os_ptr op = osp;
+     os_ptr op1 = op - 1;
+     gs_matrix imat;
+     gx_device *new_dev;
+     const byte *colors;
+     int colors_size;
+     int code;
+     psi_device_ref *psdev;
+ 
+     check_int_leu(op[-3], max_uint >> 1);	/* width */
+     check_int_leu(op[-2], max_uint >> 1);	/* height */
+     check_type(*op, t_boolean);
+     if (r_has_type(op1, t_null)) {	/* true color */
+         colors = 0;
+         colors_size = -24;	/* 24-bit true color */
+     } else if (r_has_type(op1, t_integer)) {
+         /*
+          * We use if/else rather than switch because the value is long,
+          * which is not supported as a switch value in pre-ANSI C.
+          */
+         if (op1->value.intval != 16 && op1->value.intval != 24 &&
+             op1->value.intval != 32
+             )
+             return_error(gs_error_rangecheck);
+         colors = 0;
+         colors_size = -op1->value.intval;
+     } else {
+         check_type(*op1, t_string);	/* palette */
+         if (r_size(op1) > 3 * 256)
+             return_error(gs_error_rangecheck);
+         colors = op1->value.bytes;
+         colors_size = r_size(op1);
+     }
+     if ((code = read_matrix(imemory, op - 4, &imat)) < 0)
+         return code;
+     /* Everything OK, create device */
+     code = gs_makewordimagedevice(&new_dev, &imat,
+                                   (int)op[-3].value.intval,
+                                   (int)op[-2].value.intval,
+                                   colors, colors_size,
+                                   op->value.boolval, true, imemory);
+     if (code == 0) {
+         new_dev->memory = imemory;
+ 
+         psdev = gs_alloc_struct(imemory, psi_device_ref, &st_psi_device_ref, "zcurrentdevice");
+         if (!psdev) {
+             rc_decrement(new_dev, "zmakewordimagedevice");
+             return_error(gs_error_VMerror);
+         }
+         psdev->device = new_dev;
++        rc_increment(new_dev);
+         make_tav(op - 4, t_device, imemory_space(iimemory) | a_all, pdevice, psdev);
+         pop(4);
+     }
+     return code;
+ }
+ 
+ /* - nulldevice - */
+ /* Note that nulldevice clears the current pagedevice. */

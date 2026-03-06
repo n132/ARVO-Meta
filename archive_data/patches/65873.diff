@@ -1,0 +1,484 @@
+commit 3eb8923b9730efeae10a92f8054f63495fe8a95f
+Author: Frank Tang <ftang@chromium.org>
+Date:   Fri Jan 19 00:37:46 2024 +0000
+
+    ICU-22638 Use parseNumber to fix buffer-overflow
+    
+    See #2795
+
+diff --git a/icu4c/source/common/util_props.cpp b/icu4c/source/common/util_props.cpp
+index 5991769d068..366a555eeeb 100644
+--- a/icu4c/source/common/util_props.cpp
++++ b/icu4c/source/common/util_props.cpp
+@@ -172,43 +172,42 @@ UnicodeString ICU_Utility::parseUnicodeIdentifier(const UnicodeString& str, int3
+ /**
+  * Parse an unsigned 31-bit integer at the given offset.  Use
+  * UCharacter.digit() to parse individual characters into digits.
+  * @param text the text to be parsed
+  * @param pos INPUT-OUTPUT parameter.  On entry, pos[0] is the
+  * offset within text at which to start parsing; it should point
+  * to a valid digit.  On exit, pos[0] is the offset after the last
+  * parsed character.  If the parse failed, it will be unchanged on
+  * exit.  Must be >= 0 on entry.
+  * @param radix the radix in which to parse; must be >= 2 and <=
+  * 36.
+  * @return a non-negative parsed number, or -1 upon parse failure.
+  * Parse fails if there are no digits, that is, if pos[0] does not
+  * point to a valid digit on entry, or if the number to be parsed
+  * does not fit into a 31-bit unsigned integer.
+  */
+ int32_t ICU_Utility::parseNumber(const UnicodeString& text,
+                                  int32_t& pos, int8_t radix) {
+     // assert(pos[0] >= 0);
+     // assert(radix >= 2);
+     // assert(radix <= 36);
+     int32_t n = 0;
+     int32_t p = pos;
+     while (p < text.length()) {
+         UChar32 ch = text.char32At(p);
+         int32_t d = u_digit(ch, radix);
+         if (d < 0) {
+             break;
+         }
+-        n = radix*n + d;
+-        // ASSUME that when a 32-bit integer overflows it becomes
+-        // negative.  E.g., 214748364 * 10 + 8 => negative value.
+-        if (n < 0) {
++        int64_t update = radix*static_cast<int64_t>(n) + d;
++        if (update > INT32_MAX) {
+             return -1;
+         }
++        n = static_cast<int32_t>(update);
+         ++p;
+     }
+     if (p == pos) {
+         return -1;
+     }
+     pos = p;
+     return n;
+ }
+diff --git a/icu4c/source/i18n/plurrule.cpp b/icu4c/source/i18n/plurrule.cpp
+index b8ad0b2736f..1a9bdf47125 100644
+--- a/icu4c/source/i18n/plurrule.cpp
++++ b/icu4c/source/i18n/plurrule.cpp
+@@ -602,201 +602,221 @@ void
+ PluralRuleParser::parse(const UnicodeString& ruleData, PluralRules *prules, UErrorCode &status)
+ {
+     if (U_FAILURE(status)) {
+         return;
+     }
+     U_ASSERT(ruleIndex == 0);    // Parsers are good for a single use only!
+     ruleSrc = &ruleData;
+ 
+     while (ruleIndex< ruleSrc->length()) {
+         getNextToken(status);
+         if (U_FAILURE(status)) {
+             return;
+         }
+         checkSyntax(status);
+         if (U_FAILURE(status)) {
+             return;
+         }
+         switch (type) {
+         case tAnd:
+             U_ASSERT(curAndConstraint != nullptr);
+             curAndConstraint = curAndConstraint->add(status);
+             break;
+         case tOr:
+             {
+                 U_ASSERT(currentChain != nullptr);
+                 OrConstraint *orNode=currentChain->ruleHeader;
+                 while (orNode->next != nullptr) {
+                     orNode = orNode->next;
+                 }
+                 orNode->next= new OrConstraint();
+                 if (orNode->next == nullptr) {
+                     status = U_MEMORY_ALLOCATION_ERROR;
+                     break;
+                 }
+                 orNode=orNode->next;
+                 orNode->next=nullptr;
+                 curAndConstraint = orNode->add(status);
+             }
+             break;
+         case tIs:
+             U_ASSERT(curAndConstraint != nullptr);
+             U_ASSERT(curAndConstraint->value == -1);
+             U_ASSERT(curAndConstraint->rangeList == nullptr);
+             break;
+         case tNot:
+             U_ASSERT(curAndConstraint != nullptr);
+             curAndConstraint->negated=true;
+             break;
+ 
+         case tNotEqual:
+             curAndConstraint->negated=true;
+             U_FALLTHROUGH;
+         case tIn:
+         case tWithin:
+         case tEqual:
+             {
+                 U_ASSERT(curAndConstraint != nullptr);
+                 if (curAndConstraint->rangeList != nullptr) {
+                     // Already get a '='.
+                     status = U_UNEXPECTED_TOKEN;
+                     break;
+                 }
+                 LocalPointer<UVector32> newRangeList(new UVector32(status), status);
+                 if (U_FAILURE(status)) {
+                     break;
+                 }
+                 curAndConstraint->rangeList = newRangeList.orphan();
+                 curAndConstraint->rangeList->addElement(-1, status);  // range Low
+                 curAndConstraint->rangeList->addElement(-1, status);  // range Hi
+                 rangeLowIdx = 0;
+                 rangeHiIdx  = 1;
+                 curAndConstraint->value=PLURAL_RANGE_HIGH;
+                 curAndConstraint->integerOnly = (type != tWithin);
+             }
+             break;
+         case tNumber:
+             U_ASSERT(curAndConstraint != nullptr);
+             if ( (curAndConstraint->op==AndConstraint::MOD)&&
+                  (curAndConstraint->opNum == -1 ) ) {
+-                curAndConstraint->opNum=getNumberValue(token);
++                int32_t num = getNumberValue(token);
++                if (num == -1) {
++                    status = U_UNEXPECTED_TOKEN;
++                    break;
++                }
++                curAndConstraint->opNum=num;
+             }
+             else {
+                 if (curAndConstraint->rangeList == nullptr) {
+                     // this is for an 'is' rule
+-                    curAndConstraint->value = getNumberValue(token);
++                    int32_t num = getNumberValue(token);
++                    if (num == -1) {
++                        status = U_UNEXPECTED_TOKEN;
++                        break;
++                    }
++                    curAndConstraint->value = num;
+                 } else {
+                     // this is for an 'in' or 'within' rule
+                     if (curAndConstraint->rangeList->elementAti(rangeLowIdx) == -1) {
+-                        curAndConstraint->rangeList->setElementAt(getNumberValue(token), rangeLowIdx);
+-                        curAndConstraint->rangeList->setElementAt(getNumberValue(token), rangeHiIdx);
++                        int32_t num = getNumberValue(token);
++                        if (num == -1) {
++                            status = U_UNEXPECTED_TOKEN;
++                            break;
++                        }
++                        curAndConstraint->rangeList->setElementAt(num, rangeLowIdx);
++                        curAndConstraint->rangeList->setElementAt(num, rangeHiIdx);
+                     }
+                     else {
+-                        curAndConstraint->rangeList->setElementAt(getNumberValue(token), rangeHiIdx);
++                        int32_t num = getNumberValue(token);
++                        if (num == -1) {
++                            status = U_UNEXPECTED_TOKEN;
++                            break;
++                        }
++                        curAndConstraint->rangeList->setElementAt(num, rangeHiIdx);
+                         if (curAndConstraint->rangeList->elementAti(rangeLowIdx) >
+                                 curAndConstraint->rangeList->elementAti(rangeHiIdx)) {
+                             // Range Lower bound > Range Upper bound.
+                             // U_UNEXPECTED_TOKEN seems a little funny, but it is consistently
+                             // used for all plural rule parse errors.
+                             status = U_UNEXPECTED_TOKEN;
+                             break;
+                         }
+                     }
+                 }
+             }
+             break;
+         case tComma:
+             // TODO: rule syntax checking is inadequate, can happen with badly formed rules.
+             //       Catch cases like "n mod 10, is 1" here instead.
+             if (curAndConstraint == nullptr || curAndConstraint->rangeList == nullptr) {
+                 status = U_UNEXPECTED_TOKEN;
+                 break;
+             }
+             U_ASSERT(curAndConstraint->rangeList->size() >= 2);
+             rangeLowIdx = curAndConstraint->rangeList->size();
+             curAndConstraint->rangeList->addElement(-1, status);  // range Low
+             rangeHiIdx = curAndConstraint->rangeList->size();
+             curAndConstraint->rangeList->addElement(-1, status);  // range Hi
+             break;
+         case tMod:
+             U_ASSERT(curAndConstraint != nullptr);
+             curAndConstraint->op=AndConstraint::MOD;
+             break;
+         case tVariableN:
+         case tVariableI:
+         case tVariableF:
+         case tVariableT:
+         case tVariableE:
+         case tVariableC:
+         case tVariableV:
+             U_ASSERT(curAndConstraint != nullptr);
+             curAndConstraint->digitsType = type;
+             break;
+         case tKeyword:
+             {
+             RuleChain *newChain = new RuleChain;
+             if (newChain == nullptr) {
+                 status = U_MEMORY_ALLOCATION_ERROR;
+                 break;
+             }
+             newChain->fKeyword = token;
+             if (prules->mRules == nullptr) {
+                 prules->mRules = newChain;
+             } else {
+                 // The new rule chain goes at the end of the linked list of rule chains,
+                 //   unless there is an "other" keyword & chain. "other" must remain last.
+                 RuleChain *insertAfter = prules->mRules;
+                 while (insertAfter->fNext!=nullptr &&
+                        insertAfter->fNext->fKeyword.compare(PLURAL_KEYWORD_OTHER, 5) != 0 ){
+                     insertAfter=insertAfter->fNext;
+                 }
+                 newChain->fNext = insertAfter->fNext;
+                 insertAfter->fNext = newChain;
+             }
+             OrConstraint *orNode = new OrConstraint();
+             if (orNode == nullptr) {
+                 status = U_MEMORY_ALLOCATION_ERROR;
+                 break;
+             }
+             newChain->ruleHeader = orNode;
+             curAndConstraint = orNode->add(status);
+             currentChain = newChain;
+             }
+             break;
+ 
+         case tInteger:
+             for (;;) {
+                 getNextToken(status);
+                 if (U_FAILURE(status) || type == tSemiColon || type == tEOF || type == tAt) {
+                     break;
+                 }
+                 if (type == tEllipsis) {
+                     currentChain->fIntegerSamplesUnbounded = true;
+                     continue;
+                 }
+                 currentChain->fIntegerSamples.append(token);
+             }
+             break;
+ 
+         case tDecimal:
+             for (;;) {
+                 getNextToken(status);
+                 if (U_FAILURE(status) || type == tSemiColon || type == tEOF || type == tAt) {
+                     break;
+                 }
+                 if (type == tEllipsis) {
+                     currentChain->fDecimalSamplesUnbounded = true;
+                     continue;
+                 }
+                 currentChain->fDecimalSamples.append(token);
+             }
+             break;
+ 
+         default:
+             break;
+         }
+         prevType=type;
+         if (U_FAILURE(status)) {
+             break;
+         }
+     }
+ }
+@@ -1263,13 +1283,8 @@ PluralRuleParser::~PluralRuleParser() {
+ 
+ int32_t
+ PluralRuleParser::getNumberValue(const UnicodeString& token) {
+-    int32_t i;
+-    char digits[128];
+-
+-    i = token.extract(0, token.length(), digits, UPRV_LENGTHOF(digits), US_INV);
+-    digits[i]='\0';
+-
+-    return((int32_t)atoi(digits));
++    int32_t pos = 0;
++    return ICU_Utility::parseNumber(token, pos, 10);
+ }
+ 
+ 
+diff --git a/icu4c/source/test/depstest/dependencies.txt b/icu4c/source/test/depstest/dependencies.txt
+index 8474348b037..e0484f76329 100644
+--- a/icu4c/source/test/depstest/dependencies.txt
++++ b/icu4c/source/test/depstest/dependencies.txt
+@@ -987,13 +987,14 @@ group: number_representation
+ group: number_output
+     # PluralRules and FormattedNumber
+     number_output.o
+     standardplural.o plurrule.o pluralranges.o
+   deps
+     # FormattedNumber internals:
+     number_representation format formatted_value_sbimpl units
+     # PluralRules internals:
+     unifiedcache
+     display_options
++    icu_utility_with_props
+ 
+ group: numberformatter
+     # ICU 60+ NumberFormatter API
+diff --git a/icu4c/source/test/intltest/plurults.cpp b/icu4c/source/test/intltest/plurults.cpp
+index 0771baa7586..fb95ef43dc7 100644
+--- a/icu4c/source/test/intltest/plurults.cpp
++++ b/icu4c/source/test/intltest/plurults.cpp
+@@ -46,33 +46,34 @@ UBool testEquality(const PluralRules &test);
+ void PluralRulesTest::runIndexedTest( int32_t index, UBool exec, const char* &name, char* /*par*/ )
+ {
+     if (exec) logln("TestSuite PluralRulesAPI");
+     TESTCASE_AUTO_BEGIN;
+     TESTCASE_AUTO(testAPI);
+     // TESTCASE_AUTO(testGetUniqueKeywordValue);
+     TESTCASE_AUTO(testGetSamples);
+     TESTCASE_AUTO(testGetDecimalQuantitySamples);
+     TESTCASE_AUTO(testGetOrAddSamplesFromString);
+     TESTCASE_AUTO(testGetOrAddSamplesFromStringCompactNotation);
+     TESTCASE_AUTO(testSamplesWithExponent);
+     TESTCASE_AUTO(testSamplesWithCompactNotation);
+     TESTCASE_AUTO(testWithin);
+     TESTCASE_AUTO(testGetAllKeywordValues);
+     TESTCASE_AUTO(testScientificPluralKeyword);
+     TESTCASE_AUTO(testCompactDecimalPluralKeyword);
+     TESTCASE_AUTO(testDoubleValue);
+     TESTCASE_AUTO(testLongValue);
+     TESTCASE_AUTO(testOrdinal);
+     TESTCASE_AUTO(testSelect);
+     TESTCASE_AUTO(testSelectRange);
+     TESTCASE_AUTO(testAvailableLocales);
+     TESTCASE_AUTO(testParseErrors);
+     TESTCASE_AUTO(testFixedDecimal);
+     TESTCASE_AUTO(testSelectTrailingZeros);
+     TESTCASE_AUTO(testLocaleExtension);
+     TESTCASE_AUTO(testDoubleEqualSign);
++    TESTCASE_AUTO(test22638LongNumberValue);
+     TESTCASE_AUTO_END;
+ }
+ 
+ 
+ // Quick and dirty class for putting UnicodeStrings in char * messages.
+ //   TODO: something like this should be generally available.
+@@ -1065,6 +1066,16 @@ PluralRulesTest::testDoubleValue() {
+     }
+ }
+ 
++void
++PluralRulesTest::test22638LongNumberValue() {
++    IcuTestErrorCode errorCode(*this, "test22638LongNumberValue");
++    LocalPointer<PluralRules> pr(PluralRules::createRules(
++        u"g:c%4422322222232222222222232222222322222223222222232222222322222223"
++        u"2222222322222232222222322222223222232222222222222322222223222222",
++        errorCode));
++    errorCode.expectErrorAndReset(U_UNEXPECTED_TOKEN);
++}
++
+ void
+ PluralRulesTest::testLongValue() {
+     IcuTestErrorCode errorCode(*this, "testLongValue");
+diff --git a/icu4c/source/test/intltest/plurults.h b/icu4c/source/test/intltest/plurults.h
+index e245a44590b..14d397e05c1 100644
+--- a/icu4c/source/test/intltest/plurults.h
++++ b/icu4c/source/test/intltest/plurults.h
+@@ -21,52 +21,53 @@
+ /**
+  * Test basic functionality of various API functions
+  **/
+ class PluralRulesTest : public IntlTest {
+     void runIndexedTest( int32_t index, UBool exec, const char* &name, char* par = nullptr ) override;
+ 
+ private:
+     /**
+      * Performs tests on many API functions, see detailed comments in source code
+      **/
+     void testAPI();
+     void testGetUniqueKeywordValue();
+     void testGetSamples();
+     void testGetDecimalQuantitySamples();
+     void testGetOrAddSamplesFromString();
+     void testGetOrAddSamplesFromStringCompactNotation();
+     void testSamplesWithExponent();
+     void testSamplesWithCompactNotation();
+     void testWithin();
+     void testGetAllKeywordValues();
+     void testCompactDecimalPluralKeyword();
+     void testDoubleValue();
+     void testLongValue();
+     void testScientificPluralKeyword();
+     void testOrdinal();
+     void testSelect();
+     void testSelectRange();
+     void testAvailableLocales();
+     void testParseErrors();
+     void testFixedDecimal();
+     void testSelectTrailingZeros();
+     void testLocaleExtension();
+     void testDoubleEqualSign();
++    void test22638LongNumberValue();
+ 
+     void assertRuleValue(const UnicodeString& rule, double expected);
+     void assertRuleKeyValue(const UnicodeString& rule, const UnicodeString& key,
+                             double expected);
+     void checkNewSamples(UnicodeString description, 
+                          const LocalPointer<PluralRules> &test,
+                          UnicodeString keyword,
+                          UnicodeString samplesString,
+                          ::icu::number::impl::DecimalQuantity firstInRange);
+     UnicodeString getPluralKeyword(const LocalPointer<PluralRules> &rules,
+                                    Locale locale, double number, const char16_t* skeleton);
+     void checkSelect(const LocalPointer<PluralRules> &rules, UErrorCode &status, 
+                                   int32_t line, const char *keyword, ...);
+     void compareLocaleResults(const char* loc1, const char* loc2, const char* loc3);
+ };
+ 
+ #endif /* #if !UCONFIG_NO_FORMATTING */
+ 
+ #endif
+diff --git a/icu4j/main/common_tests/src/test/java/com/ibm/icu/dev/test/format/PluralRulesTest.java b/icu4j/main/common_tests/src/test/java/com/ibm/icu/dev/test/format/PluralRulesTest.java
+index 7a80c790156..8093d5eb581 100644
+--- a/icu4j/main/common_tests/src/test/java/com/ibm/icu/dev/test/format/PluralRulesTest.java
++++ b/icu4j/main/common_tests/src/test/java/com/ibm/icu/dev/test/format/PluralRulesTest.java
+@@ -1728,33 +1728,40 @@ public void testBug20264() {
+     @Test
+     public void testSelectRange() {
+         int d1 = 102;
+         int d2 = 201;
+         ULocale locale = new ULocale("sl");
+ 
+         // Locale sl has interesting data: one + two => few
+         FormattedNumberRange range = NumberRangeFormatter.withLocale(locale).formatRange(d1, d2);
+         PluralRules rules = PluralRules.forLocale(locale);
+ 
+         // For testing: get plural form of first and second numbers
+         FormattedNumber a = NumberFormatter.withLocale(locale).format(d1);
+         FormattedNumber b = NumberFormatter.withLocale(locale).format(d2);
+         assertEquals("First plural", "two", rules.select(a));
+         assertEquals("Second plural", "one", rules.select(b));
+ 
+         // Check the range plural now:
+         String form = rules.select(range);
+         assertEquals("Range plural", "few", form);
+ 
+         // Test when plural ranges data is unavailable:
+         PluralRules bare = PluralRules.createRules("a: i = 0,1");
+         try {
+             form = bare.select(range);
+             fail("Expected exception");
+         } catch (UnsupportedOperationException e) {}
+ 
+         // However, they should not throw when no data is available for a language.
+         PluralRules xyz = PluralRules.forLocale(new ULocale("xyz"));
+         form = xyz.select(range);
+         assertEquals("Fallback form", "other", form);
+     }
++    @Test
++    public void test22638LongNumberValue() {
++        PluralRules test = PluralRules.createRules(
++            "g:c%4422322222232222222222232222222322222223222222232222222322222223" +
++            "2222222322222232222222322222223222232222222222222322222223222222");
++        assertEquals("Long number value should get null", null, test);
++    }
+ }

@@ -1,0 +1,187 @@
+commit 32011d23a879283d845993e9358f64a6e8aefa98
+Author: Alan Modra <amodra@gmail.com>
+Date:   Wed Apr 12 09:30:26 2023 +0930
+
+    ubsan: dwarf2.c:2232:7: runtime error: index 16 out of bounds
+    
+    Except it isn't out of bounds because space for a larger array has
+    been allocated.
+    
+            * dwarf2.c (struct trie_leaf): Make ranges a C99 flexible array.
+            (alloc_trie_leaf, insert_arange_in_trie): Adjust sizing.
+
+diff --git a/bfd/dwarf2.c b/bfd/dwarf2.c
+index d99508a96c7..b135ef09120 100644
+--- a/bfd/dwarf2.c
++++ b/bfd/dwarf2.c
+@@ -133,11 +133,11 @@ struct trie_node
+ struct trie_leaf
+ {
+   struct trie_node head;
+   unsigned int num_stored_in_leaf;
+   struct {
+     struct comp_unit *unit;
+     bfd_vma low_pc, high_pc;
+-  } ranges[TRIE_LEAF_SIZE];
++  } ranges[];
+ };
+ 
+ struct trie_interior
+@@ -148,9 +148,11 @@ struct trie_interior
+ 
+ static struct trie_node *alloc_trie_leaf (bfd *abfd)
+ {
+-  struct trie_leaf *leaf = bfd_zalloc (abfd, sizeof (struct trie_leaf));
++  struct trie_leaf *leaf;
++  size_t amt = sizeof (*leaf) + TRIE_LEAF_SIZE * sizeof (leaf->ranges[0]);
++  leaf = bfd_zalloc (abfd, amt);
+   if (leaf == NULL)
+     return NULL;
+   leaf->head.num_room_in_leaf = TRIE_LEAF_SIZE;
+   return &leaf->head;
+ }
+@@ -2141,143 +2143,141 @@ static struct trie_node *
+ insert_arange_in_trie (bfd *abfd,
+ 		       struct trie_node *trie,
+ 		       bfd_vma trie_pc,
+ 		       unsigned int trie_pc_bits,
+ 		       struct comp_unit *unit,
+ 		       bfd_vma low_pc,
+ 		       bfd_vma high_pc)
+ {
+   bfd_vma clamped_low_pc, clamped_high_pc;
+   int ch, from_ch, to_ch;
+   bool is_full_leaf = false;
+ 
+   /* See if we can extend any of the existing ranges.  This merging
+      isn't perfect (if merging opens up the possibility of merging two existing
+      ranges, we won't find them), but it takes the majority of the cases.  */
+   if (trie->num_room_in_leaf > 0)
+     {
+       struct trie_leaf *leaf = (struct trie_leaf *) trie;
+       unsigned int i;
+ 
+       for (i = 0; i < leaf->num_stored_in_leaf; ++i)
+ 	{
+ 	  if (leaf->ranges[i].unit == unit
+ 	      && ranges_overlap (low_pc, high_pc,
+ 				 leaf->ranges[i].low_pc,
+ 				 leaf->ranges[i].high_pc))
+ 	    {
+ 	      if (low_pc < leaf->ranges[i].low_pc)
+ 		leaf->ranges[i].low_pc = low_pc;
+ 	      if (high_pc > leaf->ranges[i].high_pc)
+ 		leaf->ranges[i].high_pc = high_pc;
+ 	      return trie;
+ 	    }
+ 	}
+ 
+       is_full_leaf = leaf->num_stored_in_leaf == trie->num_room_in_leaf;
+     }
+ 
+   /* If we're a leaf with no more room and we're _not_ at the bottom,
+      convert to an interior node.  */
+   if (is_full_leaf && trie_pc_bits < VMA_BITS)
+     {
+       const struct trie_leaf *leaf = (struct trie_leaf *) trie;
+       unsigned int i;
+ 
+       trie = bfd_zalloc (abfd, sizeof (struct trie_interior));
+       if (!trie)
+ 	return NULL;
+       is_full_leaf = false;
+ 
+       /* TODO: If we wanted to save a little more memory at the cost of
+ 	 complexity, we could have reused the old leaf node as one of the
+ 	 children of the new interior node, instead of throwing it away.  */
+       for (i = 0; i < leaf->num_stored_in_leaf; ++i)
+         {
+ 	  if (!insert_arange_in_trie (abfd, trie, trie_pc, trie_pc_bits,
+ 				      leaf->ranges[i].unit, leaf->ranges[i].low_pc,
+ 				      leaf->ranges[i].high_pc))
+ 	    return NULL;
+ 	}
+     }
+ 
+   /* If we're a leaf with no more room and we _are_ at the bottom,
+      we have no choice but to just make it larger. */
+   if (is_full_leaf)
+     {
+       const struct trie_leaf *leaf = (struct trie_leaf *) trie;
+       unsigned int new_room_in_leaf = trie->num_room_in_leaf * 2;
+       struct trie_leaf *new_leaf;
+-      size_t amt = (sizeof (struct trie_leaf)
+-		    + ((new_room_in_leaf - TRIE_LEAF_SIZE)
+-		       * sizeof (leaf->ranges[0])));
++      size_t amt = sizeof (*leaf) + new_room_in_leaf * sizeof (leaf->ranges[0]);
+       new_leaf = bfd_zalloc (abfd, amt);
+       new_leaf->head.num_room_in_leaf = new_room_in_leaf;
+       new_leaf->num_stored_in_leaf = leaf->num_stored_in_leaf;
+ 
+       memcpy (new_leaf->ranges,
+ 	      leaf->ranges,
+ 	      leaf->num_stored_in_leaf * sizeof (leaf->ranges[0]));
+       trie = &new_leaf->head;
+       is_full_leaf = false;
+ 
+       /* Now the insert below will go through.  */
+     }
+ 
+   /* If we're a leaf (now with room), we can just insert at the end.  */
+   if (trie->num_room_in_leaf > 0)
+     {
+       struct trie_leaf *leaf = (struct trie_leaf *) trie;
+ 
+       unsigned int i = leaf->num_stored_in_leaf++;
+       leaf->ranges[i].unit = unit;
+       leaf->ranges[i].low_pc = low_pc;
+       leaf->ranges[i].high_pc = high_pc;
+       return trie;
+     }
+ 
+   /* Now we are definitely an interior node, so recurse into all
+      the relevant buckets.  */
+ 
+   /* Clamp the range to the current trie bucket.  */
+   clamped_low_pc = low_pc;
+   clamped_high_pc = high_pc;
+   if (trie_pc_bits > 0)
+     {
+       bfd_vma bucket_high_pc =
+ 	trie_pc + ((bfd_vma) -1 >> trie_pc_bits);  /* Inclusive.  */
+       if (clamped_low_pc < trie_pc)
+ 	clamped_low_pc = trie_pc;
+       if (clamped_high_pc > bucket_high_pc)
+ 	clamped_high_pc = bucket_high_pc;
+     }
+ 
+   /* Insert the ranges in all buckets that it spans.  */
+   from_ch = (clamped_low_pc >> (VMA_BITS - trie_pc_bits - 8)) & 0xff;
+   to_ch = ((clamped_high_pc - 1) >> (VMA_BITS - trie_pc_bits - 8)) & 0xff;
+   for (ch = from_ch; ch <= to_ch; ++ch)
+     {
+       struct trie_interior *interior = (struct trie_interior *) trie;
+       struct trie_node *child = interior->children[ch];
+ 
+       if (child == NULL)
+         {
+ 	  child = alloc_trie_leaf (abfd);
+ 	  if (!child)
+ 	    return NULL;
+ 	}
+       bfd_vma bucket = (bfd_vma) ch << (VMA_BITS - trie_pc_bits - 8);
+       child = insert_arange_in_trie (abfd,
+ 				     child,
+ 				     trie_pc + bucket,
+ 				     trie_pc_bits + 8,
+ 				     unit,
+ 				     low_pc,
+ 				     high_pc);
+       if (!child)
+ 	return NULL;
+ 
+       interior->children[ch] = child;
+     }
+ 
+     return trie;
+ }

@@ -1,0 +1,107 @@
+commit ae0b2633c935950084860e5f6a1c2c3203726489
+Author: DavidKorczynski <david@adalogics.com>
+Date:   Wed Dec 27 08:26:21 2023 +0000
+
+    [BitcodeReader] Add bounds checking on Strtab (#76403)
+    
+    This is needed to protect against global overflows, which was found by a
+    fuzzer recently.
+    
+    Fixes: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=65283
+    
+    ---------
+    
+    Signed-off-by: David Korczynski <david@adalogics.com>
+
+diff --git a/llvm/lib/Bitcode/Reader/BitcodeReader.cpp b/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
+index 8907f6fa4ff3..a027d0c21ba0 100644
+--- a/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
++++ b/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
+@@ -4146,84 +4146,87 @@ Error BitcodeReader::parseFunctionRecord(ArrayRef<uint64_t> Record) {
+ Error BitcodeReader::parseGlobalIndirectSymbolRecord(
+     unsigned BitCode, ArrayRef<uint64_t> Record) {
+   // v1 ALIAS_OLD: [alias type, aliasee val#, linkage] (name in VST)
+   // v1 ALIAS: [alias type, addrspace, aliasee val#, linkage, visibility,
+   // dllstorageclass, threadlocal, unnamed_addr,
+   // preemption specifier] (name in VST)
+   // v1 IFUNC: [alias type, addrspace, aliasee val#, linkage,
+   // visibility, dllstorageclass, threadlocal, unnamed_addr,
+   // preemption specifier] (name in VST)
+   // v2: [strtab_offset, strtab_size, v1]
+   StringRef Name;
+   std::tie(Name, Record) = readNameFromStrtab(Record);
+ 
+   bool NewRecord = BitCode != bitc::MODULE_CODE_ALIAS_OLD;
+   if (Record.size() < (3 + (unsigned)NewRecord))
+     return error("Invalid record");
+   unsigned OpNum = 0;
+   unsigned TypeID = Record[OpNum++];
+   Type *Ty = getTypeByID(TypeID);
+   if (!Ty)
+     return error("Invalid record");
+ 
+   unsigned AddrSpace;
+   if (!NewRecord) {
+     auto *PTy = dyn_cast<PointerType>(Ty);
+     if (!PTy)
+       return error("Invalid type for value");
+     AddrSpace = PTy->getAddressSpace();
+     TypeID = getContainedTypeID(TypeID);
+     Ty = getTypeByID(TypeID);
+     if (!Ty)
+       return error("Missing element type for old-style indirect symbol");
+   } else {
+     AddrSpace = Record[OpNum++];
+   }
+ 
+   auto Val = Record[OpNum++];
+   auto Linkage = Record[OpNum++];
+   GlobalValue *NewGA;
+   if (BitCode == bitc::MODULE_CODE_ALIAS ||
+       BitCode == bitc::MODULE_CODE_ALIAS_OLD)
+     NewGA = GlobalAlias::create(Ty, AddrSpace, getDecodedLinkage(Linkage), Name,
+                                 TheModule);
+   else
+     NewGA = GlobalIFunc::create(Ty, AddrSpace, getDecodedLinkage(Linkage), Name,
+                                 nullptr, TheModule);
+ 
+   // Local linkage must have default visibility.
+   // auto-upgrade `hidden` and `protected` for old bitcode.
+   if (OpNum != Record.size()) {
+     auto VisInd = OpNum++;
+     if (!NewGA->hasLocalLinkage())
+       NewGA->setVisibility(getDecodedVisibility(Record[VisInd]));
+   }
+   if (BitCode == bitc::MODULE_CODE_ALIAS ||
+       BitCode == bitc::MODULE_CODE_ALIAS_OLD) {
+     if (OpNum != Record.size()) {
+       auto S = Record[OpNum++];
+       // A GlobalValue with local linkage cannot have a DLL storage class.
+       if (!NewGA->hasLocalLinkage())
+         NewGA->setDLLStorageClass(getDecodedDLLStorageClass(S));
+     }
+     else
+       upgradeDLLImportExportLinkage(NewGA, Linkage);
+     if (OpNum != Record.size())
+       NewGA->setThreadLocalMode(getDecodedThreadLocalMode(Record[OpNum++]));
+     if (OpNum != Record.size())
+       NewGA->setUnnamedAddr(getDecodedUnnamedAddrType(Record[OpNum++]));
+   }
+   if (OpNum != Record.size())
+     NewGA->setDSOLocal(getDecodedDSOLocal(Record[OpNum++]));
+   inferDSOLocal(NewGA);
+ 
+   // Check whether we have enough values to read a partition name.
+   if (OpNum + 1 < Record.size()) {
++    // Check Strtab has enough values for the partition.
++    if (Record[OpNum] + Record[OpNum + 1] > Strtab.size())
++      return error("Malformed partition, too large.");
+     NewGA->setPartition(
+         StringRef(Strtab.data() + Record[OpNum], Record[OpNum + 1]));
+     OpNum += 2;
+   }
+ 
+   ValueList.push_back(NewGA, getVirtualTypeID(NewGA->getType(), TypeID));
+   IndirectSymbolInits.push_back(std::make_pair(NewGA, Val));
+   return Error::success();
+ }

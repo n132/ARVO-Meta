@@ -1,0 +1,165 @@
+commit 18315b80ba40e56fc2981c848d86e604d223bde6
+Author: Luca Deri <deri@ntop.org>
+Date:   Mon May 22 22:59:45 2023 +0200
+
+    Added check for invalid packet lenght
+
+diff --git a/src/NetworkInterface.cpp b/src/NetworkInterface.cpp
+index be4ea5d09..938361cd2 100644
+--- a/src/NetworkInterface.cpp
++++ b/src/NetworkInterface.cpp
+@@ -2396,136 +2396,148 @@ u_int16_t NetworkInterface::guessEthType(const u_char *p, u_int len,
+ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+                                      bool ingressPacket, u_int8_t *sender_mac,
+                                      const struct pcap_pkthdr *h,
+                                      const u_char *packet,
+                                      u_int16_t *ndpiProtocol, Host **srcHost,
+                                      Host **dstHost, Flow **flow) {
+   struct ndpi_ethhdr *ethernet = NULL, dummy_ethernet;
+   u_int64_t time;
+   u_int16_t eth_type, ip_offset = 0, vlan_id = 0, eth_offset = 0,
+-                      encapsulation_overhead = 0;
++    encapsulation_overhead = 0;
+   u_int32_t null_type;
+   int pcap_datalink_type = get_datalink();
+   bool pass_verdict = true;
+   u_int32_t len_on_wire = h->len * getScalingFactor();
+   *flow = NULL;
+ 
+   /* Note summy ethernet is always 0 unless sender_mac is set (Netfilter only)
+    */
+   memset(&dummy_ethernet, 0, sizeof(dummy_ethernet));
+ 
+   pollQueuedeCompanionEvents();
+   bcast_domains->reloadBroadcastDomains();
+ 
+   /* Netfilter interfaces don't report MAC addresses on packets */
+   if (getIfType() == interface_type_NETFILTER)
+     len_on_wire += sizeof(struct ndpi_ethhdr);
+ 
+-  if (h->len > ifMTU) {
++  if (h->len == 0) {
++    return (false);
++  } else if (h->len > ifMTU) {
+     if (!mtuWarningShown) {
+ #ifdef __linux__
+       ntop->getTrace()->traceEvent(
+           TRACE_NORMAL,
+           "Packets exceeding the expected max size have been received "
+           "[len: %u][max len: %u].",
+           h->len, ifMTU);
+ 
+       if (!read_from_pcap_dump()) {
+         ntop->getTrace()->traceEvent(
+             TRACE_WARNING,
+             "If TSO/GRO is enabled, please disable it for best accuracy");
+         if (strchr(ifname, ':') ==
+             NULL) /* print ethtool command for standard interfaces only */
+           ntop->getTrace()->traceEvent(
+               TRACE_WARNING,
+               "using: sudo ethtool -K %s gro off gso off tso off", ifname);
+       }
+ #endif
+       mtuWarningShown = true;
+     }
+   }
+ 
+   setTimeLastPktRcvd(h->ts.tv_sec);
+ 
+   if (last_purge_idle != (u_int32_t)h->ts.tv_sec) {
+     if (!read_from_pcap_dump()) purgeIdle(h->ts.tv_sec);
+     last_purge_idle = h->ts.tv_sec;
+   }
+ 
+   time = ((uint64_t)h->ts.tv_sec) * 1000 + h->ts.tv_usec / 1000;
+ 
+ datalink_check:
+   if (pcap_datalink_type == DLT_NULL) {
++    if (h->caplen < sizeof(u_int32_t))
++      return (false);
++
+     memcpy(&null_type, &packet[eth_offset], sizeof(u_int32_t));
+ 
+     switch (null_type) {
+       case BSD_AF_INET:
+         eth_type = ETHERTYPE_IP;
+         break;
+       case BSD_AF_INET6_BSD:
+       case BSD_AF_INET6_FREEBSD:
+       case BSD_AF_INET6_DARWIN:
+         eth_type = ETHERTYPE_IPV6;
+         break;
+       default:
+         incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+                  NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+         goto dissect_packet_end; /* Any other non IP protocol */
+     }
+ 
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ip_offset = 4 + eth_offset;
+   } else if (pcap_datalink_type == DLT_EN10MB) {
++    if (h->caplen < sizeof(ndpi_ethhdr))
++      return (false);
++
+     ethernet = (struct ndpi_ethhdr *)&packet[eth_offset];
+     ip_offset = sizeof(struct ndpi_ethhdr) + eth_offset;
+     eth_type = ntohs(ethernet->h_proto);
+   } else if (pcap_datalink_type == 113 /* Linux Cooked Capture */) {
++    if (h->caplen < 16)
++      return (false);
++
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     eth_type = (packet[eth_offset + 14] << 8) + packet[eth_offset + 15];
+     ip_offset = 16 + eth_offset;
+ #ifdef DLT_RAW
+-  } else if (pcap_datalink_type ==
+-                 DLT_RAW /* Linux TUN/TAP device in TUN mode; Raw IP capture */
+-             || pcap_datalink_type ==
+-                    14 /* raw IP DLT_RAW on OpenBSD captures */) {
++  } else if (pcap_datalink_type == DLT_RAW /* Linux TUN/TAP device in TUN mode; Raw IP capture */
++             || pcap_datalink_type == 14 /* raw IP DLT_RAW on OpenBSD captures */) {
++    if (h->caplen < sizeof(u_int32_t))
++      return (false);
++
+     switch ((packet[eth_offset] & 0xf0) >> 4) {
+       case 4:
+         eth_type = ETHERTYPE_IP;
+         break;
+       case 6:
+         eth_type = ETHERTYPE_IPV6;
+         break;
+       default:
+         incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+                  NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+         goto dissect_packet_end; /* Unknown IP protocol version */
+     }
+ 
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     ip_offset = eth_offset;
+ #endif /* DLT_RAW */
+   } else if (pcap_datalink_type == DLT_ENC) {
+     if (packet[0] == 2 /* IPv4 */) {
+       eth_type = ETHERTYPE_IP;
+       ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+       ip_offset = 12;
+     }
+     /* TODO support IPv6 encapsulation one day */
+   } else if (pcap_datalink_type == DLT_IPV4) {
+     eth_type = ETHERTYPE_IP;
+     if (sender_mac) memcpy(&dummy_ethernet.h_source, sender_mac, 6);
+     ethernet = (struct ndpi_ethhdr *)&dummy_ethernet;
+     ip_offset = 0;
+   } else {
+     incStats(ingressPacket, h->ts.tv_sec, 0, NDPI_PROTOCOL_UNKNOWN,
+              NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+     goto dissect_packet_end;
+   }
+ 
+   /*
+     Make sure this label is BEFORE detunneling of VLAN or MPLS traffic.
+     Otherwise, VLAN or MPLS traffic carried inside other tunnels, i.e.,
+     GRE or ERSPAN, won't be detunneled.
+   */

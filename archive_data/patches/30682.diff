@@ -1,0 +1,792 @@
+commit 0e453ac3524100e7d78481d75e44ad3515dde0c1
+Author: Vladimir Glavnyy <31897320+vglavnyy@users.noreply.github.com>
+Date:   Fri Mar 12 02:12:06 2021 +0700
+
+    [idl_parser] Add kTokenNumericConstant token (#6432)
+    
+    * [idl_parser] Add kTokenNumericConstant token
+    
+    This commit adds the new token for correct parsing of signed numeric constants.
+    Before this expressions `-nan` or `-inf` were treated as kTokenStringConstant.
+    This was ambiguous if a real string field parsed.
+    For example, `{ "text_field" : -name }` was accepted by the parser as valid JSON object.
+    
+    Related oss-fuzz issue: 6200301176619008
+    
+    * Add additional positive tests fo 'inf' and 'nan' as identifiers
+    
+    * Rebase to HEAD
+    
+    * Move processing of signed constants to ParseSingleValue method.
+    
+    * Add missed `--cpp-static-reflection` (#6324) to pass CI
+    
+    * Remove `flatbuffers.pc` from repository to unblock CI (#6455).
+    
+    Probably the generated flatbuffers.pc should not be a part of repo.
+    
+    * Fix FieldIdentifierTest()
+
+diff --git a/src/idl_parser.cpp b/src/idl_parser.cpp
+index 87b999d7..6faee4d3 100644
+--- a/src/idl_parser.cpp
++++ b/src/idl_parser.cpp
+@@ -333,239 +333,243 @@ static inline bool IsIdentifierStart(char c) {
+ CheckedError Parser::Next() {
+   doc_comment_.clear();
+   bool seen_newline = cursor_ == source_;
+   attribute_.clear();
+   attr_is_trivial_ascii_string_ = true;
+   for (;;) {
+     char c = *cursor_++;
+     token_ = c;
+     switch (c) {
+       case '\0':
+         cursor_--;
+         token_ = kTokenEof;
+         return NoError();
+       case ' ':
+       case '\r':
+       case '\t': break;
+       case '\n':
+         MarkNewLine();
+         seen_newline = true;
+         break;
+       case '{':
+       case '}':
+       case '(':
+       case ')':
+       case '[':
+       case ']':
+       case ',':
+       case ':':
+       case ';':
+       case '=': return NoError();
+       case '\"':
+       case '\'': {
+         int unicode_high_surrogate = -1;
+ 
+         while (*cursor_ != c) {
+           if (*cursor_ < ' ' && static_cast<signed char>(*cursor_) >= 0)
+             return Error("illegal character in string constant");
+           if (*cursor_ == '\\') {
+             attr_is_trivial_ascii_string_ = false;  // has escape sequence
+             cursor_++;
+             if (unicode_high_surrogate != -1 && *cursor_ != 'u') {
+               return Error(
+                   "illegal Unicode sequence (unpaired high surrogate)");
+             }
+             switch (*cursor_) {
+               case 'n':
+                 attribute_ += '\n';
+                 cursor_++;
+                 break;
+               case 't':
+                 attribute_ += '\t';
+                 cursor_++;
+                 break;
+               case 'r':
+                 attribute_ += '\r';
+                 cursor_++;
+                 break;
+               case 'b':
+                 attribute_ += '\b';
+                 cursor_++;
+                 break;
+               case 'f':
+                 attribute_ += '\f';
+                 cursor_++;
+                 break;
+               case '\"':
+                 attribute_ += '\"';
+                 cursor_++;
+                 break;
+               case '\'':
+                 attribute_ += '\'';
+                 cursor_++;
+                 break;
+               case '\\':
+                 attribute_ += '\\';
+                 cursor_++;
+                 break;
+               case '/':
+                 attribute_ += '/';
+                 cursor_++;
+                 break;
+               case 'x': {  // Not in the JSON standard
+                 cursor_++;
+                 uint64_t val;
+                 ECHECK(ParseHexNum(2, &val));
+                 attribute_ += static_cast<char>(val);
+                 break;
+               }
+               case 'u': {
+                 cursor_++;
+                 uint64_t val;
+                 ECHECK(ParseHexNum(4, &val));
+                 if (val >= 0xD800 && val <= 0xDBFF) {
+                   if (unicode_high_surrogate != -1) {
+                     return Error(
+                         "illegal Unicode sequence (multiple high surrogates)");
+                   } else {
+                     unicode_high_surrogate = static_cast<int>(val);
+                   }
+                 } else if (val >= 0xDC00 && val <= 0xDFFF) {
+                   if (unicode_high_surrogate == -1) {
+                     return Error(
+                         "illegal Unicode sequence (unpaired low surrogate)");
+                   } else {
+                     int code_point = 0x10000 +
+                                      ((unicode_high_surrogate & 0x03FF) << 10) +
+                                      (val & 0x03FF);
+                     ToUTF8(code_point, &attribute_);
+                     unicode_high_surrogate = -1;
+                   }
+                 } else {
+                   if (unicode_high_surrogate != -1) {
+                     return Error(
+                         "illegal Unicode sequence (unpaired high surrogate)");
+                   }
+                   ToUTF8(static_cast<int>(val), &attribute_);
+                 }
+                 break;
+               }
+               default: return Error("unknown escape code in string constant");
+             }
+           } else {  // printable chars + UTF-8 bytes
+             if (unicode_high_surrogate != -1) {
+               return Error(
+                   "illegal Unicode sequence (unpaired high surrogate)");
+             }
+             // reset if non-printable
+             attr_is_trivial_ascii_string_ &=
+                 check_ascii_range(*cursor_, ' ', '~');
+ 
+             attribute_ += *cursor_++;
+           }
+         }
+         if (unicode_high_surrogate != -1) {
+           return Error("illegal Unicode sequence (unpaired high surrogate)");
+         }
+         cursor_++;
+         if (!attr_is_trivial_ascii_string_ && !opts.allow_non_utf8 &&
+             !ValidateUTF8(attribute_)) {
+           return Error("illegal UTF-8 sequence");
+         }
+         token_ = kTokenStringConstant;
+         return NoError();
+       }
+       case '/':
+         if (*cursor_ == '/') {
+           const char *start = ++cursor_;
+           while (*cursor_ && *cursor_ != '\n' && *cursor_ != '\r') cursor_++;
+           if (*start == '/') {  // documentation comment
+             if (!seen_newline)
+               return Error(
+                   "a documentation comment should be on a line on its own");
+             doc_comment_.push_back(std::string(start + 1, cursor_));
+           }
+           break;
+         } else if (*cursor_ == '*') {
+           cursor_++;
+           // TODO: make nested.
+           while (*cursor_ != '*' || cursor_[1] != '/') {
+             if (*cursor_ == '\n') MarkNewLine();
+             if (!*cursor_) return Error("end of file in comment");
+             cursor_++;
+           }
+           cursor_ += 2;
+           break;
+         }
+         FLATBUFFERS_FALLTHROUGH();  // else fall thru
+       default:
+-        const auto has_sign = (c == '+') || (c == '-');
+-        // '-'/'+' and following identifier - can be a predefined constant like:
+-        // NAN, INF, PI, etc or it can be a function name like cos/sin/deg.
+-        if (IsIdentifierStart(c) || (has_sign && IsIdentifierStart(*cursor_))) {
++        if (IsIdentifierStart(c)) {
+           // Collect all chars of an identifier:
+           const char *start = cursor_ - 1;
+           while (IsIdentifierStart(*cursor_) || is_digit(*cursor_)) cursor_++;
+           attribute_.append(start, cursor_);
+-          token_ = has_sign ? kTokenStringConstant : kTokenIdentifier;
++          token_ = kTokenIdentifier;
++          return NoError();
++        }
++
++        const auto has_sign = (c == '+') || (c == '-');
++        if (has_sign && IsIdentifierStart(*cursor_)) {
++          // '-'/'+' and following identifier - it could be a predefined
++          // constant. Return the sign in token_, see ParseSingleValue.
+           return NoError();
+         }
+ 
+         auto dot_lvl =
+             (c == '.') ? 0 : 1;  // dot_lvl==0 <=> exactly one '.' seen
+         if (!dot_lvl && !is_digit(*cursor_)) return NoError();  // enum?
+         // Parser accepts hexadecimal-floating-literal (see C++ 5.13.4).
+         if (is_digit(c) || has_sign || !dot_lvl) {
+           const auto start = cursor_ - 1;
+           auto start_digits = !is_digit(c) ? cursor_ : cursor_ - 1;
+           if (!is_digit(c) && is_digit(*cursor_)) {
+             start_digits = cursor_;  // see digit in cursor_ position
+             c = *cursor_++;
+           }
+           // hex-float can't begind with '.'
+           auto use_hex = dot_lvl && (c == '0') && is_alpha_char(*cursor_, 'X');
+           if (use_hex) start_digits = ++cursor_;  // '0x' is the prefix, skip it
+           // Read an integer number or mantisa of float-point number.
+           do {
+             if (use_hex) {
+               while (is_xdigit(*cursor_)) cursor_++;
+             } else {
+               while (is_digit(*cursor_)) cursor_++;
+             }
+           } while ((*cursor_ == '.') && (++cursor_) && (--dot_lvl >= 0));
+           // Exponent of float-point number.
+           if ((dot_lvl >= 0) && (cursor_ > start_digits)) {
+             // The exponent suffix of hexadecimal float number is mandatory.
+             if (use_hex && !dot_lvl) start_digits = cursor_;
+             if ((use_hex && is_alpha_char(*cursor_, 'P')) ||
+                 is_alpha_char(*cursor_, 'E')) {
+               dot_lvl = 0;  // Emulate dot to signal about float-point number.
+               cursor_++;
+               if (*cursor_ == '+' || *cursor_ == '-') cursor_++;
+               start_digits = cursor_;  // the exponent-part has to have digits
+               // Exponent is decimal integer number
+               while (is_digit(*cursor_)) cursor_++;
+               if (*cursor_ == '.') {
+                 cursor_++;  // If see a dot treat it as part of invalid number.
+                 dot_lvl = -1;  // Fall thru to Error().
+               }
+             }
+           }
+           // Finalize.
+           if ((dot_lvl >= 0) && (cursor_ > start_digits)) {
+             attribute_.append(start, cursor_);
+             token_ = dot_lvl ? kTokenIntegerConstant : kTokenFloatConstant;
+             return NoError();
+           } else {
+             return Error("invalid number: " + std::string(start, cursor_));
+           }
+         }
+         std::string ch;
+         ch = c;
+         if (false == check_ascii_range(c, ' ', '~'))
+           ch = "code: " + NumToString(c);
+         return Error("illegal character: " + ch);
+     }
+   }
+ }
+ 
+ // Check if a given token is next.
+@@ -1852,167 +1856,172 @@ CheckedError Parser::ParseFunction(const std::string *name, Value &e) {
+ CheckedError Parser::TryTypedValue(const std::string *name, int dtoken,
+                                    bool check, Value &e, BaseType req,
+                                    bool *destmatch) {
+-  bool match = dtoken == token_;
+-  if (match) {
+-    FLATBUFFERS_ASSERT(*destmatch == false);
+-    *destmatch = true;
+-    e.constant = attribute_;
+-    // Check token match
+-    if (!check) {
+-      if (e.type.base_type == BASE_TYPE_NONE) {
+-        e.type.base_type = req;
+-      } else {
+-        return Error(
+-            std::string("type mismatch: expecting: ") +
+-            kTypeNames[e.type.base_type] + ", found: " + kTypeNames[req] +
+-            ", name: " + (name ? *name : "") + ", value: " + e.constant);
+-      }
+-    }
+-    // The exponent suffix of hexadecimal float-point number is mandatory.
+-    // A hex-integer constant is forbidden as an initializer of float number.
+-    if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
+-      const auto &s = e.constant;
+-      const auto k = s.find_first_of("0123456789.");
+-      if ((std::string::npos != k) && (s.length() > (k + 1)) &&
+-          (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
+-          (std::string::npos == s.find_first_of("pP", k + 2))) {
+-        return Error(
+-            "invalid number, the exponent suffix of hexadecimal "
+-            "floating-point literals is mandatory: \"" +
+-            s + "\"");
+-      }
++  FLATBUFFERS_ASSERT(*destmatch == false && dtoken == token_);
++  *destmatch = true;
++  e.constant = attribute_;
++  // Check token match
++  if (!check) {
++    if (e.type.base_type == BASE_TYPE_NONE) {
++      e.type.base_type = req;
++    } else {
++      return Error(std::string("type mismatch: expecting: ") +
++                   kTypeNames[e.type.base_type] +
++                   ", found: " + kTypeNames[req] +
++                   ", name: " + (name ? *name : "") + ", value: " + e.constant);
++    }
++  }
++  // The exponent suffix of hexadecimal float-point number is mandatory.
++  // A hex-integer constant is forbidden as an initializer of float number.
++  if ((kTokenFloatConstant != dtoken) && IsFloat(e.type.base_type)) {
++    const auto &s = e.constant;
++    const auto k = s.find_first_of("0123456789.");
++    if ((std::string::npos != k) && (s.length() > (k + 1)) &&
++        (s[k] == '0' && is_alpha_char(s[k + 1], 'X')) &&
++        (std::string::npos == s.find_first_of("pP", k + 2))) {
++      return Error(
++          "invalid number, the exponent suffix of hexadecimal "
++          "floating-point literals is mandatory: \"" +
++          s + "\"");
+     }
+-    NEXT();
+   }
++  NEXT();
+   return NoError();
+ }
+ 
+ CheckedError Parser::ParseSingleValue(const std::string *name, Value &e,
+                                       bool check_now) {
++  if (token_ == '+' || token_ == '-') {
++    const char sign = static_cast<char>(token_);
++    // Get an indentifier: NAN, INF, or function name like cos/sin/deg.
++    NEXT();
++    if (token_ != kTokenIdentifier) return Error("constant name expected");
++    attribute_.insert(0, 1, sign);
++  }
++
+   const auto in_type = e.type.base_type;
+   const auto is_tok_ident = (token_ == kTokenIdentifier);
+   const auto is_tok_string = (token_ == kTokenStringConstant);
+ 
+-  // First see if this could be a conversion function:
++  // First see if this could be a conversion function.
+   if (is_tok_ident && *cursor_ == '(') { return ParseFunction(name, e); }
+ 
+   // clang-format off
+   auto match = false;
+ 
+   #define IF_ECHECK_(force, dtoken, check, req)    \
+-    if (!match && ((check) || IsConstTrue(force))) \
+-    ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
++    if (!match && ((dtoken) == token_) && ((check) || IsConstTrue(force))) \
++      ECHECK(TryTypedValue(name, dtoken, check, e, req, &match))
+   #define TRY_ECHECK(dtoken, check, req) IF_ECHECK_(false, dtoken, check, req)
+   #define FORCE_ECHECK(dtoken, check, req) IF_ECHECK_(true, dtoken, check, req)
+   // clang-format on
+ 
+   if (is_tok_ident || is_tok_string) {
+     const auto kTokenStringOrIdent = token_;
+     // The string type is a most probable type, check it first.
+     TRY_ECHECK(kTokenStringConstant, in_type == BASE_TYPE_STRING,
+                BASE_TYPE_STRING);
+ 
+     // avoid escaped and non-ascii in the string
+     if (!match && is_tok_string && IsScalar(in_type) &&
+         !attr_is_trivial_ascii_string_) {
+       return Error(
+           std::string("type mismatch or invalid value, an initializer of "
+                       "non-string field must be trivial ASCII string: type: ") +
+           kTypeNames[in_type] + ", name: " + (name ? *name : "") +
+           ", value: " + attribute_);
+     }
+ 
+     // A boolean as true/false. Boolean as Integer check below.
+     if (!match && IsBool(in_type)) {
+       auto is_true = attribute_ == "true";
+       if (is_true || attribute_ == "false") {
+         attribute_ = is_true ? "1" : "0";
+         // accepts both kTokenStringConstant and kTokenIdentifier
+         TRY_ECHECK(kTokenStringOrIdent, IsBool(in_type), BASE_TYPE_BOOL);
+       }
+     }
+     // Check for optional scalars.
+     if (!match && IsScalar(in_type) && attribute_ == "null") {
+       e.constant = "null";
+       NEXT();
+       match = true;
+     }
+     // Check if this could be a string/identifier enum value.
+     // Enum can have only true integer base type.
+     if (!match && IsInteger(in_type) && !IsBool(in_type) &&
+         IsIdentifierStart(*attribute_.c_str())) {
+       ECHECK(ParseEnumFromString(e.type, &e.constant));
+       NEXT();
+       match = true;
+     }
+     // Parse a float/integer number from the string.
+     // A "scalar-in-string" value needs extra checks.
+     if (!match && is_tok_string && IsScalar(in_type)) {
+       // Strip trailing whitespaces from attribute_.
+       auto last_non_ws = attribute_.find_last_not_of(' ');
+       if (std::string::npos != last_non_ws) attribute_.resize(last_non_ws + 1);
+       if (IsFloat(e.type.base_type)) {
+         // The functions strtod() and strtof() accept both 'nan' and
+         // 'nan(number)' literals. While 'nan(number)' is rejected by the parser
+         // as an unsupported function if is_tok_ident is true.
+         if (attribute_.find_last_of(')') != std::string::npos) {
+           return Error("invalid number: " + attribute_);
+         }
+       }
+     }
+     // Float numbers or nan, inf, pi, etc.
+     TRY_ECHECK(kTokenStringOrIdent, IsFloat(in_type), BASE_TYPE_FLOAT);
+     // An integer constant in string.
+     TRY_ECHECK(kTokenStringOrIdent, IsInteger(in_type), BASE_TYPE_INT);
+     // Unknown tokens will be interpreted as string type.
+     // An attribute value may be a scalar or string constant.
+     FORCE_ECHECK(kTokenStringConstant, in_type == BASE_TYPE_STRING,
+                  BASE_TYPE_STRING);
+   } else {
+     // Try a float number.
+     TRY_ECHECK(kTokenFloatConstant, IsFloat(in_type), BASE_TYPE_FLOAT);
+     // Integer token can init any scalar (integer of float).
+     FORCE_ECHECK(kTokenIntegerConstant, IsScalar(in_type), BASE_TYPE_INT);
+   }
+   // Match empty vectors for default-empty-vectors.
+   if (!match && IsVector(e.type) && token_ == '[') {
+     NEXT();
+     if (token_ != ']') { return Error("Expected `]` in vector default"); }
+     NEXT();
+     match = true;
+     e.constant = "[]";
+   }
+ 
+ #undef FORCE_ECHECK
+ #undef TRY_ECHECK
+ #undef IF_ECHECK_
+ 
+   if (!match) {
+     std::string msg;
+     msg += "Cannot assign token starting with '" + TokenToStringId(token_) +
+            "' to value of <" + std::string(kTypeNames[in_type]) + "> type.";
+     return Error(msg);
+   }
+   const auto match_type = e.type.base_type;  // may differ from in_type
+   // The check_now flag must be true when parse a fbs-schema.
+   // This flag forces to check default scalar values or metadata of field.
+   // For JSON parser the flag should be false.
+   // If it is set for JSON each value will be checked twice (see ParseTable).
+   // Special case 'null' since atot can't handle that.
+   if (check_now && IsScalar(match_type) && e.constant != "null") {
+     // clang-format off
+     switch (match_type) {
+     #define FLATBUFFERS_TD(ENUM, IDLTYPE, CTYPE, ...) \
+       case BASE_TYPE_ ## ENUM: {\
+           CTYPE val; \
+           ECHECK(atot(e.constant.c_str(), *this, &val)); \
+           SingleValueRepack(e, val); \
+         break; }
+     FLATBUFFERS_GEN_TYPES_SCALAR(FLATBUFFERS_TD)
+     #undef FLATBUFFERS_TD
+     default: break;
+     }
+     // clang-format on
+   }
+   return NoError();
+ }
+diff --git a/tests/test.cpp b/tests/test.cpp
+index f745bc7c..ffd293dd 100644
+--- a/tests/test.cpp
++++ b/tests/test.cpp
+@@ -1632,68 +1632,71 @@ void TestError_(const char *src, const char *error_substr, const char *file,
+ // Test that parsing errors occur as we'd expect.
+ // Also useful for coverage, making sure these paths are run.
+ void ErrorTest() {
+   // In order they appear in idl_parser.cpp
+   TestError("table X { Y:byte; } root_type X; { Y: 999 }", "does not fit");
+   TestError("\"\0", "illegal");
+   TestError("\"\\q", "escape code");
+   TestError("table ///", "documentation");
+   TestError("@", "illegal");
+   TestError("table 1", "expecting");
+   TestError("table X { Y:[[int]]; }", "nested vector");
+   TestError("table X { Y:1; }", "illegal type");
+   TestError("table X { Y:int; Y:int; }", "field already");
+   TestError("table Y {} table X { Y:int; }", "same as table");
+   TestError("struct X { Y:string; }", "only scalar");
+   TestError("struct X { a:uint = 42; }", "default values");
+   TestError("enum Y:byte { Z = 1 } table X { y:Y; }", "not part of enum");
+   TestError("struct X { Y:int (deprecated); }", "deprecate");
+   TestError("union Z { X } table X { Y:Z; } root_type X; { Y: {}, A:1 }",
+             "missing type field");
+   TestError("union Z { X } table X { Y:Z; } root_type X; { Y_type: 99, Y: {",
+             "type id");
+   TestError("table X { Y:int; } root_type X; { Z:", "unknown field");
+   TestError("table X { Y:int; } root_type X; { Y:", "string constant", true);
+   TestError("table X { Y:int; } root_type X; { \"Y\":1, }", "string constant",
+             true);
+   TestError(
+       "struct X { Y:int; Z:int; } table W { V:X; } root_type W; "
+       "{ V:{ Y:1 } }",
+       "wrong number");
+   TestError("enum E:byte { A } table X { Y:E; } root_type X; { Y:U }",
+             "unknown enum value");
+   TestError("table X { Y:byte; } root_type X; { Y:; }", "starting");
+   TestError("enum X:byte { Y } enum X {", "enum already");
+   TestError("enum X:float {}", "underlying");
+   TestError("enum X:byte { Y, Y }", "value already");
+   TestError("enum X:byte { Y=2, Z=2 }", "unique");
+   TestError("table X { Y:int; } table X {", "datatype already");
+   TestError("struct X (force_align: 7) { Y:int; }", "force_align");
+   TestError("struct X {}", "size 0");
+   TestError("{}", "no root");
+   TestError("table X { Y:byte; } root_type X; { Y:1 } { Y:1 }", "end of file");
+   TestError("table X { Y:byte; } root_type X; { Y:1 } table Y{ Z:int }",
+             "end of file");
+   TestError("root_type X;", "unknown root");
+   TestError("struct X { Y:int; } root_type X;", "a table");
+   TestError("union X { Y }", "referenced");
+   TestError("union Z { X } struct X { Y:int; }", "only tables");
+   TestError("table X { Y:[int]; YLength:int; }", "clash");
+   TestError("table X { Y:byte; } root_type X; { Y:1, Y:2 }", "more than once");
+   // float to integer conversion is forbidden
+   TestError("table X { Y:int; } root_type X; { Y:1.0 }", "float");
+   TestError("table X { Y:bool; } root_type X; { Y:1.0 }", "float");
+   TestError("enum X:bool { Y = true }", "must be integral");
+   // Array of non-scalar
+   TestError("table X { x:int; } struct Y { y:[X:2]; }",
+             "may contain only scalar or struct fields");
+   // Non-snake case field names
+   TestError("table X { Y: int; } root_type Y: {Y:1.0}", "snake_case");
+   // Complex defaults
+   TestError("table X { y: string = 1; }", "expecting: string");
+   TestError("table X { y: string = []; }", " Cannot assign token");
+   TestError("table X { y: [int] = [1]; }", "Expected `]`");
+   TestError("table X { y: [int] = [; }", "Expected `]`");
+   TestError("table X { y: [int] = \"\"; }", "type mismatch");
++  // An identifier can't start from sign (+|-)
++  TestError("table X { -Y: int; } root_type Y: {Y:1.0}", "identifier");
++  TestError("table X { +Y: int; } root_type Y: {Y:1.0}", "identifier");
+ }
+ 
+ template<typename T>
+@@ -1992,78 +1995,82 @@ void IntegerBoundaryTest() {
+ void ValidFloatTest() {
+   // check rounding to infinity
+   TEST_EQ(TestValue<float>("{ y:+3.4029e+38 }", "float"), +infinity_f);
+   TEST_EQ(TestValue<float>("{ y:-3.4029e+38 }", "float"), -infinity_f);
+   TEST_EQ(TestValue<double>("{ y:+1.7977e+308 }", "double"), +infinity_d);
+   TEST_EQ(TestValue<double>("{ y:-1.7977e+308 }", "double"), -infinity_d);
+ 
+   TEST_EQ(
+       FloatCompare(TestValue<float>("{ y:0.0314159e+2 }", "float"), 3.14159f),
+       true);
+   // float in string
+   TEST_EQ(FloatCompare(TestValue<float>("{ y:\" 0.0314159e+2  \" }", "float"),
+                        3.14159f),
+           true);
+ 
+   TEST_EQ(TestValue<float>("{ y:1 }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:1.0 }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:1. }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:+1. }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:-1. }", "float"), -1.0f);
+   TEST_EQ(TestValue<float>("{ y:1.e0 }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:1.e+0 }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:1.e-0 }", "float"), 1.0f);
+   TEST_EQ(TestValue<float>("{ y:0.125 }", "float"), 0.125f);
+   TEST_EQ(TestValue<float>("{ y:.125 }", "float"), 0.125f);
+   TEST_EQ(TestValue<float>("{ y:-.125 }", "float"), -0.125f);
+   TEST_EQ(TestValue<float>("{ y:+.125 }", "float"), +0.125f);
+   TEST_EQ(TestValue<float>("{ y:5 }", "float"), 5.0f);
+   TEST_EQ(TestValue<float>("{ y:\"5\" }", "float"), 5.0f);
+ 
+ #if defined(FLATBUFFERS_HAS_NEW_STRTOD) && (FLATBUFFERS_HAS_NEW_STRTOD > 0)
+   // Old MSVC versions may have problem with this check.
+   // https://www.exploringbinary.com/visual-c-plus-plus-strtod-still-broken/
+   TEST_EQ(TestValue<double>("{ y:6.9294956446009195e15 }", "double"),
+           6929495644600920.0);
+   // check nan's
+   TEST_EQ(std::isnan(TestValue<double>("{ y:nan }", "double")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:\"nan\" }", "float")), true);
++  TEST_EQ(std::isnan(TestValue<float>("{ y:\"+nan\" }", "float")), true);
++  TEST_EQ(std::isnan(TestValue<float>("{ y:\"-nan\" }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:+nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>("{ y:-nan }", "float")), true);
+   TEST_EQ(std::isnan(TestValue<float>(nullptr, "float=nan")), true);
+   TEST_EQ(std::isnan(TestValue<float>(nullptr, "float=-nan")), true);
+   // check inf
+   TEST_EQ(TestValue<float>("{ y:inf }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:\"inf\" }", "float"), infinity_f);
++  TEST_EQ(TestValue<float>("{ y:\"-inf\" }", "float"), -infinity_f);
++  TEST_EQ(TestValue<float>("{ y:\"+inf\" }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:+inf }", "float"), infinity_f);
+   TEST_EQ(TestValue<float>("{ y:-inf }", "float"), -infinity_f);
+   TEST_EQ(TestValue<float>(nullptr, "float=inf"), infinity_f);
+   TEST_EQ(TestValue<float>(nullptr, "float=-inf"), -infinity_f);
+   TestValue<double>(
+       "{ y: [0.2, .2, 1.0, -1.0, -2., 2., 1e0, -1e0, 1.0e0, -1.0e0, -3.e2, "
+       "3.0e2] }",
+       "[double]");
+   TestValue<float>(
+       "{ y: [0.2, .2, 1.0, -1.0, -2., 2., 1e0, -1e0, 1.0e0, -1.0e0, -3.e2, "
+       "3.0e2] }",
+       "[float]");
+ 
+   // Test binary format of float point.
+   // https://en.cppreference.com/w/cpp/language/floating_literal
+   // 0x11.12p-1 = (1*16^1 + 2*16^0 + 3*16^-1 + 4*16^-2) * 2^-1 =
+   TEST_EQ(TestValue<double>("{ y:0x12.34p-1 }", "double"), 9.1015625);
+   // hex fraction 1.2 (decimal 1.125) scaled by 2^3, that is 9.0
+   TEST_EQ(TestValue<float>("{ y:-0x0.2p0 }", "float"), -0.125f);
+   TEST_EQ(TestValue<float>("{ y:-0x.2p1 }", "float"), -0.25f);
+   TEST_EQ(TestValue<float>("{ y:0x1.2p3 }", "float"), 9.0f);
+   TEST_EQ(TestValue<float>("{ y:0x10.1p0 }", "float"), 16.0625f);
+   TEST_EQ(TestValue<double>("{ y:0x1.2p3 }", "double"), 9.0);
+   TEST_EQ(TestValue<double>("{ y:0x10.1p0 }", "double"), 16.0625);
+   TEST_EQ(TestValue<double>("{ y:0xC.68p+2 }", "double"), 49.625);
+   TestValue<double>("{ y: [0x20.4ep1, +0x20.4ep1, -0x20.4ep1] }", "[double]");
+   TestValue<float>("{ y: [0x20.4ep1, +0x20.4ep1, -0x20.4ep1] }", "[float]");
+ 
+ #else   // FLATBUFFERS_HAS_NEW_STRTOD
+   TEST_OUTPUT_LINE("FLATBUFFERS_HAS_NEW_STRTOD tests skipped");
+ #endif  // !FLATBUFFERS_HAS_NEW_STRTOD
+ }
+@@ -3764,115 +3771,144 @@ void ParseFlexbuffersFromJsonWithNullTest() {
+ void FieldIdentifierTest() {
+   using flatbuffers::Parser;
+   TEST_EQ(true, Parser().Parse("table T{ f: int (id:0); }"));
+   // non-integer `id` should be rejected
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:text); }"));
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:\"text\"); }"));
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:0text); }"));
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:1.0); }"));
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:-1); g: int (id:0); }"));
+   TEST_EQ(false, Parser().Parse("table T{ f: int (id:129496726); }"));
+   // A unuion filed occupys two ids: enumerator + pointer (offset).
+   TEST_EQ(false,
+           Parser().Parse("union X{} table T{ u: X(id:0); table F{x:int;\n}"));
+   // Positive tests for unions
+   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X (id:1); }"));
+   TEST_EQ(true, Parser().Parse("union X{} table T{ u: X; }"));
++  // Test using 'inf' and 'nan' words both as identifiers and as default values.
++  TEST_EQ(true, Parser().Parse("table T{ nan: string; }"));
++  TEST_EQ(true, Parser().Parse("table T{ inf: string; }"));
++#if defined(FLATBUFFERS_HAS_NEW_STRTOD) && (FLATBUFFERS_HAS_NEW_STRTOD > 0)
++  TEST_EQ(true, Parser().Parse("table T{ inf: float = inf; }"));
++  TEST_EQ(true, Parser().Parse("table T{ nan: float = inf; }"));
++#endif
++}
++
++void ParseIncorrectMonsterJsonTest() {
++  std::string schemafile;
++  TEST_EQ(flatbuffers::LoadFile((test_data_path + "monster_test.bfbs").c_str(),
++                                true, &schemafile),
++          true);
++  flatbuffers::Parser parser;
++  flatbuffers::Verifier verifier(
++      reinterpret_cast<const uint8_t *>(schemafile.c_str()), schemafile.size());
++  TEST_EQ(reflection::VerifySchemaBuffer(verifier), true);
++  TEST_EQ(parser.Deserialize((const uint8_t *)schemafile.c_str(),
++                             schemafile.size()),
++          true);
++  TEST_EQ(parser.ParseJson("{name:\"monster\"}"), true);
++  TEST_EQ(parser.ParseJson(""), false);
++  TEST_EQ(parser.ParseJson("{name: 1}"), false);
++  TEST_EQ(parser.ParseJson("{name:+1}"), false);
++  TEST_EQ(parser.ParseJson("{name:-1}"), false);
++  TEST_EQ(parser.ParseJson("{name:-f}"), false);
++  TEST_EQ(parser.ParseJson("{name:+f}"), false);
+ }
+ 
+ int FlatBufferTests() {
+   // clang-format off
+ 
+   // Run our various test suites:
+ 
+   std::string rawbuf;
+   auto flatbuf1 = CreateFlatBufferTest(rawbuf);
+   #if !defined(FLATBUFFERS_CPP98_STL)
+     auto flatbuf = std::move(flatbuf1);  // Test move assignment.
+   #else
+     auto &flatbuf = flatbuf1;
+   #endif // !defined(FLATBUFFERS_CPP98_STL)
+ 
+   TriviallyCopyableTest();
+ 
+   AccessFlatBufferTest(reinterpret_cast<const uint8_t *>(rawbuf.c_str()),
+                        rawbuf.length());
+   AccessFlatBufferTest(flatbuf.data(), flatbuf.size());
+ 
+   MutateFlatBuffersTest(flatbuf.data(), flatbuf.size());
+ 
+   ObjectFlatBuffersTest(flatbuf.data());
+ 
+   MiniReflectFlatBuffersTest(flatbuf.data());
+   MiniReflectFixedLengthArrayTest();
+ 
+   SizePrefixedTest();
+ 
+   #ifndef FLATBUFFERS_NO_FILE_TESTS
+     #ifdef FLATBUFFERS_TEST_PATH_PREFIX
+       test_data_path = FLATBUFFERS_STRING(FLATBUFFERS_TEST_PATH_PREFIX) +
+                        test_data_path;
+     #endif
+     ParseAndGenerateTextTest(false);
+     ParseAndGenerateTextTest(true);
+     FixedLengthArrayJsonTest(false);
+     FixedLengthArrayJsonTest(true);
+     ReflectionTest(flatbuf.data(), flatbuf.size());
+     ParseProtoTest();
+     ParseProtoTestWithSuffix();
+     ParseProtoTestWithIncludes();
+     EvolutionTest();
+     UnionDeprecationTest();
+     UnionVectorTest();
+     LoadVerifyBinaryTest();
+     GenerateTableTextTest();
+     TestEmbeddedBinarySchema();
+   #endif
+   // clang-format on
+ 
+   FuzzTest1();
+   FuzzTest2();
+ 
+   ErrorTest();
+   ValueTest();
+   EnumValueTest();
+   EnumStringsTest();
+   EnumNamesTest();
+   EnumOutOfRangeTest();
+   IntegerOutOfRangeTest();
+   IntegerBoundaryTest();
+   UnicodeTest();
+   UnicodeTestAllowNonUTF8();
+   UnicodeTestGenerateTextFailsOnNonUTF8();
+   UnicodeSurrogatesTest();
+   UnicodeInvalidSurrogatesTest();
+   InvalidUTF8Test();
+   UnknownFieldsTest();
+   ParseUnionTest();
+   InvalidNestedFlatbufferTest();
+   ConformTest();
+   ParseProtoBufAsciiTest();
+   TypeAliasesTest();
+   EndianSwapTest();
+   CreateSharedStringTest();
+   JsonDefaultTest();
+   JsonEnumsTest();
+   FlexBuffersTest();
+   FlexBuffersDeprecatedTest();
+   UninitializedVectorTest();
+   EqualOperatorTest();
+   NumericUtilsTest();
+   IsAsciiUtilsTest();
+   ValidFloatTest();
+   InvalidFloatTest();
+   TestMonsterExtraFloats();
+   FixedLengthArrayTest();
+   NativeTypeTest();
+   OptionalScalarsTest();
+   ParseFlexbuffersFromJsonWithNullTest();
+   FlatbuffersSpanTest();
+   FixedLengthArrayConstructorTest();
+   FieldIdentifierTest();
+   StringVectorDefaultsTest();
++  ParseIncorrectMonsterJsonTest();
+   return 0;
+ }
+ 

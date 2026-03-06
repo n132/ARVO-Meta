@@ -1,0 +1,163 @@
+commit 5d6d197a03c100428cd523346ace880ef9e56fe5
+Author: Frank Tang <ftang@chromium.org>
+Date:   Mon Aug 21 17:40:19 2023 -0700
+
+    ICU-22466 Fix incorrect memory read while the locale is bogus
+    
+    ICU-22466 Fix illegal read
+    
+    ICU-22466 Fix memory issue
+
+diff --git a/icu4c/source/common/loclikely.cpp b/icu4c/source/common/loclikely.cpp
+index d361dc96a35..92ae4e09ae3 100644
+--- a/icu4c/source/common/loclikely.cpp
++++ b/icu4c/source/common/loclikely.cpp
+@@ -432,89 +432,98 @@ static UBool
+ _uloc_addLikelySubtags(const char* localeID,
+                        icu::ByteSink& sink,
+                        UErrorCode* err) {
+     char lang[ULOC_LANG_CAPACITY];
+     int32_t langLength = sizeof(lang);
+     char script[ULOC_SCRIPT_CAPACITY];
+     int32_t scriptLength = sizeof(script);
+     char region[ULOC_COUNTRY_CAPACITY];
+     int32_t regionLength = sizeof(region);
+     const char* trailing = "";
+     int32_t trailingLength = 0;
+     int32_t trailingIndex = 0;
+ 
+     if(U_FAILURE(*err)) {
+         goto error;
+     }
+     if (localeID == nullptr) {
+         goto error;
+     }
+ 
+     trailingIndex = parseTagString(
+         localeID,
+         lang,
+         &langLength,
+         script,
+         &scriptLength,
+         region,
+         &regionLength,
+         err);
+     if(U_FAILURE(*err)) {
+         /* Overflow indicates an illegal argument error */
+         if (*err == U_BUFFER_OVERFLOW_ERROR) {
+             *err = U_ILLEGAL_ARGUMENT_ERROR;
+         }
+ 
+         goto error;
+     }
+     if (langLength > 3) {
+         goto error;
+     }
+ 
+     /* Find the length of the trailing portion. */
+     while (_isIDSeparator(localeID[trailingIndex])) {
+         trailingIndex++;
+     }
+     trailing = &localeID[trailingIndex];
+     trailingLength = (int32_t)uprv_strlen(trailing);
+ 
+     CHECK_TRAILING_VARIANT_SIZE(trailing, trailingLength);
+     {
+         const icu::XLikelySubtags* likelySubtags = icu::XLikelySubtags::getSingleton(*err);
+         if(U_FAILURE(*err)) {
+             goto error;
+         }
+-        icu::LSR lsr = likelySubtags->makeMaximizedLsrFrom(icu::Locale::createFromName(localeID), true, *err);
++        // We need to keep l on the stack because lsr may point into internal
++        // memory of l.
++        icu::Locale l = icu::Locale::createFromName(localeID);
++        if (l.isBogus()) {
++            goto error;
++        }
++        icu::LSR lsr = likelySubtags->makeMaximizedLsrFrom(l, true, *err);
++        if(U_FAILURE(*err)) {
++            goto error;
++        }
+         const char* language = lsr.language;
+         if (uprv_strcmp(language, "und") == 0) {
+             language = "";
+         }
+         createTagStringWithAlternates(
+             language,
+             (int32_t)uprv_strlen(language),
+             lsr.script,
+             (int32_t)uprv_strlen(lsr.script),
+             lsr.region,
+             (int32_t)uprv_strlen(lsr.region),
+             trailing,
+             trailingLength,
+             nullptr,
+             sink,
+             err);
+         if(U_FAILURE(*err)) {
+             goto error;
+         }
+     }
+     return true;
+ 
+ error:
+ 
+     if (!U_FAILURE(*err)) {
+         *err = U_ILLEGAL_ARGUMENT_ERROR;
+     }
+     return false;
+ }
+ 
+ // Add likely subtags to the sink
+ // return true if the value in the sink is produced by a match during the lookup
+ // return false if the value in the sink is the same as input because there are
+ // no match after the lookup.
+diff --git a/icu4c/source/common/loclikelysubtags.cpp b/icu4c/source/common/loclikelysubtags.cpp
+index e81af4191c0..c2a7011b509 100644
+--- a/icu4c/source/common/loclikelysubtags.cpp
++++ b/icu4c/source/common/loclikelysubtags.cpp
+@@ -456,23 +456,27 @@ XLikelySubtags::~XLikelySubtags() {
+ LSR XLikelySubtags::makeMaximizedLsrFrom(const Locale &locale,
+                                          bool returnInputIfUnmatch,
+                                          UErrorCode &errorCode) const {
++    if (locale.isBogus()) {
++        errorCode = U_ILLEGAL_ARGUMENT_ERROR;
++        return LSR("", "", "", LSR::EXPLICIT_LSR);
++    }
+     const char *name = locale.getName();
+     if (uprv_isAtSign(name[0]) && name[1] == 'x' && name[2] == '=') {  // name.startsWith("@x=")
+         // Private use language tag x-subtag-subtag... which CLDR changes to
+         // und-x-subtag-subtag...
+         return LSR(name, "", "", LSR::EXPLICIT_LSR);
+     }
+     LSR max = makeMaximizedLsr(locale.getLanguage(), locale.getScript(), locale.getCountry(),
+                             locale.getVariant(), returnInputIfUnmatch, errorCode);
+ 
+     if (uprv_strlen(max.language) == 0 &&
+         uprv_strlen(max.script) == 0 &&
+         uprv_strlen(max.region) == 0) {
+         // No match. ICU API mandate us to
+         // If the provided ULocale instance is already in the maximal form, or
+         // there is no data available available for maximization, it will be
+         // returned.
+         return LSR(locale.getLanguage(), locale.getScript(), locale.getCountry(), LSR::EXPLICIT_LSR, errorCode);
+     }
+     return max;
+ }
+diff --git a/icu4c/source/test/cintltst/cloctst.c b/icu4c/source/test/cintltst/cloctst.c
+index f28cdd108e1..d4c00129c8f 100644
+--- a/icu4c/source/test/cintltst/cloctst.c
++++ b/icu4c/source/test/cintltst/cloctst.c
+@@ -6884,8 +6884,12 @@ static void TestUnicodeDefines(void) {
+ static void TestIsRightToLeft() {
+     // API test only. More test cases in intltest/LocaleTest.
+     if(uloc_isRightToLeft("root") || !uloc_isRightToLeft("EN-HEBR")) {
+         log_err("uloc_isRightToLeft() failed");
+     }
++    // ICU-22466 Make sure no crash when locale is bogus
++    uloc_isRightToLeft(
++        "uF-Vd_u-VaapoPos-u1-Pos-u1-Pos-u1-Pos-u1-oPos-u1-Pufu1-PuosPos-u1-Pos-u1-Pos-u1-Pzghu1-Pos-u1-PoP-u1@osus-u1");
++    uloc_isRightToLeft("-Xa");
+ }
+ 
+ typedef struct {

@@ -1,0 +1,112 @@
+commit 06f3b079093a202a9565bbd27b6b278dc15f420d
+Author: Ivan Nardi <12729895+IvanNardi@users.noreply.github.com>
+Date:   Tue Jan 11 17:57:34 2022 +0100
+
+    QUIC: fix an integer overflow (#1396)
+    
+    Reported by oss-fuzz:
+    ```
+    ==685288==ERROR: AddressSanitizer: SEGV on unknown address 0x61a100000687 (pc 0x0000005aba64 bp 0x7ffe3f29f510 sp 0x7ffe3f29f400 T0)
+    ==685288==The signal is caused by a READ memory access.
+    SCARINESS: 20 (wild-addr-read)
+     #0 0x5aba64 in quic_len ndpi/src/lib/protocols/quic.c:203:12
+     #1 0x5aba64 in decrypt_initial_packet ndpi/src/lib/protocols/quic.c:993:16
+     #2 0x5aba64 in get_clear_payload ndpi/src/lib/protocols/quic.c:1302:21
+     #3 0x5aba64 in ndpi_search_quic ndpi/src/lib/protocols/quic.c:1658:19
+     #4 0x579f00 in check_ndpi_detection_func ndpi/src/lib/ndpi_main.c:4683:6
+     #5 0x57abe6 in ndpi_check_flow_func ndpi/src/lib/ndpi_main.c:0
+     #6 0x583b2c in ndpi_detection_process_packet ndpi/src/lib/ndpi_main.c:5545:15
+     #7 0x55e75e in LLVMFuzzerTestOneInput ndpi/fuzz/fuzz_process_packet.c:30:3
+    [...]
+    ```
+
+diff --git a/src/lib/protocols/quic.c b/src/lib/protocols/quic.c
+index 7468cd39..9ba2eade 100644
+--- a/src/lib/protocols/quic.c
++++ b/src/lib/protocols/quic.c
+@@ -954,82 +954,83 @@ static int quic_derive_initial_secrets(uint32_t version,
+ static uint8_t *decrypt_initial_packet(struct ndpi_detection_module_struct *ndpi_struct,
+ 				       struct ndpi_flow_struct *flow,
+ 				       const uint8_t *dest_conn_id, uint8_t dest_conn_id_len,
+ 				       uint8_t source_conn_id_len, uint32_t version,
+ 				       uint32_t *clear_payload_len)
+ {
+   uint64_t token_length, payload_length, packet_number;
+   struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+   uint8_t first_byte;
+   uint32_t pkn32, pn_offset, pkn_len, offset;
+   quic_ciphers ciphers; /* Client initial ciphers */
+   quic_decrypt_result_t decryption = { 0, 0};
+   uint8_t client_secret[HASH_SHA2_256_LENGTH];
+ 
+   memset(&ciphers, '\0', sizeof(ciphers));
+   if(quic_derive_initial_secrets(version, dest_conn_id, dest_conn_id_len,
+ 				 client_secret) != 0) {
+     NDPI_LOG_DBG(ndpi_struct, "Error quic_derive_initial_secrets\n");
+     return NULL;
+   }
+ 
+   /* Packet numbers are protected with AES128-CTR,
+      Initial packets are protected with AEAD_AES_128_GCM. */
+   if(!quic_ciphers_prepare(&ciphers, GCRY_MD_SHA256,
+                            GCRY_CIPHER_AES128, GCRY_CIPHER_MODE_GCM,
+                            client_secret, version)) {
+     NDPI_LOG_DBG(ndpi_struct, "Error quic_cipher_prepare\n");
+     return NULL;
+   }
+ 
+   /* Type(1) + version(4) + DCIL + DCID + SCIL + SCID */
+   pn_offset = 1 + 4 + 1 + dest_conn_id_len + 1 + source_conn_id_len;
+   pn_offset += quic_len(&packet->payload[pn_offset], &token_length);
+   pn_offset += token_length;
+-  /* Checks: quic_len reads 8 bytes, at most; quic_decrypt_header reads other 20 bytes */
+-  if(pn_offset + 8 + (4 + 16) >= packet->payload_packet_len) {
++  /* Checks: quic_len reads 8 bytes, at most; quic_decrypt_header reads other 20 bytes.
++     Promote to uint64_t to avoid unsigned wrapping */
++  if((uint64_t)pn_offset + 8 + (4 + 16) >= (uint64_t)packet->payload_packet_len) {
+     quic_ciphers_reset(&ciphers);
+     return NULL;
+   }
+   pn_offset += quic_len(&packet->payload[pn_offset], &payload_length);
+ 
+   NDPI_LOG_DBG2(ndpi_struct, "pn_offset %d token_length %d payload_length %d\n",
+ 		pn_offset, token_length, payload_length);
+ 
+   if (pn_offset + payload_length > packet->payload_packet_len) {
+     NDPI_LOG_DBG(ndpi_struct, "Too short %d %d\n", pn_offset + payload_length,
+                  packet->payload_packet_len);
+     quic_ciphers_reset(&ciphers);
+     return NULL;
+   }
+ 
+   if(!quic_decrypt_header(&packet->payload[0], pn_offset, &ciphers.hp_cipher,
+ 			  GCRY_CIPHER_AES128, &first_byte, &pkn32, 0)) {
+     quic_ciphers_reset(&ciphers);
+     return NULL;
+   }
+   NDPI_LOG_DBG2(ndpi_struct, "first_byte 0x%x pkn32 0x%x\n", first_byte, pkn32);
+ 
+   pkn_len = (first_byte & 3) + 1;
+   /* TODO: is it always true in Initial Packets? */
+   packet_number = pkn32;
+ 
+   offset = pn_offset + pkn_len;
+   if (!(pn_offset + payload_length >= offset + 16)) {
+     NDPI_LOG_DBG(ndpi_struct, "No room for Auth Tag %d %d",
+                  pn_offset + payload_length, offset);
+     quic_ciphers_reset(&ciphers);
+     return NULL;
+   }
+   quic_decrypt_message(&ciphers.pp_cipher, &packet->payload[0], pn_offset + payload_length,
+ 		       offset, first_byte, pkn_len, packet_number, &decryption);
+ 
+   quic_ciphers_reset(&ciphers);
+ 
+   if(decryption.data_len) {
+     *clear_payload_len = decryption.data_len;
+     return decryption.data;
+   }
+   return NULL;
+ }
+ 
+ #endif /* HAVE_LIBGCRYPT */

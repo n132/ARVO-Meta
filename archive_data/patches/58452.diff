@@ -1,0 +1,262 @@
+commit d7aa650f3c04aa344ab236d784394c8f6d8d59ee
+Author: Eugene Kliuchnikov <eustas.ru@gmail.com>
+Date:   Tue May 2 17:06:18 2023 +0200
+
+    Fix: Use-of-uninitialized-value in lt_update_state (#123)
+    
+    In some cases spec1/spec2 are only transformed, but never filled.
+    Calming down MSAN, as it is the safest way to fix the problem.
+    Unfortuantely, there is not enough evidence to reject streams
+    with `num_swb == 0`.
+
+diff --git a/fuzz/build_fuzz.sh b/fuzz/build_fuzz.sh
+index f51d6dc..41a7bf5 100644
+--- a/fuzz/build_fuzz.sh
++++ b/fuzz/build_fuzz.sh
+@@ -29,6 +29,9 @@
+ # ASAN:
+ export SANITIZER=address
+ export SANITIZER_FLAGS="-fsanitize=$SANITIZER -fsanitize-address-use-after-scope"
++# MSAN:
++#export SANITIZER=memory
++#export SANITIZER_FLAGS="-fsanitize=$SANITIZER -fsanitize-memory-track-origins=2"
+ # UBSAN:
+ #export SANITIZER=array-bounds,bool,builtin,enum,float-divide-by-zero,function,integer-divide-by-zero,null,object-size,return,returns-nonnull-attribute,shift,signed-integer-overflow,unsigned-integer-overflow,unreachable,vla-bound,vptr
+ #export SANITIZER_FLAGS="-fsanitize=$SANITIZER -fno-sanitize-recover=$SANITIZER"
+@@ -43,6 +46,7 @@ export CXXFLAGS="${BASE_FLAGS} -stdlib=libc++"
+ ./bootstrap
+ ./configure
+ cd libfaad
++make clean -j `nproc`
+ make -j `nproc`
+ cd ../
+ for fname in config decode; do
+diff --git a/libfaad/specrec.c b/libfaad/specrec.c
+index 41c3507..ae4887b 100644
+--- a/libfaad/specrec.c
++++ b/libfaad/specrec.c
+@@ -1,60 +1,61 @@
+ /*
+ ** FAAD2 - Freeware Advanced Audio (AAC) Decoder including SBR decoding
+ ** Copyright (C) 2003-2005 M. Bakker, Nero AG, http://www.nero.com
+ **
+ ** This program is free software; you can redistribute it and/or modify
+ ** it under the terms of the GNU General Public License as published by
+ ** the Free Software Foundation; either version 2 of the License, or
+ ** (at your option) any later version.
+ **
+ ** This program is distributed in the hope that it will be useful,
+ ** but WITHOUT ANY WARRANTY; without even the implied warranty of
+ ** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ ** GNU General Public License for more details.
+ **
+ ** You should have received a copy of the GNU General Public License
+ ** along with this program; if not, write to the Free Software
+ ** Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ **
+ ** Any non-GPL usage of this software or parts of this software is strictly
+ ** forbidden.
+ **
+ ** The "appropriate copyright message" mentioned in section 2c of the GPLv2
+ ** must read: "Code from FAAD2 is copyright (c) Nero AG, www.nero.com"
+ **
+ ** Commercial non-GPL licensing of this software is possible.
+ ** For more info contact Nero AG through Mpeg4AAClicense@nero.com.
+ **
+ ** $Id: specrec.c,v 1.63 2010/06/04 20:47:56 menno Exp $
+ **/
+ 
+ /*
+   Spectral reconstruction:
+    - grouping/sectioning
+    - inverse quantization
+    - applying scalefactors
+ */
+ 
+ #include "common.h"
+ #include "structs.h"
+ 
+ #include <string.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include "specrec.h"
+ #include "filtbank.h"
+ #include "syntax.h"
+ #include "iq_table.h"
+ #include "ms.h"
+ #include "is.h"
+ #include "pns.h"
+ #include "tns.h"
+ #include "drc.h"
+ #include "lt_predict.h"
+ #include "ic_predict.h"
+ #ifdef SSR_DEC
+ #include "ssr.h"
+ #include "ssr_fb.h"
+ #endif
+ 
+ 
+ /* static function declarations */
+@@ -529,156 +530,162 @@ ALIGN static const real_t pow2sf_tab[] = {
+ /* quant_to_spec: perform dequantisation and scaling
+  * and in case of short block it also does the deinterleaving
+  */
+ /*
+   For ONLY_LONG_SEQUENCE windows (num_window_groups = 1,
+   window_group_length[0] = 1) the spectral data is in ascending spectral
+   order.
+   For the EIGHT_SHORT_SEQUENCE window, the spectral order depends on the
+   grouping in the following manner:
+   - Groups are ordered sequentially
+   - Within a group, a scalefactor band consists of the spectral data of all
+     grouped SHORT_WINDOWs for the associated scalefactor window band. To
+     clarify via example, the length of a group is in the range of one to eight
+     SHORT_WINDOWs.
+   - If there are eight groups each with length one (num_window_groups = 8,
+     window_group_length[0..7] = 1), the result is a sequence of eight spectra,
+     each in ascending spectral order.
+   - If there is only one group with length eight (num_window_groups = 1,
+     window_group_length[0] = 8), the result is that spectral data of all eight
+     SHORT_WINDOWs is interleaved by scalefactor window bands.
+   - Within a scalefactor window band, the coefficients are in ascending
+     spectral order.
+ */
+ static uint8_t quant_to_spec(NeAACDecStruct *hDecoder,
+                              ic_stream *ics, int16_t *quant_data,
+                              real_t *spec_data, uint16_t frame_len)
+ {
+     ALIGN static const real_t pow2_table[] =
+     {
+         COEF_CONST(1.0),
+         COEF_CONST(1.1892071150027210667174999705605), /* 2^0.25 */
+         COEF_CONST(1.4142135623730950488016887242097), /* 2^0.5 */
+         COEF_CONST(1.6817928305074290860622509524664) /* 2^0.75 */
+     };
+     const real_t *tab = iq_table;
+ 
+     uint8_t g, sfb, win;
+     uint16_t width, bin, k, gindex, wa, wb;
+     uint8_t error = 0; /* Init error flag */
+ #ifndef FIXED_POINT
+     real_t scf;
+ #endif
+ 
+     k = 0;
+     gindex = 0;
+ 
++    /* In this case quant_to_spec is no-op and spec_data remains undefined.
++     * Without peeking into AAC specification, there is no strong evidence if
++     * such streams are invalid -> just calm down MSAN. */
++    if (ics->num_swb == 0)
++        memset(spec_data, 0, frame_len * sizeof(real_t));
++
+     for (g = 0; g < ics->num_window_groups; g++)
+     {
+         uint16_t j = 0;
+         uint16_t gincrease = 0;
+         uint16_t win_inc = ics->swb_offset[ics->num_swb];
+ 
+         for (sfb = 0; sfb < ics->num_swb; sfb++)
+         {
+             int32_t exp, frac;
+ 
+             width = ics->swb_offset[sfb+1] - ics->swb_offset[sfb];
+ 
+             /* this could be scalefactor for IS or PNS, those can be negative or bigger then 255 */
+             /* just ignore them */
+             if (ics->scale_factors[g][sfb] < 0 || ics->scale_factors[g][sfb] > 255)
+             {
+                 exp = 0;
+                 frac = 0;
+             } else {
+                 /* ics->scale_factors[g][sfb] must be between 0 and 255 */
+                 exp = (ics->scale_factors[g][sfb] /* - 100 */) >> 2;
+                 /* frac must always be > 0 */
+                 frac = (ics->scale_factors[g][sfb] /* - 100 */) & 3;
+             }
+ 
+ #ifdef FIXED_POINT
+             exp -= 25;
+             /* IMDCT pre-scaling */
+             if (hDecoder->object_type == LD)
+             {
+                 exp -= 6 /*9*/;
+             } else {
+                 if (ics->window_sequence == EIGHT_SHORT_SEQUENCE)
+                     exp -= 4 /*7*/;
+                 else
+                     exp -= 7 /*10*/;
+             }
+ #endif
+ 
+             wa = gindex + j;
+ 
+ #ifndef FIXED_POINT
+             scf = pow2sf_tab[exp/*+25*/] * pow2_table[frac];
+ #endif
+ 
+             for (win = 0; win < ics->window_group_length[g]; win++)
+             {
+                 for (bin = 0; bin < width; bin += 4)
+                 {
+ #ifndef FIXED_POINT
+                     wb = wa + bin;
+ 
+                     spec_data[wb+0] = iquant(quant_data[k+0], tab, &error) * scf;
+                     spec_data[wb+1] = iquant(quant_data[k+1], tab, &error) * scf;
+                     spec_data[wb+2] = iquant(quant_data[k+2], tab, &error) * scf;
+                     spec_data[wb+3] = iquant(quant_data[k+3], tab, &error) * scf;
+ 
+ #else
+                     real_t iq0 = iquant(quant_data[k+0], tab, &error);
+                     real_t iq1 = iquant(quant_data[k+1], tab, &error);
+                     real_t iq2 = iquant(quant_data[k+2], tab, &error);
+                     real_t iq3 = iquant(quant_data[k+3], tab, &error);
+ 
+                     wb = wa + bin;
+ 
+                     if (exp < 0)
+                     {
+                         spec_data[wb+0] = iq0 >>= -exp;
+                         spec_data[wb+1] = iq1 >>= -exp;
+                         spec_data[wb+2] = iq2 >>= -exp;
+                         spec_data[wb+3] = iq3 >>= -exp;
+                     } else {
+                         spec_data[wb+0] = iq0 <<= exp;
+                         spec_data[wb+1] = iq1 <<= exp;
+                         spec_data[wb+2] = iq2 <<= exp;
+                         spec_data[wb+3] = iq3 <<= exp;
+                     }
+                     if (frac != 0)
+                     {
+                         spec_data[wb+0] = MUL_C(spec_data[wb+0],pow2_table[frac]);
+                         spec_data[wb+1] = MUL_C(spec_data[wb+1],pow2_table[frac]);
+                         spec_data[wb+2] = MUL_C(spec_data[wb+2],pow2_table[frac]);
+                         spec_data[wb+3] = MUL_C(spec_data[wb+3],pow2_table[frac]);
+                     }
+ 
+ //#define SCFS_PRINT
+ #ifdef SCFS_PRINT
+                     printf("%d\n", spec_data[gindex+(win*win_inc)+j+bin+0]);
+                     printf("%d\n", spec_data[gindex+(win*win_inc)+j+bin+1]);
+                     printf("%d\n", spec_data[gindex+(win*win_inc)+j+bin+2]);
+                     printf("%d\n", spec_data[gindex+(win*win_inc)+j+bin+3]);
+                     //printf("0x%.8X\n", spec_data[gindex+(win*win_inc)+j+bin+0]);
+                     //printf("0x%.8X\n", spec_data[gindex+(win*win_inc)+j+bin+1]);
+                     //printf("0x%.8X\n", spec_data[gindex+(win*win_inc)+j+bin+2]);
+                     //printf("0x%.8X\n", spec_data[gindex+(win*win_inc)+j+bin+3]);
+ #endif
+ #endif
+ 
+                     gincrease += 4;
+                     k += 4;
+                 }
+                 wa += win_inc;
+             }
+             j += width;
+         }
+         gindex += gincrease;
+     }
+ 
+     return error;
+ }

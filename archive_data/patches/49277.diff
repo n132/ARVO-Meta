@@ -1,0 +1,231 @@
+commit 66afb51bb4f132f205ba16d236993ebf8fdba89f
+Author: Zoltan Szabadka <szabadka@google.com>
+Date:   Mon Jul 18 17:15:10 2022 +0200
+
+    Fix ASAN crash after #1624
+
+diff --git a/lib/jxl/alpha.cc b/lib/jxl/alpha.cc
+index 77ac9021..f0ab39ac 100644
+--- a/lib/jxl/alpha.cc
++++ b/lib/jxl/alpha.cc
+@@ -100,12 +100,21 @@ void PremultiplyAlpha(float* JXL_RESTRICT r, float* JXL_RESTRICT g,
+ void UnpremultiplyAlpha(float* JXL_RESTRICT r, float* JXL_RESTRICT g,
+                         float* JXL_RESTRICT b, const float* JXL_RESTRICT a,
+                         size_t num_pixels) {
+   for (size_t x = 0; x < num_pixels; ++x) {
+     const float multiplier = 1.f / std::max(kSmallAlpha, a[x]);
+     r[x] *= multiplier;
+     g[x] *= multiplier;
+     b[x] *= multiplier;
+   }
+ }
+ 
++void UnpremultiplyAlpha(float* JXL_RESTRICT rgba, size_t num_pixels) {
++  for (size_t x = 0, ix = 0; x < num_pixels; ++x, ix += 4) {
++    const float multiplier = 1.f / std::max(kSmallAlpha, rgba[ix + 3]);
++    rgba[ix] *= multiplier;
++    rgba[ix + 1] *= multiplier;
++    rgba[ix + 2] *= multiplier;
++  }
++}
++
+ }  // namespace jxl
+diff --git a/lib/jxl/alpha.h b/lib/jxl/alpha.h
+index efb76c80..f49790b5 100644
+--- a/lib/jxl/alpha.h
++++ b/lib/jxl/alpha.h
+@@ -58,9 +58,10 @@ void PremultiplyAlpha(float* JXL_RESTRICT r, float* JXL_RESTRICT g,
+                       float* JXL_RESTRICT b, const float* JXL_RESTRICT a,
+                       size_t num_pixels);
+ void UnpremultiplyAlpha(float* JXL_RESTRICT r, float* JXL_RESTRICT g,
+                         float* JXL_RESTRICT b, const float* JXL_RESTRICT a,
+                         size_t num_pixels);
++void UnpremultiplyAlpha(float* JXL_RESTRICT rgba, size_t num_pixels);
+ 
+ }  // namespace jxl
+ 
+ #endif  // LIB_JXL_ALPHA_H_
+diff --git a/lib/jxl/jxl_test.cc b/lib/jxl/jxl_test.cc
+index 9ebb5cbf..47c8b16f 100644
+--- a/lib/jxl/jxl_test.cc
++++ b/lib/jxl/jxl_test.cc
+@@ -844,60 +844,60 @@ TEST(JxlTest, RoundtripAlpha) {
+ TEST(JxlTest, RoundtripAlphaPremultiplied) {
+   ThreadPool* pool = nullptr;
+   const PaddedBytes orig =
+       ReadTestData("external/wesaturate/500px/tmshre_riaphotographs_alpha.png");
+   CodecInOut io, io_nopremul;
+   ASSERT_TRUE(SetFromBytes(Span<const uint8_t>(orig), &io, pool));
+   ASSERT_TRUE(SetFromBytes(Span<const uint8_t>(orig), &io_nopremul, pool));
+ 
+   ASSERT_NE(io.xsize(), 0u);
+   ASSERT_TRUE(io.metadata.m.HasAlpha());
+   ASSERT_TRUE(io.Main().HasAlpha());
+   io.ShrinkTo(300, 300);
+   io_nopremul.ShrinkTo(300, 300);
+ 
+   CompressParams cparams;
+   cparams.butteraugli_distance = 1.0;
+ 
+   io.PremultiplyAlpha();
+   EXPECT_TRUE(io.Main().AlphaIsPremultiplied());
+   PassesEncoderState enc_state;
+   AuxOut* aux_out = nullptr;
+   PaddedBytes compressed;
+   EXPECT_TRUE(EncodeFile(cparams, &io, &enc_state, &compressed, GetJxlCms(),
+                          aux_out, pool));
+ 
+   for (bool use_image_callback : {false, true}) {
+     for (bool unpremul_alpha : {false, true}) {
+       for (bool use_uint8 : {false, true}) {
+         printf(
+             "Testing premultiplied alpha using %s %s requesting "
+             "%spremultiplied output.\n",
+             use_uint8 ? "uint8" : "float",
+             use_image_callback ? "image callback" : "image_buffer",
+             unpremul_alpha ? "un" : "");
+         CodecInOut io2;
+         extras::JXLDecompressParams dparams;
+         dparams.use_image_callback = use_image_callback;
+         dparams.unpremultiply_alpha = unpremul_alpha;
+         if (use_uint8) {
+           dparams.accepted_formats = {
+               {4, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0}};
+         }
+         EXPECT_TRUE(test::DecodeFile(dparams, compressed, &io2, pool));
+ 
+         EXPECT_LE(compressed.size(), 10000u);
+         if (!unpremul_alpha) {
+           EXPECT_THAT(
+               ButteraugliDistance(io, io2, cparams.ba_params, GetJxlCms(),
+                                   /*distmap=*/nullptr, pool),
+-              IsSlightlyBelow(1.2));
++              IsSlightlyBelow(1.25));
+           io2.Main().UnpremultiplyAlpha();
+         }
+         EXPECT_THAT(ButteraugliDistance(io_nopremul, io2, cparams.ba_params,
+                                         GetJxlCms(),
+                                         /*distmap=*/nullptr, pool),
+                     IsSlightlyBelow(1.35));
+       }
+     }
+   }
+ }
+diff --git a/lib/jxl/render_pipeline/stage_write.cc b/lib/jxl/render_pipeline/stage_write.cc
+index ccf137b8..2462fd18 100644
+--- a/lib/jxl/render_pipeline/stage_write.cc
++++ b/lib/jxl/render_pipeline/stage_write.cc
+@@ -272,109 +272,102 @@ class WriteToImage3FStage : public RenderPipelineStage {
+ class WriteToPixelCallbackStage : public RenderPipelineStage {
+  public:
+   WriteToPixelCallbackStage(const PixelCallback& pixel_callback, size_t width,
+                             size_t height, bool rgba, bool has_alpha,
+                             bool unpremul_alpha, size_t alpha_c)
+       : RenderPipelineStage(RenderPipelineStage::Settings()),
+         pixel_callback_(pixel_callback),
+         width_(width),
+         height_(height),
+         rgba_(rgba),
+         has_alpha_(has_alpha),
+         unpremul_alpha_(unpremul_alpha),
+         alpha_c_(alpha_c),
+         opaque_alpha_(kMaxPixelsPerCall, 1.0f) {}
+ 
+   WriteToPixelCallbackStage(const WriteToPixelCallbackStage&) = delete;
+   WriteToPixelCallbackStage& operator=(const WriteToPixelCallbackStage&) =
+       delete;
+   WriteToPixelCallbackStage(WriteToPixelCallbackStage&&) = delete;
+   WriteToPixelCallbackStage& operator=(WriteToPixelCallbackStage&&) = delete;
+ 
+   ~WriteToPixelCallbackStage() override {
+     if (run_opaque_) {
+       pixel_callback_.destroy(run_opaque_);
+     }
+   }
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     JXL_DASSERT(run_opaque_);
+     if (ypos >= height_) return;
+     const float* line_buffers[4];
+     for (size_t c = 0; c < 3; c++) {
+       line_buffers[c] = GetInputRow(input_rows, c, 0) - xextra;
+     }
+     if (has_alpha_) {
+       line_buffers[3] = GetInputRow(input_rows, alpha_c_, 0) - xextra;
+     } else {
+       // No xextra offset; opaque_alpha_ is a way to set all values to 1.0f.
+       line_buffers[3] = opaque_alpha_.data();
+     }
+-    if (has_alpha_ && rgba_ && unpremul_alpha_) {
+-      ImageF tmp(xsize + 2 * xextra, 3);
+-      for (size_t c = 0; c < 3; ++c) {
+-        memcpy(tmp.Row(c), line_buffers[c], sizeof(float) * tmp.xsize());
+-      }
+-      UnpremultiplyAlpha(tmp.Row(0), tmp.Row(1), tmp.Row(2), line_buffers[3],
+-                         tmp.xsize());
+-      for (size_t c = 0; c < 3; ++c) {
+-        line_buffers[c] = tmp.Row(c);
+-      }
+-    }
+ 
+     // TODO(veluca): SIMD.
+     ssize_t limit = std::min(xextra + xsize, width_ - xpos);
+     for (ssize_t x0 = -xextra; x0 < limit; x0 += kMaxPixelsPerCall) {
+       size_t j = 0;
+       size_t ix = 0;
+       float* JXL_RESTRICT temp =
+           reinterpret_cast<float*>(temp_[thread_id].get());
+       for (; ix < kMaxPixelsPerCall && ssize_t(ix) + x0 < limit; ix++) {
+         temp[j++] = line_buffers[0][ix];
+         temp[j++] = line_buffers[1][ix];
+         temp[j++] = line_buffers[2][ix];
+         if (rgba_) {
+           temp[j++] = line_buffers[3][ix];
+         }
+       }
++      if (has_alpha_ && rgba_ && unpremul_alpha_) {
++        // TODO(szabadka) SIMDify (possibly in a separate pipeline stage).
++        UnpremultiplyAlpha(temp, ix);
++      }
+       pixel_callback_.run(run_opaque_, thread_id, xpos + x0, ypos, ix, temp);
+       for (size_t c = 0; c < 3; c++) line_buffers[c] += kMaxPixelsPerCall;
+       if (has_alpha_) line_buffers[3] += kMaxPixelsPerCall;
+     }
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 || (has_alpha_ && c == alpha_c_)
+                ? RenderPipelineChannelMode::kInput
+                : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "WritePixelCB"; }
+ 
+  private:
+   Status PrepareForThreads(size_t num_threads) override {
+     run_opaque_ =
+         pixel_callback_.Init(num_threads, /*num_pixels=*/kMaxPixelsPerCall);
+     JXL_RETURN_IF_ERROR(run_opaque_ != nullptr);
+     temp_.resize(num_threads);
+     for (CacheAlignedUniquePtr& temp : temp_) {
+       temp = AllocateArray(sizeof(float) * kMaxPixelsPerCall * (rgba_ ? 4 : 3));
+     }
+     return true;
+   }
+ 
+   static constexpr size_t kMaxPixelsPerCall = 1024;
+   PixelCallback pixel_callback_;
+   void* run_opaque_ = nullptr;
+   size_t width_;
+   size_t height_;
+   bool rgba_;
+   bool has_alpha_;
+   bool unpremul_alpha_;
+   size_t alpha_c_;
+   std::vector<float> opaque_alpha_;
+   std::vector<CacheAlignedUniquePtr> temp_;
+ };
+ 
+ }  // namespace

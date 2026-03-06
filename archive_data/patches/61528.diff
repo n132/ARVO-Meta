@@ -1,0 +1,192 @@
+commit 274f30e00840cfe0d4476f3b7959cf847a4f9104
+Author: Mirco Miranda <mirco.miranda@systemceramics.com>
+Date:   Fri Aug 18 15:11:41 2023 +0000
+
+    qoi: fix buffer overflow kf5
+    
+    Backport of MR !167:
+    - fix buffer overflow with corrupted images without image data
+    - fix unable to read very small images (e.g. 1x1 px)
+    - new test cases added
+    - detect incomplete files by checking the end of streams as written in the specs
+
+diff --git a/autotests/read/qoi/1px.png b/autotests/read/qoi/1px.png
+new file mode 100644
+index 0000000..01928c8
+Binary files /dev/null and b/autotests/read/qoi/1px.png differ
+diff --git a/autotests/read/qoi/1px.qoi b/autotests/read/qoi/1px.qoi
+new file mode 100644
+index 0000000..f3a3da5
+Binary files /dev/null and b/autotests/read/qoi/1px.qoi differ
+diff --git a/autotests/read/qoi/2px.png b/autotests/read/qoi/2px.png
+new file mode 100644
+index 0000000..e56d820
+Binary files /dev/null and b/autotests/read/qoi/2px.png differ
+diff --git a/autotests/read/qoi/2px.qoi b/autotests/read/qoi/2px.qoi
+new file mode 100644
+index 0000000..045a4ad
+Binary files /dev/null and b/autotests/read/qoi/2px.qoi differ
+diff --git a/autotests/read/qoi/bnm_rgb.png b/autotests/read/qoi/bnm_rgb.png
+new file mode 100644
+index 0000000..8be63d3
+Binary files /dev/null and b/autotests/read/qoi/bnm_rgb.png differ
+diff --git a/autotests/read/qoi/bnm_rgb.qoi b/autotests/read/qoi/bnm_rgb.qoi
+new file mode 100644
+index 0000000..6479320
+Binary files /dev/null and b/autotests/read/qoi/bnm_rgb.qoi differ
+diff --git a/autotests/read/qoi/bnm_rgba.png b/autotests/read/qoi/bnm_rgba.png
+new file mode 100644
+index 0000000..41b1e5a
+Binary files /dev/null and b/autotests/read/qoi/bnm_rgba.png differ
+diff --git a/autotests/read/qoi/bnm_rgba.qoi b/autotests/read/qoi/bnm_rgba.qoi
+new file mode 100644
+index 0000000..35cdd4a
+Binary files /dev/null and b/autotests/read/qoi/bnm_rgba.qoi differ
+diff --git a/src/imageformats/qoi.cpp b/src/imageformats/qoi.cpp
+index a7b5dd4..fae24eb 100644
+--- a/src/imageformats/qoi.cpp
++++ b/src/imageformats/qoi.cpp
+@@ -16,16 +16,17 @@
+ namespace // Private
+ {
+ 
+ #define QOI_OP_INDEX 0x00 /* 00xxxxxx */
+ #define QOI_OP_DIFF 0x40 /* 01xxxxxx */
+ #define QOI_OP_LUMA 0x80 /* 10xxxxxx */
+ #define QOI_OP_RUN 0xc0 /* 11xxxxxx */
+ #define QOI_OP_RGB 0xfe /* 11111110 */
+ #define QOI_OP_RGBA 0xff /* 11111111 */
+ #define QOI_MASK_2 0xc0 /* 11000000 */
+ 
+ #define QOI_MAGIC (((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | ((unsigned int)'i') << 8 | ((unsigned int)'f'))
+ #define QOI_HEADER_SIZE 14
++#define QOI_END_STREAM_PAD 8
+ 
+ struct QoiHeader {
+     quint32 MagicNumber;
+@@ -55,13 +56,17 @@ static QDataStream &operator>>(QDataStream &s, QoiHeader &head)
+ static bool IsSupported(const QoiHeader &head)
+ {
+     // Check magic number
+     if (head.MagicNumber != QOI_MAGIC) {
+         return false;
+     }
+     // Check if the header is a valid QOI header
+     if (head.Width == 0 || head.Height == 0 || head.Channels < 3 || head.Colorspace > 1) {
+         return false;
+     }
++    // Set a reasonable upper limit
++    if (head.Width > 300000 || head.Height > 300000) {
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -81,91 +86,103 @@ static QImage::Format imageFormat(const QoiHeader &head)
+ static bool LoadQOI(QIODevice *device, const QoiHeader &qoi, QImage &img)
+ {
+     Px index[64] = {Px{
+         0,
+         0,
+         0,
+         0,
+     }};
+ 
+     Px px = Px{
+         0,
+         0,
+         0,
+         255,
+     };
+ 
+-    quint64 px_len = quint64(qoi.Width) * qoi.Channels * 3 / 2;
++    // The px_len should be enough to read a complete "compressed" row: an uncompressible row can become
++    // larger than the row itself. It should never be more than 1/3 (RGB) or 1/4 (RGBA) the length of the
++    // row itself (see test bnm_rgb*.qoi) so I set the extra data to 1/2.
++    // The minimum value is to ensure that enough bytes are read when the image is very small (e.g. 1x1px):
++    // it can be set as large as you like.
++    quint64 px_len = std::max(quint64(1024), quint64(qoi.Width) * qoi.Channels * 3 / 2);
+     if (px_len > kMaxQVectorSize) {
+         return false;
+     }
+ 
+     // Allocate image
+     img = imageAlloc(qoi.Width, qoi.Height, imageFormat(qoi));
+     if (img.isNull()) {
+         return false;
+     }
+ 
+     // Set the image colorspace based on the qoi.Colorspace value
+     // As per specification: 0 = sRGB with linear alpha, 1 = all channels linear
+     if (qoi.Colorspace) {
+         img.setColorSpace(QColorSpace(QColorSpace::SRgbLinear));
+     } else {
+         img.setColorSpace(QColorSpace(QColorSpace::SRgb));
+     }
+ 
+     // Handle the byte stream
+     QByteArray ba;
+     for (quint32 y = 0, run = 0; y < qoi.Height; ++y) {
+         if (quint64(ba.size()) < px_len) {
+             ba.append(device->read(px_len));
+         }
+ 
+-        quint64 chunks_len = ba.size() - 8; // 8 is the size of the QOI padding
++        if (ba.size() < QOI_END_STREAM_PAD) {
++            return false;
++        }
++
++        quint64 chunks_len = ba.size() - QOI_END_STREAM_PAD;
+         quint64 p = 0;
+         QRgb *scanline = (QRgb *)img.scanLine(y);
+-        quint8 *input = reinterpret_cast<quint8 *>(ba.data());
++        const quint8 *input = reinterpret_cast<const quint8 *>(ba.constData());
+         for (quint32 x = 0; x < qoi.Width; ++x) {
+             if (run > 0) {
+                 run--;
+             } else if (p < chunks_len) {
+                 quint32 b1 = input[p++];
+ 
+                 if (b1 == QOI_OP_RGB) {
+                     px.r = input[p++];
+                     px.g = input[p++];
+                     px.b = input[p++];
+                 } else if (b1 == QOI_OP_RGBA) {
+                     px.r = input[p++];
+                     px.g = input[p++];
+                     px.b = input[p++];
+                     px.a = input[p++];
+                 } else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+                     px = index[b1];
+                 } else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+                     px.r += ((b1 >> 4) & 0x03) - 2;
+                     px.g += ((b1 >> 2) & 0x03) - 2;
+                     px.b += (b1 & 0x03) - 2;
+                 } else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+                     quint32 b2 = input[p++];
+                     quint32 vg = (b1 & 0x3f) - 32;
+                     px.r += vg - 8 + ((b2 >> 4) & 0x0f);
+                     px.g += vg;
+                     px.b += vg - 8 + (b2 & 0x0f);
+                 } else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+                     run = (b1 & 0x3f);
+                 }
+                 index[QoiHash(px) & 0x3F] = px;
+             }
+             // Set the values for the pixel at (x, y)
+             scanline[x] = qRgba(px.r, px.g, px.b, px.a);
+         }
+ 
+         if (p) {
+             ba.remove(0, p);
+         }
+     }
+ 
+-    return true;
++    // From specs the byte stream's end is marked with 7 0x00 bytes followed by a single 0x01 byte.
++    // NOTE: Instead of using "ba == QByteArray::fromRawData("\x00\x00\x00\x00\x00\x00\x00\x01", 8)"
++    //       we preferred a generic check that allows data to exist after the end of the file.
++    return (ba.startsWith(QByteArray::fromRawData("\x00\x00\x00\x00\x00\x00\x00\x01", 8)));
+ }
+ 
+ } // namespace

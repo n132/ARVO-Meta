@@ -1,0 +1,145 @@
+commit ac7b9359e84d796bfb1ff1fd3f7c9eaf9a506799
+Author: Nathan Moinvaziri <nathan@nathanm.com>
+Date:   Mon May 10 07:41:00 2021 -0700
+
+    Added typesize check when reading frame header info.
+    https://oss-fuzz.com/testcase-detail/6103287616110592
+
+diff --git a/blosc/frame.c b/blosc/frame.c
+index 83e4a7b6..29a106ac 100644
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -361,121 +361,128 @@ void *new_header_frame(blosc2_schunk *schunk, blosc2_frame_s *frame) {
+ int get_header_info(blosc2_frame_s *frame, int32_t *header_len, int64_t *frame_len, int64_t *nbytes, int64_t *cbytes,
+                     int32_t *blocksize, int32_t *chunksize, int32_t *nchunks, int32_t *typesize, uint8_t *compcode,
+                     uint8_t *compcode_meta, uint8_t *clevel, uint8_t *filters, uint8_t *filters_meta, const blosc2_io *io) {
+   uint8_t* framep = frame->cframe;
+   uint8_t header[FRAME_HEADER_MINLEN];
+ 
+   blosc2_io_cb *io_cb = blosc2_get_io_cb(io->id);
+   if (io_cb == NULL) {
+     BLOSC_TRACE_ERROR("Error getting the input/output API");
+     return BLOSC2_ERROR_PLUGIN_IO;
+   }
+ 
+   if (frame->len <= 0) {
+     return BLOSC2_ERROR_READ_BUFFER;
+   }
+ 
+   if (frame->cframe == NULL) {
+     int64_t rbytes = 0;
+     void* fp = NULL;
+     if (frame->sframe) {
+       fp = sframe_open_index(frame->urlpath, "rb",
+                              io);
+     }
+     else {
+       fp = io_cb->open(frame->urlpath, "rb", io->params);
+     }
+     if (fp != NULL) {
+       rbytes = io_cb->read(header, 1, FRAME_HEADER_MINLEN, fp);
+       io_cb->close(fp);
+     }
+     (void) rbytes;
+     if (rbytes != FRAME_HEADER_MINLEN) {
+       return BLOSC2_ERROR_FILE_READ;
+     }
+     framep = header;
+   }
+ 
+   // Consistency check for frame type
+   uint8_t frame_type = framep[FRAME_TYPE];
+   if (frame->sframe) {
+     if (frame_type != FRAME_DIRECTORY_TYPE) {
+       return BLOSC2_ERROR_FRAME_TYPE;
+     }
+   } else {
+     if (frame_type != FRAME_CONTIGUOUS_TYPE) {
+       return BLOSC2_ERROR_FRAME_TYPE;
+     }
+   }
+ 
+   // Fetch some internal lengths
+   from_big(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
++  if (*header_len < FRAME_HEADER_MINLEN) {
++    BLOSC_TRACE_ERROR("Header length is zero or smaller than min allowed.");
++    return BLOSC2_ERROR_INVALID_HEADER;
++  }
+   from_big(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
++  if (*header_len > *frame_len) {
++    BLOSC_TRACE_ERROR("Header length exceeds length of the frame.");
++    return BLOSC2_ERROR_INVALID_HEADER;
++  }
+   from_big(nbytes, framep + FRAME_NBYTES, sizeof(*nbytes));
+   from_big(cbytes, framep + FRAME_CBYTES, sizeof(*cbytes));
+   from_big(blocksize, framep + FRAME_BLOCKSIZE, sizeof(*blocksize));
+   if (chunksize != NULL) {
+     from_big(chunksize, framep + FRAME_CHUNKSIZE, sizeof(*chunksize));
+   }
+   if (typesize != NULL) {
+     from_big(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
+-  }
+-
+-  if (*header_len < FRAME_HEADER_MINLEN || *header_len > *frame_len) {
+-    BLOSC_TRACE_ERROR("Header length is invalid or exceeds length of the frame.");
+-    return BLOSC2_ERROR_INVALID_HEADER;
++    if (*typesize <= 0 || *typesize > BLOSC_MAX_TYPESIZE) {
++      BLOSC_TRACE_ERROR("`typesize` is zero or greater than max allowed.");
++      return BLOSC2_ERROR_INVALID_HEADER;
++    }
+   }
+ 
+   // Codecs
+   uint8_t frame_codecs = framep[FRAME_CODECS];
+   if (clevel != NULL) {
+     *clevel = frame_codecs >> 4u;
+   }
+   if (compcode != NULL) {
+     *compcode = frame_codecs & 0xFu;
+     if (*compcode == BLOSC_UDCODEC_FORMAT) {
+       from_big(compcode, framep + FRAME_UDCODEC, sizeof(*compcode));
+     }
+   }
+ 
+ 
+   if (compcode_meta != NULL) {
+     from_big(compcode_meta, framep + FRAME_CODEC_META, sizeof(*compcode_meta));
+   }
+ 
+   // Filters
+   if (filters != NULL && filters_meta != NULL) {
+     uint8_t nfilters = framep[FRAME_FILTER_PIPELINE];
+     if (nfilters > BLOSC2_MAX_FILTERS) {
+       BLOSC_TRACE_ERROR("The number of filters in frame header are too large for Blosc2.");
+       return BLOSC2_ERROR_INVALID_HEADER;
+     }
+     uint8_t *filters_ = framep + FRAME_FILTER_PIPELINE + 1;
+     uint8_t *filters_meta_ = framep + FRAME_FILTER_PIPELINE + 1 + FRAME_FILTER_PIPELINE_MAX;
+     for (int i = 0; i < nfilters; i++) {
+       filters[i] = filters_[i];
+       filters_meta[i] = filters_meta_[i];
+     }
+   }
+ 
+   if (*nbytes > 0 && *chunksize > 0) {
+     // We can compute the number of chunks only when the frame has actual data
+     *nchunks = (int32_t) (*nbytes / *chunksize);
+     if (*nbytes % *chunksize > 0) {
+       if (*nchunks == INT32_MAX) {
+         BLOSC_TRACE_ERROR("Number of chunks exceeds maximum allowed.");
+         return BLOSC2_ERROR_INVALID_HEADER;
+       }
+       *nchunks += 1;
+     }
+ 
+     // Sanity check for compressed sizes
+     if ((*cbytes < 0) || ((int64_t)*nchunks * *chunksize < *nbytes)) {
+       BLOSC_TRACE_ERROR("Invalid compressed size in frame header.");
+       return BLOSC2_ERROR_INVALID_HEADER;
+     }
+   } else {
+     *nchunks = 0;
+   }
+ 
+   return 0;
+ }

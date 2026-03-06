@@ -1,0 +1,990 @@
+commit 3af0bda8b79ed775d3b243bfb794ebdeb51378e2
+Author: Jonathan Hui <jonhui@nestlabs.com>
+Date:   Sun May 6 19:13:57 2018 -0700
+
+    [dataset] validate TLVs when applying configuration (#2680)
+    
+    Credit to OSS-Fuzz.
+
+diff --git a/src/core/meshcop/dataset.cpp b/src/core/meshcop/dataset.cpp
+index 5c7888de0..df02c5cd5 100644
+--- a/src/core/meshcop/dataset.cpp
++++ b/src/core/meshcop/dataset.cpp
+@@ -60,6 +60,21 @@ void Dataset::Clear(void)
+     mLength = 0;
+ }
+ 
++bool Dataset::IsValid(void) const
++{
++    bool       rval = true;
++    const Tlv *cur  = reinterpret_cast<const Tlv *>(mTlvs);
++    const Tlv *end  = reinterpret_cast<const Tlv *>(mTlvs + mLength);
++
++    for (; cur < end; cur = cur->GetNext())
++    {
++        VerifyOrExit((cur + 1) <= end && cur->GetNext() <= end && Tlv::IsValid(*cur), rval = false);
++    }
++
++exit:
++    return rval;
++}
++
+ Tlv *Dataset::Get(Tlv::Type aType)
+ {
+     Tlv *cur  = reinterpret_cast<Tlv *>(mTlvs);
+@@ -517,117 +532,120 @@ void Dataset::Remove(uint8_t *aStart, uint8_t aLength)
+ otError Dataset::ApplyConfiguration(Instance &aInstance) const
+ {
+     ThreadNetif &netif    = aInstance.GetThreadNetif();
+     Notifier &   notifier = aInstance.GetNotifier();
+     Mac::Mac &   mac      = netif.GetMac();
+     otError      error    = OT_ERROR_NONE;
+     const Tlv *  cur      = reinterpret_cast<const Tlv *>(mTlvs);
+     const Tlv *  end      = reinterpret_cast<const Tlv *>(mTlvs + mLength);
+ 
++    VerifyOrExit(IsValid(), error = OT_ERROR_PARSE);
++
+     while (cur < end)
+     {
+         switch (cur->GetType())
+         {
+         case Tlv::kChannel:
+         {
+             uint8_t channel = static_cast<uint8_t>(static_cast<const ChannelTlv *>(cur)->GetChannel());
+ 
+             if (mac.GetChannel() != channel)
+             {
+                 error = mac.SetChannel(channel);
+ 
+                 if (error != OT_ERROR_NONE)
+                 {
+                     otLogWarnMeshCoP(aInstance, "DatasetManager::ApplyConfiguration() Failed to set channel to %d (%s)",
+                                      channel, otThreadErrorToString(error));
+                     ExitNow();
+                 }
+ 
+                 notifier.SetFlags(OT_CHANGED_THREAD_CHANNEL);
+             }
+ 
+             break;
+         }
+ 
+         case Tlv::kPanId:
+         {
+             uint16_t panid = static_cast<const PanIdTlv *>(cur)->GetPanId();
+ 
+             if (mac.GetPanId() != panid)
+             {
+                 mac.SetPanId(panid);
+                 notifier.SetFlags(OT_CHANGED_THREAD_PANID);
+             }
+ 
+             break;
+         }
+ 
+         case Tlv::kExtendedPanId:
+         {
+             const ExtendedPanIdTlv *extpanid = static_cast<const ExtendedPanIdTlv *>(cur);
+ 
+             if (memcmp(mac.GetExtendedPanId(), extpanid->GetExtendedPanId(), OT_EXT_PAN_ID_SIZE) != 0)
+             {
+                 mac.SetExtendedPanId(extpanid->GetExtendedPanId());
+                 notifier.SetFlags(OT_CHANGED_THREAD_EXT_PANID);
+             }
+ 
+             break;
+         }
+ 
+         case Tlv::kNetworkName:
+         {
+             const NetworkNameTlv *name = static_cast<const NetworkNameTlv *>(cur);
+             otNetworkName         networkName;
++
+             memcpy(networkName.m8, name->GetNetworkName(), name->GetLength());
+             networkName.m8[name->GetLength()] = '\0';
+ 
+             if (strcmp(networkName.m8, mac.GetNetworkName()) != 0)
+             {
+                 mac.SetNetworkName(networkName.m8);
+                 notifier.SetFlags(OT_CHANGED_THREAD_NETWORK_NAME);
+             }
+ 
+             break;
+         }
+ 
+         case Tlv::kNetworkMasterKey:
+         {
+             const NetworkMasterKeyTlv *key = static_cast<const NetworkMasterKeyTlv *>(cur);
+             netif.GetKeyManager().SetMasterKey(key->GetNetworkMasterKey());
+             break;
+         }
+ 
+ #if OPENTHREAD_FTD
+ 
+         case Tlv::kPSKc:
+         {
+             const PSKcTlv *pskc = static_cast<const PSKcTlv *>(cur);
+             netif.GetKeyManager().SetPSKc(pskc->GetPSKc());
+             break;
+         }
+ 
+ #endif
+ 
+         case Tlv::kMeshLocalPrefix:
+         {
+             const MeshLocalPrefixTlv *prefix = static_cast<const MeshLocalPrefixTlv *>(cur);
+             netif.GetMle().SetMeshLocalPrefix(prefix->GetMeshLocalPrefix());
+             break;
+         }
+ 
+         case Tlv::kSecurityPolicy:
+         {
+             const SecurityPolicyTlv *securityPolicy = static_cast<const SecurityPolicyTlv *>(cur);
+             netif.GetKeyManager().SetKeyRotation(securityPolicy->GetRotationTime());
+             netif.GetKeyManager().SetSecurityPolicyFlags(securityPolicy->GetFlags());
+             break;
+         }
+ 
+         default:
+         {
+             break;
+         }
+         }
+ 
+         cur = cur->GetNext();
+     }
+diff --git a/src/core/meshcop/dataset.hpp b/src/core/meshcop/dataset.hpp
+index 7c937307c..f2c1c903e 100644
+--- a/src/core/meshcop/dataset.hpp
++++ b/src/core/meshcop/dataset.hpp
+@@ -51,182 +51,191 @@ class Dataset
+ public:
+     enum
+     {
+         kMaxSize      = 256, ///< Maximum size of MeshCoP Dataset (bytes)
+         kMaxValueSize = 16,  /// < Maximum size of each Dataset TLV value (bytes)
+     };
+ 
+     /**
+      * This constructor initializes the object.
+      *
+      * @param[in]  aType       The type of the dataset, active or pending.
+      *
+      */
+     Dataset(const Tlv::Type aType);
+ 
+     /**
+      * This method clears the Dataset.
+      *
+      */
+     void Clear(void);
+ 
++    /**
++     * This method indicates whether or not the dataset appears to be well-formed.
++     *
++     * @returns TRUE if the dataset appears to be well-formed, FALSE otherwise.
++     *
++     */
++    bool IsValid(void) const;
++
+     /**
+      * This method returns a pointer to the TLV.
+      *
+      * @returns A pointer to the TLV or NULL if none is found.
+      *
+      */
+     Tlv *Get(Tlv::Type aType);
+ 
+     /**
+      * This method returns a pointer to the TLV.
+      *
+      * @returns A pointer to the TLV or NULL if none is found.
+      *
+      */
+     const Tlv *Get(Tlv::Type aType) const;
+ 
+     /**
+      * This method returns a pointer to the byte representation of the Dataset.
+      *
+      * @returns A pointer to the byte representation of the Dataset.
+      *
+      */
+     uint8_t *GetBytes(void) { return mTlvs; }
+ 
+     /**
+      * This method returns a pointer to the byte representation of the Dataset.
+      *
+      * @returns A pointer to the byte representation of the Dataset.
+      *
+      */
+     const uint8_t *GetBytes(void) const { return mTlvs; }
+ 
+     /**
+      * This method converts the TLV representation to structure representation.
+      *
+      */
+     void Get(otOperationalDataset &aDataset) const;
+ 
+     /**
+      * This method returns the Dataset size in bytes.
+      *
+      * @returns The Dataset size in bytes.
+      *
+      */
+     uint16_t GetSize(void) const { return mLength; }
+ 
+     /**
+      * This method sets the Dataset size in bytes.
+      *
+      * @param[in] aSize  The Dataset size in bytes.
+      *
+      */
+     void SetSize(uint16_t aSize) { mLength = aSize; }
+ 
+     /**
+      * This method returns the local time the dataset was last updated.
+      *
+      * @returns The local time the dataset was last updated.
+      *
+      */
+     uint32_t GetUpdateTime(void) const { return mUpdateTime; }
+ 
+     /**
+      * This method returns a reference to the Timestamp.
+      *
+      * @returns A pointer to the Timestamp.
+      *
+      */
+     const Timestamp *GetTimestamp(void) const;
+ 
+     /**
+      * This method sets the Timestamp value.
+      *
+      */
+     void SetTimestamp(const Timestamp &aTimestamp);
+ 
+     /**
+      * This method sets a TLV in the Dataset.
+      *
+      * @param[in]  aTlv  A reference to the TLV.
+      *
+      * @retval OT_ERROR_NONE     Successfully set the TLV.
+      * @retval OT_ERROR_NO_BUFS  Could not set the TLV due to insufficient buffer space.
+      *
+      */
+     otError Set(const Tlv &aTlv);
+ 
+     /**
+      * This method sets the Dataset using TLVs stored in a message buffer.
+      *
+      * @param[in]  aMessage  The message buffer.
+      * @param[in]  aOffset   The message buffer offset where the dataset starts.
+      * @param[in]  aLength   The TLVs length in the message buffer in bytes.
+      *
+      * @retval OT_ERROR_NONE          Successfully set the Dataset.
+      * @retval OT_ERROR_INVALID_ARGS  The values of @p aOffset and @p aLength are not valid for @p aMessage.
+      *
+      */
+     otError Set(const Message &aMessage, uint16_t aOffset, uint8_t aLength);
+ 
+     /**
+      * This method sets the Dataset using an existing Dataset.
+      *
+      * If this Dataset is an Active Dataset, any Pending Timestamp and Delay Timer TLVs will be omitted in the copy
+      * from @p aDataset.
+      *
+      * @param[in]  aDataset  The input Dataset.
+      *
+      * @retval OT_ERROR_NONE  Successfully set the Dataset.
+      *
+      */
+     otError Set(const Dataset &aDataset);
+ 
+ #if OPENTHREAD_FTD
+     /**
+      * This method sets the Dataset.
+      *
+      * @param[in]  aDataset  The input Dataset.
+      *
+      * @retval OT_ERROR_NONE  Successfully set the Dataset.
+      *
+      */
+     otError Set(const otOperationalDataset &aDataset);
+ #endif
+ 
+     /**
+      * This method removes a TLV from the Dataset.
+      *
+      * @param[in] aType The type of a specific TLV.
+      *
+      */
+     void Remove(Tlv::Type aType);
+ 
+     /**
+      * This method appends the MLE Dataset TLV but excluding MeshCoP Sub Timestamp TLV.
+      *
+      * @retval OT_ERROR_NONE     Successfully append MLE Dataset TLV without MeshCoP Sub Timestamp TLV.
+      * @retval OT_ERROR_NO_BUFS  Insufficient available buffers to append the message with MLE Dataset TLV.
+      *
+      */
+     otError AppendMleDatasetTlv(Message &aMessage) const;
+ 
+     /**
+      * This method applies the Active or Pending Dataset to the Thread interface.
+      *
+      * @param[in]  aInstance  A reference to the OpenThread instance.
+      *
+-     * @retval OT_ERROR_NONE  Successfully applied configuration.
++     * @retval OT_ERROR_NONE   Successfully applied configuration.
++     * @retval OT_ERROR_PARSE  The dataset has at least one TLV with invalid format.
+      *
+      */
+     otError ApplyConfiguration(Instance &aInstance) const;
+ 
+     /**
+      * This method converts a Pending Dataset to an Active Dataset.
+      *
+      * This method removes the Delay Timer and Pending Timestamp TLVs
+      *
+      * @retval OT_ERROR_NONE  Successfully converted to Active Dataset.
+      *
+      */
+     otError ConvertToActive(void);
+diff --git a/src/core/meshcop/dataset_manager.cpp b/src/core/meshcop/dataset_manager.cpp
+index 8560217f6..b2fb3bb3a 100644
+--- a/src/core/meshcop/dataset_manager.cpp
++++ b/src/core/meshcop/dataset_manager.cpp
+@@ -146,42 +146,46 @@ void DatasetManager::HandleDetach(void)
+     Restore();
+ }
+ 
+-void DatasetManager::Set(const Dataset &aDataset)
++otError DatasetManager::Set(const Dataset &aDataset)
+ {
++    otError          error = OT_ERROR_NONE;
+     const Timestamp *timestamp;
+     int              compare;
+ 
+     timestamp = aDataset.GetTimestamp();
+ 
+     if (timestamp != NULL)
+     {
+         mTimestamp      = *timestamp;
+         mTimestampValid = true;
+ 
+         if (mLocal.GetType() == Tlv::kActiveTimestamp)
+         {
+-            aDataset.ApplyConfiguration(GetInstance());
++            SuccessOrExit(error = aDataset.ApplyConfiguration(GetInstance()));
+         }
+     }
+ 
+     compare = mLocal.Compare(timestamp);
+ 
+     if (compare > 0)
+     {
+         ThreadNetif &netif = GetNetif();
+ 
+         mLocal.Set(aDataset);
+ 
+         if (netif.GetMle().GetRole() == OT_DEVICE_ROLE_LEADER)
+         {
+             netif.GetNetworkDataLeader().IncrementVersion();
+             netif.GetNetworkDataLeader().IncrementStableVersion();
+         }
+     }
+     else if (compare < 0)
+     {
+         mTimer.Start(1000);
+     }
++
++exit:
++    return error;
+ }
+ 
+ void DatasetManager::HandleTimer(void)
+diff --git a/src/core/meshcop/dataset_manager.hpp b/src/core/meshcop/dataset_manager.hpp
+index d136aeec3..b5e096d29 100644
+--- a/src/core/meshcop/dataset_manager.hpp
++++ b/src/core/meshcop/dataset_manager.hpp
+@@ -54,77 +54,78 @@ class DatasetManager : public InstanceLocator
+ {
+ public:
+     /**
+      * This method returns a reference to the Timestamp.
+      *
+      * @returns A pointer to the Timestamp.
+      *
+      */
+     const Timestamp *GetTimestamp(void) const;
+ 
+     /**
+      * This method restores the Operational Dataset from non-volatile memory.
+      *
+      * @retval OT_ERROR_NONE       Successfully restore the dataset.
+      * @retval OT_ERROR_NOT_FOUND  There is no corresponding dataset stored in non-volatile memory.
+      *
+      */
+     otError Restore(void);
+ 
+     /**
+      * This method compares @p aTimestamp to the dataset's timestamp value.
+      *
+      * @param[in]  aCompare  A reference to the timestamp to compare.
+      *
+      * @retval -1  if @p aCompare is older than this dataset.
+      * @retval  0  if @p aCompare is equal to this dataset.
+      * @retval  1  if @p aCompare is newer than this dataset.
+      *
+      */
+     int Compare(const Timestamp &aTimestamp) const;
+ 
+     /**
+      * This method appends the MLE Dataset TLV but excluding MeshCoP Sub Timestamp TLV.
+      *
+      * @retval OT_ERROR_NONE     Successfully append MLE Dataset TLV without MeshCoP Sub Timestamp TLV.
+      * @retval OT_ERROR_NO_BUFS  Insufficient available buffers to append the message with MLE Dataset TLV.
+      *
+      */
+     otError AppendMleDatasetTlv(Message &aMessage) const;
+ 
+     /**
+      * This method retrieves the dataset from non-volatile memory.
+      *
+      * @param[out]  aDataset  Where to place the dataset.
+      *
+      * @retval OT_ERROR_NONE       Successfully retrieved the dataset.
+      * @retval OT_ERROR_NOT_FOUND  There is no corresponding dataset stored in non-volatile memory.
+      *
+      */
+     otError Get(Dataset &aDataset) const { return mLocal.Get(aDataset); }
+ 
+     /**
+      * This method retrieves the dataset from non-volatile memory.
+      *
+      * @param[out]  aDataset  Where to place the dataset.
+      *
+      * @retval OT_ERROR_NONE       Successfully retrieved the dataset.
+      * @retval OT_ERROR_NOT_FOUND  There is no corresponding dataset stored in non-volatile memory.
+      *
+      */
+     otError Get(otOperationalDataset &aDataset) const { return mLocal.Get(aDataset); }
+ 
+     /**
+      * This method applies the Active or Pending Dataset to the Thread interface.
+      *
+-     * @retval OT_ERROR_NONE  Successfully applied configuration.
++     * @retval OT_ERROR_NONE   Successfully applied configuration.
++     * @retval OT_ERROR_PARSE  The dataset has at least one TLV with invalid format.
+      *
+      */
+     otError ApplyConfiguration(void) const;
+ 
+     /**
+      * This method updates the Operational Dataset when detaching from the network.
+      *
+      * On detach, the Operational Dataset is restored from non-volatile memory.
+      *
+      */
+     void HandleDetach(void);
+@@ -132,72 +133,75 @@ public:
+ protected:
+     /**
+      * This constructor initializes the object.
+      *
+      * @param[in]  aInstance      A reference to the OpenThread instance.
+      * @param[in]  aType          Identifies Active or Pending Operational Dataset.
+      * @param[in]  aUriGet        The URI-PATH for getting the Operational Dataset.
+      * @param[in]  aUriSet        The URI-PATH for setting the Operational Dataset.
+      * @param[in]  aTimerHandler  The registration timer handler.
+      *
+      */
+     DatasetManager(Instance &          aInstance,
+                    const Tlv::Type     aType,
+                    const char *        aUriGet,
+                    const char *        aUriSet,
+                    TimerMilli::Handler aTimerHandler);
+ 
+     /**
+      * This method clears the Operational Dataset.
+      *
+      */
+     void Clear(void);
+ 
+     /**
+      * This method sets the Operational Dataset in non-volatile memory.
+      *
+      * @param[in]  aDataset  The Operational Dataset.
+      *
++     * @retval OT_ERROR_NONE   Successfully applied configuration.
++     * @retval OT_ERROR_PARSE  The dataset has at least one TLV with invalid format.
++     *
+      */
+-    void Set(const Dataset &aDataset);
++    otError Set(const Dataset &aDataset);
+ 
+     /**
+      * This method sets the Operational Dataset for the partition.
+      *
+      * This method also updates the non-volatile version if the partition's Operational Dataset is newer.
+      *
+      * @param[in]  aTimestamp  The timestamp for the Operational Dataset.
+      * @param[in]  aMessage    The message buffer.
+      * @param[in]  aOffset     The offset where the Operational Dataset begins.
+      * @param[in]  aLength     The length of the Operational Dataset.
+      *
+      */
+     otError Set(const Timestamp &aTimestamp, const Message &aMessage, uint16_t aOffset, uint8_t aLength);
+ 
+     /**
+      * This method handles a MGMT_GET request message.
+      *
+      * @param[in]  aHeader       The CoAP header.
+      * @param[in]  aMessage      The CoAP message buffer.
+      * @param[in]  aMessageInfo  The message info.
+      *
+      */
+     void Get(const Coap::Header &aHeader, const Message &aMessage, const Ip6::MessageInfo &aMessageInfo) const;
+ 
+     /**
+      * This method compares the partition's Operational Dataset with that stored in non-volatile memory.
+      *
+      * If the partition's Operational Dataset is newer, the non-volatile storage is updated.
+      * If the partition's Operational Dataset is older, the registration process is started.
+      *
+      */
+     void HandleNetworkUpdate(void);
+ 
+     /**
+      * This method initiates a network data registration message with the Leader.
+      *
+      */
+     void HandleTimer(void);
+ 
+     DatasetLocal mLocal;
+     Timestamp    mTimestamp;
+     bool         mTimestampValid : 1;
+diff --git a/src/core/meshcop/dataset_manager_ftd.cpp b/src/core/meshcop/dataset_manager_ftd.cpp
+index 38d42f676..64ca6077c 100644
+--- a/src/core/meshcop/dataset_manager_ftd.cpp
++++ b/src/core/meshcop/dataset_manager_ftd.cpp
+@@ -93,235 +93,235 @@ exit:
+ otError DatasetManager::Set(Coap::Header &aHeader, Message &aMessage, const Ip6::MessageInfo &aMessageInfo)
+ {
+     ThreadNetif &   netif = GetNetif();
+     Tlv             tlv;
+     Timestamp *     timestamp;
+     uint16_t        offset = aMessage.GetOffset();
+     Tlv::Type       type;
+     bool            isUpdateFromCommissioner = false;
+     bool            doesAffectConnectivity   = false;
+     bool            doesAffectMasterKey      = false;
+     StateTlv::State state                    = StateTlv::kAccept;
+     Dataset         dataset(mLocal.GetType());
+ 
+     ActiveTimestampTlv       activeTimestamp;
+     PendingTimestampTlv      pendingTimestamp;
+     ChannelTlv               channel;
+     CommissionerSessionIdTlv sessionId;
+     MeshLocalPrefixTlv       meshLocalPrefix;
+     NetworkMasterKeyTlv      masterKey;
+     PanIdTlv                 panId;
+ 
+     mLocal.Get(dataset);
+ 
+     activeTimestamp.SetLength(0);
+     pendingTimestamp.SetLength(0);
+     channel.SetLength(0);
+     masterKey.SetLength(0);
+     meshLocalPrefix.SetLength(0);
+     panId.SetLength(0);
+     pendingTimestamp.SetLength(0);
+     sessionId.SetLength(0);
+ 
+     VerifyOrExit(netif.GetMle().GetRole() == OT_DEVICE_ROLE_LEADER, state = StateTlv::kReject);
+ 
+     // verify that TLV data size is less than maximum TLV value size
+     while (offset < aMessage.GetLength())
+     {
+         aMessage.Read(offset, sizeof(tlv), &tlv);
+         VerifyOrExit(tlv.GetLength() <= Dataset::kMaxValueSize, state = StateTlv::kReject);
+         offset += sizeof(tlv) + tlv.GetLength();
+     }
+ 
+     // verify that does not overflow dataset buffer
+     VerifyOrExit((offset - aMessage.GetOffset()) <= Dataset::kMaxSize, state = StateTlv::kReject);
+ 
+     type = (strcmp(mUriSet, OT_URI_PATH_ACTIVE_SET) == 0 ? Tlv::kActiveTimestamp : Tlv::kPendingTimestamp);
+ 
+     if (Tlv::GetTlv(aMessage, Tlv::kActiveTimestamp, sizeof(activeTimestamp), activeTimestamp) != OT_ERROR_NONE)
+     {
+         ExitNow(state = StateTlv::kReject);
+     }
+ 
+     VerifyOrExit(activeTimestamp.IsValid(), state = StateTlv::kReject);
+ 
+     if (Tlv::GetTlv(aMessage, Tlv::kPendingTimestamp, sizeof(pendingTimestamp), pendingTimestamp) == OT_ERROR_NONE)
+     {
+         VerifyOrExit(pendingTimestamp.IsValid(), state = StateTlv::kReject);
+     }
+ 
+     // verify the request includes a timestamp that is ahead of the locally stored value
+     timestamp = (type == Tlv::kActiveTimestamp) ? static_cast<Timestamp *>(&activeTimestamp)
+                                                 : static_cast<Timestamp *>(&pendingTimestamp);
+ 
+     VerifyOrExit(mLocal.Compare(timestamp) > 0, state = StateTlv::kReject);
+ 
+     // check channel
+     if (Tlv::GetTlv(aMessage, Tlv::kChannel, sizeof(channel), channel) == OT_ERROR_NONE)
+     {
+         VerifyOrExit(channel.IsValid() && channel.GetChannel() >= OT_RADIO_CHANNEL_MIN &&
+                          channel.GetChannel() <= OT_RADIO_CHANNEL_MAX,
+                      state = StateTlv::kReject);
+ 
+         if (channel.GetChannel() != netif.GetMac().GetChannel())
+         {
+             doesAffectConnectivity = true;
+         }
+     }
+ 
+     // check PAN ID
+     if (Tlv::GetTlv(aMessage, Tlv::kPanId, sizeof(panId), panId) == OT_ERROR_NONE && panId.IsValid() &&
+         panId.GetPanId() != netif.GetMac().GetPanId())
+     {
+         doesAffectConnectivity = true;
+     }
+ 
+     // check mesh local prefix
+     if (Tlv::GetTlv(aMessage, Tlv::kMeshLocalPrefix, sizeof(meshLocalPrefix), meshLocalPrefix) == OT_ERROR_NONE &&
+         meshLocalPrefix.IsValid() &&
+         memcmp(meshLocalPrefix.GetMeshLocalPrefix(), netif.GetMle().GetMeshLocalPrefix(), meshLocalPrefix.GetLength()))
+     {
+         doesAffectConnectivity = true;
+     }
+ 
+     // check network master key
+     if (Tlv::GetTlv(aMessage, Tlv::kNetworkMasterKey, sizeof(masterKey), masterKey) == OT_ERROR_NONE &&
+         masterKey.IsValid() &&
+         memcmp(&masterKey.GetNetworkMasterKey(), &netif.GetKeyManager().GetMasterKey(), OT_MASTER_KEY_SIZE))
+     {
+         doesAffectConnectivity = true;
+         doesAffectMasterKey    = true;
+     }
+ 
+     // check active timestamp rollback
+     if (type == Tlv::kPendingTimestamp &&
+         (masterKey.GetLength() == 0 ||
+          memcmp(&masterKey.GetNetworkMasterKey(), &netif.GetKeyManager().GetMasterKey(), OT_MASTER_KEY_SIZE) == 0))
+     {
+         // no change to master key, active timestamp must be ahead
+         const Timestamp *localActiveTimestamp = netif.GetActiveDataset().GetTimestamp();
+ 
+         VerifyOrExit(localActiveTimestamp == NULL || localActiveTimestamp->Compare(activeTimestamp) > 0,
+                      state = StateTlv::kReject);
+     }
+ 
+     // check commissioner session id
+     if (Tlv::GetTlv(aMessage, Tlv::kCommissionerSessionId, sizeof(sessionId), sessionId) == OT_ERROR_NONE)
+     {
+         CommissionerSessionIdTlv *localId;
+ 
+         isUpdateFromCommissioner = true;
+ 
+         localId = static_cast<CommissionerSessionIdTlv *>(
+             netif.GetNetworkDataLeader().GetCommissioningDataSubTlv(Tlv::kCommissionerSessionId));
+ 
+         VerifyOrExit(sessionId.IsValid() && localId != NULL &&
+                          localId->GetCommissionerSessionId() == sessionId.GetCommissionerSessionId(),
+                      state = StateTlv::kReject);
+     }
+ 
+     // verify an MGMT_ACTIVE_SET.req from a Commissioner does not affect connectivity
+     VerifyOrExit(!isUpdateFromCommissioner || type == Tlv::kPendingTimestamp || !doesAffectConnectivity,
+                  state = StateTlv::kReject);
+ 
+     // update dataset
+     // Thread specification allows partial dataset changes for MGMT_ACTIVE_SET.req/MGMT_PENDING_SET.req
+     // from Commissioner.
+     // Updates based on existing active/pending dataset if it is from Commissioner.
+     if (isUpdateFromCommissioner)
+     {
+         // take active dataset as the update base for MGMT_PENDING_SET.req if no existing pending dataset.
+         if (type == Tlv::kPendingTimestamp && dataset.GetSize() == 0)
+         {
+             netif.GetActiveDataset().Get(dataset);
+         }
+     }
+ 
+ #if 0
+     // Interim workaround for certification:
+     // Thread specification requires entire dataset for MGMT_ACTIVE_SET.req/MGMT_PENDING_SET.req from thread device.
+     // Not all stack vendors would send entire dataset in MGMT_ACTIVE_SET.req triggered by command as known when
+     // testing 9.2.5.
+     // So here would accept even if it is not entire, update the Tlvs in the message on existing dataset in
+     // order to avoid interop issue for now.
+     // TODO: remove '#if 0' condition after all stack vendors reach consensus-MGMT_ACTIVE_SET.req/MGMT_PENDING_SET.req
+     // from thread device triggered by command would include entire dataset as expected.
+     else
+     {
+         dataset.Clear();
+     }
+ 
+ #endif
+ 
+     if (type == Tlv::kPendingTimestamp || !doesAffectConnectivity)
+     {
+         offset = aMessage.GetOffset();
+ 
+         while (offset < aMessage.GetLength())
+         {
+             OT_TOOL_PACKED_BEGIN
+             struct
+             {
+                 Tlv     tlv;
+                 uint8_t value[Dataset::kMaxValueSize];
+             } OT_TOOL_PACKED_END data;
+ 
+             aMessage.Read(offset, sizeof(Tlv), &data.tlv);
+             VerifyOrExit(data.tlv.GetLength() <= sizeof(data.value), state = StateTlv::kReject);
+ 
+             aMessage.Read(offset + sizeof(Tlv), data.tlv.GetLength(), data.value);
+ 
+             switch (data.tlv.GetType())
+             {
+             case Tlv::kCommissionerSessionId:
+                 // do not store Commissioner Session ID TLV
+                 break;
+ 
+             case Tlv::kDelayTimer:
+             {
+                 DelayTimerTlv *delayTimerTlv = static_cast<DelayTimerTlv *>(&data.tlv);
+ 
+                 if (doesAffectMasterKey && delayTimerTlv->GetDelayTimer() < DelayTimerTlv::kDelayTimerDefault)
+                 {
+                     delayTimerTlv->SetDelayTimer(DelayTimerTlv::kDelayTimerDefault);
+                 }
+                 else if (delayTimerTlv->GetDelayTimer() < netif.GetLeader().GetDelayTimerMinimal())
+                 {
+                     delayTimerTlv->SetDelayTimer(netif.GetLeader().GetDelayTimerMinimal());
+                 }
+             }
+ 
+                 // fall through
+ 
+             default:
+                 VerifyOrExit(dataset.Set(data.tlv) == OT_ERROR_NONE, state = StateTlv::kReject);
+                 break;
+             }
+ 
+             offset += sizeof(Tlv) + data.tlv.GetLength();
+         }
+ 
+-        Set(dataset);
++        VerifyOrExit(Set(dataset) == OT_ERROR_NONE, state = StateTlv::kReject);
+         netif.GetNetworkDataLeader().IncrementVersion();
+         netif.GetNetworkDataLeader().IncrementStableVersion();
+     }
+     else
+     {
+         netif.GetPendingDataset().ApplyActiveDataset(activeTimestamp, aMessage);
+     }
+ 
+     // notify commissioner if update is from thread device
+     if (!isUpdateFromCommissioner)
+     {
+         BorderAgentLocatorTlv *borderAgentLocator;
+         Ip6::Address           destination;
+ 
+         borderAgentLocator = static_cast<BorderAgentLocatorTlv *>(
+             netif.GetNetworkDataLeader().GetCommissioningDataSubTlv(Tlv::kBorderAgentLocator));
+         VerifyOrExit(borderAgentLocator != NULL);
+ 
+         memset(&destination, 0, sizeof(destination));
+         destination                = netif.GetMle().GetMeshLocal16();
+         destination.mFields.m16[7] = HostSwap16(borderAgentLocator->GetBorderAgentLocator());
+ 
+         netif.GetLeader().SendDatasetChanged(destination);
+     }
+diff --git a/src/core/meshcop/meshcop_tlvs.cpp b/src/core/meshcop/meshcop_tlvs.cpp
+index 515b1aa08..46d095db8 100644
+--- a/src/core/meshcop/meshcop_tlvs.cpp
++++ b/src/core/meshcop/meshcop_tlvs.cpp
+@@ -36,6 +36,51 @@
+ namespace ot {
+ namespace MeshCoP {
+ 
++bool Tlv::IsValid(const Tlv &aTlv)
++{
++    bool rval = true;
++
++    switch (aTlv.GetType())
++    {
++    case Tlv::kChannel:
++        rval = static_cast<const ChannelTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kPanId:
++        rval = static_cast<const PanIdTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kExtendedPanId:
++        rval = static_cast<const ExtendedPanIdTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kNetworkName:
++        rval = static_cast<const NetworkNameTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kNetworkMasterKey:
++        rval = static_cast<const NetworkMasterKeyTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kPSKc:
++        rval = static_cast<const PSKcTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kMeshLocalPrefix:
++        rval = static_cast<const MeshLocalPrefixTlv &>(aTlv).IsValid();
++        break;
++
++    case Tlv::kSecurityPolicy:
++        rval = static_cast<const SecurityPolicyTlv &>(aTlv).IsValid();
++        break;
++
++    default:
++        break;
++    }
++
++    return rval;
++}
++
+ bool SteeringDataTlv::IsCleared(void) const
+ {
+     bool rval = true;
+diff --git a/src/core/meshcop/meshcop_tlvs.hpp b/src/core/meshcop/meshcop_tlvs.hpp
+index d41ca829a..508d58373 100644
+--- a/src/core/meshcop/meshcop_tlvs.hpp
++++ b/src/core/meshcop/meshcop_tlvs.hpp
+@@ -63,112 +63,122 @@ class Tlv : public ot::Tlv
+ {
+ public:
+     /**
+      * MeshCoP TLV Types.
+      *
+      */
+     enum Type
+     {
+         kChannel                 = OT_MESHCOP_TLV_CHANNEL,                  ///< Channel TLV
+         kPanId                   = OT_MESHCOP_TLV_PANID,                    ///< PAN ID TLV
+         kExtendedPanId           = OT_MESHCOP_TLV_EXTPANID,                 ///< Extended PAN ID TLV
+         kNetworkName             = OT_MESHCOP_TLV_NETWORKNAME,              ///< Newtork Name TLV
+         kPSKc                    = OT_MESHCOP_TLV_PSKC,                     ///< PSKc TLV
+         kNetworkMasterKey        = OT_MESHCOP_TLV_MASTERKEY,                ///< Network Master Key TLV
+         kNetworkKeySequence      = OT_MESHCOP_TLV_NETWORK_KEY_SEQUENCE,     ///< Network Key Sequence TLV
+         kMeshLocalPrefix         = OT_MESHCOP_TLV_MESHLOCALPREFIX,          ///< Mesh Local Prefix TLV
+         kSteeringData            = OT_MESHCOP_TLV_STEERING_DATA,            ///< Steering Data TLV
+         kBorderAgentLocator      = OT_MESHCOP_TLV_BORDER_AGENT_RLOC,        ///< Border Agent Locator TLV
+         kCommissionerId          = OT_MESHCOP_TLV_COMMISSIONER_ID,          ///< Commissioner ID TLV
+         kCommissionerSessionId   = OT_MESHCOP_TLV_COMM_SESSION_ID,          ///< Commissioner Session ID TLV
+         kSecurityPolicy          = OT_MESHCOP_TLV_SECURITYPOLICY,           ///< Security Policy TLV
+         kGet                     = OT_MESHCOP_TLV_GET,                      ///< Get TLV
+         kActiveTimestamp         = OT_MESHCOP_TLV_ACTIVETIMESTAMP,          ///< Active Timestamp TLV
+         kState                   = OT_MESHCOP_TLV_STATE,                    ///< State TLV
+         kJoinerDtlsEncapsulation = OT_MESHCOP_TLV_JOINER_DTLS,              ///< Joiner DTLS Encapsulation TLV
+         kJoinerUdpPort           = OT_MESHCOP_TLV_JOINER_UDP_PORT,          ///< Joiner UDP Port TLV
+         kJoinerIid               = OT_MESHCOP_TLV_JOINER_IID,               ///< Joiner IID TLV
+         kJoinerRouterLocator     = OT_MESHCOP_TLV_JOINER_RLOC,              ///< Joiner Router Locator TLV
+         kJoinerRouterKek         = OT_MESHCOP_TLV_JOINER_ROUTER_KEK,        ///< Joiner Router KEK TLV
+         kProvisioningUrl         = OT_MESHCOP_TLV_PROVISIONING_URL,         ///< Provisioning URL TLV
+         kVendorName              = OT_MESHCOP_TLV_VENDOR_NAME_TLV,          ///< meshcop Vendor Name TLV
+         kVendorModel             = OT_MESHCOP_TLV_VENDOR_MODEL_TLV,         ///< meshcop Vendor Model TLV
+         kVendorSwVersion         = OT_MESHCOP_TLV_VENDOR_SW_VERSION_TLV,    ///< meshcop Vendor SW Version TLV
+         kVendorData              = OT_MESHCOP_TLV_VENDOR_DATA_TLV,          ///< meshcop Vendor Data TLV
+         kVendorStackVersion      = OT_MESHCOP_TLV_VENDOR_STACK_VERSION_TLV, ///< meshcop Vendor Stack Version TLV
+         kPendingTimestamp        = OT_MESHCOP_TLV_PENDINGTIMESTAMP,         ///< Pending Timestamp TLV
+         kDelayTimer              = OT_MESHCOP_TLV_DELAYTIMER,               ///< Delay Timer TLV
+         kChannelMask             = OT_MESHCOP_TLV_CHANNELMASK,              ///< Channel Mask TLV
+         kCount                   = OT_MESHCOP_TLV_COUNT,                    ///< Count TLV
+         kPeriod                  = OT_MESHCOP_TLV_PERIOD,                   ///< Period TLV
+         kScanDuration            = OT_MESHCOP_TLV_SCAN_DURATION,            ///< Scan Duration TLV
+         kEnergyList              = OT_MESHCOP_TLV_ENERGY_LIST,              ///< Energy List TLV
+         kDiscoveryRequest        = OT_MESHCOP_TLV_DISCOVERYREQUEST,         ///< Discovery Request TLV
+         kDiscoveryResponse       = OT_MESHCOP_TLV_DISCOVERYRESPONSE,        ///< Discovery Response TLV
+     };
+ 
+     /**
+      * This method returns the Type value.
+      *
+      * @returns The Type value.
+      *
+      */
+     Type GetType(void) const { return static_cast<Type>(ot::Tlv::GetType()); }
+ 
+     /**
+      * This method sets the Type value.
+      *
+      * @param[in]  aType  The Type value.
+      *
+      */
+     void SetType(Type aType) { ot::Tlv::SetType(static_cast<uint8_t>(aType)); }
+ 
+     /**
+      * This method returns a pointer to the next TLV.
+      *
+      * @returns A pointer to the next TLV.
+      *
+      */
+     Tlv *GetNext(void) { return static_cast<Tlv *>(ot::Tlv::GetNext()); }
+ 
+     const Tlv *GetNext(void) const { return static_cast<const Tlv *>(ot::Tlv::GetNext()); }
+ 
+     /**
+      * This static method reads the requested TLV out of @p aMessage.
+      *
+      * @param[in]   aMessage    A reference to the message.
+      * @param[in]   aType       The Type value to search for.
+      * @param[in]   aMaxLength  Maximum number of bytes to read.
+      * @param[out]  aTlv        A reference to the TLV that will be copied to.
+      *
+      * @retval OT_ERROR_NONE       Successfully copied the TLV.
+      * @retval OT_ERROR_NOT_FOUND  Could not find the TLV with Type @p aType.
+      *
+      */
+     static otError GetTlv(const Message &aMessage, Type aType, uint16_t aMaxLength, Tlv &aTlv)
+     {
+         return ot::Tlv::Get(aMessage, static_cast<uint8_t>(aType), aMaxLength, aTlv);
+     }
+ 
+     /**
+      * This static method finds the offset and length of a given TLV type.
+      *
+      * @param[in]   aMessage    A reference to the message.
+      * @param[in]   aType       The Type value to search for.
+      * @param[out]  aOffset     The offset where the value starts.
+      * @param[out]  aLength     The length of the value.
+      *
+      * @retval OT_ERROR_NONE       Successfully found the TLV.
+      * @retval OT_ERROR_NOT_FOUND  Could not find the TLV with Type @p aType.
+      *
+      */
+     static otError GetValueOffset(const Message &aMessage, Type aType, uint16_t &aOffset, uint16_t &aLength)
+     {
+         return ot::Tlv::GetValueOffset(aMessage, static_cast<uint8_t>(aType), aOffset, aLength);
+     }
+ 
++    /**
++     * This static method indicates whether a TLV appears to be well-formed.
++     *
++     * @param[in]  aTlv  A reference to the TLV.
++     *
++     * @returns TRUE if the TLV appears to be well-formed, FALSE otherwise.
++     *
++     */
++    static bool IsValid(const Tlv &aTlv);
++
+ } OT_TOOL_PACKED_END;
+ 
+ /**
+  * This class implements Channel TLV generation and parsing.
+  *
+  */

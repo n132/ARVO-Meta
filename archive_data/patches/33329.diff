@@ -1,0 +1,386 @@
+commit 0c13c3e550fddbb5544e56947843f282dd08468c
+Author: Volodymyr Shymanskyy <vshymanskyi@gmail.com>
+Date:   Sat Apr 17 23:15:34 2021 +0300
+
+    Improve backtraces
+
+diff --git a/platforms/app/main.c b/platforms/app/main.c
+index 7f9f264..7c63cc6 100644
+--- a/platforms/app/main.c
++++ b/platforms/app/main.c
+@@ -64,83 +64,93 @@ m3ApiRawFunction(metering_usegas)
+ M3Result link_all  (IM3Module module)
+ {
+     M3Result res;
+     res = m3_LinkSpecTest (module);
+     if (res) return res;
+ 
+     res = m3_LinkLibC (module);
+     if (res) return res;
+ 
+ #if defined(LINK_WASI)
+     res = m3_LinkWASI (module);
+     if (res) return res;
+ #endif
+ 
+ #if defined(d_m3HasTracer)
+     res = m3_LinkTracer (module);
+     if (res) return res;
+ #endif
+ 
+ #if defined(GAS_LIMIT)
+     res = m3_LinkRawFunction (module, "metering", "usegas", "v(i)", &metering_usegas);
+     if (!res) {
+         fprintf(stderr, "Warning: Gas is limited to %0.4f\n", (double)(current_gas) / GAS_FACTOR);
+         is_gas_metered = true;
+     }
+     if (res == m3Err_functionLookupFailed) { res = NULL; }
+ #endif
+ 
+     return res;
+ }
+ 
++const char* moduleNameFromFn(const char* fn)
++{
++	const char* off = strrchr(fn, '/');
++	if (off) return off+1;
++	off = strrchr(fn, '\\');
++	if (off) return off+1;
++	return fn;
++}
+ 
+ M3Result repl_load  (const char* fn)
+ {
+     M3Result result = m3Err_none;
+ 
+     u8* wasm = NULL;
+     u32 fsize = 0;
+ 
+     FILE* f = fopen (fn, "rb");
+     if (!f) {
+         return "cannot open file";
+     }
+     fseek (f, 0, SEEK_END);
+     fsize = ftell(f);
+     fseek (f, 0, SEEK_SET);
+ 
+     if (fsize < 8) {
+         result = "file is too small";
+         goto on_error;
+     } else if (fsize > 64*1024*1024) {
+         result = "file is too big";
+         goto on_error;
+     }
+ 
+     wasm = (u8*) malloc(fsize);
+     if (!wasm) {
+         result = "cannot allocate memory for wasm binary";
+         goto on_error;
+     }
+ 
+     if (fread (wasm, 1, fsize, f) != fsize) {
+         result = "cannot read file";
+         goto on_error;
+     }
+     fclose (f);
+     f = NULL;
+ 
+     IM3Module module;
+     result = m3_ParseModule (env, &module, wasm, fsize);
+     if (result) goto on_error;
+ 
+     result = m3_LoadModule (runtime, module);
+     if (result) goto on_error;
+ 
++    m3_SetModuleName(module, moduleNameFromFn(fn));
++
+     result = link_all (module);
+     if (result) goto on_error;
+ 
+     if (wasm_bins_qty < MAX_MODULES) {
+         wasm_bins[wasm_bins_qty++] = wasm;
+     }
+ 
+     return result;
+diff --git a/source/m3_env.c b/source/m3_env.c
+index 9a3e233..6805c5b 100644
+--- a/source/m3_env.c
++++ b/source/m3_env.c
+@@ -559,8 +559,12 @@ _   (InitDataSegments (memory, io_module));
+ _   (InitElements (io_module));
+ 
+     // Start func might use imported functions, which are not liked here yet,
+     // so it will be called before a function call is attempted (in m3_FindFunction)
+ 
++#ifdef DEBUG
++    Module_GenerateNames(io_module);
++#endif
++
+     io_module->next = io_runtime->modules;
+     io_runtime->modules = io_module;
+     return result; // ok
+diff --git a/source/m3_env.h b/source/m3_env.h
+index 5f5c482..33d0e00 100644
+--- a/source/m3_env.h
++++ b/source/m3_env.h
+@@ -123,6 +123,8 @@ M3Result                    Module_AddGlobal            (IM3Module io_module, IM
+ M3Result                    Module_AddFunction          (IM3Module io_module, u32 i_typeIndex, IM3ImportInfo i_importInfo /* can be null */);
+ IM3Function                 Module_GetFunction          (IM3Module i_module, u32 i_functionIndex);
+ 
++void                        Module_GenerateNames        (IM3Module i_module);
++
+ void                        FreeImportInfo              (M3ImportInfo * i_info);
+ 
+ //---------------------------------------------------------------------------------------------------------------------------------
+diff --git a/source/m3_exec.h b/source/m3_exec.h
+index fc69524..154d534 100644
+--- a/source/m3_exec.h
++++ b/source/m3_exec.h
+@@ -718,66 +718,60 @@ d_m3Op  (Compile)
+ d_m3Op  (Entry)
+ {
+     d_m3ClearRegisters
+ 
+     d_m3TracePrepare
+ 
+     IM3Function function = immediate (IM3Function);
+     IM3Memory memory = m3MemInfo (_mem);
+ 
+ #if d_m3SkipStackCheck
+     if (true)
+ #else
+     if (LIKELY((void *)((m3slot_t *) _sp + function->maxStackSlots) < _mem->maxStack))
+ #endif
+     {
+ #if defined(DEBUG)
+         function->hits++;
+ #endif
+         u8 * stack = (u8 *) ((m3slot_t *) _sp + function->numRetAndArgSlots);
+ 
+         memset (stack, 0x0, function->numLocalBytes);
+         stack += function->numLocalBytes;
+ 
+         if (function->constants)
+         {
+             memcpy (stack, function->constants, function->numConstantBytes);
+         }
+ 
+ #if d_m3EnableStrace >= 2
+-        u16 numNames = 0;
+-        cstr_t *names = GetFunctionNames(function, &numNames);
+-        if (numNames) {
+-            d_m3TracePrint("%s %s {", names[0], SPrintFunctionArgList (function, _sp));
+-        } else {
+-            d_m3TracePrint("$%d %s {", function->index, SPrintFunctionArgList (function, _sp));
+-        }
++        d_m3TracePrint("%s %s {", m3_GetFunctionName(function), SPrintFunctionArgList (function, _sp));
+         trace_rt->callDepth++;
+ #endif
+ 
+         m3ret_t r = nextOpImpl ();
+ 
+ #if d_m3EnableStrace >= 2
+         trace_rt->callDepth--;
+ 
+         if (r) {
+             d_m3TracePrint("} !trap = %s", (char*)r);
+         } else {
+             int rettype = GetSingleRetType(function->funcType);
+             if (rettype != c_m3Type_none) {
+                 char str [128] = { 0 };
+                 SPrintArg (str, 127, _sp, rettype);
+                 d_m3TracePrint("} = %s", str);
+             } else {
+                 d_m3TracePrint("}");
+             }
+         }
+ #endif
+ 
+         if (UNLIKELY(r)) {
+             _mem = memory->mallocated;
+             fillBacktraceFrame ();
+         }
+         forwardTrap (r);
+     }
+     else newTrap (m3Err_trapStackOverflow);
+ }
+diff --git a/source/m3_function.h b/source/m3_function.h
+index c9f756b..46418e6 100644
+--- a/source/m3_function.h
++++ b/source/m3_function.h
+@@ -37,42 +37,38 @@ u8          GetFuncTypeReturnType           (const IM3FuncType i_funcType, u16 i
+ typedef struct M3Function
+ {
+     struct M3Module *       module;
+ 
+     M3ImportInfo            import;
+ 
+     bytes_t                 wasm;
+     bytes_t                 wasmEnd;
+ 
+     u16                     numNames;                               // maximum of d_m3MaxDuplicateFunctionImpl
+     cstr_t                  names[d_m3MaxDuplicateFunctionImpl];
+ 
+     IM3FuncType             funcType;
+ 
+     pc_t                    compiled;
+ 
+ #if (d_m3EnableCodePageRefCounting)
+     IM3CodePage *           codePageRefs;                           // array of all pages used
+     u32                     numCodePageRefs;
+ #endif
+ 
+ #if defined(DEBUG)
+     u32                     hits;
+ #endif
+ 
+-# if d_m3EnableStrace >= 2 || d_m3LogCompile
+-    u32                     index;
+-# endif
+-
+     u16                     maxStackSlots;
+ 
+     u16                     numRetSlots;
+     u16                     numRetAndArgSlots;
+ 
+     u16                     numLocals;                              // not including args
+     u16                     numLocalBytes;
+ 
+     bool                    ownsWasmCode;
+ 
+     u16                     numConstantBytes;
+     void *                  constants;
+ }
+diff --git a/source/m3_module.c b/source/m3_module.c
+index eeb6fdb..babb511 100644
+--- a/source/m3_module.c
++++ b/source/m3_module.c
+@@ -74,30 +74,53 @@ M3Result  Module_AddFunction  (IM3Module io_module, u32 i_typeIndex, IM3ImportIn
+ _try {
+     u32 index = io_module->numFunctions++;
+     io_module->functions = m3_ReallocArray (M3Function, io_module->functions, io_module->numFunctions, index);
+     _throwifnull(io_module->functions);
+     _throwif("type sig index out of bounds", i_typeIndex >= io_module->numFuncTypes);
+ 
+     IM3FuncType ft = io_module->funcTypes [i_typeIndex];
+ 
+     IM3Function func = Module_GetFunction (io_module, index);
+     func->funcType = ft;
+-#if d_m3EnableStrace >= 2 || d_m3LogCompile
+-    func->index = index;
+-#endif
+ 
+     if (i_importInfo and func->numNames == 0)
+     {
+         func->import = * i_importInfo;
+-        func->numNames = 1;
+         func->names[0] = i_importInfo->fieldUtf8;
++        func->numNames = 1;
+     }
+ 
+     m3log (module, "   added function: %3d; sig: %d", index, i_typeIndex);
+ 
+ } _catch:
+     return result;
+ }
+ 
++void  Module_GenerateNames  (IM3Module i_module)
++{
++    for (u32 i = 0; i < i_module->numFunctions; ++i)
++    {
++        IM3Function func = & i_module->functions [i];
++
++        if (func->numNames == 0)
++        {
++            char* buff = m3_AllocArray(char, 16);
++            snprintf(buff, 16, "$func%d", i);
++            func->names[0] = buff;
++            func->numNames = 1;
++        }
++    }
++    for (u32 i = 0; i < i_module->numGlobals; ++i)
++    {
++        IM3Global global = & i_module->globals [i];
++
++        if (global->name == NULL)
++        {
++            char* buff = m3_AllocArray(char, 16);
++            snprintf(buff, 16, "$global%d", i);
++            global->name = buff;
++        }
++    }
++}
+ 
+ IM3Function  Module_GetFunction  (IM3Module i_module, u32 i_functionIndex)
+ {
+diff --git a/source/m3_parse.c b/source/m3_parse.c
+index 81f55f5..4ea7bb1 100644
+--- a/source/m3_parse.c
++++ b/source/m3_parse.c
+@@ -125,8 +125,10 @@ M3Result  ParseSection_Function  (IM3Module io_module, bytes_t i_bytes, cbytes_t
+     u32 numFunctions;
+ _   (ReadLEB_u32 (& numFunctions, & i_bytes, i_end));                               m3log (parse, "** Function [%d]", numFunctions);
+ 
+     _throwif("too many functions", numFunctions > d_m3MaxSaneFunctionsCount);
+ 
++    // TODO: prealloc functions
++
+     for (u32 i = 0; i < numFunctions; ++i)
+     {
+         u32 funcTypeIndex;
+@@ -234,22 +236,23 @@ _       (Read_u8 (& exportKind, & i_bytes, i_end));
+ _       (ReadLEB_u32 (& index, & i_bytes, i_end));                                  m3log (parse, "    index: %3d; kind: %d; export: '%s'; ", index, (u32) exportKind, utf8);
+ 
+         if (exportKind == d_externalKind_function)
+         {
+             _throwif(m3Err_wasmMalformed, index >= io_module->numFunctions);
+-            u16 numNames = io_module->functions [index].numNames;
+-            if (numNames < d_m3MaxDuplicateFunctionImpl)
++            IM3Function func = &(io_module->functions [index]);
++            if (func->numNames < d_m3MaxDuplicateFunctionImpl)
+             {
+-                io_module->functions [index].numNames++;
+-                io_module->functions [index].names[numNames] = utf8;
++                func->names[func->numNames++] = utf8;
+                 utf8 = NULL; // ownership transferred to M3Function
+             }
+         }
+         else if (exportKind == d_externalKind_global)
+         {
+             _throwif(m3Err_wasmMalformed, index >= io_module->numGlobals);
+-            io_module->globals[index].name = utf8;
++            IM3Global global = &(io_module->globals [index]);
++            m3_Free (global->name);
++            global->name = utf8;
+             utf8 = NULL; // ownership transferred to M3Global
+         }
+ 
+         m3_Free (utf8);
+     }
+@@ -505,22 +508,23 @@ _               (ReadLEB_u32 (& index, & i_bytes, i_end));
+ _               (Read_utf8 (& name, & i_bytes, i_end));
+ 
+                 if (index < io_module->numFunctions)
+                 {
+-                    if (io_module->functions [index].numNames == 0)
++                    IM3Function func = &(io_module->functions [index]);
++                    if (func->numNames == 0)
+                     {
+-                        io_module->functions [index].numNames = 1;
+-                        io_module->functions [index].names[0] = name;        m3log (parse, "    naming function%5d:  %s", index, name);
++                        func->names[0] = name;        m3log (parse, "    naming function%5d:  %s", index, name);
++                        func->numNames = 1;
+                         name = NULL; // transfer ownership
+                     }
+ //                          else m3log (parse, "prenamed: %s", io_module->functions [index].name);
+                 }
+ 
+                 m3_Free (name);
+             }
+         }
+ 
+         i_bytes = start + payloadLength;
+     }
+ 
+     _catch: return result;
+ }

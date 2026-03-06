@@ -1,0 +1,164 @@
+commit 41a641203d9eba9469416f9e87ff241ed4f743a7
+Author: Dan Bloomberg <dan.bloomberg@gmail.com>
+Date:   Sat Jun 22 14:14:39 2019 -0700
+
+    even.rouault@gmail.com fixed two difficult bugs in tiffio found by oss-fuzz
+    
+    Issues 14773 (heap buffer overflow), 15269 (uninitialized value).
+    Both fixes handle fuzzing overflows: a 64 bit overflow in the read from
+    buffer callback, and a 32 bit overflow in size_t (which is 32 bits in
+    32 bit systems).  The readback issue can also be triggered when
+    using versions of tifflib before 4.0, which used uint32 for t_off.
+
+diff --git a/prog/comparetest.c b/prog/comparetest.c
+index 775f537..1f19183 100644
+--- a/prog/comparetest.c
++++ b/prog/comparetest.c
+@@ -66,93 +66,90 @@ PIX         *pixs1, *pixs2, *pixd;
+ static char  mainName[] = "comparetest";
+ 
+     if (argc != 5)
+         return ERROR_INT(" Syntax:  comparetest filein1 filein2 type fileout",
+                          mainName, 1);
+     filein1 = argv[1];
+     filein2 = argv[2];
+     type = atoi(argv[3]);
+     pixd = NULL;
+     fileout = argv[4];
+     setLeptDebugOK(1);
+ 
+         /* If comparing image files with 16 bps and spp > 1,
+          * comment this line out to strip 16 --> 8 spp */
+     l_pngSetReadStrip16To8(0);
+ 
+     if ((pixs1 = pixRead(filein1)) == NULL)
+         return ERROR_INT("pixs1 not made", mainName, 1);
+     if ((pixs2 = pixRead(filein2)) == NULL)
+         return ERROR_INT("pixs2 not made", mainName, 1);
+     d1 = pixGetDepth(pixs1);
+     d2 = pixGetDepth(pixs2);
+ 
+     if (d1 == 1 && d2 == 1) {
+         pixEqual(pixs1, pixs2, &same);
+         if (same) {
+             fprintf(stderr, "Images are identical\n");
+             pixd = pixCreateTemplate(pixs1);  /* write empty pix for diff */
+         } else {
+             if (type == 0)
+                 comptype = L_COMPARE_XOR;
+             else
+                 comptype = L_COMPARE_SUBTRACT;
+             pixCompareBinary(pixs1, pixs2, comptype, &fract, &pixd);
+             fprintf(stderr, "Fraction of different pixels: %10.6f\n", fract);
+         }
+         pixWrite(fileout, pixd, IFF_PNG);
+     } else {
+         if (type == 0)
+             comptype = L_COMPARE_ABS_DIFF;
+         else
+             comptype = L_COMPARE_SUBTRACT;
+         pixCompareGrayOrRGB(pixs1, pixs2, comptype, GPLOT_PNG, &same, &diff,
+                             &rmsdiff, &pixd);
+         if (type == 0) {
+             if (same)
+                 fprintf(stderr, "Images are identical\n");
+             else {
+                 fprintf(stderr, "Images differ: <diff> = %10.6f\n", diff);
+                 fprintf(stderr, "               <rmsdiff> = %10.6f\n", rmsdiff);
+             }
+         }
+         else {  /* subtraction */
+             if (same)
+                 fprintf(stderr, "pixs2 strictly greater than pixs1\n");
+             else {
+                 fprintf(stderr, "Images differ: <diff> = %10.6f\n", diff);
+                 fprintf(stderr, "               <rmsdiff> = %10.6f\n", rmsdiff);
+             }
+         }
+         if (d1 != 16)
+             pixWrite(fileout, pixd, IFF_JFIF_JPEG);
+         else
+             pixWrite(fileout, pixd, IFF_PNG);
+ 
+         if (d1 != 16 && !same) {
+             na1 = pixCompareRankDifference(pixs1, pixs2, 1);
+             if (na1) {
+-                fprintf(stderr, "na1[150] = %20.10f\n", na1->array[150]);
+-                fprintf(stderr, "na1[200] = %20.10f\n", na1->array[200]);
+-                fprintf(stderr, "na1[250] = %20.10f\n", na1->array[250]);
+                 numaGetNonzeroRange(na1, 0.00005, &first, &last);
+                 fprintf(stderr, "Nonzero diff range: first = %d, last = %d\n",
+                         first, last);
+                 na2 = numaClipToInterval(na1, first, last);
+                 gplot = gplotCreate("/tmp/lept/comp/rank", GPLOT_PNG,
+                                     "Pixel Rank Difference",
+                                     "pixel val difference", "rank");
+                 gplotAddPlot(gplot, NULL, na2, GPLOT_LINES, "rank");
+                 gplotMakeOutput(gplot);
+                 gplotDestroy(&gplot);
+                 l_fileDisplay("/tmp/lept/comp/rank.png", 100, 100, 1.0);
+                 numaDestroy(&na1);
+                 numaDestroy(&na2);
+             }
+         }
+     }
+ 
+     pixDestroy(&pixs1);
+     pixDestroy(&pixs2);
+     pixDestroy(&pixd);
+     return 0;
+ }
+diff --git a/src/tiffio.c b/src/tiffio.c
+index cd59a83..5a761ff 100644
+--- a/src/tiffio.c
++++ b/src/tiffio.c
+@@ -2344,15 +2344,16 @@ L_MEMSTREAM  *mstream;
+ size_t        amount;
+ 
+     mstream = (L_MEMSTREAM *)handle;
+     amount = L_MIN((size_t)length, mstream->hw - mstream->offset);
+ 
+         /* Fuzzed files can create this condition! */
+-    if (mstream->offset + amount > mstream->hw) {
++    if (mstream->offset + amount < amount ||  /* overflow */
++        mstream->offset + amount > mstream->hw) {
+         fprintf(stderr, "Bad file: amount too big: %zu\n", amount);
+         return 0;
+     }
+ 
+     memcpy(data, mstream->buffer + mstream->offset, amount);
+     mstream->offset += amount;
+     return amount;
+ }
+@@ -2390,28 +2391,31 @@ tiffSeekCallback(thandle_t  handle,
+                  toff_t     offset,
+                  l_int32    whence)
+ {
+ L_MEMSTREAM  *mstream;
+ 
+     PROCNAME("tiffSeekCallback");
+     mstream = (L_MEMSTREAM *)handle;
+     switch (whence) {
+         case SEEK_SET:
+ /*            fprintf(stderr, "seek_set: offset = %d\n", offset); */
++            if((size_t)offset != offset) {  /* size_t overflow on uint32 */
++                return (toff_t)ERROR_INT("too large offset value", procName, 1);
++            }
+             mstream->offset = offset;
+             break;
+         case SEEK_CUR:
+ /*            fprintf(stderr, "seek_cur: offset = %d\n", offset); */
+             mstream->offset += offset;
+             break;
+         case SEEK_END:
+ /*            fprintf(stderr, "seek end: hw = %d, offset = %d\n",
+                     mstream->hw, offset); */
+             mstream->offset = mstream->hw - offset;  /* offset >= 0 */
+             break;
+         default:
+             return (toff_t)ERROR_INT("bad whence value", procName,
+                                      mstream->offset);
+     }
+ 
+     return mstream->offset;
+ }

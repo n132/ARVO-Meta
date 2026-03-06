@@ -1,0 +1,303 @@
+commit bb9303899b8bd7a9251a723393959c923d0c0196
+Author: Ilya Maximets <i.maximets@ovn.org>
+Date:   Mon Oct 19 17:14:37 2020 +0200
+
+    odp-util: Fix overflow of nested netlink attributes.
+    
+    Length of nested attributes must be checked before storing to the
+    header.  If current length exceeds the maximum value parsing should
+    fail, otherwise the length value will be truncated leading to
+    corrupted netlink message and out-of-bound memory accesses:
+    
+      ERROR: AddressSanitizer: heap-buffer-overflow on address 0x6310002cc838
+             at pc 0x000000575470 bp 0x7ffc6c322d60 sp 0x7ffc6c322d58
+      READ of size 1 at 0x6310002cc838 thread T0
+      SCARINESS: 12 (1-byte-read-heap-buffer-overflow)
+        #0 0x57546f in format_generic_odp_key lib/odp-util.c:2738:39
+        #1 0x559e70 in check_attr_len lib/odp-util.c:3572:13
+        #2 0x56581a in format_odp_key_attr lib/odp-util.c:4392:9
+        #3 0x5563b9 in format_odp_action lib/odp-util.c:1192:9
+        #4 0x555d75 in format_odp_actions lib/odp-util.c:1279:13
+        ...
+    
+    Fix that by checking the length of nested netlink attributes before
+    updating 'nla_len' inside the header.  Additionally introduced
+    assertion inside nl_msg_end_nested() to catch this kind of issues
+    before actual overflow happened.
+    
+    Credit to OSS-Fuzz.
+    
+    Reported-at: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=20003
+    Fixes: 65da723b40a5 ("odp-util: Format tunnel attributes directly from netlink.")
+    Acked-by: Flavio Leitner <fbl@sysclose.org>
+    Signed-off-by: Ilya Maximets <i.maximets@ovn.org>
+
+diff --git a/lib/netlink.c b/lib/netlink.c
+index de3ebcd0e..26ab20bb4 100644
+--- a/lib/netlink.c
++++ b/lib/netlink.c
+@@ -498,8 +498,9 @@ void
+ nl_msg_end_nested(struct ofpbuf *msg, size_t offset)
+ {
+     struct nlattr *attr = ofpbuf_at_assert(msg, offset, sizeof *attr);
++    ovs_assert(!nl_attr_oversized(msg->size - offset - NLA_HDRLEN));
+     attr->nla_len = msg->size - offset;
+ }
+ 
+ /* Cancel a nested Netlink attribute in 'msg'.  'offset' should be the value
+  * returned by nl_msg_start_nested(). */
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 0bd2f9aa8..252a91bfa 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -5468,200 +5468,203 @@ static void
+ gtpu_to_attr(struct ofpbuf *a, const void *data_)
+ {
+     const struct gtpu_metadata *md = data_;
+ 
+     nl_msg_put_unspec(a, OVS_TUNNEL_KEY_ATTR_GTPU_OPTS, md,
+                       sizeof *md);
+ }
+ 
+ #define SCAN_PUT_ATTR(BUF, ATTR, DATA, FUNC)                      \
+     {                                                             \
+         unsigned long call_fn = (unsigned long)FUNC;              \
+         if (call_fn) {                                            \
+             typedef void (*fn)(struct ofpbuf *, const void *);    \
+             fn func = FUNC;                                       \
+             func(BUF, &(DATA));                                   \
+         } else {                                                  \
+             nl_msg_put_unspec(BUF, ATTR, &(DATA), sizeof (DATA)); \
+         }                                                         \
+     }
+ 
+ #define SCAN_IF(NAME)                           \
+     if (strncmp(s, NAME, strlen(NAME)) == 0) {  \
+         const char *start = s;                  \
+         int len;                                \
+                                                 \
+         s += strlen(NAME)
+ 
+ /* Usually no special initialization is needed. */
+ #define SCAN_BEGIN(NAME, TYPE)                  \
+     SCAN_IF(NAME);                              \
+         TYPE skey, smask;                       \
+         memset(&skey, 0, sizeof skey);          \
+         memset(&smask, 0, sizeof smask);        \
+         do {                                    \
+             len = 0;
+ 
+ /* Init as fully-masked as mask will not be scanned. */
+ #define SCAN_BEGIN_FULLY_MASKED(NAME, TYPE)     \
+     SCAN_IF(NAME);                              \
+         TYPE skey, smask;                       \
+         memset(&skey, 0, sizeof skey);          \
+         memset(&smask, 0xff, sizeof smask);     \
+         do {                                    \
+             len = 0;
+ 
+ /* VLAN needs special initialization. */
+ #define SCAN_BEGIN_INIT(NAME, TYPE, KEY_INIT, MASK_INIT)  \
+     SCAN_IF(NAME);                                        \
+         TYPE skey = KEY_INIT;                       \
+         TYPE smask = MASK_INIT;                     \
+         do {                                        \
+             len = 0;
+ 
+ /* Scan unnamed entry as 'TYPE' */
+ #define SCAN_TYPE(TYPE, KEY, MASK)              \
+     len = scan_##TYPE(s, KEY, MASK);            \
+     if (len == 0) {                             \
+         return -EINVAL;                         \
+     }                                           \
+     s += len
+ 
+ /* Scan named ('NAME') entry 'FIELD' as 'TYPE'. */
+ #define SCAN_FIELD(NAME, TYPE, FIELD)                                   \
+     if (strncmp(s, NAME, strlen(NAME)) == 0) {                          \
+         s += strlen(NAME);                                              \
+         SCAN_TYPE(TYPE, &skey.FIELD, mask ? &smask.FIELD : NULL);       \
+         continue;                                                       \
+     }
+ 
+ #define SCAN_FINISH()                           \
+         } while (*s++ == ',' && len != 0);      \
+         if (s[-1] != ')') {                     \
+             return -EINVAL;                     \
+         }
+ 
+ #define SCAN_FINISH_SINGLE()                    \
+         } while (false);                        \
+         if (*s++ != ')') {                      \
+             return -EINVAL;                     \
+         }
+ 
+ /* Beginning of nested attribute. */
+ #define SCAN_BEGIN_NESTED(NAME, ATTR)                      \
+     SCAN_IF(NAME);                                         \
+         size_t key_offset, mask_offset = 0;                \
+         key_offset = nl_msg_start_nested(key, ATTR);       \
+         if (mask) {                                        \
+             mask_offset = nl_msg_start_nested(mask, ATTR); \
+         }                                                  \
+         do {                                               \
+             len = 0;
+ 
+-#define SCAN_END_NESTED()                               \
+-        SCAN_FINISH();                                  \
+-        nl_msg_end_nested(key, key_offset);             \
+-        if (mask) {                                     \
+-            nl_msg_end_nested(mask, mask_offset);       \
+-        }                                               \
+-        return s - start;                               \
++#define SCAN_END_NESTED()                                                     \
++        SCAN_FINISH();                                                        \
++        if (nl_attr_oversized(key->size - key_offset - NLA_HDRLEN)) {         \
++            return -E2BIG;                                                    \
++        }                                                                     \
++        nl_msg_end_nested(key, key_offset);                                   \
++        if (mask) {                                                           \
++            nl_msg_end_nested(mask, mask_offset);                             \
++        }                                                                     \
++        return s - start;                                                     \
+     }
+ 
+ #define SCAN_FIELD_NESTED__(NAME, TYPE, SCAN_AS, ATTR, FUNC)  \
+     if (strncmp(s, NAME, strlen(NAME)) == 0) {                \
+         TYPE skey, smask;                                     \
+         memset(&skey, 0, sizeof skey);                        \
+         memset(&smask, 0xff, sizeof smask);                   \
+         s += strlen(NAME);                                    \
+         SCAN_TYPE(SCAN_AS, &skey, &smask);                    \
+         SCAN_PUT(ATTR, FUNC);                                 \
+         continue;                                             \
+     }
+ 
+ #define SCAN_FIELD_NESTED(NAME, TYPE, SCAN_AS, ATTR)  \
+         SCAN_FIELD_NESTED__(NAME, TYPE, SCAN_AS, ATTR, NULL)
+ 
+ #define SCAN_FIELD_NESTED_FUNC(NAME, TYPE, SCAN_AS, FUNC)  \
+         SCAN_FIELD_NESTED__(NAME, TYPE, SCAN_AS, 0, FUNC)
+ 
+ #define SCAN_PUT(ATTR, FUNC)                            \
+         SCAN_PUT_ATTR(key, ATTR, skey, FUNC);           \
+         if (mask)                                       \
+             SCAN_PUT_ATTR(mask, ATTR, smask, FUNC);     \
+ 
+ #define SCAN_END(ATTR)                                  \
+         SCAN_FINISH();                                  \
+         SCAN_PUT(ATTR, NULL);                           \
+         return s - start;                               \
+     }
+ 
+ #define SCAN_BEGIN_ARRAY(NAME, TYPE, CNT)       \
+     SCAN_IF(NAME);                              \
+         TYPE skey[CNT], smask[CNT];             \
+         memset(&skey, 0, sizeof skey);          \
+         memset(&smask, 0, sizeof smask);        \
+         int idx = 0, cnt = CNT;                 \
+         uint64_t fields = 0;                    \
+         do {                                    \
+             int field = 0;                      \
+             len = 0;
+ 
+ /* Scan named ('NAME') entry 'FIELD' as 'TYPE'. */
+ #define SCAN_FIELD_ARRAY(NAME, TYPE, FIELD)                             \
+     if (strncmp(s, NAME, strlen(NAME)) == 0) {                          \
+         if (fields & (1UL << field)) {                                  \
+             fields = 0;                                                 \
+             if (++idx == cnt) {                                         \
+                 break;                                                  \
+             }                                                           \
+         }                                                               \
+         s += strlen(NAME);                                              \
+         SCAN_TYPE(TYPE, &skey[idx].FIELD, mask ? &smask[idx].FIELD : NULL); \
+         fields |= 1UL << field;                                         \
+         continue;                                                       \
+     }                                                                   \
+     field++;
+ 
+ #define SCAN_PUT_ATTR_ARRAY(BUF, ATTR, DATA, CNT)                    \
+     nl_msg_put_unspec(BUF, ATTR, &(DATA), sizeof (DATA)[0] * (CNT)); \
+ 
+ #define SCAN_PUT_ARRAY(ATTR, CNT)                        \
+     SCAN_PUT_ATTR_ARRAY(key, ATTR, skey, CNT);       \
+     if (mask) {                                      \
+         SCAN_PUT_ATTR_ARRAY(mask, ATTR, smask, CNT); \
+     }
+ 
+ #define SCAN_END_ARRAY(ATTR)             \
+         SCAN_FINISH();                   \
+         if (idx == cnt) {                \
+             return -EINVAL;              \
+         }                                \
+         SCAN_PUT_ARRAY(ATTR, idx + 1);   \
+         return s - start;                \
+     }
+ 
+ #define SCAN_END_SINGLE(ATTR)                           \
+         SCAN_FINISH_SINGLE();                           \
+         SCAN_PUT(ATTR, NULL);                           \
+         return s - start;                               \
+     }
+ 
+ #define SCAN_SINGLE(NAME, TYPE, SCAN_AS, ATTR)       \
+     SCAN_BEGIN(NAME, TYPE) {                         \
+         SCAN_TYPE(SCAN_AS, &skey, &smask);           \
+     } SCAN_END_SINGLE(ATTR)
+ 
+ #define SCAN_SINGLE_FULLY_MASKED(NAME, TYPE, SCAN_AS, ATTR) \
+     SCAN_BEGIN_FULLY_MASKED(NAME, TYPE) {                   \
+         SCAN_TYPE(SCAN_AS, &skey, NULL);                    \
+     } SCAN_END_SINGLE(ATTR)
+ 
+ /* scan_port needs one extra argument. */
+ #define SCAN_SINGLE_PORT(NAME, TYPE, ATTR)  \
+     SCAN_BEGIN(NAME, TYPE) {                            \
+         len = scan_port(s, &skey, &smask,               \
+                         context->port_names);           \
+         if (len == 0) {                                 \
+             return -EINVAL;                             \
+         }                                               \
+         s += len;                                       \
+     } SCAN_END_SINGLE(ATTR)
+diff --git a/tests/tunnel.at b/tests/tunnel.at
+index e08fd1e04..b8ae7caa9 100644
+--- a/tests/tunnel.at
++++ b/tests/tunnel.at
+@@ -132,6 +132,35 @@ tunnel(src=3.3.3.200/255.255.255.0,dst=1.1.1.1,ttl=64,tp_src=1,tp_dst=123),recir
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([tunnel - too long nested attributes])
++OVS_VSWITCHD_START([add-port br0 p1 \
++    -- set Interface p1 type=gre options:remote_ip=1.1.1.1 ofport_request=1 \
++    -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++    br0 65534/100: (dummy-internal)
++    p1 1/1: (gre: remote_ip=1.1.1.1)
++    p2 2/2: (dummy)
++])
++
++dst_single="dst=1.1.1.1"
++dst_rep=${dst_single}
++dnl Size of one OVS_TUNNEL_KEY_ATTR_IPV4_DST is 4 bytes + NLA_HDRLEN (4 bytes).
++dnl One nested message has room for UINT16_MAX - NLA_HDRLEN (4) bytes, i.e.
++dnl (UINT16_MAX - NLA_HDRLEN) / (4 + NLA_HDRLEN) = 8191.375 of dst addresses.
++for i in `seq 1 8192` ; do
++    dst_rep="${dst_rep},${dst_single}"
++done
++
++AT_CHECK([ovs-appctl dpctl/add-flow "tunnel(${dst_rep})" "2" 2>&1 | dnl
++          sed "s/${dst_single},//g"], [], [dnl
++ovs-vswitchd: parsing flow key (syntax error at tunnel(dst=1.1.1.1)) (Argument list too long)
++ovs-appctl: ovs-vswitchd: server returned an error
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
+ AT_SETUP([tunnel - output])
+ OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=gre \
+                     options:remote_ip=1.1.1.1 options:local_ip=2.2.2.2 \

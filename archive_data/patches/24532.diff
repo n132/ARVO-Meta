@@ -1,0 +1,1085 @@
+commit 32f052b033f12fbeb8741c9616860743b1f567c4
+Author: Garret Rieger <grieger@google.com>
+Date:   Thu Jul 30 13:45:04 2020 -0700
+
+    [ENOMEM] Fix several instances of not checking resize in CFF.
+
+diff --git a/src/hb-subset-cff-common.hh b/src/hb-subset-cff-common.hh
+index 340089283..422b20b8d 100644
+--- a/src/hb-subset-cff-common.hh
++++ b/src/hb-subset-cff-common.hh
+@@ -37,93 +37,97 @@ namespace CFF {
+ /* Used for writing a temporary charstring */
+ struct str_encoder_t
+ {
+   str_encoder_t (str_buff_t &buff_)
+     : buff (buff_), error (false) {}
+ 
+   void reset () { buff.resize (0); }
+ 
+   void encode_byte (unsigned char b)
+   {
+     if (unlikely (buff.push (b) == &Crap (unsigned char)))
+       set_error ();
+   }
+ 
+   void encode_int (int v)
+   {
+     if ((-1131 <= v) && (v <= 1131))
+     {
+       if ((-107 <= v) && (v <= 107))
+ 	encode_byte (v + 139);
+       else if (v > 0)
+       {
+ 	v -= 108;
+ 	encode_byte ((v >> 8) + OpCode_TwoBytePosInt0);
+ 	encode_byte (v & 0xFF);
+       }
+       else
+       {
+ 	v = -v - 108;
+ 	encode_byte ((v >> 8) + OpCode_TwoByteNegInt0);
+ 	encode_byte (v & 0xFF);
+       }
+     }
+     else
+     {
+       if (unlikely (v < -32768))
+ 	v = -32768;
+       else if (unlikely (v > 32767))
+ 	v = 32767;
+       encode_byte (OpCode_shortint);
+       encode_byte ((v >> 8) & 0xFF);
+       encode_byte (v & 0xFF);
+     }
+   }
+ 
+   void encode_num (const number_t& n)
+   {
+     if (n.in_int_range ())
+     {
+       encode_int (n.to_int ());
+     }
+     else
+     {
+       int32_t v = n.to_fixed ();
+       encode_byte (OpCode_fixedcs);
+       encode_byte ((v >> 24) & 0xFF);
+       encode_byte ((v >> 16) & 0xFF);
+       encode_byte ((v >> 8) & 0xFF);
+       encode_byte (v & 0xFF);
+     }
+   }
+ 
+   void encode_op (op_code_t op)
+   {
+     if (Is_OpCode_ESC (op))
+     {
+       encode_byte (OpCode_escape);
+       encode_byte (Unmake_OpCode_ESC (op));
+     }
+     else
+       encode_byte (op);
+   }
+ 
+   void copy_str (const byte_str_t &str)
+   {
+     unsigned int  offset = buff.length;
+-    buff.resize (offset + str.length);
++    if (unlikely (!buff.resize (offset + str.length)))
++    {
++      set_error ();
++      return;
++    }
+     if (unlikely (buff.length < offset + str.length))
+     {
+       set_error ();
+       return;
+     }
+     memcpy (&buff[offset], &str[0], str.length);
+   }
+ 
+   bool is_error () const { return error; }
+ 
+   protected:
+   void set_error () { error = true; }
+ 
+   str_buff_t &buff;
+   bool    error;
+ };
+@@ -410,14 +414,15 @@ struct parsed_cs_str_t : parsed_values_t<parsed_cs_op_t>
+ struct parsed_cs_str_vec_t : hb_vector_t<parsed_cs_str_t>
+ {
+   void init (unsigned int len_ = 0)
+   {
+     SUPER::init ();
+-    resize (len_);
++    if (unlikely (!resize (len_)))
++      return;
+     for (unsigned int i = 0; i < length; i++)
+       (*this)[i].init ();
+   }
+   void fini () { SUPER::fini_deep (); }
+ 
+   private:
+   typedef hb_vector_t<parsed_cs_str_t> SUPER;
+ };
+@@ -519,33 +524,38 @@ struct subr_remap_t : hb_inc_bimap_t
+ struct subr_remaps_t
+ {
+   subr_remaps_t ()
+   {
+     global_remap.init ();
+     local_remaps.init ();
+   }
+ 
+   ~subr_remaps_t () { fini (); }
+ 
+   void init (unsigned int fdCount)
+   {
+-    local_remaps.resize (fdCount);
++    if (unlikely (!local_remaps.resize (fdCount))) return;
+     for (unsigned int i = 0; i < fdCount; i++)
+       local_remaps[i].init ();
+   }
+ 
++  bool in_error()
++  {
++    return local_remaps.in_error ();
++  }
++
+   void create (subr_closures_t& closures)
+   {
+     global_remap.create (closures.global_closure);
+     for (unsigned int i = 0; i < local_remaps.length; i++)
+       local_remaps[i].create (closures.local_closures[i]);
+   }
+ 
+   void fini ()
+   {
+     global_remap.fini ();
+     local_remaps.fini_deep ();
+   }
+ 
+   subr_remap_t	       global_remap;
+   hb_vector_t<subr_remap_t>  local_remaps;
+ };
+@@ -554,396 +564,405 @@ template <typename SUBSETTER, typename SUBRS, typename ACC, typename ENV, typena
+ struct subr_subsetter_t
+ {
+   subr_subsetter_t (ACC &acc_, const hb_subset_plan_t *plan_)
+     : acc (acc_), plan (plan_)
+   {
+     parsed_charstrings.init ();
+     parsed_global_subrs.init ();
+     parsed_local_subrs.init ();
+   }
+ 
+   ~subr_subsetter_t ()
+   {
+     closures.fini ();
+     remaps.fini ();
+     parsed_charstrings.fini_deep ();
+     parsed_global_subrs.fini_deep ();
+     parsed_local_subrs.fini_deep ();
+   }
+ 
+   /* Subroutine subsetting with --no-desubroutinize runs in phases:
+    *
+    * 1. execute charstrings/subroutines to determine subroutine closures
+    * 2. parse out all operators and numbers
+    * 3. mark hint operators and operands for removal if --no-hinting
+    * 4. re-encode all charstrings and subroutines with new subroutine numbers
+    *
+    * Phases #1 and #2 are done at the same time in collect_subrs ().
+    * Phase #3 walks charstrings/subroutines forward then backward (hence parsing required),
+    * because we can't tell if a number belongs to a hint op until we see the first moveto.
+    *
+    * Assumption: a callsubr/callgsubr operator must immediately follow a (biased) subroutine number
+    * within the same charstring/subroutine, e.g., not split across a charstring and a subroutine.
+    */
+   bool subset (void)
+   {
+     closures.init (acc.fdCount);
+     remaps.init (acc.fdCount);
+ 
+     parsed_charstrings.init (plan->num_output_glyphs ());
+     parsed_global_subrs.init (acc.globalSubrs->count);
+-    parsed_local_subrs.resize (acc.fdCount);
++
++    if (unlikely (remaps.in_error()
++                  || parsed_charstrings.in_error ()
++                  || parsed_global_subrs.in_error ())) {
++      return false;
++    }
++
++    if (unlikely (!parsed_local_subrs.resize (acc.fdCount))) return false;
++
+     for (unsigned int i = 0; i < acc.fdCount; i++)
+     {
+       parsed_local_subrs[i].init (acc.privateDicts[i].localSubrs->count);
++      if (unlikely (parsed_local_subrs[i].in_error ())) return false;
+     }
+     if (unlikely (!closures.valid))
+       return false;
+ 
+     /* phase 1 & 2 */
+     for (unsigned int i = 0; i < plan->num_output_glyphs (); i++)
+     {
+       hb_codepoint_t  glyph;
+       if (!plan->old_gid_for_new_gid (i, &glyph))
+ 	continue;
+       const byte_str_t str = (*acc.charStrings)[glyph];
+       unsigned int fd = acc.fdSelect->get_fd (glyph);
+       if (unlikely (fd >= acc.fdCount))
+ 	return false;
+ 
+       cs_interpreter_t<ENV, OPSET, subr_subset_param_t> interp;
+       interp.env.init (str, acc, fd);
+ 
+       subr_subset_param_t  param;
+       param.init (&parsed_charstrings[i],
+ 		  &parsed_global_subrs,  &parsed_local_subrs[fd],
+ 		  closures.global_closure, closures.local_closures[fd],
+ 		  plan->drop_hints);
+ 
+       if (unlikely (!interp.interpret (param)))
+ 	return false;
+ 
+       /* complete parsed string esp. copy CFF1 width or CFF2 vsindex to the parsed charstring for encoding */
+       SUBSETTER::complete_parsed_str (interp.env, param, parsed_charstrings[i]);
+     }
+ 
+     if (plan->drop_hints)
+     {
+       /* mark hint ops and arguments for drop */
+       for (unsigned int i = 0; i < plan->num_output_glyphs (); i++)
+       {
+ 	hb_codepoint_t  glyph;
+ 	if (!plan->old_gid_for_new_gid (i, &glyph))
+ 	  continue;
+ 	unsigned int fd = acc.fdSelect->get_fd (glyph);
+ 	if (unlikely (fd >= acc.fdCount))
+ 	  return false;
+ 	subr_subset_param_t  param;
+ 	param.init (&parsed_charstrings[i],
+ 		    &parsed_global_subrs,  &parsed_local_subrs[fd],
+ 		    closures.global_closure, closures.local_closures[fd],
+ 		    plan->drop_hints);
+ 
+ 	drop_hints_param_t  drop;
+ 	if (drop_hints_in_str (parsed_charstrings[i], param, drop))
+ 	{
+ 	  parsed_charstrings[i].set_hint_dropped ();
+ 	  if (drop.vsindex_dropped)
+ 	    parsed_charstrings[i].set_vsindex_dropped ();
+ 	}
+       }
+ 
+       /* after dropping hints recreate closures of actually used subrs */
+       closures.reset ();
+       for (unsigned int i = 0; i < plan->num_output_glyphs (); i++)
+       {
+ 	hb_codepoint_t  glyph;
+ 	if (!plan->old_gid_for_new_gid (i, &glyph))
+ 	  continue;
+ 	unsigned int fd = acc.fdSelect->get_fd (glyph);
+ 	if (unlikely (fd >= acc.fdCount))
+ 	  return false;
+ 	subr_subset_param_t  param;
+ 	param.init (&parsed_charstrings[i],
+ 		    &parsed_global_subrs,  &parsed_local_subrs[fd],
+ 		    closures.global_closure, closures.local_closures[fd],
+ 		    plan->drop_hints);
+ 	collect_subr_refs_in_str (parsed_charstrings[i], param);
+       }
+     }
+ 
+     remaps.create (closures);
+ 
+     return true;
+   }
+ 
+   bool encode_charstrings (str_buff_vec_t &buffArray) const
+   {
+     if (unlikely (!buffArray.resize (plan->num_output_glyphs ())))
+       return false;
+     for (unsigned int i = 0; i < plan->num_output_glyphs (); i++)
+     {
+       hb_codepoint_t  glyph;
+       if (!plan->old_gid_for_new_gid (i, &glyph))
+       {
+ 	/* add an endchar only charstring for a missing glyph if CFF1 */
+ 	if (endchar_op != OpCode_Invalid) buffArray[i].push (endchar_op);
+ 	continue;
+       }
+       unsigned int  fd = acc.fdSelect->get_fd (glyph);
+       if (unlikely (fd >= acc.fdCount))
+ 	return false;
+       if (unlikely (!encode_str (parsed_charstrings[i], fd, buffArray[i])))
+ 	return false;
+     }
+     return true;
+   }
+ 
+   bool encode_subrs (const parsed_cs_str_vec_t &subrs, const subr_remap_t& remap, unsigned int fd, str_buff_vec_t &buffArray) const
+   {
+     unsigned int  count = remap.get_population ();
+ 
+     if (unlikely (!buffArray.resize (count)))
+       return false;
+     for (unsigned int old_num = 0; old_num < subrs.length; old_num++)
+     {
+       hb_codepoint_t new_num = remap[old_num];
+       if (new_num != CFF_UNDEF_CODE)
+       {
+ 	if (unlikely (!encode_str (subrs[old_num], fd, buffArray[new_num])))
+ 	  return false;
+       }
+     }
+     return true;
+   }
+ 
+   bool encode_globalsubrs (str_buff_vec_t &buffArray)
+   {
+     return encode_subrs (parsed_global_subrs, remaps.global_remap, 0, buffArray);
+   }
+ 
+   bool encode_localsubrs (unsigned int fd, str_buff_vec_t &buffArray) const
+   {
+     return encode_subrs (parsed_local_subrs[fd], remaps.local_remaps[fd], fd, buffArray);
+   }
+ 
+   protected:
+   struct drop_hints_param_t
+   {
+     drop_hints_param_t ()
+       : seen_moveto (false),
+ 	ends_in_hint (false),
+ 	all_dropped (false),
+ 	vsindex_dropped (false) {}
+ 
+     bool  seen_moveto;
+     bool  ends_in_hint;
+     bool  all_dropped;
+     bool  vsindex_dropped;
+   };
+ 
+   bool drop_hints_in_subr (parsed_cs_str_t &str, unsigned int pos,
+ 			   parsed_cs_str_vec_t &subrs, unsigned int subr_num,
+ 			   const subr_subset_param_t &param, drop_hints_param_t &drop)
+   {
+     drop.ends_in_hint = false;
+     bool has_hint = drop_hints_in_str (subrs[subr_num], param, drop);
+ 
+     /* if this subr ends with a stem hint (i.e., not a number; potential argument for moveto),
+      * then this entire subroutine must be a hint. drop its call. */
+     if (drop.ends_in_hint)
+     {
+       str.values[pos].set_drop ();
+       /* if this subr call is at the end of the parent subr, propagate the flag
+        * otherwise reset the flag */
+       if (!str.at_end (pos))
+ 	drop.ends_in_hint = false;
+     }
+     else if (drop.all_dropped)
+     {
+       str.values[pos].set_drop ();
+     }
+ 
+     return has_hint;
+   }
+ 
+   /* returns true if it sees a hint op before the first moveto */
+   bool drop_hints_in_str (parsed_cs_str_t &str, const subr_subset_param_t &param, drop_hints_param_t &drop)
+   {
+     bool  seen_hint = false;
+ 
+     for (unsigned int pos = 0; pos < str.values.length; pos++)
+     {
+       bool  has_hint = false;
+       switch (str.values[pos].op)
+       {
+ 	case OpCode_callsubr:
+ 	  has_hint = drop_hints_in_subr (str, pos,
+ 					*param.parsed_local_subrs, str.values[pos].subr_num,
+ 					param, drop);
+ 	  break;
+ 
+ 	case OpCode_callgsubr:
+ 	  has_hint = drop_hints_in_subr (str, pos,
+ 					*param.parsed_global_subrs, str.values[pos].subr_num,
+ 					param, drop);
+ 	  break;
+ 
+ 	case OpCode_rmoveto:
+ 	case OpCode_hmoveto:
+ 	case OpCode_vmoveto:
+ 	  drop.seen_moveto = true;
+ 	  break;
+ 
+ 	case OpCode_hintmask:
+ 	case OpCode_cntrmask:
+ 	  if (drop.seen_moveto)
+ 	  {
+ 	    str.values[pos].set_drop ();
+ 	    break;
+ 	  }
+ 	  HB_FALLTHROUGH;
+ 
+ 	case OpCode_hstemhm:
+ 	case OpCode_vstemhm:
+ 	case OpCode_hstem:
+ 	case OpCode_vstem:
+ 	  has_hint = true;
+ 	  str.values[pos].set_drop ();
+ 	  if (str.at_end (pos))
+ 	    drop.ends_in_hint = true;
+ 	  break;
+ 
+ 	case OpCode_dotsection:
+ 	  str.values[pos].set_drop ();
+ 	  break;
+ 
+ 	default:
+ 	  /* NONE */
+ 	  break;
+       }
+       if (has_hint)
+       {
+ 	for (int i = pos - 1; i >= 0; i--)
+ 	{
+ 	  parsed_cs_op_t  &csop = str.values[(unsigned)i];
+ 	  if (csop.for_drop ())
+ 	    break;
+ 	  csop.set_drop ();
+ 	  if (csop.op == OpCode_vsindexcs)
+ 	    drop.vsindex_dropped = true;
+ 	}
+ 	seen_hint |= has_hint;
+       }
+     }
+ 
+     /* Raise all_dropped flag if all operators except return are dropped from a subr.
+      * It may happen even after seeing the first moveto if a subr contains
+      * only (usually one) hintmask operator, then calls to this subr can be dropped.
+      */
+     drop.all_dropped = true;
+     for (unsigned int pos = 0; pos < str.values.length; pos++)
+     {
+       parsed_cs_op_t  &csop = str.values[pos];
+       if (csop.op == OpCode_return)
+ 	break;
+       if (!csop.for_drop ())
+       {
+ 	drop.all_dropped = false;
+ 	break;
+       }
+     }
+ 
+     return seen_hint;
+   }
+ 
+   void collect_subr_refs_in_subr (parsed_cs_str_t &str, unsigned int pos,
+ 				  unsigned int subr_num, parsed_cs_str_vec_t &subrs,
+ 				  hb_set_t *closure,
+ 				  const subr_subset_param_t &param)
+   {
+     closure->add (subr_num);
+     collect_subr_refs_in_str (subrs[subr_num], param);
+   }
+ 
+   void collect_subr_refs_in_str (parsed_cs_str_t &str, const subr_subset_param_t &param)
+   {
+     for (unsigned int pos = 0; pos < str.values.length; pos++)
+     {
+       if (!str.values[pos].for_drop ())
+       {
+ 	switch (str.values[pos].op)
+ 	{
+ 	  case OpCode_callsubr:
+ 	    collect_subr_refs_in_subr (str, pos,
+ 				       str.values[pos].subr_num, *param.parsed_local_subrs,
+ 				       param.local_closure, param);
+ 	    break;
+ 
+ 	  case OpCode_callgsubr:
+ 	    collect_subr_refs_in_subr (str, pos,
+ 				       str.values[pos].subr_num, *param.parsed_global_subrs,
+ 				       param.global_closure, param);
+ 	    break;
+ 
+ 	  default: break;
+ 	}
+       }
+     }
+   }
+ 
+   bool encode_str (const parsed_cs_str_t &str, const unsigned int fd, str_buff_t &buff) const
+   {
+     buff.init ();
+     str_encoder_t  encoder (buff);
+     encoder.reset ();
+     /* if a prefix (CFF1 width or CFF2 vsindex) has been removed along with hints,
+      * re-insert it at the beginning of charstreing */
+     if (str.has_prefix () && str.is_hint_dropped ())
+     {
+       encoder.encode_num (str.prefix_num ());
+       if (str.prefix_op () != OpCode_Invalid)
+ 	encoder.encode_op (str.prefix_op ());
+     }
+     for (unsigned int i = 0; i < str.get_count(); i++)
+     {
+       const parsed_cs_op_t  &opstr = str.values[i];
+       if (!opstr.for_drop () && !opstr.for_skip ())
+       {
+ 	switch (opstr.op)
+ 	{
+ 	  case OpCode_callsubr:
+ 	    encoder.encode_int (remaps.local_remaps[fd].biased_num (opstr.subr_num));
+ 	    encoder.encode_op (OpCode_callsubr);
+ 	    break;
+ 
+ 	  case OpCode_callgsubr:
+ 	    encoder.encode_int (remaps.global_remap.biased_num (opstr.subr_num));
+ 	    encoder.encode_op (OpCode_callgsubr);
+ 	    break;
+ 
+ 	  default:
+ 	    encoder.copy_str (opstr.str);
+ 	    break;
+ 	}
+       }
+     }
+     return !encoder.is_error ();
+   }
+ 
+   protected:
+   const ACC			&acc;
+   const hb_subset_plan_t	*plan;
+ 
+   subr_closures_t		closures;
+ 
+   parsed_cs_str_vec_t		parsed_charstrings;
+   parsed_cs_str_vec_t		parsed_global_subrs;
+   hb_vector_t<parsed_cs_str_vec_t>  parsed_local_subrs;
+ 
+   subr_remaps_t			remaps;
+ 
+   private:
+   typedef typename SUBRS::count_type subr_count_type;
+ };
+ 
+ } /* namespace CFF */
+diff --git a/src/hb-subset-cff1.cc b/src/hb-subset-cff1.cc
+index f16b2533a..df322f845 100644
+--- a/src/hb-subset-cff1.cc
++++ b/src/hb-subset-cff1.cc
+@@ -363,336 +363,346 @@ struct cff1_subr_subsetter_t : subr_subsetter_t<cff1_subr_subsetter_t, CFF1Subrs
+ struct cff_subset_plan {
+   cff_subset_plan ()
+     : info (),
+       orig_fdcount (0),
+       subset_fdcount (1),
+       subset_fdselect_format (0),
+       drop_hints (false),
+       desubroutinize(false)
+   {
+     topdict_mod.init ();
+     subset_fdselect_ranges.init ();
+     fdmap.init ();
+     subset_charstrings.init ();
+     subset_globalsubrs.init ();
+     subset_localsubrs.init ();
+     fontdicts_mod.init ();
+     subset_enc_code_ranges.init ();
+     subset_enc_supp_codes.init ();
+     subset_charset_ranges.init ();
+     sidmap.init ();
+     for (unsigned int i = 0; i < name_dict_values_t::ValCount; i++)
+       topDictModSIDs[i] = CFF_UNDEF_SID;
+   }
+ 
+   ~cff_subset_plan ()
+   {
+     topdict_mod.fini ();
+     subset_fdselect_ranges.fini ();
+     fdmap.fini ();
+     subset_charstrings.fini_deep ();
+     subset_globalsubrs.fini_deep ();
+     subset_localsubrs.fini_deep ();
+     fontdicts_mod.fini ();
+     subset_enc_code_ranges.fini ();
+     subset_enc_supp_codes.fini ();
+     subset_charset_ranges.fini ();
+     sidmap.fini ();
+   }
+ 
+   void plan_subset_encoding (const OT::cff1::accelerator_subset_t &acc, hb_subset_plan_t *plan)
+   {
+     const Encoding *encoding = acc.encoding;
+     unsigned int  size0, size1, supp_size;
+     hb_codepoint_t  code, last_code = CFF_UNDEF_CODE;
+     hb_vector_t<hb_codepoint_t> supp_codes;
+ 
+-    subset_enc_code_ranges.resize (0);
++    if (unlikely (!subset_enc_code_ranges.resize (0)))
++    {
++      plan->check_success (false);
++      return;
++    }
++
+     supp_size = 0;
+     supp_codes.init ();
+ 
+     subset_enc_num_codes = plan->num_output_glyphs () - 1;
+     unsigned int glyph;
+     for (glyph = 1; glyph < plan->num_output_glyphs (); glyph++)
+     {
+       hb_codepoint_t  old_glyph;
+       if (!plan->old_gid_for_new_gid (glyph, &old_glyph))
+       {
+ 	/* Retain the code for the old missing glyph ID */
+ 	old_glyph = glyph;
+       }
+       code = acc.glyph_to_code (old_glyph);
+       if (code == CFF_UNDEF_CODE)
+       {
+ 	subset_enc_num_codes = glyph - 1;
+ 	break;
+       }
+ 
+       if ((last_code == CFF_UNDEF_CODE) || (code != last_code + 1))
+       {
+ 	code_pair_t pair = { code, glyph };
+ 	subset_enc_code_ranges.push (pair);
+       }
+       last_code = code;
+ 
+       if (encoding != &Null (Encoding))
+       {
+ 	hb_codepoint_t  sid = acc.glyph_to_sid (old_glyph);
+ 	encoding->get_supplement_codes (sid, supp_codes);
+ 	for (unsigned int i = 0; i < supp_codes.length; i++)
+ 	{
+ 	  code_pair_t pair = { supp_codes[i], sid };
+ 	  subset_enc_supp_codes.push (pair);
+ 	}
+ 	supp_size += SuppEncoding::static_size * supp_codes.length;
+       }
+     }
+     supp_codes.fini ();
+ 
+     subset_enc_code_ranges.complete (glyph);
+ 
+     assert (subset_enc_num_codes <= 0xFF);
+     size0 = Encoding0::min_size + HBUINT8::static_size * subset_enc_num_codes;
+     size1 = Encoding1::min_size + Encoding1_Range::static_size * subset_enc_code_ranges.length;
+ 
+     if (size0 < size1)
+       subset_enc_format = 0;
+     else
+       subset_enc_format = 1;
+   }
+ 
+   void plan_subset_charset (const OT::cff1::accelerator_subset_t &acc, hb_subset_plan_t *plan)
+   {
+     unsigned int  size0, size_ranges;
+     hb_codepoint_t  sid, last_sid = CFF_UNDEF_CODE;
+ 
+-    subset_charset_ranges.resize (0);
++    if (unlikely (!subset_charset_ranges.resize (0)))
++    {
++      plan->check_success (false);
++      return;
++    }
++
+     unsigned int glyph;
+     for (glyph = 1; glyph < plan->num_output_glyphs (); glyph++)
+     {
+       hb_codepoint_t  old_glyph;
+       if (!plan->old_gid_for_new_gid (glyph, &old_glyph))
+       {
+ 	/* Retain the SID for the old missing glyph ID */
+ 	old_glyph = glyph;
+       }
+       sid = acc.glyph_to_sid (old_glyph);
+ 
+       if (!acc.is_CID ())
+ 	sid = sidmap.add (sid);
+ 
+       if ((last_sid == CFF_UNDEF_CODE) || (sid != last_sid + 1))
+       {
+ 	code_pair_t pair = { sid, glyph };
+ 	subset_charset_ranges.push (pair);
+       }
+       last_sid = sid;
+     }
+ 
+     bool two_byte = subset_charset_ranges.complete (glyph);
+ 
+     size0 = Charset0::min_size + HBUINT16::static_size * (plan->num_output_glyphs () - 1);
+     if (!two_byte)
+       size_ranges = Charset1::min_size + Charset1_Range::static_size * subset_charset_ranges.length;
+     else
+       size_ranges = Charset2::min_size + Charset2_Range::static_size * subset_charset_ranges.length;
+ 
+     if (size0 < size_ranges)
+       subset_charset_format = 0;
+     else if (!two_byte)
+       subset_charset_format = 1;
+     else
+       subset_charset_format = 2;
+   }
+ 
+   bool collect_sids_in_dicts (const OT::cff1::accelerator_subset_t &acc)
+   {
+     sidmap.reset ();
+ 
+     for (unsigned int i = 0; i < name_dict_values_t::ValCount; i++)
+     {
+       unsigned int sid = acc.topDict.nameSIDs[i];
+       if (sid != CFF_UNDEF_SID)
+       {
+ 	(void)sidmap.add (sid);
+ 	topDictModSIDs[i] = sidmap[sid];
+       }
+     }
+ 
+     if (acc.fdArray != &Null (CFF1FDArray))
+       for (unsigned int i = 0; i < orig_fdcount; i++)
+ 	if (fdmap.has (i))
+ 	  (void)sidmap.add (acc.fontDicts[i].fontName);
+ 
+     return true;
+   }
+ 
+   bool create (const OT::cff1::accelerator_subset_t &acc,
+ 	       hb_subset_plan_t *plan)
+   {
+     /* make sure notdef is first */
+     hb_codepoint_t old_glyph;
+     if (!plan->old_gid_for_new_gid (0, &old_glyph) || (old_glyph != 0)) return false;
+ 
+     num_glyphs = plan->num_output_glyphs ();
+     orig_fdcount = acc.fdCount;
+     drop_hints = plan->drop_hints;
+     desubroutinize = plan->desubroutinize;
+ 
+     /* check whether the subset renumbers any glyph IDs */
+     gid_renum = false;
+     for (hb_codepoint_t new_glyph = 0; new_glyph < plan->num_output_glyphs (); new_glyph++)
+     {
+       if (!plan->old_gid_for_new_gid(new_glyph, &old_glyph))
+ 	continue;
+       if (new_glyph != old_glyph) {
+ 	gid_renum = true;
+ 	break;
+       }
+     }
+ 
+     subset_charset = gid_renum || !acc.is_predef_charset ();
+     subset_encoding = !acc.is_CID() && !acc.is_predef_encoding ();
+ 
+     /* top dict INDEX */
+     {
+       /* Add encoding/charset to a (copy of) top dict as necessary */
+       topdict_mod.init (&acc.topDict);
+       bool need_to_add_enc = (subset_encoding && !acc.topDict.has_op (OpCode_Encoding));
+       bool need_to_add_set = (subset_charset && !acc.topDict.has_op (OpCode_charset));
+       if (need_to_add_enc || need_to_add_set)
+       {
+ 	if (need_to_add_enc)
+ 	  topdict_mod.add_op (OpCode_Encoding);
+ 	if (need_to_add_set)
+ 	  topdict_mod.add_op (OpCode_charset);
+       }
+     }
+ 
+     /* Determine re-mapping of font index as fdmap among other info */
+     if (acc.fdSelect != &Null (CFF1FDSelect))
+     {
+ 	if (unlikely (!hb_plan_subset_cff_fdselect (plan,
+ 				  orig_fdcount,
+ 				  *acc.fdSelect,
+ 				  subset_fdcount,
+ 				  info.fd_select.size,
+ 				  subset_fdselect_format,
+ 				  subset_fdselect_ranges,
+ 				  fdmap)))
+ 	return false;
+     }
+     else
+       fdmap.identity (1);
+ 
+     /* remove unused SIDs & reassign SIDs */
+     {
+       /* SIDs for name strings in dicts are added before glyph names so they fit in 16-bit int range */
+       if (unlikely (!collect_sids_in_dicts (acc)))
+ 	return false;
+       if (unlikely (sidmap.get_population () > 0x8000))	/* assumption: a dict won't reference that many strings */
+ 	return false;
+ 
+       if (subset_charset) plan_subset_charset (acc, plan);
+ 
+       topdict_mod.reassignSIDs (sidmap);
+     }
+ 
+     if (desubroutinize)
+     {
+       /* Flatten global & local subrs */
+       subr_flattener_t<const OT::cff1::accelerator_subset_t, cff1_cs_interp_env_t, cff1_cs_opset_flatten_t, OpCode_endchar>
+ 		    flattener(acc, plan);
+       if (!flattener.flatten (subset_charstrings))
+ 	return false;
+     }
+     else
+     {
+       cff1_subr_subsetter_t       subr_subsetter (acc, plan);
+ 
+       /* Subset subrs: collect used subroutines, leaving all unused ones behind */
+       if (!subr_subsetter.subset ())
+ 	return false;
+ 
+       /* encode charstrings, global subrs, local subrs with new subroutine numbers */
+       if (!subr_subsetter.encode_charstrings (subset_charstrings))
+ 	return false;
+ 
+       if (!subr_subsetter.encode_globalsubrs (subset_globalsubrs))
+ 	return false;
+ 
+       /* local subrs */
+       if (!subset_localsubrs.resize (orig_fdcount))
+ 	return false;
+       for (unsigned int fd = 0; fd < orig_fdcount; fd++)
+       {
+ 	subset_localsubrs[fd].init ();
+ 	if (fdmap.has (fd))
+ 	{
+ 	  if (!subr_subsetter.encode_localsubrs (fd, subset_localsubrs[fd]))
+ 	    return false;
+ 	}
+       }
+     }
+ 
+     /* Encoding */
+     if (subset_encoding)
+       plan_subset_encoding (acc, plan);
+ 
+     /* private dicts & local subrs */
+     if (!acc.is_CID ())
+       fontdicts_mod.push (cff1_font_dict_values_mod_t ());
+     else
+     {
+       + hb_iter (acc.fontDicts)
+       | hb_filter ([&] (const cff1_font_dict_values_t &_)
+ 	{ return fdmap.has (&_ - &acc.fontDicts[0]); } )
+       | hb_map ([&] (const cff1_font_dict_values_t &_)
+ 	{
+ 	  cff1_font_dict_values_mod_t mod;
+ 	  mod.init (&_, sidmap[_.fontName]);
+ 	  return mod;
+ 	})
+       | hb_sink (fontdicts_mod)
+       ;
+     }
+ 
+     return ((subset_charstrings.length == plan->num_output_glyphs ())
+ 	   && (fontdicts_mod.length == subset_fdcount));
+   }
+ 
+   cff1_top_dict_values_mod_t	topdict_mod;
+   cff1_sub_table_info_t		info;
+ 
+   unsigned int    num_glyphs;
+   unsigned int    orig_fdcount;
+   unsigned int    subset_fdcount;
+   unsigned int    subset_fdselect_format;
+   hb_vector_t<code_pair_t>   subset_fdselect_ranges;
+ 
+   /* font dict index remap table from fullset FDArray to subset FDArray.
+    * set to CFF_UNDEF_CODE if excluded from subset */
+   hb_inc_bimap_t   fdmap;
+ 
+   str_buff_vec_t		subset_charstrings;
+   str_buff_vec_t		subset_globalsubrs;
+   hb_vector_t<str_buff_vec_t>	subset_localsubrs;
+   hb_vector_t<cff1_font_dict_values_mod_t>  fontdicts_mod;
+ 
+   bool		drop_hints;
+ 
+   bool		gid_renum;
+   bool		subset_encoding;
+   uint8_t	subset_enc_format;
+   unsigned int	subset_enc_num_codes;
+   range_list_t	subset_enc_code_ranges;
+   hb_vector_t<code_pair_t>  subset_enc_supp_codes;
+ 
+   uint8_t	subset_charset_format;
+   range_list_t	subset_charset_ranges;
+   bool		subset_charset;
+ 
+   remap_sid_t	sidmap;
+   unsigned int	topDictModSIDs[name_dict_values_t::ValCount];
+ 
+   bool		desubroutinize;
+ };
+diff --git a/src/hb-subset-plan.hh b/src/hb-subset-plan.hh
+index 5abd84fb1..e9f603dd1 100644
+--- a/src/hb-subset-plan.hh
++++ b/src/hb-subset-plan.hh
+@@ -38,140 +38,146 @@
+ struct hb_subset_plan_t
+ {
+   hb_object_header_t header;
+ 
+   bool successful : 1;
+   bool drop_hints : 1;
+   bool desubroutinize : 1;
+   bool retain_gids : 1;
+   bool name_legacy : 1;
+ 
+   // For each cp that we'd like to retain maps to the corresponding gid.
+   hb_set_t *unicodes;
+ 
+   // name_ids we would like to retain
+   hb_set_t *name_ids;
+ 
+   // name_languages we would like to retain
+   hb_set_t *name_languages;
+ 
+   //glyph ids requested to retain
+   hb_set_t *glyphs_requested;
+ 
+   // Tables which should be dropped.
+   hb_set_t *drop_tables;
+ 
+   // The glyph subset
+   hb_map_t *codepoint_to_glyph;
+ 
+   // Old -> New glyph id mapping
+   hb_map_t *glyph_map;
+   hb_map_t *reverse_glyph_map;
+ 
+   // Plan is only good for a specific source/dest so keep them with it
+   hb_face_t *source;
+   hb_face_t *dest;
+ 
+   unsigned int _num_output_glyphs;
+   hb_set_t *_glyphset;
+   hb_set_t *_glyphset_gsub;
+ 
+   //active lookups we'd like to retain
+   hb_map_t *gsub_lookups;
+   hb_map_t *gpos_lookups;
+ 
+   //active features we'd like to retain
+   hb_map_t *gsub_features;
+   hb_map_t *gpos_features;
+ 
+   //The set of layout item variation store delta set indices to be retained
+   hb_set_t *layout_variation_indices;
+   //Old -> New layout item variation store delta set index mapping
+   hb_map_t *layout_variation_idx_map;
+ 
+  public:
+ 
+   bool in_error () const { return !successful; }
+ 
++  bool check_success(bool success)
++  {
++    successful = (successful && success);
++    return successful;
++  }
++
+   /*
+    * The set of input glyph ids which will be retained in the subset.
+    * Does NOT include ids kept due to retain_gids. You probably want to use
+    * glyph_map/reverse_glyph_map.
+    */
+   inline const hb_set_t *
+   glyphset () const
+   {
+     return _glyphset;
+   }
+ 
+   /*
+    * The set of input glyph ids which will be retained in the subset.
+    */
+   inline const hb_set_t *
+   glyphset_gsub () const
+   {
+     return _glyphset_gsub;
+   }
+ 
+   /*
+    * The total number of output glyphs in the final subset.
+    */
+   inline unsigned int
+   num_output_glyphs () const
+   {
+     return _num_output_glyphs;
+   }
+ 
+   /*
+    * Given an output gid , returns true if that glyph id is an empty
+    * glyph (ie. it's a gid that we are dropping all data for).
+    */
+   inline bool is_empty_glyph (hb_codepoint_t gid) const
+   {
+     return !_glyphset->has (gid);
+   }
+ 
+   inline bool new_gid_for_codepoint (hb_codepoint_t codepoint,
+ 				     hb_codepoint_t *new_gid) const
+   {
+     hb_codepoint_t old_gid = codepoint_to_glyph->get (codepoint);
+     if (old_gid == HB_MAP_VALUE_INVALID)
+       return false;
+ 
+     return new_gid_for_old_gid (old_gid, new_gid);
+   }
+ 
+   inline bool new_gid_for_old_gid (hb_codepoint_t old_gid,
+ 				   hb_codepoint_t *new_gid) const
+   {
+     hb_codepoint_t gid = glyph_map->get (old_gid);
+     if (gid == HB_MAP_VALUE_INVALID)
+       return false;
+ 
+     *new_gid = gid;
+     return true;
+   }
+ 
+   inline bool old_gid_for_new_gid (hb_codepoint_t  new_gid,
+ 				   hb_codepoint_t *old_gid) const
+   {
+     hb_codepoint_t gid = reverse_glyph_map->get (new_gid);
+     if (gid == HB_MAP_VALUE_INVALID)
+       return false;
+ 
+     *old_gid = gid;
+     return true;
+   }
+ 
+   inline bool
+   add_table (hb_tag_t tag,
+ 	     hb_blob_t *contents)
+   {
+     hb_blob_t *source_blob = source->reference_table (tag);
+     DEBUG_MSG(SUBSET, nullptr, "add table %c%c%c%c, dest %d bytes, source %d bytes",
+ 	      HB_UNTAG(tag),
+ 	      hb_blob_get_length (contents),
+ 	      hb_blob_get_length (source_blob));
+     hb_blob_destroy (source_blob);
+     return hb_face_builder_add_table (dest, tag, contents);
+   }
+ };
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5707809174585344 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5707809174585344
+new file mode 100644
+index 000000000..fba50e50e
+Binary files /dev/null and b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5707809174585344 differ
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5708623339323392 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5708623339323392
+new file mode 100644
+index 000000000..4356547dd
+Binary files /dev/null and b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-5708623339323392 differ

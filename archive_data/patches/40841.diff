@@ -1,0 +1,2156 @@
+commit 383d350bd5107bfe00e3b90a00cab9a3c1397c72
+Merge: 913b7148a2 a99ed89865
+Author: W. J. van der Laan <laanwj@protonmail.com>
+Date:   Mon Nov 29 17:13:06 2021 +0100
+
+    Merge bitcoin/bitcoin#22513: rpc: Allow walletprocesspsbt to sign without finalizing
+    
+    a99ed8986554fa1ecc854e43ea373d957e598db8 psbt: sign without finalizing (Andrew Chow)
+    
+    Pull request description:
+    
+      It can be useful to sign an input with `walletprocesspsbt` but not finalize that input if it is complete. This PR adds another option to `walletprocesspsbt` to be able to do that. We will still finalize by default.
+    
+      This does not materially change the PSBT workflow since `finalizepsbt` needs to be called in order to extract the tx for broadcast.
+    
+    ACKs for top commit:
+      meshcollider:
+        utACK a99ed8986554fa1ecc854e43ea373d957e598db8
+      Sjors:
+        utACK a99ed89
+    
+    Tree-SHA512: c88e5d3222109c5f4e763b1b9d97ce4655f68f2985a4509caab2d4e7f5bac5047328fd69696e82a330f5c5a333e0312568ae293515689b77a4747ca2f17caca6
+
+diff --git a/src/psbt.cpp b/src/psbt.cpp
+index b3d8e052bc..6585766807 100644
+--- a/src/psbt.cpp
++++ b/src/psbt.cpp
+@@ -247,70 +247,74 @@ PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction&
+     return txdata;
+ }
+ 
+-bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash, SignatureData* out_sigdata)
++bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash,  SignatureData* out_sigdata, bool finalize)
+ {
+     PSBTInput& input = psbt.inputs.at(index);
+     const CMutableTransaction& tx = *psbt.tx;
+ 
+     if (PSBTInputSigned(input)) {
+         return true;
+     }
+ 
+     // Fill SignatureData with input info
+     SignatureData sigdata;
+     input.FillSignatureData(sigdata);
+ 
+     // Get UTXO
+     bool require_witness_sig = false;
+     CTxOut utxo;
+ 
+     if (input.non_witness_utxo) {
+         // If we're taking our information from a non-witness UTXO, verify that it matches the prevout.
+         COutPoint prevout = tx.vin[index].prevout;
+         if (prevout.n >= input.non_witness_utxo->vout.size()) {
+             return false;
+         }
+         if (input.non_witness_utxo->GetHash() != prevout.hash) {
+             return false;
+         }
+         utxo = input.non_witness_utxo->vout[prevout.n];
+     } else if (!input.witness_utxo.IsNull()) {
+         utxo = input.witness_utxo;
+         // When we're taking our information from a witness UTXO, we can't verify it is actually data from
+         // the output being spent. This is safe in case a witness signature is produced (which includes this
+         // information directly in the hash), but not for non-witness signatures. Remember that we require
+         // a witness signature in this situation.
+         require_witness_sig = true;
+     } else {
+         return false;
+     }
+ 
+     sigdata.witness = false;
+     bool sig_complete;
+     if (txdata == nullptr) {
+         sig_complete = ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR, utxo.scriptPubKey, sigdata);
+     } else {
+         MutableTransactionSignatureCreator creator(&tx, index, utxo.nValue, txdata, sighash);
+         sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey, sigdata);
+     }
+     // Verify that a witness signature was produced in case one was required.
+     if (require_witness_sig && !sigdata.witness) return false;
++
++    // If we are not finalizing, set sigdata.complete to false to not set the scriptWitness
++    if (!finalize && sigdata.complete) sigdata.complete = false;
++
+     input.FromSignatureData(sigdata);
+ 
+     // If we have a witness signature, put a witness UTXO.
+     // TODO: For segwit v1, we should remove the non_witness_utxo
+     if (sigdata.witness) {
+         input.witness_utxo = utxo;
+         // input.non_witness_utxo = nullptr;
+     }
+ 
+     // Fill in the missing info
+     if (out_sigdata) {
+         out_sigdata->missing_pubkeys = sigdata.missing_pubkeys;
+         out_sigdata->missing_sigs = sigdata.missing_sigs;
+         out_sigdata->missing_redeem_script = sigdata.missing_redeem_script;
+         out_sigdata->missing_witness_script = sigdata.missing_witness_script;
+     }
+ 
+     return sig_complete;
+ }
+@@ -318,14 +322,14 @@ bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction&
+ bool FinalizePSBT(PartiallySignedTransaction& psbtx)
+ {
+     // Finalize input signatures -- in case we have partial signatures that add up to a complete
+     //   signature, but have not combined them yet (e.g. because the combiner that created this
+     //   PartiallySignedTransaction did not understand them), this will combine them into a final
+     //   script.
+     bool complete = true;
+     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+-        complete &= SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, SIGHASH_ALL);
++        complete &= SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, SIGHASH_ALL, nullptr, true);
+     }
+ 
+     return complete;
+ }
+diff --git a/src/psbt.h b/src/psbt.h
+index f6b82b43de..7808a247c0 100644
+--- a/src/psbt.h
++++ b/src/psbt.h
+@@ -576,9 +576,9 @@ bool PSBTInputSigned(const PSBTInput& input);
+ /** Signs a PSBTInput, verifying that all provided data matches what is being signed.
+  *
+  * txdata should be the output of PrecomputePSBTData (which can be shared across
+  * multiple SignPSBTInput calls). If it is nullptr, a dummy signature will be created.
+  **/
+-bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash = SIGHASH_ALL, SignatureData* out_sigdata = nullptr);
++bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, int sighash = SIGHASH_ALL, SignatureData* out_sigdata = nullptr, bool finalize = true);
+ 
+ /** Counts the unsigned inputs of a PSBT. */
+ size_t CountPSBTUnsignedInputs(const PartiallySignedTransaction& psbt);
+diff --git a/src/rpc/client.cpp b/src/rpc/client.cpp
+index 93e49cb9a8..90fbd823a4 100644
+--- a/src/rpc/client.cpp
++++ b/src/rpc/client.cpp
+@@ -20,180 +20,181 @@ public:
+ // clang-format off
+ /**
+  * Specify a (method, idx, name) here if the argument is a non-string RPC
+  * argument and needs to be converted from JSON.
+  *
+  * @note Parameter indexes start from 0.
+  */
+ static const CRPCConvertParam vRPCConvertParams[] =
+ {
+     { "setmocktime", 0, "timestamp" },
+     { "mockscheduler", 0, "delta_time" },
+     { "utxoupdatepsbt", 1, "descriptors" },
+     { "generatetoaddress", 0, "nblocks" },
+     { "generatetoaddress", 2, "maxtries" },
+     { "generatetodescriptor", 0, "num_blocks" },
+     { "generatetodescriptor", 2, "maxtries" },
+     { "generateblock", 1, "transactions" },
+     { "getnetworkhashps", 0, "nblocks" },
+     { "getnetworkhashps", 1, "height" },
+     { "sendtoaddress", 1, "amount" },
+     { "sendtoaddress", 4, "subtractfeefromamount" },
+     { "sendtoaddress", 5 , "replaceable" },
+     { "sendtoaddress", 6 , "conf_target" },
+     { "sendtoaddress", 8, "avoid_reuse" },
+     { "sendtoaddress", 9, "fee_rate"},
+     { "sendtoaddress", 10, "verbose"},
+     { "settxfee", 0, "amount" },
+     { "sethdseed", 0, "newkeypool" },
+     { "getreceivedbyaddress", 1, "minconf" },
+     { "getreceivedbylabel", 1, "minconf" },
+     { "listreceivedbyaddress", 0, "minconf" },
+     { "listreceivedbyaddress", 1, "include_empty" },
+     { "listreceivedbyaddress", 2, "include_watchonly" },
+     { "listreceivedbylabel", 0, "minconf" },
+     { "listreceivedbylabel", 1, "include_empty" },
+     { "listreceivedbylabel", 2, "include_watchonly" },
+     { "getbalance", 1, "minconf" },
+     { "getbalance", 2, "include_watchonly" },
+     { "getbalance", 3, "avoid_reuse" },
+     { "getblockhash", 0, "height" },
+     { "waitforblockheight", 0, "height" },
+     { "waitforblockheight", 1, "timeout" },
+     { "waitforblock", 1, "timeout" },
+     { "waitfornewblock", 0, "timeout" },
+     { "listtransactions", 1, "count" },
+     { "listtransactions", 2, "skip" },
+     { "listtransactions", 3, "include_watchonly" },
+     { "walletpassphrase", 1, "timeout" },
+     { "getblocktemplate", 0, "template_request" },
+     { "listsinceblock", 1, "target_confirmations" },
+     { "listsinceblock", 2, "include_watchonly" },
+     { "listsinceblock", 3, "include_removed" },
+     { "sendmany", 1, "amounts" },
+     { "sendmany", 2, "minconf" },
+     { "sendmany", 4, "subtractfeefrom" },
+     { "sendmany", 5 , "replaceable" },
+     { "sendmany", 6 , "conf_target" },
+     { "sendmany", 8, "fee_rate"},
+     { "sendmany", 9, "verbose" },
+     { "deriveaddresses", 1, "range" },
+     { "scantxoutset", 1, "scanobjects" },
+     { "addmultisigaddress", 0, "nrequired" },
+     { "addmultisigaddress", 1, "keys" },
+     { "createmultisig", 0, "nrequired" },
+     { "createmultisig", 1, "keys" },
+     { "listunspent", 0, "minconf" },
+     { "listunspent", 1, "maxconf" },
+     { "listunspent", 2, "addresses" },
+     { "listunspent", 3, "include_unsafe" },
+     { "listunspent", 4, "query_options" },
+     { "getblock", 1, "verbosity" },
+     { "getblock", 1, "verbose" },
+     { "getblockheader", 1, "verbose" },
+     { "getchaintxstats", 0, "nblocks" },
+     { "gettransaction", 1, "include_watchonly" },
+     { "gettransaction", 2, "verbose" },
+     { "getrawtransaction", 1, "verbose" },
+     { "createrawtransaction", 0, "inputs" },
+     { "createrawtransaction", 1, "outputs" },
+     { "createrawtransaction", 2, "locktime" },
+     { "createrawtransaction", 3, "replaceable" },
+     { "decoderawtransaction", 1, "iswitness" },
+     { "signrawtransactionwithkey", 1, "privkeys" },
+     { "signrawtransactionwithkey", 2, "prevtxs" },
+     { "signrawtransactionwithwallet", 1, "prevtxs" },
+     { "sendrawtransaction", 1, "maxfeerate" },
+     { "testmempoolaccept", 0, "rawtxs" },
+     { "testmempoolaccept", 1, "maxfeerate" },
+     { "combinerawtransaction", 0, "txs" },
+     { "fundrawtransaction", 1, "options" },
+     { "fundrawtransaction", 2, "iswitness" },
+     { "walletcreatefundedpsbt", 0, "inputs" },
+     { "walletcreatefundedpsbt", 1, "outputs" },
+     { "walletcreatefundedpsbt", 2, "locktime" },
+     { "walletcreatefundedpsbt", 3, "options" },
+     { "walletcreatefundedpsbt", 4, "bip32derivs" },
+     { "walletprocesspsbt", 1, "sign" },
+     { "walletprocesspsbt", 3, "bip32derivs" },
++    { "walletprocesspsbt", 4, "finalize" },
+     { "createpsbt", 0, "inputs" },
+     { "createpsbt", 1, "outputs" },
+     { "createpsbt", 2, "locktime" },
+     { "createpsbt", 3, "replaceable" },
+     { "combinepsbt", 0, "txs"},
+     { "joinpsbts", 0, "txs"},
+     { "finalizepsbt", 1, "extract"},
+     { "converttopsbt", 1, "permitsigdata"},
+     { "converttopsbt", 2, "iswitness"},
+     { "gettxout", 1, "n" },
+     { "gettxout", 2, "include_mempool" },
+     { "gettxoutproof", 0, "txids" },
+     { "gettxoutsetinfo", 1, "hash_or_height" },
+     { "gettxoutsetinfo", 2, "use_index"},
+     { "lockunspent", 0, "unlock" },
+     { "lockunspent", 1, "transactions" },
+     { "lockunspent", 2, "persistent" },
+     { "send", 0, "outputs" },
+     { "send", 1, "conf_target" },
+     { "send", 3, "fee_rate"},
+     { "send", 4, "options" },
+     { "importprivkey", 2, "rescan" },
+     { "importaddress", 2, "rescan" },
+     { "importaddress", 3, "p2sh" },
+     { "importpubkey", 2, "rescan" },
+     { "importmulti", 0, "requests" },
+     { "importmulti", 1, "options" },
+     { "importdescriptors", 0, "requests" },
+     { "listdescriptors", 0, "private" },
+     { "verifychain", 0, "checklevel" },
+     { "verifychain", 1, "nblocks" },
+     { "getblockstats", 0, "hash_or_height" },
+     { "getblockstats", 1, "stats" },
+     { "pruneblockchain", 0, "height" },
+     { "keypoolrefill", 0, "newsize" },
+     { "getrawmempool", 0, "verbose" },
+     { "getrawmempool", 1, "mempool_sequence" },
+     { "estimatesmartfee", 0, "conf_target" },
+     { "estimaterawfee", 0, "conf_target" },
+     { "estimaterawfee", 1, "threshold" },
+     { "prioritisetransaction", 1, "dummy" },
+     { "prioritisetransaction", 2, "fee_delta" },
+     { "setban", 2, "bantime" },
+     { "setban", 3, "absolute" },
+     { "setnetworkactive", 0, "state" },
+     { "setwalletflag", 1, "value" },
+     { "getmempoolancestors", 1, "verbose" },
+     { "getmempooldescendants", 1, "verbose" },
+     { "bumpfee", 1, "options" },
+     { "psbtbumpfee", 1, "options" },
+     { "logging", 0, "include" },
+     { "logging", 1, "exclude" },
+     { "disconnectnode", 1, "nodeid" },
+     { "upgradewallet", 0, "version" },
+     // Echo with conversion (For testing only)
+     { "echojson", 0, "arg0" },
+     { "echojson", 1, "arg1" },
+     { "echojson", 2, "arg2" },
+     { "echojson", 3, "arg3" },
+     { "echojson", 4, "arg4" },
+     { "echojson", 5, "arg5" },
+     { "echojson", 6, "arg6" },
+     { "echojson", 7, "arg7" },
+     { "echojson", 8, "arg8" },
+     { "echojson", 9, "arg9" },
+     { "rescanblockchain", 0, "start_height"},
+     { "rescanblockchain", 1, "stop_height"},
+     { "createwallet", 1, "disable_private_keys"},
+     { "createwallet", 2, "blank"},
+     { "createwallet", 4, "avoid_reuse"},
+     { "createwallet", 5, "descriptors"},
+     { "createwallet", 6, "load_on_startup"},
+     { "createwallet", 7, "external_signer"},
+     { "restorewallet", 2, "load_on_startup"},
+     { "loadwallet", 1, "load_on_startup"},
+     { "unloadwallet", 1, "load_on_startup"},
+     { "getnodeaddresses", 0, "count"},
+     { "addpeeraddress", 1, "port"},
+     { "addpeeraddress", 2, "tried"},
+     { "stop", 0, "wait" },
+ };
+ // clang-format on
+diff --git a/src/wallet/external_signer_scriptpubkeyman.cpp b/src/wallet/external_signer_scriptpubkeyman.cpp
+index efef1ec754..6a73efb472 100644
+--- a/src/wallet/external_signer_scriptpubkeyman.cpp
++++ b/src/wallet/external_signer_scriptpubkeyman.cpp
+@@ -60,25 +60,25 @@ bool ExternalSignerScriptPubKeyMan::DisplayAddress(const CScript scriptPubKey, c
+ }
+ 
+ // If sign is true, transaction must previously have been filled
+-TransactionError ExternalSignerScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed) const
++TransactionError ExternalSignerScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+ {
+     if (!sign) {
+-        return DescriptorScriptPubKeyMan::FillPSBT(psbt, txdata, sighash_type, false, bip32derivs, n_signed);
++        return DescriptorScriptPubKeyMan::FillPSBT(psbt, txdata, sighash_type, false, bip32derivs, n_signed, finalize);
+     }
+ 
+     // Already complete if every input is now signed
+     bool complete = true;
+     for (const auto& input : psbt.inputs) {
+         // TODO: for multisig wallets, we should only care if all _our_ inputs are signed
+         complete &= PSBTInputSigned(input);
+     }
+     if (complete) return TransactionError::OK;
+ 
+     std::string strFailReason;
+     if(!GetExternalSigner().SignTransaction(psbt, strFailReason)) {
+         tfm::format(std::cerr, "Failed to sign: %s\n", strFailReason);
+         return TransactionError::EXTERNAL_SIGNER_FAILED;
+     }
+-    FinalizePSBT(psbt); // This won't work in a multisig setup
++    if (finalize) FinalizePSBT(psbt); // This won't work in a multisig setup
+     return TransactionError::OK;
+ }
+diff --git a/src/wallet/external_signer_scriptpubkeyman.h b/src/wallet/external_signer_scriptpubkeyman.h
+index 61df3d0015..53d65d9e46 100644
+--- a/src/wallet/external_signer_scriptpubkeyman.h
++++ b/src/wallet/external_signer_scriptpubkeyman.h
+@@ -12,22 +12,22 @@
+ class ExternalSignerScriptPubKeyMan : public DescriptorScriptPubKeyMan
+ {
+   public:
+   ExternalSignerScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor)
+       :   DescriptorScriptPubKeyMan(storage, descriptor)
+       {}
+   ExternalSignerScriptPubKeyMan(WalletStorage& storage)
+       :   DescriptorScriptPubKeyMan(storage)
+       {}
+ 
+   /** Provide a descriptor at setup time
+   * Returns false if already setup or setup fails, true if setup is successful
+   */
+   bool SetupDescriptor(std::unique_ptr<Descriptor>desc);
+ 
+   static ExternalSigner GetExternalSigner();
+ 
+   bool DisplayAddress(const CScript scriptPubKey, const ExternalSigner &signer) const;
+ 
+-  TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr) const override;
++  TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+ };
+ #endif // BITCOIN_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
+diff --git a/src/wallet/rpcwallet.cpp b/src/wallet/rpcwallet.cpp
+index c895d5af8c..bb5b388791 100644
+--- a/src/wallet/rpcwallet.cpp
++++ b/src/wallet/rpcwallet.cpp
+@@ -4536,73 +4536,75 @@ static RPCHelpMan sethdseed()
+ static RPCHelpMan walletprocesspsbt()
+ {
+     return RPCHelpMan{"walletprocesspsbt",
+                 "\nUpdate a PSBT with input information from our wallet and then sign inputs\n"
+                 "that we can sign for." +
+         HELP_REQUIRING_PASSPHRASE,
+                 {
+                     {"psbt", RPCArg::Type::STR, RPCArg::Optional::NO, "The transaction base64 string"},
+                     {"sign", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also sign the transaction when updating (requires wallet to be unlocked)"},
+                     {"sighashtype", RPCArg::Type::STR, RPCArg::Default{"DEFAULT"}, "The signature hash type to sign with if not specified by the PSBT. Must be one of\n"
+             "       \"DEFAULT\"\n"
+             "       \"ALL\"\n"
+             "       \"NONE\"\n"
+             "       \"SINGLE\"\n"
+             "       \"ALL|ANYONECANPAY\"\n"
+             "       \"NONE|ANYONECANPAY\"\n"
+             "       \"SINGLE|ANYONECANPAY\""},
+                     {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them"},
++                    {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible"},
+                 },
+                 RPCResult{
+                     RPCResult::Type::OBJ, "", "",
+                     {
+                         {RPCResult::Type::STR, "psbt", "The base64-encoded partially signed transaction"},
+                         {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
+                     }
+                 },
+                 RPCExamples{
+                     HelpExampleCli("walletprocesspsbt", "\"psbt\"")
+                 },
+         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+ {
+     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+     if (!pwallet) return NullUniValue;
+ 
+     const CWallet& wallet{*pwallet};
+     // Make sure the results are valid at least up to the most recent block
+     // the user could have gotten from another RPC command prior to now
+     wallet.BlockUntilSyncedToCurrentChain();
+ 
+-    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL, UniValue::VSTR});
++    RPCTypeCheck(request.params, {UniValue::VSTR});
+ 
+     // Unserialize the transaction
+     PartiallySignedTransaction psbtx;
+     std::string error;
+     if (!DecodeBase64PSBT(psbtx, request.params[0].get_str(), error)) {
+         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf("TX decode failed %s", error));
+     }
+ 
+     // Get the sighash type
+     int nHashType = ParseSighashString(request.params[2]);
+ 
+     // Fill transaction with our data and also sign
+     bool sign = request.params[1].isNull() ? true : request.params[1].get_bool();
+     bool bip32derivs = request.params[3].isNull() ? true : request.params[3].get_bool();
++    bool finalize = request.params[4].isNull() ? true : request.params[4].get_bool();
+     bool complete = true;
+ 
+     if (sign) EnsureWalletIsUnlocked(*pwallet);
+ 
+-    const TransactionError err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs)};
++    const TransactionError err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize)};
+     if (err != TransactionError::OK) {
+         throw JSONRPCTransactionError(err);
+     }
+ 
+     UniValue result(UniValue::VOBJ);
+     CDataStream ssTx(SER_NETWORK, PROTOCOL_VERSION);
+     ssTx << psbtx;
+     result.pushKV("psbt", EncodeBase64(ssTx.str()));
+     result.pushKV("complete", complete);
+ 
+     return result;
+ },
+     };
+ }
+diff --git a/src/wallet/scriptpubkeyman.cpp b/src/wallet/scriptpubkeyman.cpp
+index 0b4632bd99..a82eaa4879 100644
+--- a/src/wallet/scriptpubkeyman.cpp
++++ b/src/wallet/scriptpubkeyman.cpp
+@@ -610,50 +610,50 @@ SigningResult LegacyScriptPubKeyMan::SignMessage(const std::string& message, con
+     return SigningResult::SIGNING_FAILED;
+ }
+ 
+-TransactionError LegacyScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed) const
++TransactionError LegacyScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+ {
+     if (n_signed) {
+         *n_signed = 0;
+     }
+     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+         const CTxIn& txin = psbtx.tx->vin[i];
+         PSBTInput& input = psbtx.inputs.at(i);
+ 
+         if (PSBTInputSigned(input)) {
+             continue;
+         }
+ 
+         // Get the Sighash type
+         if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {
+             return TransactionError::SIGHASH_MISMATCH;
+         }
+ 
+         // Check non_witness_utxo has specified prevout
+         if (input.non_witness_utxo) {
+             if (txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                 return TransactionError::MISSING_INPUTS;
+             }
+         } else if (input.witness_utxo.IsNull()) {
+             // There's no UTXO so we can just skip this now
+             continue;
+         }
+         SignatureData sigdata;
+         input.FillSignatureData(sigdata);
+-        SignPSBTInput(HidingSigningProvider(this, !sign, !bip32derivs), psbtx, i, &txdata, sighash_type);
++        SignPSBTInput(HidingSigningProvider(this, !sign, !bip32derivs), psbtx, i, &txdata, sighash_type, nullptr, finalize);
+ 
+         bool signed_one = PSBTInputSigned(input);
+         if (n_signed && (signed_one || !sign)) {
+             // If sign is false, we assume that we _could_ sign if we get here. This
+             // will never have false negatives; it is hard to tell under what i
+             // circumstances it could have false positives.
+             (*n_signed)++;
+         }
+     }
+ 
+     // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change
+     for (unsigned int i = 0; i < psbtx.tx->vout.size(); ++i) {
+         UpdatePSBTOutput(HidingSigningProvider(this, true, !bip32derivs), psbtx, i);
+     }
+ 
+     return TransactionError::OK;
+ }
+@@ -2074,75 +2074,75 @@ SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message,
+     return SigningResult::OK;
+ }
+ 
+-TransactionError DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed) const
++TransactionError DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+ {
+     if (n_signed) {
+         *n_signed = 0;
+     }
+     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+         const CTxIn& txin = psbtx.tx->vin[i];
+         PSBTInput& input = psbtx.inputs.at(i);
+ 
+         if (PSBTInputSigned(input)) {
+             continue;
+         }
+ 
+         // Get the Sighash type
+         if (sign && input.sighash_type > 0 && input.sighash_type != sighash_type) {
+             return TransactionError::SIGHASH_MISMATCH;
+         }
+ 
+         // Get the scriptPubKey to know which SigningProvider to use
+         CScript script;
+         if (!input.witness_utxo.IsNull()) {
+             script = input.witness_utxo.scriptPubKey;
+         } else if (input.non_witness_utxo) {
+             if (txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                 return TransactionError::MISSING_INPUTS;
+             }
+             script = input.non_witness_utxo->vout[txin.prevout.n].scriptPubKey;
+         } else {
+             // There's no UTXO so we can just skip this now
+             continue;
+         }
+         SignatureData sigdata;
+         input.FillSignatureData(sigdata);
+ 
+         std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
+         std::unique_ptr<FlatSigningProvider> script_keys = GetSigningProvider(script, sign);
+         if (script_keys) {
+             *keys = Merge(*keys, *script_keys);
+         } else {
+             // Maybe there are pubkeys listed that we can sign for
+             script_keys = std::make_unique<FlatSigningProvider>();
+             for (const auto& pk_pair : input.hd_keypaths) {
+                 const CPubKey& pubkey = pk_pair.first;
+                 std::unique_ptr<FlatSigningProvider> pk_keys = GetSigningProvider(pubkey);
+                 if (pk_keys) {
+                     *keys = Merge(*keys, *pk_keys);
+                 }
+             }
+         }
+ 
+-        SignPSBTInput(HidingSigningProvider(keys.get(), !sign, !bip32derivs), psbtx, i, &txdata, sighash_type);
++        SignPSBTInput(HidingSigningProvider(keys.get(), !sign, !bip32derivs), psbtx, i, &txdata, sighash_type, nullptr, finalize);
+ 
+         bool signed_one = PSBTInputSigned(input);
+         if (n_signed && (signed_one || !sign)) {
+             // If sign is false, we assume that we _could_ sign if we get here. This
+             // will never have false negatives; it is hard to tell under what i
+             // circumstances it could have false positives.
+             (*n_signed)++;
+         }
+     }
+ 
+     // Fill in the bip32 keypaths and redeemscripts for the outputs so that hardware wallets can identify change
+     for (unsigned int i = 0; i < psbtx.tx->vout.size(); ++i) {
+         std::unique_ptr<SigningProvider> keys = GetSolvingProvider(psbtx.tx->vout.at(i).scriptPubKey);
+         if (!keys) {
+             continue;
+         }
+         UpdatePSBTOutput(HidingSigningProvider(keys.get(), true, !bip32derivs), psbtx, i);
+     }
+ 
+     return TransactionError::OK;
+ }
+diff --git a/src/wallet/scriptpubkeyman.h b/src/wallet/scriptpubkeyman.h
+index 2d447f1d67..9d2304a542 100644
+--- a/src/wallet/scriptpubkeyman.h
++++ b/src/wallet/scriptpubkeyman.h
+@@ -164,81 +164,81 @@ protected:
+ public:
+     explicit ScriptPubKeyMan(WalletStorage& storage) : m_storage(storage) {}
+     virtual ~ScriptPubKeyMan() {};
+     virtual bool GetNewDestination(const OutputType type, CTxDestination& dest, bilingual_str& error) { return false; }
+     virtual isminetype IsMine(const CScript& script) const { return ISMINE_NO; }
+ 
+     //! Check that the given decryption key is valid for this ScriptPubKeyMan, i.e. it decrypts all of the keys handled by it.
+     virtual bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) { return false; }
+     virtual bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) { return false; }
+ 
+     virtual bool GetReservedDestination(const OutputType type, bool internal, CTxDestination& address, int64_t& index, CKeyPool& keypool, bilingual_str& error) { return false; }
+     virtual void KeepDestination(int64_t index, const OutputType& type) {}
+     virtual void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) {}
+ 
+     /** Fills internal address pool. Use within ScriptPubKeyMan implementations should be used sparingly and only
+       * when something from the address pool is removed, excluding GetNewDestination and GetReservedDestination.
+       * External wallet code is primarily responsible for topping up prior to fetching new addresses
+       */
+     virtual bool TopUp(unsigned int size = 0) { return false; }
+ 
+     //! Mark unused addresses as being used
+     virtual void MarkUnusedAddresses(const CScript& script) {}
+ 
+     /** Sets up the key generation stuff, i.e. generates new HD seeds and sets them as active.
+       * Returns false if already setup or setup fails, true if setup is successful
+       * Set force=true to make it re-setup if already setup, used for upgrades
+       */
+     virtual bool SetupGeneration(bool force = false) { return false; }
+ 
+     /* Returns true if HD is enabled */
+     virtual bool IsHDEnabled() const { return false; }
+ 
+     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
+     virtual bool CanGetAddresses(bool internal = false) const { return false; }
+ 
+     /** Upgrades the wallet to the specified version */
+     virtual bool Upgrade(int prev_version, int new_version, bilingual_str& error) { return true; }
+ 
+     virtual bool HavePrivateKeys() const { return false; }
+ 
+     //! The action to do when the DB needs rewrite
+     virtual void RewriteDB() {}
+ 
+     virtual std::optional<int64_t> GetOldestKeyPoolTime() const { return GetTime(); }
+ 
+     virtual unsigned int GetKeyPoolSize() const { return 0; }
+ 
+     virtual int64_t GetTimeFirstKey() const { return 0; }
+ 
+     virtual std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const { return nullptr; }
+ 
+     virtual std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const { return nullptr; }
+ 
+     /** Whether this ScriptPubKeyMan can provide a SigningProvider (via GetSolvingProvider) that, combined with
+       * sigdata, can produce solving data.
+       */
+     virtual bool CanProvide(const CScript& script, SignatureData& sigdata) { return false; }
+ 
+     /** Creates new signatures and adds them to the transaction. Returns whether all inputs were signed */
+     virtual bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const { return false; }
+     /** Sign a message with the given script */
+     virtual SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const { return SigningResult::SIGNING_FAILED; };
+     /** Adds script and derivation path information to a PSBT, and optionally signs it. */
+-    virtual TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr) const { return TransactionError::INVALID_PSBT; }
++    virtual TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const { return TransactionError::INVALID_PSBT; }
+ 
+     virtual uint256 GetID() const { return uint256(); }
+ 
+     /** Prepends the wallet name in logging output to ease debugging in multi-wallet use cases */
+     template<typename... Params>
+     void WalletLogPrintf(std::string fmt, Params... parameters) const {
+         LogPrintf(("%s " + fmt).c_str(), m_storage.GetDisplayName(), parameters...);
+     };
+ 
+     /** Watch-only address added */
+     boost::signals2::signal<void (bool fHaveWatchOnly)> NotifyWatchonlyChanged;
+ 
+     /** Keypool has new keys */
+     boost::signals2::signal<void ()> NotifyCanGetAddressesChanged;
+ };
+ 
+ /** OutputTypes supported by the LegacyScriptPubKeyMan */
+@@ -345,149 +345,149 @@ private:
+ public:
+     using ScriptPubKeyMan::ScriptPubKeyMan;
+ 
+     bool GetNewDestination(const OutputType type, CTxDestination& dest, bilingual_str& error) override;
+     isminetype IsMine(const CScript& script) const override;
+ 
+     bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) override;
+     bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override;
+ 
+     bool GetReservedDestination(const OutputType type, bool internal, CTxDestination& address, int64_t& index, CKeyPool& keypool, bilingual_str& error) override;
+     void KeepDestination(int64_t index, const OutputType& type) override;
+     void ReturnDestination(int64_t index, bool internal, const CTxDestination&) override;
+ 
+     bool TopUp(unsigned int size = 0) override;
+ 
+     void MarkUnusedAddresses(const CScript& script) override;
+ 
+     //! Upgrade stored CKeyMetadata objects to store key origin info as KeyOriginInfo
+     void UpgradeKeyMetadata();
+ 
+     bool IsHDEnabled() const override;
+ 
+     bool SetupGeneration(bool force = false) override;
+ 
+     bool Upgrade(int prev_version, int new_version, bilingual_str& error) override;
+ 
+     bool HavePrivateKeys() const override;
+ 
+     void RewriteDB() override;
+ 
+     std::optional<int64_t> GetOldestKeyPoolTime() const override;
+     size_t KeypoolCountExternalKeys() const;
+     unsigned int GetKeyPoolSize() const override;
+ 
+     int64_t GetTimeFirstKey() const override;
+ 
+     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
+ 
+     bool CanGetAddresses(bool internal = false) const override;
+ 
+     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
+ 
+     bool CanProvide(const CScript& script, SignatureData& sigdata) override;
+ 
+     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const override;
+     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
+-    TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr) const override;
++    TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+ 
+     uint256 GetID() const override;
+ 
+     // Map from Key ID to key metadata.
+     std::map<CKeyID, CKeyMetadata> mapKeyMetadata GUARDED_BY(cs_KeyStore);
+ 
+     // Map from Script ID to key metadata (for watch-only keys).
+     std::map<CScriptID, CKeyMetadata> m_script_metadata GUARDED_BY(cs_KeyStore);
+ 
+     //! Adds a key to the store, and saves it to disk.
+     bool AddKeyPubKey(const CKey& key, const CPubKey &pubkey) override;
+     //! Adds a key to the store, without saving it to disk (used by LoadWallet)
+     bool LoadKey(const CKey& key, const CPubKey &pubkey);
+     //! Adds an encrypted key to the store, and saves it to disk.
+     bool AddCryptedKey(const CPubKey &vchPubKey, const std::vector<unsigned char> &vchCryptedSecret);
+     //! Adds an encrypted key to the store, without saving it to disk (used by LoadWallet)
+     bool LoadCryptedKey(const CPubKey &vchPubKey, const std::vector<unsigned char> &vchCryptedSecret, bool checksum_valid);
+     void UpdateTimeFirstKey(int64_t nCreateTime) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+     //! Adds a CScript to the store
+     bool LoadCScript(const CScript& redeemScript);
+     //! Load metadata (used by LoadWallet)
+     void LoadKeyMetadata(const CKeyID& keyID, const CKeyMetadata &metadata);
+     void LoadScriptMetadata(const CScriptID& script_id, const CKeyMetadata &metadata);
+     //! Generate a new key
+     CPubKey GenerateNewKey(WalletBatch& batch, CHDChain& hd_chain, bool internal = false) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+ 
+     /* Set the HD chain model (chain child index counters) and writes it to the database */
+     void AddHDChain(const CHDChain& chain);
+     //! Load a HD chain model (used by LoadWallet)
+     void LoadHDChain(const CHDChain& chain);
+     const CHDChain& GetHDChain() const { return m_hd_chain; }
+     void AddInactiveHDChain(const CHDChain& chain);
+ 
+     //! Adds a watch-only address to the store, without saving it to disk (used by LoadWallet)
+     bool LoadWatchOnly(const CScript &dest);
+     //! Returns whether the watch-only script is in the wallet
+     bool HaveWatchOnly(const CScript &dest) const;
+     //! Returns whether there are any watch-only things in the wallet
+     bool HaveWatchOnly() const;
+     //! Remove a watch only script from the keystore
+     bool RemoveWatchOnly(const CScript &dest);
+     bool AddWatchOnly(const CScript& dest, int64_t nCreateTime) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+ 
+     //! Fetches a pubkey from mapWatchKeys if it exists there
+     bool GetWatchPubKey(const CKeyID &address, CPubKey &pubkey_out) const;
+ 
+     /* SigningProvider overrides */
+     bool HaveKey(const CKeyID &address) const override;
+     bool GetKey(const CKeyID &address, CKey& keyOut) const override;
+     bool GetPubKey(const CKeyID &address, CPubKey& vchPubKeyOut) const override;
+     bool AddCScript(const CScript& redeemScript) override;
+     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
+ 
+     //! Load a keypool entry
+     void LoadKeyPool(int64_t nIndex, const CKeyPool &keypool);
+     bool NewKeyPool();
+     void MarkPreSplitKeys() EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+ 
+     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+     bool ImportPubKeys(const std::vector<CKeyID>& ordered_pubkeys, const std::map<CKeyID, CPubKey>& pubkey_map, const std::map<CKeyID, std::pair<CPubKey, KeyOriginInfo>>& key_origins, const bool add_keypool, const bool internal, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+     bool ImportScriptPubKeys(const std::set<CScript>& script_pub_keys, const bool have_solving_data, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+ 
+     /* Returns true if the wallet can generate new keys */
+     bool CanGenerateKeys() const;
+ 
+     /* Generates a new HD seed (will not be activated) */
+     CPubKey GenerateNewSeed();
+ 
+     /* Derives a new HD seed (will not be activated) */
+     CPubKey DeriveNewSeed(const CKey& key);
+ 
+     /* Set the current HD seed (will reset the chain child index counters)
+        Sets the seed's version based on the current wallet version (so the
+        caller must ensure the current wallet version is correct before calling
+        this function). */
+     void SetHDSeed(const CPubKey& key);
+ 
+     /**
+      * Explicitly make the wallet learn the related scripts for outputs to the
+      * given key. This is purely to make the wallet file compatible with older
+      * software, as FillableSigningProvider automatically does this implicitly for all
+      * keys now.
+      */
+     void LearnRelatedScripts(const CPubKey& key, OutputType);
+ 
+     /**
+      * Same as LearnRelatedScripts, but when the OutputType is not known (and could
+      * be anything).
+      */
+     void LearnAllRelatedScripts(const CPubKey& key);
+ 
+     /**
+      * Marks all keys in the keypool up to and including reserve_key as used.
+      */
+     void MarkReserveKeysAsUsed(int64_t keypool_id) EXCLUSIVE_LOCKS_REQUIRED(cs_KeyStore);
+     const std::map<CKeyID, int64_t>& GetAllReserveKeys() const { return m_pool_key_to_index; }
+ 
+     std::set<CKeyID> GetKeys() const override;
+ };
+ 
+ /** Wraps a LegacyScriptPubKeyMan so that it can be returned in a new unique_ptr. Does not provide privkeys */
+@@ -541,79 +541,79 @@ protected:
+ public:
+     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor)
+         :   ScriptPubKeyMan(storage),
+             m_wallet_descriptor(descriptor)
+         {}
+     DescriptorScriptPubKeyMan(WalletStorage& storage)
+         :   ScriptPubKeyMan(storage)
+         {}
+ 
+     mutable RecursiveMutex cs_desc_man;
+ 
+     bool GetNewDestination(const OutputType type, CTxDestination& dest, bilingual_str& error) override;
+     isminetype IsMine(const CScript& script) const override;
+ 
+     bool CheckDecryptionKey(const CKeyingMaterial& master_key, bool accept_no_keys = false) override;
+     bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override;
+ 
+     bool GetReservedDestination(const OutputType type, bool internal, CTxDestination& address, int64_t& index, CKeyPool& keypool, bilingual_str& error) override;
+     void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) override;
+ 
+     // Tops up the descriptor cache and m_map_script_pub_keys. The cache is stored in the wallet file
+     // and is used to expand the descriptor in GetNewDestination. DescriptorScriptPubKeyMan relies
+     // more on ephemeral data than LegacyScriptPubKeyMan. For wallets using unhardened derivation
+     // (with or without private keys), the "keypool" is a single xpub.
+     bool TopUp(unsigned int size = 0) override;
+ 
+     void MarkUnusedAddresses(const CScript& script) override;
+ 
+     bool IsHDEnabled() const override;
+ 
+     //! Setup descriptors based on the given CExtkey
+     bool SetupDescriptorGeneration(const CExtKey& master_key, OutputType addr_type, bool internal);
+ 
+     /** Provide a descriptor at setup time
+     * Returns false if already setup or setup fails, true if setup is successful
+     */
+     bool SetupDescriptor(std::unique_ptr<Descriptor>desc);
+ 
+     bool HavePrivateKeys() const override;
+ 
+     std::optional<int64_t> GetOldestKeyPoolTime() const override;
+     unsigned int GetKeyPoolSize() const override;
+ 
+     int64_t GetTimeFirstKey() const override;
+ 
+     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
+ 
+     bool CanGetAddresses(bool internal = false) const override;
+ 
+     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
+ 
+     bool CanProvide(const CScript& script, SignatureData& sigdata) override;
+ 
+     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const override;
+     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
+-    TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr) const override;
++    TransactionError FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, int sighash_type = 1 /* SIGHASH_ALL */, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+ 
+     uint256 GetID() const override;
+ 
+     void SetCache(const DescriptorCache& cache);
+ 
+     bool AddKey(const CKeyID& key_id, const CKey& key);
+     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
+ 
+     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
+     void UpdateWalletDescriptor(WalletDescriptor& descriptor);
+     bool CanUpdateToWalletDescriptor(const WalletDescriptor& descriptor, std::string& error);
+     void AddDescriptorKey(const CKey& key, const CPubKey &pubkey);
+     void WriteDescriptor();
+ 
+     const WalletDescriptor GetWalletDescriptor() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+     const std::vector<CScript> GetScriptPubKeys() const;
+ 
+     bool GetDescriptorString(std::string& out, const bool priv) const;
+ 
+     void UpgradeDescriptorCache();
+ };
+ 
+ #endif // BITCOIN_WALLET_SCRIPTPUBKEYMAN_H
+diff --git a/src/wallet/wallet.cpp b/src/wallet/wallet.cpp
+index 2382ac268d..e4c3822305 100644
+--- a/src/wallet/wallet.cpp
++++ b/src/wallet/wallet.cpp
+@@ -1849,53 +1849,53 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
+     return false;
+ }
+ 
+-TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed) const
++TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
+ {
+     if (n_signed) {
+         *n_signed = 0;
+     }
+     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+     LOCK(cs_wallet);
+     // Get all of the previous transactions
+     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+         const CTxIn& txin = psbtx.tx->vin[i];
+         PSBTInput& input = psbtx.inputs.at(i);
+ 
+         if (PSBTInputSigned(input)) {
+             continue;
+         }
+ 
+         // If we have no utxo, grab it from the wallet.
+         if (!input.non_witness_utxo) {
+             const uint256& txhash = txin.prevout.hash;
+             const auto it = mapWallet.find(txhash);
+             if (it != mapWallet.end()) {
+                 const CWalletTx& wtx = it->second;
+                 // We only need the non_witness_utxo, which is a superset of the witness_utxo.
+                 //   The signing code will switch to the smaller witness_utxo if this is ok.
+                 input.non_witness_utxo = wtx.tx;
+             }
+         }
+     }
+ 
+     // Fill in information from ScriptPubKeyMans
+     for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+         int n_signed_this_spkm = 0;
+-        TransactionError res = spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm);
++        TransactionError res = spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize);
+         if (res != TransactionError::OK) {
+             return res;
+         }
+ 
+         if (n_signed) {
+             (*n_signed) += n_signed_this_spkm;
+         }
+     }
+ 
+     // Complete if every input is now signed
+     complete = true;
+     for (const auto& input : psbtx.inputs) {
+         complete &= PSBTInputSigned(input);
+     }
+ 
+     return TransactionError::OK;
+ }
+diff --git a/src/wallet/wallet.h b/src/wallet/wallet.h
+index 3390d632e7..e294358609 100644
+--- a/src/wallet/wallet.h
++++ b/src/wallet/wallet.h
+@@ -343,547 +343,550 @@ private:
+ public:
+     /**
+      * Main wallet lock.
+      * This lock protects all the fields added by CWallet.
+      */
+     mutable RecursiveMutex cs_wallet;
+ 
+     WalletDatabase& GetDatabase() const override
+     {
+         assert(static_cast<bool>(m_database));
+         return *m_database;
+     }
+ 
+     /** Get a name for this wallet for logging/debugging purposes.
+      */
+     const std::string& GetName() const { return m_name; }
+ 
+     typedef std::map<unsigned int, CMasterKey> MasterKeyMap;
+     MasterKeyMap mapMasterKeys;
+     unsigned int nMasterKeyMaxID = 0;
+ 
+     /** Construct wallet with specified name and database implementation. */
+     CWallet(interfaces::Chain* chain, const std::string& name, const ArgsManager& args, std::unique_ptr<WalletDatabase> database)
+         : m_args(args),
+           m_chain(chain),
+           m_name(name),
+           m_database(std::move(database))
+     {
+     }
+ 
+     ~CWallet()
+     {
+         // Should not have slots connected at this point.
+         assert(NotifyUnload.empty());
+     }
+ 
+     bool IsCrypted() const;
+     bool IsLocked() const override;
+     bool Lock();
+ 
+     /** Interface to assert chain access */
+     bool HaveChain() const { return m_chain ? true : false; }
+ 
+     /** Map from txid to CWalletTx for all transactions this wallet is
+      * interested in, including received and sent transactions. */
+     std::map<uint256, CWalletTx> mapWallet GUARDED_BY(cs_wallet);
+ 
+     typedef std::multimap<int64_t, CWalletTx*> TxItems;
+     TxItems wtxOrdered;
+ 
+     int64_t nOrderPosNext GUARDED_BY(cs_wallet) = 0;
+     uint64_t nAccountingEntryNumber = 0;
+ 
+     std::map<CTxDestination, CAddressBookData> m_address_book GUARDED_BY(cs_wallet);
+     const CAddressBookData* FindAddressBookEntry(const CTxDestination&, bool allow_change = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     /** Set of Coins owned by this wallet that we won't try to spend from. A
+      * Coin may be locked if it has already been used to fund a transaction
+      * that hasn't confirmed yet. We wouldn't consider the Coin spent already,
+      * but also shouldn't try to use it again. */
+     std::set<COutPoint> setLockedCoins GUARDED_BY(cs_wallet);
+ 
+     /** Registered interfaces::Chain::Notifications handler. */
+     std::unique_ptr<interfaces::Handler> m_chain_notifications_handler;
+ 
+     /** Interface for accessing chain state. */
+     interfaces::Chain& chain() const { assert(m_chain); return *m_chain; }
+ 
+     const CWalletTx* GetWalletTx(const uint256& hash) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     // TODO: Remove "NO_THREAD_SAFETY_ANALYSIS" and replace it with the correct
+     // annotation "EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)". The annotation
+     // "NO_THREAD_SAFETY_ANALYSIS" was temporarily added to avoid having to
+     // resolve the issue of member access into incomplete type CWallet. Note
+     // that we still have the runtime check "AssertLockHeld(pwallet->cs_wallet)"
+     // in place.
+     std::set<uint256> GetTxConflicts(const CWalletTx& wtx) const NO_THREAD_SAFETY_ANALYSIS;
+ 
+     /**
+      * Return depth of transaction in blockchain:
+      * <0  : conflicts with a transaction this deep in the blockchain
+      *  0  : in memory pool, waiting to be included in a block
+      * >=1 : this many blocks deep in the main chain
+      */
+     // TODO: Remove "NO_THREAD_SAFETY_ANALYSIS" and replace it with the correct
+     // annotation "EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)". The annotation
+     // "NO_THREAD_SAFETY_ANALYSIS" was temporarily added to avoid having to
+     // resolve the issue of member access into incomplete type CWallet. Note
+     // that we still have the runtime check "AssertLockHeld(pwallet->cs_wallet)"
+     // in place.
+     int GetTxDepthInMainChain(const CWalletTx& wtx) const NO_THREAD_SAFETY_ANALYSIS;
+     bool IsTxInMainChain(const CWalletTx& wtx) const { return GetTxDepthInMainChain(wtx) > 0; }
+ 
+     /**
+      * @return number of blocks to maturity for this transaction:
+      *  0 : is not a coinbase transaction, or is a mature coinbase transaction
+      * >0 : is a coinbase transaction which matures in this many blocks
+      */
+     int GetTxBlocksToMaturity(const CWalletTx& wtx) const;
+     bool IsTxImmatureCoinBase(const CWalletTx& wtx) const;
+ 
+     //! check whether we support the named feature
+     bool CanSupportFeature(enum WalletFeature wf) const override EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { AssertLockHeld(cs_wallet); return IsFeatureSupported(nWalletVersion, wf); }
+ 
+     bool IsSpent(const uint256& hash, unsigned int n) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     // Whether this or any known UTXO with the same single key has been spent.
+     bool IsSpentKey(const uint256& hash, unsigned int n) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     void SetSpentKeyState(WalletBatch& batch, const uint256& hash, unsigned int n, bool used, std::set<CTxDestination>& tx_destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     /** Display address on an external signer. Returns false if external signer support is not compiled */
+     bool DisplayAddress(const CTxDestination& dest) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     bool IsLockedCoin(uint256 hash, unsigned int n) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool LockCoin(const COutPoint& output, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool UnlockCoin(const COutPoint& output, WalletBatch* batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool UnlockAllCoins() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     void ListLockedCoins(std::vector<COutPoint>& vOutpts) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     /*
+      * Rescan abort properties
+      */
+     void AbortRescan() { fAbortRescan = true; }
+     bool IsAbortingRescan() const { return fAbortRescan; }
+     bool IsScanning() const { return fScanningWallet; }
+     int64_t ScanningDuration() const { return fScanningWallet ? GetTimeMillis() - m_scanning_start : 0; }
+     double ScanningProgress() const { return fScanningWallet ? (double) m_scanning_progress : 0; }
+ 
+     //! Upgrade stored CKeyMetadata objects to store key origin info as KeyOriginInfo
+     void UpgradeKeyMetadata() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! Upgrade DescriptorCaches
+     void UpgradeDescriptorCache() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     bool LoadMinVersion(int nVersion) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { AssertLockHeld(cs_wallet); nWalletVersion = nVersion; return true; }
+ 
+     //! Adds a destination data tuple to the store, without saving it to disk
+     void LoadDestData(const CTxDestination& dest, const std::string& key, const std::string& value) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! Holds a timestamp at which point the wallet is scheduled (externally) to be relocked. Caller must arrange for actual relocking to occur via Lock().
+     int64_t nRelockTime GUARDED_BY(cs_wallet){0};
+ 
+     // Used to prevent concurrent calls to walletpassphrase RPC.
+     Mutex m_unlock_mutex;
+     bool Unlock(const SecureString& strWalletPassphrase, bool accept_no_keys = false);
+     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
+     bool EncryptWallet(const SecureString& strWalletPassphrase);
+ 
+     void GetKeyBirthTimes(std::map<CKeyID, int64_t> &mapKeyBirth) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
+ 
+     /**
+      * Increment the next transaction order id
+      * @return next transaction order id
+      */
+     int64_t IncOrderPosNext(WalletBatch *batch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     DBErrors ReorderTransactions();
+ 
+     void MarkDirty();
+ 
+     //! Callback for updating transaction metadata in mapWallet.
+     //!
+     //! @param wtx - reference to mapWallet transaction to update
+     //! @param new_tx - true if wtx is newly inserted, false if it previously existed
+     //!
+     //! @return true if wtx is changed and needs to be saved to disk, otherwise false
+     using UpdateWalletTxFn = std::function<bool(CWalletTx& wtx, bool new_tx)>;
+ 
+     CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr, bool fFlushOnClose=true, bool rescanning_old_block = false);
+     bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     void transactionAddedToMempool(const CTransactionRef& tx, uint64_t mempool_sequence) override;
+     void blockConnected(const CBlock& block, int height) override;
+     void blockDisconnected(const CBlock& block, int height) override;
+     void updatedBlockTip() override;
+     int64_t RescanFromTime(int64_t startTime, const WalletRescanReserver& reserver, bool update);
+ 
+     struct ScanResult {
+         enum { SUCCESS, FAILURE, USER_ABORT } status = SUCCESS;
+ 
+         //! Hash and height of most recent block that was successfully scanned.
+         //! Unset if no blocks were scanned due to read errors or the chain
+         //! being empty.
+         uint256 last_scanned_block;
+         std::optional<int> last_scanned_height;
+ 
+         //! Height of the most recent block that could not be scanned due to
+         //! read errors or pruning. Will be set if status is FAILURE, unset if
+         //! status is SUCCESS, and may or may not be set if status is
+         //! USER_ABORT.
+         uint256 last_failed_block;
+     };
+     ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate);
+     void transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason, uint64_t mempool_sequence) override;
+     void ReacceptWalletTransactions() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     void ResendWalletTransactions();
+ 
+     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
+ 
+     /** Fetch the inputs and sign with SIGHASH_ALL. */
+     bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     /** Sign the tx given the input coins and sighash. */
+     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const;
+     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
+ 
+     /**
+      * Fills out a PSBT with information from the wallet. Fills in UTXOs if we have
+      * them. Tries to sign if sign=true. Sets `complete` if the PSBT is now complete
+      * (i.e. has all required signatures or signature-parts, and is ready to
+      * finalize.) Sets `error` and returns false if something goes wrong.
+      *
+      * @param[in]  psbtx PartiallySignedTransaction to fill in
+      * @param[out] complete indicates whether the PSBT is now complete
+      * @param[in]  sighash_type the sighash type to use when signing (if PSBT does not specify)
+      * @param[in]  sign whether to sign or not
+      * @param[in]  bip32derivs whether to fill in bip32 derivation information if available
++     * @param[out] n_signed the number of inputs signed by this wallet
++     * @param[in] finalize whether to create the final scriptSig or scriptWitness if possible
+      * return error
+      */
+     TransactionError FillPSBT(PartiallySignedTransaction& psbtx,
+                   bool& complete,
+                   int sighash_type = 1 /* SIGHASH_ALL */,
+                   bool sign = true,
+                   bool bip32derivs = true,
+-                  size_t* n_signed = nullptr) const;
++                  size_t* n_signed = nullptr,
++                  bool finalize = true) const;
+ 
+     /**
+      * Submit the transaction to the node's mempool and then relay to peers.
+      * Should be called after CreateTransaction unless you want to abort
+      * broadcasting the transaction.
+      *
+      * @param[in] tx The transaction to be broadcast.
+      * @param[in] mapValue key-values to be set on the transaction.
+      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
+      */
+     void CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm);
+ 
+     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */
+     bool SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, bool relay) const;
+ 
+     bool DummySignTx(CMutableTransaction &txNew, const std::set<CTxOut> &txouts, const CCoinControl* coin_control = nullptr) const
+     {
+         std::vector<CTxOut> v_txouts(txouts.size());
+         std::copy(txouts.begin(), txouts.end(), v_txouts.begin());
+         return DummySignTx(txNew, v_txouts, coin_control);
+     }
+     bool DummySignTx(CMutableTransaction &txNew, const std::vector<CTxOut> &txouts, const CCoinControl* coin_control = nullptr) const;
+ 
+     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool ImportPubKeys(const std::vector<CKeyID>& ordered_pubkeys, const std::map<CKeyID, CPubKey>& pubkey_map, const std::map<CKeyID, std::pair<CPubKey, KeyOriginInfo>>& key_origins, const bool add_keypool, const bool internal, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool ImportScriptPubKeys(const std::string& label, const std::set<CScript>& script_pub_keys, const bool have_solving_data, const bool apply_label, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     CFeeRate m_pay_tx_fee{DEFAULT_PAY_TX_FEE};
+     unsigned int m_confirm_target{DEFAULT_TX_CONFIRM_TARGET};
+     /** Allow Coin Selection to pick unconfirmed UTXOs that were sent from our own wallet if it
+      * cannot fund the transaction otherwise. */
+     bool m_spend_zero_conf_change{DEFAULT_SPEND_ZEROCONF_CHANGE};
+     bool m_signal_rbf{DEFAULT_WALLET_RBF};
+     bool m_allow_fallback_fee{true}; //!< will be false if -fallbackfee=0
+     CFeeRate m_min_fee{DEFAULT_TRANSACTION_MINFEE}; //!< Override with -mintxfee
+     /**
+      * If fee estimation does not have enough data to provide estimates, use this fee instead.
+      * Has no effect if not using fee estimation
+      * Override with -fallbackfee
+      */
+     CFeeRate m_fallback_fee{DEFAULT_FALLBACK_FEE};
+ 
+      /** If the cost to spend a change output at this feerate is greater than the value of the
+       * output itself, just drop it to fees. */
+     CFeeRate m_discard_rate{DEFAULT_DISCARD_FEE};
+ 
+     /** When the actual feerate is less than the consolidate feerate, we will tend to make transactions which
+      * consolidate inputs. When the actual feerate is greater than the consolidate feerate, we will tend to make
+      * transactions which have the lowest fees.
+      */
+     CFeeRate m_consolidate_feerate{DEFAULT_CONSOLIDATE_FEERATE};
+ 
+     /** The maximum fee amount we're willing to pay to prioritize partial spend avoidance. */
+     CAmount m_max_aps_fee{DEFAULT_MAX_AVOIDPARTIALSPEND_FEE}; //!< note: this is absolute fee, not fee rate
+     OutputType m_default_address_type{DEFAULT_ADDRESS_TYPE};
+     /**
+      * Default output type for change outputs. When unset, automatically choose type
+      * based on address type setting and the types other of non-change outputs
+      * (see -changetype option documentation and implementation in
+      * CWallet::TransactionChangeType for details).
+      */
+     std::optional<OutputType> m_default_change_type{};
+     /** Absolute maximum transaction fee (in satoshis) used by default for the wallet */
+     CAmount m_default_max_tx_fee{DEFAULT_TRANSACTION_MAXFEE};
+ 
+     size_t KeypoolCountExternalKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool TopUpKeyPool(unsigned int kpSize = 0);
+ 
+     std::optional<int64_t> GetOldestKeyPoolTime() const;
+ 
+     std::set<CTxDestination> GetLabelAddresses(const std::string& label) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     /**
+      * Marks all outputs in each one of the destinations dirty, so their cache is
+      * reset and does not return outdated information.
+      */
+     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     bool GetNewDestination(const OutputType type, const std::string label, CTxDestination& dest, bilingual_str& error);
+     bool GetNewChangeDestination(const OutputType type, CTxDestination& dest, bilingual_str& error);
+ 
+     isminetype IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     isminetype IsMine(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     /**
+      * Returns amount of debit if the input matches the
+      * filter, otherwise returns 0
+      */
+     CAmount GetDebit(const CTxIn& txin, const isminefilter& filter) const;
+     isminetype IsMine(const CTxOut& txout) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool IsMine(const CTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     /** should probably be renamed to IsRelevantToMe */
+     bool IsFromMe(const CTransaction& tx) const;
+     CAmount GetDebit(const CTransaction& tx, const isminefilter& filter) const;
+     void chainStateFlushed(const CBlockLocator& loc) override;
+ 
+     DBErrors LoadWallet();
+     DBErrors ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::string& purpose);
+ 
+     bool DelAddressBook(const CTxDestination& address);
+ 
+     bool IsAddressUsed(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool SetAddressUsed(WalletBatch& batch, const CTxDestination& dest, bool used) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     std::vector<std::string> GetAddressReceiveRequests() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+     bool SetAddressReceiveRequest(WalletBatch& batch, const CTxDestination& dest, const std::string& id, const std::string& value) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     unsigned int GetKeyPoolSize() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! signify that a particular wallet feature is now used.
+     void SetMinVersion(enum WalletFeature, WalletBatch* batch_in = nullptr) override;
+ 
+     //! get the current wallet format (the oldest client version guaranteed to understand this wallet)
+     int GetVersion() const { LOCK(cs_wallet); return nWalletVersion; }
+ 
+     //! Get wallet transactions that conflict with given transaction (spend same outputs)
+     std::set<uint256> GetConflicts(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! Check if a given transaction has any of its outputs spent by another transaction in the wallet
+     bool HasWalletSpend(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! Flush wallet (bitdb flush)
+     void Flush();
+ 
+     //! Close wallet database
+     void Close();
+ 
+     /** Wallet is about to be unloaded */
+     boost::signals2::signal<void ()> NotifyUnload;
+ 
+     /**
+      * Address book entry changed.
+      * @note called without lock cs_wallet held.
+      */
+     boost::signals2::signal<void(const CTxDestination& address,
+                                  const std::string& label, bool isMine,
+                                  const std::string& purpose, ChangeType status)>
+         NotifyAddressBookChanged;
+ 
+     /**
+      * Wallet transaction added, removed or updated.
+      * @note called with lock cs_wallet held.
+      */
+     boost::signals2::signal<void(const uint256& hashTx, ChangeType status)> NotifyTransactionChanged;
+ 
+     /** Show progress e.g. for rescan */
+     boost::signals2::signal<void (const std::string &title, int nProgress)> ShowProgress;
+ 
+     /** Watch-only address added */
+     boost::signals2::signal<void (bool fHaveWatchOnly)> NotifyWatchonlyChanged;
+ 
+     /** Keypool has new keys */
+     boost::signals2::signal<void ()> NotifyCanGetAddressesChanged;
+ 
+     /**
+      * Wallet status (encrypted, locked) changed.
+      * Note: Called without locks held.
+      */
+     boost::signals2::signal<void (CWallet* wallet)> NotifyStatusChanged;
+ 
+     /** Inquire whether this wallet broadcasts transactions. */
+     bool GetBroadcastTransactions() const { return fBroadcastTransactions; }
+     /** Set whether this wallet broadcasts transactions. */
+     void SetBroadcastTransactions(bool broadcast) { fBroadcastTransactions = broadcast; }
+ 
+     /** Return whether transaction can be abandoned */
+     bool TransactionCanBeAbandoned(const uint256& hashTx) const;
+ 
+     /* Mark a transaction (and it in-wallet descendants) as abandoned so its inputs may be respent. */
+     bool AbandonTransaction(const uint256& hashTx);
+ 
+     /** Mark a transaction as replaced by another transaction (e.g., BIP 125). */
+     bool MarkReplaced(const uint256& originalHash, const uint256& newHash);
+ 
+     /* Initializes the wallet, returns a new CWallet instance or a null pointer in case of an error */
+     static std::shared_ptr<CWallet> Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings);
+ 
+     /**
+      * Wallet post-init setup
+      * Gives the wallet a chance to register repetitive tasks and complete post-init tasks
+      */
+     void postInitProcess();
+ 
+     bool BackupWallet(const std::string& strDest) const;
+ 
+     /* Returns true if HD is enabled */
+     bool IsHDEnabled() const;
+ 
+     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
+     bool CanGetAddresses(bool internal = false) const;
+ 
+     /**
+      * Blocks until the wallet state is up-to-date to /at least/ the current
+      * chain at the time this function is entered
+      * Obviously holding cs_main/cs_wallet when going into this call may cause
+      * deadlock
+      */
+     void BlockUntilSyncedToCurrentChain() const LOCKS_EXCLUDED(::cs_main) EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+ 
+     /** set a single wallet flag */
+     void SetWalletFlag(uint64_t flags);
+ 
+     /** Unsets a single wallet flag */
+     void UnsetWalletFlag(uint64_t flag);
+ 
+     /** check if a certain wallet flag is set */
+     bool IsWalletFlagSet(uint64_t flag) const override;
+ 
+     /** overwrite all flags by the given uint64_t
+        returns false if unknown, non-tolerable flags are present */
+     bool AddWalletFlags(uint64_t flags);
+     /** Loads the flags into the wallet. (used by LoadWallet) */
+     bool LoadWalletFlags(uint64_t flags);
+ 
+     /** Determine if we are a legacy wallet */
+     bool IsLegacy() const;
+ 
+     /** Returns a bracketed wallet name for displaying in logs, will return [default wallet] if the wallet has no name */
+     const std::string GetDisplayName() const override {
+         std::string wallet_name = GetName().length() == 0 ? "default wallet" : GetName();
+         return strprintf("[%s]", wallet_name);
+     };
+ 
+     /** Prepends the wallet name in logging output to ease debugging in multi-wallet use cases */
+     template<typename... Params>
+     void WalletLogPrintf(std::string fmt, Params... parameters) const {
+         LogPrintf(("%s " + fmt).c_str(), GetDisplayName(), parameters...);
+     };
+ 
+     /** Upgrade the wallet */
+     bool UpgradeWallet(int version, bilingual_str& error);
+ 
+     //! Returns all unique ScriptPubKeyMans in m_internal_spk_managers and m_external_spk_managers
+     std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const;
+ 
+     //! Returns all unique ScriptPubKeyMans
+     std::set<ScriptPubKeyMan*> GetAllScriptPubKeyMans() const;
+ 
+     //! Get the ScriptPubKeyMan for the given OutputType and internal/external chain.
+     ScriptPubKeyMan* GetScriptPubKeyMan(const OutputType& type, bool internal) const;
+ 
+     //! Get the ScriptPubKeyMan for a script
+     ScriptPubKeyMan* GetScriptPubKeyMan(const CScript& script) const;
+     //! Get the ScriptPubKeyMan by id
+     ScriptPubKeyMan* GetScriptPubKeyMan(const uint256& id) const;
+ 
+     //! Get all of the ScriptPubKeyMans for a script given additional information in sigdata (populated by e.g. a psbt)
+     std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script, SignatureData& sigdata) const;
+ 
+     //! Get the SigningProvider for a script
+     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const;
+     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script, SignatureData& sigdata) const;
+ 
+     //! Get the LegacyScriptPubKeyMan which is used for all types, internal, and external.
+     LegacyScriptPubKeyMan* GetLegacyScriptPubKeyMan() const;
+     LegacyScriptPubKeyMan* GetOrCreateLegacyScriptPubKeyMan();
+ 
+     //! Make a LegacyScriptPubKeyMan and set it for all types, internal, and external.
+     void SetupLegacyScriptPubKeyMan();
+ 
+     const CKeyingMaterial& GetEncryptionKey() const override;
+     bool HasEncryptionKeys() const override;
+ 
+     /** Get last block processed height */
+     int GetLastBlockHeight() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+     {
+         AssertLockHeld(cs_wallet);
+         assert(m_last_block_processed_height >= 0);
+         return m_last_block_processed_height;
+     };
+     uint256 GetLastBlockHash() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+     {
+         AssertLockHeld(cs_wallet);
+         assert(m_last_block_processed_height >= 0);
+         return m_last_block_processed;
+     }
+     /** Set last block processed height, currently only use in unit test */
+     void SetLastBlockProcessed(int block_height, uint256 block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+     {
+         AssertLockHeld(cs_wallet);
+         m_last_block_processed_height = block_height;
+         m_last_block_processed = block_hash;
+     };
+ 
+     //! Connect the signals from ScriptPubKeyMans to the signals in CWallet
+     void ConnectScriptPubKeyManNotifiers();
+ 
+     //! Instantiate a descriptor ScriptPubKeyMan from the WalletDescriptor and load it
+     void LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc);
+ 
+     //! Adds the active ScriptPubKeyMan for the specified type and internal. Writes it to the wallet file
+     //! @param[in] id The unique id for the ScriptPubKeyMan
+     //! @param[in] type The OutputType this ScriptPubKeyMan provides addresses for
+     //! @param[in] internal Whether this ScriptPubKeyMan provides change addresses
+     void AddActiveScriptPubKeyMan(uint256 id, OutputType type, bool internal);
+ 
+     //! Loads an active ScriptPubKeyMan for the specified type and internal. (used by LoadWallet)
+     //! @param[in] id The unique id for the ScriptPubKeyMan
+     //! @param[in] type The OutputType this ScriptPubKeyMan provides addresses for
+     //! @param[in] internal Whether this ScriptPubKeyMan provides change addresses
+     void LoadActiveScriptPubKeyMan(uint256 id, OutputType type, bool internal);
+ 
+     //! Remove specified ScriptPubKeyMan from set of active SPK managers. Writes the change to the wallet file.
+     //! @param[in] id The unique id for the ScriptPubKeyMan
+     //! @param[in] type The OutputType this ScriptPubKeyMan provides addresses for
+     //! @param[in] internal Whether this ScriptPubKeyMan provides change addresses
+     void DeactivateScriptPubKeyMan(uint256 id, OutputType type, bool internal);
+ 
+     //! Create new DescriptorScriptPubKeyMans and add them to the wallet
+     void SetupDescriptorScriptPubKeyMans() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ 
+     //! Return the DescriptorScriptPubKeyMan for a WalletDescriptor if it is already in the wallet
+     DescriptorScriptPubKeyMan* GetDescriptorScriptPubKeyMan(const WalletDescriptor& desc) const;
+ 
+     //! Add a descriptor to the wallet, return a ScriptPubKeyMan & associated output type
+     ScriptPubKeyMan* AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+ };
+ 
+ /**
+  * Called periodically by the schedule thread. Prompts individual wallets to resend
+  * their transactions. Actual rebroadcast schedule is managed by the wallets themselves.
+  */
+diff --git a/test/functional/rpc_psbt.py b/test/functional/rpc_psbt.py
+index 4ac4f27d8a..a8034849cc 100755
+--- a/test/functional/rpc_psbt.py
++++ b/test/functional/rpc_psbt.py
+@@ -28,615 +28,617 @@ MAX_BIP125_RBF_SEQUENCE = 0xfffffffd
+ # Create one-input, one-output, no-fee transaction:
+ class PSBTTest(BitcoinTestFramework):
+ 
+     def set_test_params(self):
+         self.num_nodes = 3
+         self.extra_args = [
+             ["-walletrbf=1", "-addresstype=bech32", "-changetype=bech32"], #TODO: Remove address type restrictions once taproot has psbt extensions
+             ["-walletrbf=0", "-changetype=legacy"],
+             []
+         ]
+         self.supports_cli = False
+ 
+     def skip_test_if_missing_module(self):
+         self.skip_if_no_wallet()
+ 
+     # TODO: Re-enable this test with segwit v1
+     def test_utxo_conversion(self):
+         mining_node = self.nodes[2]
+         offline_node = self.nodes[0]
+         online_node = self.nodes[1]
+ 
+         # Disconnect offline node from others
+         # Topology of test network is linear, so this one call is enough
+         self.disconnect_nodes(0, 1)
+ 
+         # Create watchonly on online_node
+         online_node.createwallet(wallet_name='wonline', disable_private_keys=True)
+         wonline = online_node.get_wallet_rpc('wonline')
+         w2 = online_node.get_wallet_rpc('')
+ 
+         # Mine a transaction that credits the offline address
+         offline_addr = offline_node.getnewaddress(address_type="p2sh-segwit")
+         online_addr = w2.getnewaddress(address_type="p2sh-segwit")
+         wonline.importaddress(offline_addr, "", False)
+         mining_node.sendtoaddress(address=offline_addr, amount=1.0)
+         self.generate(mining_node, nblocks=1)
+ 
+         # Construct an unsigned PSBT on the online node (who doesn't know the output is Segwit, so will include a non-witness UTXO)
+         utxos = wonline.listunspent(addresses=[offline_addr])
+         raw = wonline.createrawtransaction([{"txid":utxos[0]["txid"], "vout":utxos[0]["vout"]}],[{online_addr:0.9999}])
+         psbt = wonline.walletprocesspsbt(online_node.converttopsbt(raw))["psbt"]
+         assert "non_witness_utxo" in mining_node.decodepsbt(psbt)["inputs"][0]
+ 
+         # Have the offline node sign the PSBT (which will update the UTXO to segwit)
+         signed_psbt = offline_node.walletprocesspsbt(psbt)["psbt"]
+         assert "witness_utxo" in mining_node.decodepsbt(signed_psbt)["inputs"][0]
+ 
+         # Make sure we can mine the resulting transaction
+         txid = mining_node.sendrawtransaction(mining_node.finalizepsbt(signed_psbt)["hex"])
+         self.generate(mining_node, 1)
+         assert_equal(online_node.gettxout(txid,0)["confirmations"], 1)
+ 
+         wonline.unloadwallet()
+ 
+         # Reconnect
+         self.connect_nodes(0, 1)
+         self.connect_nodes(0, 2)
+ 
+     def assert_change_type(self, psbtx, expected_type):
+         """Assert that the given PSBT has a change output with the given type."""
+ 
+         # The decodepsbt RPC is stateless and independent of any settings, we can always just call it on the first node
+         decoded_psbt = self.nodes[0].decodepsbt(psbtx["psbt"])
+         changepos = psbtx["changepos"]
+         assert_equal(decoded_psbt["tx"]["vout"][changepos]["scriptPubKey"]["type"], expected_type)
+ 
+     def run_test(self):
+         # Create and fund a raw tx for sending 10 BTC
+         psbtx1 = self.nodes[0].walletcreatefundedpsbt([], {self.nodes[2].getnewaddress():10})['psbt']
+ 
+         # If inputs are specified, do not automatically add more:
+         utxo1 = self.nodes[0].listunspent()[0]
+         assert_raises_rpc_error(-4, "Insufficient funds", self.nodes[0].walletcreatefundedpsbt, [{"txid": utxo1['txid'], "vout": utxo1['vout']}], {self.nodes[2].getnewaddress():90})
+ 
+         psbtx1 = self.nodes[0].walletcreatefundedpsbt([{"txid": utxo1['txid'], "vout": utxo1['vout']}], {self.nodes[2].getnewaddress():90}, 0, {"add_inputs": True})['psbt']
+         assert_equal(len(self.nodes[0].decodepsbt(psbtx1)['tx']['vin']), 2)
+ 
+         # Inputs argument can be null
+         self.nodes[0].walletcreatefundedpsbt(None, {self.nodes[2].getnewaddress():10})
+ 
+         # Node 1 should not be able to add anything to it but still return the psbtx same as before
+         psbtx = self.nodes[1].walletprocesspsbt(psbtx1)['psbt']
+         assert_equal(psbtx1, psbtx)
+ 
+         # Node 0 should not be able to sign the transaction with the wallet is locked
+         self.nodes[0].encryptwallet("password")
+         assert_raises_rpc_error(-13, "Please enter the wallet passphrase with walletpassphrase first", self.nodes[0].walletprocesspsbt, psbtx)
+ 
+         # Node 0 should be able to process without signing though
+         unsigned_tx = self.nodes[0].walletprocesspsbt(psbtx, False)
+         assert_equal(unsigned_tx['complete'], False)
+ 
+         self.nodes[0].walletpassphrase(passphrase="password", timeout=1000000)
+ 
+         # Sign the transaction and send
+-        signed_tx = self.nodes[0].walletprocesspsbt(psbtx)['psbt']
++        signed_tx = self.nodes[0].walletprocesspsbt(psbt=psbtx, finalize=False)['psbt']
++        finalized_tx = self.nodes[0].walletprocesspsbt(psbt=psbtx, finalize=True)['psbt']
++        assert signed_tx != finalized_tx
+         final_tx = self.nodes[0].finalizepsbt(signed_tx)['hex']
+         self.nodes[0].sendrawtransaction(final_tx)
+ 
+         # Manually selected inputs can be locked:
+         assert_equal(len(self.nodes[0].listlockunspent()), 0)
+         utxo1 = self.nodes[0].listunspent()[0]
+         psbtx1 = self.nodes[0].walletcreatefundedpsbt([{"txid": utxo1['txid'], "vout": utxo1['vout']}], {self.nodes[2].getnewaddress():1}, 0,{"lockUnspents": True})["psbt"]
+         assert_equal(len(self.nodes[0].listlockunspent()), 1)
+ 
+         # Locks are ignored for manually selected inputs
+         self.nodes[0].walletcreatefundedpsbt([{"txid": utxo1['txid'], "vout": utxo1['vout']}], {self.nodes[2].getnewaddress():1}, 0)
+ 
+         # Create p2sh, p2wpkh, and p2wsh addresses
+         pubkey0 = self.nodes[0].getaddressinfo(self.nodes[0].getnewaddress())['pubkey']
+         pubkey1 = self.nodes[1].getaddressinfo(self.nodes[1].getnewaddress())['pubkey']
+         pubkey2 = self.nodes[2].getaddressinfo(self.nodes[2].getnewaddress())['pubkey']
+ 
+         # Setup watchonly wallets
+         self.nodes[2].createwallet(wallet_name='wmulti', disable_private_keys=True)
+         wmulti = self.nodes[2].get_wallet_rpc('wmulti')
+ 
+         # Create all the addresses
+         p2sh = wmulti.addmultisigaddress(2, [pubkey0, pubkey1, pubkey2], "", "legacy")['address']
+         p2wsh = wmulti.addmultisigaddress(2, [pubkey0, pubkey1, pubkey2], "", "bech32")['address']
+         p2sh_p2wsh = wmulti.addmultisigaddress(2, [pubkey0, pubkey1, pubkey2], "", "p2sh-segwit")['address']
+         if not self.options.descriptors:
+             wmulti.importaddress(p2sh)
+             wmulti.importaddress(p2wsh)
+             wmulti.importaddress(p2sh_p2wsh)
+         p2wpkh = self.nodes[1].getnewaddress("", "bech32")
+         p2pkh = self.nodes[1].getnewaddress("", "legacy")
+         p2sh_p2wpkh = self.nodes[1].getnewaddress("", "p2sh-segwit")
+ 
+         # fund those addresses
+         rawtx = self.nodes[0].createrawtransaction([], {p2sh:10, p2wsh:10, p2wpkh:10, p2sh_p2wsh:10, p2sh_p2wpkh:10, p2pkh:10})
+         rawtx = self.nodes[0].fundrawtransaction(rawtx, {"changePosition":3})
+         signed_tx = self.nodes[0].signrawtransactionwithwallet(rawtx['hex'])['hex']
+         txid = self.nodes[0].sendrawtransaction(signed_tx)
+         self.generate(self.nodes[0], 6)
+ 
+         # Find the output pos
+         p2sh_pos = -1
+         p2wsh_pos = -1
+         p2wpkh_pos = -1
+         p2pkh_pos = -1
+         p2sh_p2wsh_pos = -1
+         p2sh_p2wpkh_pos = -1
+         decoded = self.nodes[0].decoderawtransaction(signed_tx)
+         for out in decoded['vout']:
+             if out['scriptPubKey']['address'] == p2sh:
+                 p2sh_pos = out['n']
+             elif out['scriptPubKey']['address'] == p2wsh:
+                 p2wsh_pos = out['n']
+             elif out['scriptPubKey']['address'] == p2wpkh:
+                 p2wpkh_pos = out['n']
+             elif out['scriptPubKey']['address'] == p2sh_p2wsh:
+                 p2sh_p2wsh_pos = out['n']
+             elif out['scriptPubKey']['address'] == p2sh_p2wpkh:
+                 p2sh_p2wpkh_pos = out['n']
+             elif out['scriptPubKey']['address'] == p2pkh:
+                 p2pkh_pos = out['n']
+ 
+         inputs = [{"txid": txid, "vout": p2wpkh_pos}, {"txid": txid, "vout": p2sh_p2wpkh_pos}, {"txid": txid, "vout": p2pkh_pos}]
+         outputs = [{self.nodes[1].getnewaddress(): 29.99}]
+ 
+         # spend single key from node 1
+         created_psbt = self.nodes[1].walletcreatefundedpsbt(inputs, outputs)
+         walletprocesspsbt_out = self.nodes[1].walletprocesspsbt(created_psbt['psbt'])
+         # Make sure it has both types of UTXOs
+         decoded = self.nodes[1].decodepsbt(walletprocesspsbt_out['psbt'])
+         assert 'non_witness_utxo' in decoded['inputs'][0]
+         assert 'witness_utxo' in decoded['inputs'][0]
+         # Check decodepsbt fee calculation (input values shall only be counted once per UTXO)
+         assert_equal(decoded['fee'], created_psbt['fee'])
+         assert_equal(walletprocesspsbt_out['complete'], True)
+         self.nodes[1].sendrawtransaction(self.nodes[1].finalizepsbt(walletprocesspsbt_out['psbt'])['hex'])
+ 
+         self.log.info("Test walletcreatefundedpsbt fee rate of 10000 sat/vB and 0.1 BTC/kvB produces a total fee at or slightly below -maxtxfee (~0.05290000)")
+         res1 = self.nodes[1].walletcreatefundedpsbt(inputs, outputs, 0, {"fee_rate": 10000, "add_inputs": True})
+         assert_approx(res1["fee"], 0.055, 0.005)
+         res2 = self.nodes[1].walletcreatefundedpsbt(inputs, outputs, 0, {"feeRate": "0.1", "add_inputs": True})
+         assert_approx(res2["fee"], 0.055, 0.005)
+ 
+         self.log.info("Test min fee rate checks with walletcreatefundedpsbt are bypassed, e.g. a fee_rate under 1 sat/vB is allowed")
+         res3 = self.nodes[1].walletcreatefundedpsbt(inputs, outputs, 0, {"fee_rate": "0.999", "add_inputs": True})
+         assert_approx(res3["fee"], 0.00000381, 0.0000001)
+         res4 = self.nodes[1].walletcreatefundedpsbt(inputs, outputs, 0, {"feeRate": 0.00000999, "add_inputs": True})
+         assert_approx(res4["fee"], 0.00000381, 0.0000001)
+ 
+         self.log.info("Test min fee rate checks with walletcreatefundedpsbt are bypassed and that funding non-standard 'zero-fee' transactions is valid")
+         for param, zero_value in product(["fee_rate", "feeRate"], [0, 0.000, 0.00000000, "0", "0.000", "0.00000000"]):
+             assert_equal(0, self.nodes[1].walletcreatefundedpsbt(inputs, outputs, 0, {param: zero_value, "add_inputs": True})["fee"])
+ 
+         self.log.info("Test invalid fee rate settings")
+         for param, value in {("fee_rate", 100000), ("feeRate", 1)}:
+             assert_raises_rpc_error(-4, "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {param: value, "add_inputs": True})
+             assert_raises_rpc_error(-3, "Amount out of range",
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {param: -1, "add_inputs": True})
+             assert_raises_rpc_error(-3, "Amount is not a number or string",
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {param: {"foo": "bar"}, "add_inputs": True})
+             # Test fee rate values that don't pass fixed-point parsing checks.
+             for invalid_value in ["", 0.000000001, 1e-09, 1.111111111, 1111111111111111, "31.999999999999999999999"]:
+                 assert_raises_rpc_error(-3, "Invalid amount",
+                     self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {param: invalid_value, "add_inputs": True})
+         # Test fee_rate values that cannot be represented in sat/vB.
+         for invalid_value in [0.0001, 0.00000001, 0.00099999, 31.99999999, "0.0001", "0.00000001", "0.00099999", "31.99999999"]:
+             assert_raises_rpc_error(-3, "Invalid amount",
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"fee_rate": invalid_value, "add_inputs": True})
+ 
+         self.log.info("- raises RPC error if both feeRate and fee_rate are passed")
+         assert_raises_rpc_error(-8, "Cannot specify both fee_rate (sat/vB) and feeRate (BTC/kvB)",
+             self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"fee_rate": 0.1, "feeRate": 0.1, "add_inputs": True})
+ 
+         self.log.info("- raises RPC error if both feeRate and estimate_mode passed")
+         assert_raises_rpc_error(-8, "Cannot specify both estimate_mode and feeRate",
+             self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"estimate_mode": "economical", "feeRate": 0.1, "add_inputs": True})
+ 
+         for param in ["feeRate", "fee_rate"]:
+             self.log.info("- raises RPC error if both {} and conf_target are passed".format(param))
+             assert_raises_rpc_error(-8, "Cannot specify both conf_target and {}. Please provide either a confirmation "
+                 "target in blocks for automatic fee estimation, or an explicit fee rate.".format(param),
+                 self.nodes[1].walletcreatefundedpsbt ,inputs, outputs, 0, {param: 1, "conf_target": 1, "add_inputs": True})
+ 
+         self.log.info("- raises RPC error if both fee_rate and estimate_mode are passed")
+         assert_raises_rpc_error(-8, "Cannot specify both estimate_mode and fee_rate",
+             self.nodes[1].walletcreatefundedpsbt ,inputs, outputs, 0, {"fee_rate": 1, "estimate_mode": "economical", "add_inputs": True})
+ 
+         self.log.info("- raises RPC error with invalid estimate_mode settings")
+         for k, v in {"number": 42, "object": {"foo": "bar"}}.items():
+             assert_raises_rpc_error(-3, "Expected type string for estimate_mode, got {}".format(k),
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"estimate_mode": v, "conf_target": 0.1, "add_inputs": True})
+         for mode in ["", "foo", Decimal("3.141592")]:
+             assert_raises_rpc_error(-8, 'Invalid estimate_mode parameter, must be one of: "unset", "economical", "conservative"',
+                 self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"estimate_mode": mode, "conf_target": 0.1, "add_inputs": True})
+ 
+         self.log.info("- raises RPC error with invalid conf_target settings")
+         for mode in ["unset", "economical", "conservative"]:
+             self.log.debug("{}".format(mode))
+             for k, v in {"string": "", "object": {"foo": "bar"}}.items():
+                 assert_raises_rpc_error(-3, "Expected type number for conf_target, got {}".format(k),
+                     self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"estimate_mode": mode, "conf_target": v, "add_inputs": True})
+             for n in [-1, 0, 1009]:
+                 assert_raises_rpc_error(-8, "Invalid conf_target, must be between 1 and 1008",  # max value of 1008 per src/policy/fees.h
+                     self.nodes[1].walletcreatefundedpsbt, inputs, outputs, 0, {"estimate_mode": mode, "conf_target": n, "add_inputs": True})
+ 
+         self.log.info("Test walletcreatefundedpsbt with too-high fee rate produces total fee well above -maxtxfee and raises RPC error")
+         # previously this was silently capped at -maxtxfee
+         for bool_add, outputs_array in {True: outputs, False: [{self.nodes[1].getnewaddress(): 1}]}.items():
+             msg = "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"
+             assert_raises_rpc_error(-4, msg, self.nodes[1].walletcreatefundedpsbt, inputs, outputs_array, 0, {"fee_rate": 1000000, "add_inputs": bool_add})
+             assert_raises_rpc_error(-4, msg, self.nodes[1].walletcreatefundedpsbt, inputs, outputs_array, 0, {"feeRate": 1, "add_inputs": bool_add})
+ 
+         self.log.info("Test various PSBT operations")
+         # partially sign multisig things with node 1
+         psbtx = wmulti.walletcreatefundedpsbt(inputs=[{"txid":txid,"vout":p2wsh_pos},{"txid":txid,"vout":p2sh_pos},{"txid":txid,"vout":p2sh_p2wsh_pos}], outputs={self.nodes[1].getnewaddress():29.99}, options={'changeAddress': self.nodes[1].getrawchangeaddress()})['psbt']
+         walletprocesspsbt_out = self.nodes[1].walletprocesspsbt(psbtx)
+         psbtx = walletprocesspsbt_out['psbt']
+         assert_equal(walletprocesspsbt_out['complete'], False)
+ 
+         # Unload wmulti, we don't need it anymore
+         wmulti.unloadwallet()
+ 
+         # partially sign with node 2. This should be complete and sendable
+         walletprocesspsbt_out = self.nodes[2].walletprocesspsbt(psbtx)
+         assert_equal(walletprocesspsbt_out['complete'], True)
+         self.nodes[2].sendrawtransaction(self.nodes[2].finalizepsbt(walletprocesspsbt_out['psbt'])['hex'])
+ 
+         # check that walletprocesspsbt fails to decode a non-psbt
+         rawtx = self.nodes[1].createrawtransaction([{"txid":txid,"vout":p2wpkh_pos}], {self.nodes[1].getnewaddress():9.99})
+         assert_raises_rpc_error(-22, "TX decode failed", self.nodes[1].walletprocesspsbt, rawtx)
+ 
+         # Convert a non-psbt to psbt and make sure we can decode it
+         rawtx = self.nodes[0].createrawtransaction([], {self.nodes[1].getnewaddress():10})
+         rawtx = self.nodes[0].fundrawtransaction(rawtx)
+         new_psbt = self.nodes[0].converttopsbt(rawtx['hex'])
+         self.nodes[0].decodepsbt(new_psbt)
+ 
+         # Make sure that a non-psbt with signatures cannot be converted
+         # Error could be either "TX decode failed" (segwit inputs causes parsing to fail) or "Inputs must not have scriptSigs and scriptWitnesses"
+         # We must set iswitness=True because the serialized transaction has inputs and is therefore a witness transaction
+         signedtx = self.nodes[0].signrawtransactionwithwallet(rawtx['hex'])
+         assert_raises_rpc_error(-22, "", self.nodes[0].converttopsbt, hexstring=signedtx['hex'], iswitness=True)
+         assert_raises_rpc_error(-22, "", self.nodes[0].converttopsbt, hexstring=signedtx['hex'], permitsigdata=False, iswitness=True)
+         # Unless we allow it to convert and strip signatures
+         self.nodes[0].converttopsbt(signedtx['hex'], True)
+ 
+         # Explicitly allow converting non-empty txs
+         new_psbt = self.nodes[0].converttopsbt(rawtx['hex'])
+         self.nodes[0].decodepsbt(new_psbt)
+ 
+         # Create outputs to nodes 1 and 2
+         node1_addr = self.nodes[1].getnewaddress()
+         node2_addr = self.nodes[2].getnewaddress()
+         txid1 = self.nodes[0].sendtoaddress(node1_addr, 13)
+         txid2 = self.nodes[0].sendtoaddress(node2_addr, 13)
+         blockhash = self.generate(self.nodes[0], 6)[0]
+         vout1 = find_output(self.nodes[1], txid1, 13, blockhash=blockhash)
+         vout2 = find_output(self.nodes[2], txid2, 13, blockhash=blockhash)
+ 
+         # Create a psbt spending outputs from nodes 1 and 2
+         psbt_orig = self.nodes[0].createpsbt([{"txid":txid1,  "vout":vout1}, {"txid":txid2, "vout":vout2}], {self.nodes[0].getnewaddress():25.999})
+ 
+         # Update psbts, should only have data for one input and not the other
+         psbt1 = self.nodes[1].walletprocesspsbt(psbt_orig, False, "ALL")['psbt']
+         psbt1_decoded = self.nodes[0].decodepsbt(psbt1)
+         assert psbt1_decoded['inputs'][0] and not psbt1_decoded['inputs'][1]
+         # Check that BIP32 path was added
+         assert "bip32_derivs" in psbt1_decoded['inputs'][0]
+         psbt2 = self.nodes[2].walletprocesspsbt(psbt_orig, False, "ALL", False)['psbt']
+         psbt2_decoded = self.nodes[0].decodepsbt(psbt2)
+         assert not psbt2_decoded['inputs'][0] and psbt2_decoded['inputs'][1]
+         # Check that BIP32 paths were not added
+         assert "bip32_derivs" not in psbt2_decoded['inputs'][1]
+ 
+         # Sign PSBTs (workaround issue #18039)
+         psbt1 = self.nodes[1].walletprocesspsbt(psbt_orig)['psbt']
+         psbt2 = self.nodes[2].walletprocesspsbt(psbt_orig)['psbt']
+ 
+         # Combine, finalize, and send the psbts
+         combined = self.nodes[0].combinepsbt([psbt1, psbt2])
+         finalized = self.nodes[0].finalizepsbt(combined)['hex']
+         self.nodes[0].sendrawtransaction(finalized)
+         self.generate(self.nodes[0], 6)
+ 
+         # Test additional args in walletcreatepsbt
+         # Make sure both pre-included and funded inputs
+         # have the correct sequence numbers based on
+         # replaceable arg
+         block_height = self.nodes[0].getblockcount()
+         unspent = self.nodes[0].listunspent()[0]
+         psbtx_info = self.nodes[0].walletcreatefundedpsbt([{"txid":unspent["txid"], "vout":unspent["vout"]}], [{self.nodes[2].getnewaddress():unspent["amount"]+1}], block_height+2, {"replaceable": False, "add_inputs": True}, False)
+         decoded_psbt = self.nodes[0].decodepsbt(psbtx_info["psbt"])
+         for tx_in, psbt_in in zip(decoded_psbt["tx"]["vin"], decoded_psbt["inputs"]):
+             assert_greater_than(tx_in["sequence"], MAX_BIP125_RBF_SEQUENCE)
+             assert "bip32_derivs" not in psbt_in
+         assert_equal(decoded_psbt["tx"]["locktime"], block_height+2)
+ 
+         # Same construction with only locktime set and RBF explicitly enabled
+         psbtx_info = self.nodes[0].walletcreatefundedpsbt([{"txid":unspent["txid"], "vout":unspent["vout"]}], [{self.nodes[2].getnewaddress():unspent["amount"]+1}], block_height, {"replaceable": True, "add_inputs": True}, True)
+         decoded_psbt = self.nodes[0].decodepsbt(psbtx_info["psbt"])
+         for tx_in, psbt_in in zip(decoded_psbt["tx"]["vin"], decoded_psbt["inputs"]):
+             assert_equal(tx_in["sequence"], MAX_BIP125_RBF_SEQUENCE)
+             assert "bip32_derivs" in psbt_in
+         assert_equal(decoded_psbt["tx"]["locktime"], block_height)
+ 
+         # Same construction without optional arguments
+         psbtx_info = self.nodes[0].walletcreatefundedpsbt([], [{self.nodes[2].getnewaddress():unspent["amount"]+1}])
+         decoded_psbt = self.nodes[0].decodepsbt(psbtx_info["psbt"])
+         for tx_in, psbt_in in zip(decoded_psbt["tx"]["vin"], decoded_psbt["inputs"]):
+             assert_equal(tx_in["sequence"], MAX_BIP125_RBF_SEQUENCE)
+             assert "bip32_derivs" in psbt_in
+         assert_equal(decoded_psbt["tx"]["locktime"], 0)
+ 
+         # Same construction without optional arguments, for a node with -walletrbf=0
+         unspent1 = self.nodes[1].listunspent()[0]
+         psbtx_info = self.nodes[1].walletcreatefundedpsbt([{"txid":unspent1["txid"], "vout":unspent1["vout"]}], [{self.nodes[2].getnewaddress():unspent1["amount"]+1}], block_height, {"add_inputs": True})
+         decoded_psbt = self.nodes[1].decodepsbt(psbtx_info["psbt"])
+         for tx_in, psbt_in in zip(decoded_psbt["tx"]["vin"], decoded_psbt["inputs"]):
+             assert_greater_than(tx_in["sequence"], MAX_BIP125_RBF_SEQUENCE)
+             assert "bip32_derivs" in psbt_in
+ 
+         # Make sure change address wallet does not have P2SH innerscript access to results in success
+         # when attempting BnB coin selection
+         self.nodes[0].walletcreatefundedpsbt([], [{self.nodes[2].getnewaddress():unspent["amount"]+1}], block_height+2, {"changeAddress":self.nodes[1].getnewaddress()}, False)
+ 
+         # Make sure the wallet's change type is respected by default
+         small_output = {self.nodes[0].getnewaddress():0.1}
+         psbtx_native = self.nodes[0].walletcreatefundedpsbt([], [small_output])
+         self.assert_change_type(psbtx_native, "witness_v0_keyhash")
+         psbtx_legacy = self.nodes[1].walletcreatefundedpsbt([], [small_output])
+         self.assert_change_type(psbtx_legacy, "pubkeyhash")
+ 
+         # Make sure the change type of the wallet can also be overwritten
+         psbtx_np2wkh = self.nodes[1].walletcreatefundedpsbt([], [small_output], 0, {"change_type":"p2sh-segwit"})
+         self.assert_change_type(psbtx_np2wkh, "scripthash")
+ 
+         # Make sure the change type cannot be specified if a change address is given
+         invalid_options = {"change_type":"legacy","changeAddress":self.nodes[0].getnewaddress()}
+         assert_raises_rpc_error(-8, "both change address and address type options", self.nodes[0].walletcreatefundedpsbt, [], [small_output], 0, invalid_options)
+ 
+         # Regression test for 14473 (mishandling of already-signed witness transaction):
+         psbtx_info = self.nodes[0].walletcreatefundedpsbt([{"txid":unspent["txid"], "vout":unspent["vout"]}], [{self.nodes[2].getnewaddress():unspent["amount"]+1}], 0, {"add_inputs": True})
+         complete_psbt = self.nodes[0].walletprocesspsbt(psbtx_info["psbt"])
+         double_processed_psbt = self.nodes[0].walletprocesspsbt(complete_psbt["psbt"])
+         assert_equal(complete_psbt, double_processed_psbt)
+         # We don't care about the decode result, but decoding must succeed.
+         self.nodes[0].decodepsbt(double_processed_psbt["psbt"])
+ 
+         # Make sure unsafe inputs are included if specified
+         self.nodes[2].createwallet(wallet_name="unsafe")
+         wunsafe = self.nodes[2].get_wallet_rpc("unsafe")
+         self.nodes[0].sendtoaddress(wunsafe.getnewaddress(), 2)
+         self.sync_mempools()
+         assert_raises_rpc_error(-4, "Insufficient funds", wunsafe.walletcreatefundedpsbt, [], [{self.nodes[0].getnewaddress(): 1}])
+         wunsafe.walletcreatefundedpsbt([], [{self.nodes[0].getnewaddress(): 1}], 0, {"include_unsafe": True})
+ 
+         # BIP 174 Test Vectors
+ 
+         # Check that unknown values are just passed through
+         unknown_psbt = "cHNidP8BAD8CAAAAAf//////////////////////////////////////////AAAAAAD/////AQAAAAAAAAAAA2oBAAAAAAAACg8BAgMEBQYHCAkPAQIDBAUGBwgJCgsMDQ4PAAA="
+         unknown_out = self.nodes[0].walletprocesspsbt(unknown_psbt)['psbt']
+         assert_equal(unknown_psbt, unknown_out)
+ 
+         # Open the data file
+         with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data/rpc_psbt.json'), encoding='utf-8') as f:
+             d = json.load(f)
+             invalids = d['invalid']
+             valids = d['valid']
+             creators = d['creator']
+             signers = d['signer']
+             combiners = d['combiner']
+             finalizers = d['finalizer']
+             extractors = d['extractor']
+ 
+         # Invalid PSBTs
+         for invalid in invalids:
+             assert_raises_rpc_error(-22, "TX decode failed", self.nodes[0].decodepsbt, invalid)
+ 
+         # Valid PSBTs
+         for valid in valids:
+             self.nodes[0].decodepsbt(valid)
+ 
+         # Creator Tests
+         for creator in creators:
+             created_tx = self.nodes[0].createpsbt(creator['inputs'], creator['outputs'])
+             assert_equal(created_tx, creator['result'])
+ 
+         # Signer tests
+         for i, signer in enumerate(signers):
+             self.nodes[2].createwallet(wallet_name="wallet{}".format(i))
+             wrpc = self.nodes[2].get_wallet_rpc("wallet{}".format(i))
+             for key in signer['privkeys']:
+                 wrpc.importprivkey(key)
+             signed_tx = wrpc.walletprocesspsbt(signer['psbt'])['psbt']
+             assert_equal(signed_tx, signer['result'])
+ 
+         # Combiner test
+         for combiner in combiners:
+             combined = self.nodes[2].combinepsbt(combiner['combine'])
+             assert_equal(combined, combiner['result'])
+ 
+         # Empty combiner test
+         assert_raises_rpc_error(-8, "Parameter 'txs' cannot be empty", self.nodes[0].combinepsbt, [])
+ 
+         # Finalizer test
+         for finalizer in finalizers:
+             finalized = self.nodes[2].finalizepsbt(finalizer['finalize'], False)['psbt']
+             assert_equal(finalized, finalizer['result'])
+ 
+         # Extractor test
+         for extractor in extractors:
+             extracted = self.nodes[2].finalizepsbt(extractor['extract'], True)['hex']
+             assert_equal(extracted, extractor['result'])
+ 
+         # Unload extra wallets
+         for i, signer in enumerate(signers):
+             self.nodes[2].unloadwallet("wallet{}".format(i))
+ 
+         # TODO: Re-enable this for segwit v1
+         # self.test_utxo_conversion()
+ 
+         # Test that psbts with p2pkh outputs are created properly
+         p2pkh = self.nodes[0].getnewaddress(address_type='legacy')
+         psbt = self.nodes[1].walletcreatefundedpsbt([], [{p2pkh : 1}], 0, {"includeWatching" : True}, True)
+         self.nodes[0].decodepsbt(psbt['psbt'])
+ 
+         # Test decoding error: invalid base64
+         assert_raises_rpc_error(-22, "TX decode failed invalid base64", self.nodes[0].decodepsbt, ";definitely not base64;")
+ 
+         # Send to all types of addresses
+         addr1 = self.nodes[1].getnewaddress("", "bech32")
+         txid1 = self.nodes[0].sendtoaddress(addr1, 11)
+         vout1 = find_output(self.nodes[0], txid1, 11)
+         addr2 = self.nodes[1].getnewaddress("", "legacy")
+         txid2 = self.nodes[0].sendtoaddress(addr2, 11)
+         vout2 = find_output(self.nodes[0], txid2, 11)
+         addr3 = self.nodes[1].getnewaddress("", "p2sh-segwit")
+         txid3 = self.nodes[0].sendtoaddress(addr3, 11)
+         vout3 = find_output(self.nodes[0], txid3, 11)
+         self.sync_all()
+ 
+         def test_psbt_input_keys(psbt_input, keys):
+             """Check that the psbt input has only the expected keys."""
+             assert_equal(set(keys), set(psbt_input.keys()))
+ 
+         # Create a PSBT. None of the inputs are filled initially
+         psbt = self.nodes[1].createpsbt([{"txid":txid1, "vout":vout1},{"txid":txid2, "vout":vout2},{"txid":txid3, "vout":vout3}], {self.nodes[0].getnewaddress():32.999})
+         decoded = self.nodes[1].decodepsbt(psbt)
+         test_psbt_input_keys(decoded['inputs'][0], [])
+         test_psbt_input_keys(decoded['inputs'][1], [])
+         test_psbt_input_keys(decoded['inputs'][2], [])
+ 
+         # Update a PSBT with UTXOs from the node
+         # Bech32 inputs should be filled with witness UTXO. Other inputs should not be filled because they are non-witness
+         updated = self.nodes[1].utxoupdatepsbt(psbt)
+         decoded = self.nodes[1].decodepsbt(updated)
+         test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo'])
+         test_psbt_input_keys(decoded['inputs'][1], [])
+         test_psbt_input_keys(decoded['inputs'][2], [])
+ 
+         # Try again, now while providing descriptors, making P2SH-segwit work, and causing bip32_derivs and redeem_script to be filled in
+         descs = [self.nodes[1].getaddressinfo(addr)['desc'] for addr in [addr1,addr2,addr3]]
+         updated = self.nodes[1].utxoupdatepsbt(psbt=psbt, descriptors=descs)
+         decoded = self.nodes[1].decodepsbt(updated)
+         test_psbt_input_keys(decoded['inputs'][0], ['witness_utxo', 'bip32_derivs'])
+         test_psbt_input_keys(decoded['inputs'][1], [])
+         test_psbt_input_keys(decoded['inputs'][2], ['witness_utxo', 'bip32_derivs', 'redeem_script'])
+ 
+         # Two PSBTs with a common input should not be joinable
+         psbt1 = self.nodes[1].createpsbt([{"txid":txid1, "vout":vout1}], {self.nodes[0].getnewaddress():Decimal('10.999')})
+         assert_raises_rpc_error(-8, "exists in multiple PSBTs", self.nodes[1].joinpsbts, [psbt1, updated])
+ 
+         # Join two distinct PSBTs
+         addr4 = self.nodes[1].getnewaddress("", "p2sh-segwit")
+         txid4 = self.nodes[0].sendtoaddress(addr4, 5)
+         vout4 = find_output(self.nodes[0], txid4, 5)
+         self.generate(self.nodes[0], 6)
+         psbt2 = self.nodes[1].createpsbt([{"txid":txid4, "vout":vout4}], {self.nodes[0].getnewaddress():Decimal('4.999')})
+         psbt2 = self.nodes[1].walletprocesspsbt(psbt2)['psbt']
+         psbt2_decoded = self.nodes[0].decodepsbt(psbt2)
+         assert "final_scriptwitness" in psbt2_decoded['inputs'][0] and "final_scriptSig" in psbt2_decoded['inputs'][0]
+         joined = self.nodes[0].joinpsbts([psbt, psbt2])
+         joined_decoded = self.nodes[0].decodepsbt(joined)
+         assert len(joined_decoded['inputs']) == 4 and len(joined_decoded['outputs']) == 2 and "final_scriptwitness" not in joined_decoded['inputs'][3] and "final_scriptSig" not in joined_decoded['inputs'][3]
+ 
+         # Check that joining shuffles the inputs and outputs
+         # 10 attempts should be enough to get a shuffled join
+         shuffled = False
+         for _ in range(10):
+             shuffled_joined = self.nodes[0].joinpsbts([psbt, psbt2])
+             shuffled |= joined != shuffled_joined
+             if shuffled:
+                 break
+         assert shuffled
+ 
+         # Newly created PSBT needs UTXOs and updating
+         addr = self.nodes[1].getnewaddress("", "p2sh-segwit")
+         txid = self.nodes[0].sendtoaddress(addr, 7)
+         addrinfo = self.nodes[1].getaddressinfo(addr)
+         blockhash = self.generate(self.nodes[0], 6)[0]
+         vout = find_output(self.nodes[0], txid, 7, blockhash=blockhash)
+         psbt = self.nodes[1].createpsbt([{"txid":txid, "vout":vout}], {self.nodes[0].getnewaddress("", "p2sh-segwit"):Decimal('6.999')})
+         analyzed = self.nodes[0].analyzepsbt(psbt)
+         assert not analyzed['inputs'][0]['has_utxo'] and not analyzed['inputs'][0]['is_final'] and analyzed['inputs'][0]['next'] == 'updater' and analyzed['next'] == 'updater'
+ 
+         # After update with wallet, only needs signing
+         updated = self.nodes[1].walletprocesspsbt(psbt, False, 'ALL', True)['psbt']
+         analyzed = self.nodes[0].analyzepsbt(updated)
+         assert analyzed['inputs'][0]['has_utxo'] and not analyzed['inputs'][0]['is_final'] and analyzed['inputs'][0]['next'] == 'signer' and analyzed['next'] == 'signer' and analyzed['inputs'][0]['missing']['signatures'][0] == addrinfo['embedded']['witness_program']
+ 
+         # Check fee and size things
+         assert analyzed['fee'] == Decimal('0.001') and analyzed['estimated_vsize'] == 134 and analyzed['estimated_feerate'] == Decimal('0.00746268')
+ 
+         # After signing and finalizing, needs extracting
+         signed = self.nodes[1].walletprocesspsbt(updated)['psbt']
+         analyzed = self.nodes[0].analyzepsbt(signed)
+         assert analyzed['inputs'][0]['has_utxo'] and analyzed['inputs'][0]['is_final'] and analyzed['next'] == 'extractor'
+ 
+         self.log.info("PSBT spending unspendable outputs should have error message and Creator as next")
+         analysis = self.nodes[0].analyzepsbt('cHNidP8BAJoCAAAAAljoeiG1ba8MI76OcHBFbDNvfLqlyHV5JPVFiHuyq911AAAAAAD/////g40EJ9DsZQpoqka7CwmK6kQiwHGyyng1Kgd5WdB86h0BAAAAAP////8CcKrwCAAAAAAWAEHYXCtx0AYLCcmIauuBXlCZHdoSTQDh9QUAAAAAFv8/wADXYP/7//////8JxOh0LR2HAI8AAAAAAAEBIADC6wsAAAAAF2oUt/X69ELjeX2nTof+fZ10l+OyAokDAQcJAwEHEAABAACAAAEBIADC6wsAAAAAF2oUt/X69ELjeX2nTof+fZ10l+OyAokDAQcJAwEHENkMak8AAAAA')
+         assert_equal(analysis['next'], 'creator')
+         assert_equal(analysis['error'], 'PSBT is not valid. Input 0 spends unspendable output')
+ 
+         self.log.info("PSBT with invalid values should have error message and Creator as next")
+         analysis = self.nodes[0].analyzepsbt('cHNidP8BAHECAAAAAfA00BFgAm6tp86RowwH6BMImQNL5zXUcTT97XoLGz0BAAAAAAD/////AgD5ApUAAAAAFgAUKNw0x8HRctAgmvoevm4u1SbN7XL87QKVAAAAABYAFPck4gF7iL4NL4wtfRAKgQbghiTUAAAAAAABAR8AgIFq49AHABYAFJUDtxf2PHo641HEOBOAIvFMNTr2AAAA')
+         assert_equal(analysis['next'], 'creator')
+         assert_equal(analysis['error'], 'PSBT is not valid. Input 0 has invalid value')
+ 
+         self.log.info("PSBT with signed, but not finalized, inputs should have Finalizer as next")
+         analysis = self.nodes[0].analyzepsbt('cHNidP8BAHECAAAAAZYezcxdnbXoQCmrD79t/LzDgtUo9ERqixk8wgioAobrAAAAAAD9////AlDDAAAAAAAAFgAUy/UxxZuzZswcmFnN/E9DGSiHLUsuGPUFAAAAABYAFLsH5o0R38wXx+X2cCosTMCZnQ4baAAAAAABAR8A4fUFAAAAABYAFOBI2h5thf3+Lflb2LGCsVSZwsltIgIC/i4dtVARCRWtROG0HHoGcaVklzJUcwo5homgGkSNAnJHMEQCIGx7zKcMIGr7cEES9BR4Kdt/pzPTK3fKWcGyCJXb7MVnAiALOBgqlMH4GbC1HDh/HmylmO54fyEy4lKde7/BT/PWxwEBAwQBAAAAIgYC/i4dtVARCRWtROG0HHoGcaVklzJUcwo5homgGkSNAnIYDwVpQ1QAAIABAACAAAAAgAAAAAAAAAAAAAAiAgL+CIiB59NSCssOJRGiMYQK1chahgAaaJpIXE41Cyir+xgPBWlDVAAAgAEAAIAAAACAAQAAAAAAAAAA')
+         assert_equal(analysis['next'], 'finalizer')
+ 
+         analysis = self.nodes[0].analyzepsbt('cHNidP8BAHECAAAAAfA00BFgAm6tp86RowwH6BMImQNL5zXUcTT97XoLGz0BAAAAAAD/////AgCAgWrj0AcAFgAUKNw0x8HRctAgmvoevm4u1SbN7XL87QKVAAAAABYAFPck4gF7iL4NL4wtfRAKgQbghiTUAAAAAAABAR8A8gUqAQAAABYAFJUDtxf2PHo641HEOBOAIvFMNTr2AAAA')
+         assert_equal(analysis['next'], 'creator')
+         assert_equal(analysis['error'], 'PSBT is not valid. Output amount invalid')
+ 
+         analysis = self.nodes[0].analyzepsbt('cHNidP8BAJoCAAAAAkvEW8NnDtdNtDpsmze+Ht2LH35IJcKv00jKAlUs21RrAwAAAAD/////S8Rbw2cO1020OmybN74e3Ysffkglwq/TSMoCVSzbVGsBAAAAAP7///8CwLYClQAAAAAWABSNJKzjaUb3uOxixsvh1GGE3fW7zQD5ApUAAAAAFgAUKNw0x8HRctAgmvoevm4u1SbN7XIAAAAAAAEAnQIAAAACczMa321tVHuN4GKWKRncycI22aX3uXgwSFUKM2orjRsBAAAAAP7///9zMxrfbW1Ue43gYpYpGdzJwjbZpfe5eDBIVQozaiuNGwAAAAAA/v///wIA+QKVAAAAABl2qRT9zXUVA8Ls5iVqynLHe5/vSe1XyYisQM0ClQAAAAAWABRmWQUcjSjghQ8/uH4Bn/zkakwLtAAAAAAAAQEfQM0ClQAAAAAWABRmWQUcjSjghQ8/uH4Bn/zkakwLtAAAAA==')
+         assert_equal(analysis['next'], 'creator')
+         assert_equal(analysis['error'], 'PSBT is not valid. Input 0 specifies invalid prevout')
+ 
+         assert_raises_rpc_error(-25, 'Inputs missing or spent', self.nodes[0].walletprocesspsbt, 'cHNidP8BAJoCAAAAAkvEW8NnDtdNtDpsmze+Ht2LH35IJcKv00jKAlUs21RrAwAAAAD/////S8Rbw2cO1020OmybN74e3Ysffkglwq/TSMoCVSzbVGsBAAAAAP7///8CwLYClQAAAAAWABSNJKzjaUb3uOxixsvh1GGE3fW7zQD5ApUAAAAAFgAUKNw0x8HRctAgmvoevm4u1SbN7XIAAAAAAAEAnQIAAAACczMa321tVHuN4GKWKRncycI22aX3uXgwSFUKM2orjRsBAAAAAP7///9zMxrfbW1Ue43gYpYpGdzJwjbZpfe5eDBIVQozaiuNGwAAAAAA/v///wIA+QKVAAAAABl2qRT9zXUVA8Ls5iVqynLHe5/vSe1XyYisQM0ClQAAAAAWABRmWQUcjSjghQ8/uH4Bn/zkakwLtAAAAAAAAQEfQM0ClQAAAAAWABRmWQUcjSjghQ8/uH4Bn/zkakwLtAAAAA==')
+ 
+         # Test that we can fund psbts with external inputs specified
+         eckey = ECKey()
+         eckey.generate()
+         privkey = bytes_to_wif(eckey.get_bytes())
+ 
+         # Make a weird but signable script. sh(pkh()) descriptor accomplishes this
+         desc = descsum_create("sh(pkh({}))".format(privkey))
+         if self.options.descriptors:
+             res = self.nodes[0].importdescriptors([{"desc": desc, "timestamp": "now"}])
+         else:
+             res = self.nodes[0].importmulti([{"desc": desc, "timestamp": "now"}])
+         assert res[0]["success"]
+         addr = self.nodes[0].deriveaddresses(desc)[0]
+         addr_info = self.nodes[0].getaddressinfo(addr)
+ 
+         self.nodes[0].sendtoaddress(addr, 10)
+         self.generate(self.nodes[0], 6)
+         ext_utxo = self.nodes[0].listunspent(addresses=[addr])[0]
+ 
+         # An external input without solving data should result in an error
+         assert_raises_rpc_error(-4, "Insufficient funds", self.nodes[1].walletcreatefundedpsbt, [ext_utxo], {self.nodes[0].getnewaddress(): 10 + ext_utxo['amount']}, 0, {'add_inputs': True})
+ 
+         # But funding should work when the solving data is provided
+         psbt = self.nodes[1].walletcreatefundedpsbt([ext_utxo], {self.nodes[0].getnewaddress(): 15}, 0, {'add_inputs': True, "solving_data": {"pubkeys": [addr_info['pubkey']], "scripts": [addr_info["embedded"]["scriptPubKey"]]}})
+         signed = self.nodes[1].walletprocesspsbt(psbt['psbt'])
+         assert not signed['complete']
+         signed = self.nodes[0].walletprocesspsbt(signed['psbt'])
+         assert signed['complete']
+         self.nodes[0].finalizepsbt(signed['psbt'])
+ 
+         psbt = self.nodes[1].walletcreatefundedpsbt([ext_utxo], {self.nodes[0].getnewaddress(): 15}, 0, {'add_inputs': True, "solving_data":{"descriptors": [desc]}})
+         signed = self.nodes[1].walletprocesspsbt(psbt['psbt'])
+         assert not signed['complete']
+         signed = self.nodes[0].walletprocesspsbt(signed['psbt'])
+         assert signed['complete']
+         self.nodes[0].finalizepsbt(signed['psbt'])

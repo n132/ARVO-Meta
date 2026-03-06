@@ -1,0 +1,155 @@
+commit f8dd198a2d8ad4f4fccd591349a384bc0eff5ec9
+Author: Evgenii Kliuchnikov <eustas@google.com>
+Date:   Wed Jul 7 10:45:14 2021 +0000
+
+    Fuzz: use-of-uninitialized in unsqueeze
+    
+    Previous shortcut logic created uninitialized images even for non-empty channels
+
+diff --git a/lib/jxl/modular/transform/squeeze.cc b/lib/jxl/modular/transform/squeeze.cc
+index 0239c691..c1940e4a 100644
+--- a/lib/jxl/modular/transform/squeeze.cc
++++ b/lib/jxl/modular/transform/squeeze.cc
+@@ -17,55 +17,63 @@ namespace jxl {
+ void InvHSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
+   const Channel &chin = input.channel[c];
+   const Channel &chin_residual = input.channel[rc];
+   // These must be valid since we ran MetaApply already.
+   JXL_ASSERT(chin.w == DivCeil(chin.w + chin_residual.w, 2));
+   JXL_ASSERT(chin.h == chin_residual.h);
+ 
++  if (chin_residual.w == 0) {
++    // Short-circuit: output channel has same dimensions as input.
++    input.channel[c].hshift--;
++    return;
++  }
++
++  // Note: chin.w >= chin_residual.w and at most 1 different.
+   Channel chout(chin.w + chin_residual.w, chin.h, chin.hshift - 1, chin.vshift);
+   JXL_DEBUG_V(4,
+               "Undoing horizontal squeeze of channel %i using residuals in "
+               "channel %i (going from width %zu to %zu)",
+               c, rc, chin.w, chout.w);
+-  if (chin_residual.w == 0 || chin_residual.h == 0) {
+-    // Short-circuit for channels with no pixels.
++
++  if (chin_residual.h == 0) {
++    // Short-circuit: channel with no pixels.
+     input.channel[c] = std::move(chout);
+     return;
+   }
+ 
+   RunOnPool(
+       pool, 0, chin.h, ThreadPool::SkipInit(),
+       [&](const int task, const int thread) {
+         const size_t y = task;
+         const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y);
+         const pixel_type *JXL_RESTRICT p_avg = chin.Row(y);
+         pixel_type *JXL_RESTRICT p_out = chout.Row(y);
+ 
+         // special case for x=0 so we don't have to check x>0
+         pixel_type_w avg = p_avg[0];
+         pixel_type_w next_avg = (1 < chin.w ? p_avg[1] : avg);
+         pixel_type_w tendency = SmoothTendency(avg, avg, next_avg);
+         pixel_type_w diff = p_residual[0] + tendency;
+         pixel_type_w A =
+             ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
+         pixel_type_w B = A - diff;
+         p_out[0] = A;
+         p_out[1] = B;
+ 
+         for (size_t x = 1; x < chin_residual.w; x++) {
+           pixel_type_w diff_minus_tendency = p_residual[x];
+           pixel_type_w avg = p_avg[x];
+           pixel_type_w next_avg = (x + 1 < chin.w ? p_avg[x + 1] : avg);
+           pixel_type_w left = p_out[(x << 1) - 1];
+           pixel_type_w tendency = SmoothTendency(left, avg, next_avg);
+           pixel_type_w diff = diff_minus_tendency + tendency;
+           pixel_type_w A =
+               ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
+           p_out[x << 1] = A;
+           pixel_type_w B = A - diff;
+           p_out[(x << 1) + 1] = B;
+         }
+         if (chout.w & 1) p_out[chout.w - 1] = p_avg[chin.w - 1];
+       },
+       "InvHorizontalSqueeze");
+   input.channel[c] = std::move(chout);
+ }
+@@ -73,68 +81,74 @@ void InvHSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
+ void InvVSqueeze(Image &input, int c, int rc, ThreadPool *pool) {
+   const Channel &chin = input.channel[c];
+   const Channel &chin_residual = input.channel[rc];
+   // These must be valid since we ran MetaApply already.
+   JXL_ASSERT(chin.h == DivCeil(chin.h + chin_residual.h, 2));
+   JXL_ASSERT(chin.w == chin_residual.w);
+ 
++  if (chin_residual.h == 0) {
++    // Short-circuit: output channel has same dimensions as input.
++    input.channel[c].vshift--;
++    return;
++  }
++
+   // Note: chin.h >= chin_residual.h and at most 1 different.
+   Channel chout(chin.w, chin.h + chin_residual.h, chin.hshift, chin.vshift - 1);
+   JXL_DEBUG_V(
+       4,
+       "Undoing vertical squeeze of channel %i using residuals in channel "
+       "%i (going from height %zu to %zu)",
+       c, rc, chin.h, chout.h);
+ 
+-  if (chin_residual.w == 0 || chin_residual.h == 0) {
+-    // Short-circuit for channels with no pixels.
++  if (chin_residual.w == 0) {
++    // Short-circuit: channel with no pixels.
+     input.channel[c] = std::move(chout);
+     return;
+   }
+ 
+   intptr_t onerow_in = chin.plane.PixelsPerRow();
+   intptr_t onerow_out = chout.plane.PixelsPerRow();
+   constexpr int kColsPerThread = 64;
+   RunOnPool(
+       pool, 0, DivCeil(chin.w, kColsPerThread), ThreadPool::SkipInit(),
+       [&](const int task, const int thread) {
+         const size_t x0 = task * kColsPerThread;
+         const size_t x1 = std::min((size_t)(task + 1) * kColsPerThread, chin.w);
+         // We only iterate up to std::min(chin_residual.h, chin.h) which is
+         // always chin_residual.h.
+         for (size_t y = 0; y < chin_residual.h; y++) {
+           const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y);
+           const pixel_type *JXL_RESTRICT p_avg = chin.Row(y);
+           pixel_type *JXL_RESTRICT p_out = chout.Row(y << 1);
+           for (size_t x = x0; x < x1; x++) {
+             pixel_type_w diff_minus_tendency = p_residual[x];
+             pixel_type_w avg = p_avg[x];
+ 
+             pixel_type_w next_avg = avg;
+             if (y + 1 < chin.h) next_avg = p_avg[x + onerow_in];
+             pixel_type_w top =
+                 (y > 0 ? p_out[static_cast<ssize_t>(x) - onerow_out] : avg);
+             pixel_type_w tendency = SmoothTendency(top, avg, next_avg);
+             pixel_type_w diff = diff_minus_tendency + tendency;
+             pixel_type_w out =
+                 ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
+ 
+             p_out[x] = out;
+             // If the chin_residual.h == chin.h, the output has an even number
+             // of rows so the next line is fine. Otherwise, this loop won't
+             // write to the last output row which is handled separately.
+             p_out[x + onerow_out] = p_out[x] - diff;
+           }
+         }
+       },
+       "InvVertSqueeze");
+ 
+   if (chout.h & 1) {
+     size_t y = chin.h - 1;
+     const pixel_type *p_avg = chin.Row(y);
+     pixel_type *p_out = chout.Row(y << 1);
+     for (size_t x = 0; x < chin.w; x++) {
+       p_out[x] = p_avg[x];
+     }
+   }
+   input.channel[c] = std::move(chout);
+ }

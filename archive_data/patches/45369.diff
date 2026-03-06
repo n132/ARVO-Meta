@@ -1,0 +1,640 @@
+commit c4ecd82f9399850a36bf2466d0a54a045b6dfa15
+Author: Tyson Andre <tysonandre775@hotmail.com>
+Date:   Mon Oct 24 08:33:25 2022 -0400
+
+    Make inspecting SplFixedArray instances more memory efficient/consistent, change print_r null props handling (#9757)
+    
+    * Make handling of SplFixedArray properties more consistent
+    
+    Create a brand new reference counted array every time in SplFixedArray
+    to be freed by the callers (or return null).
+    Switch from overriding `get_properties` to overriding `get_properties_for` handler
+    
+    * Print objects with null hash table like others in print_r
+    
+    Noticed when working on subsequent commits for SplFixedArray.
+    Make whether zend_get_properties_for returns null or an empty array
+    invisible to the end user - it would be always be a non-null array for
+    user-defined classes.
+    Always print newlines with `\n\s*(\n\s*)` after objects
+    
+    Noticed when working on SplFixedArray changes, e.g. in
+    ext/spl/tests/SplFixedArray__construct_param_null.phpt
+
+diff --git a/Zend/tests/function_arguments/sensitive_parameter_value.phpt b/Zend/tests/function_arguments/sensitive_parameter_value.phpt
+index accf19338a..fc797fa138 100644
+--- a/Zend/tests/function_arguments/sensitive_parameter_value.phpt
++++ b/Zend/tests/function_arguments/sensitive_parameter_value.phpt
+@@ -1,45 +1,47 @@
+ --TEST--
+ A SensitiveParameterValue keeps the inner value secret.
+ --FILE--
+ <?php
+ 
+ $v = new SensitiveParameterValue('secret');
+ 
+ echo "# var_dump() / debug_zval_dump() / print_r()", PHP_EOL;
+ var_dump($v);
+ debug_zval_dump($v);
+ print_r($v);
+ echo PHP_EOL;
+ 
+ echo "# var_export()", PHP_EOL;
+ echo var_export($v, true), PHP_EOL;
+ echo PHP_EOL;
+ 
+ echo "# (array) / json_encode()", PHP_EOL;
+ var_dump((array)$v);
+ var_dump(json_encode($v));
+ echo PHP_EOL;
+ 
+ echo "# ->getValue()", PHP_EOL;
+ var_dump($v->getValue());
+ 
+ ?>
+ --EXPECTF--
+ # var_dump() / debug_zval_dump() / print_r()
+ object(SensitiveParameterValue)#%d (0) {
+ }
+ object(SensitiveParameterValue)#%d (%d) refcount(%d){
+ }
+ SensitiveParameterValue Object
++(
++)
+ 
+ # var_export()
+ \SensitiveParameterValue::__set_state(array(
+ ))
+ 
+ # (array) / json_encode()
+ array(0) {
+ }
+ string(2) "{}"
+ 
+ # ->getValue()
+ string(6) "secret"
+diff --git a/Zend/zend.c b/Zend/zend.c
+index c6a5f7f91c..46a0e1b4c0 100644
+--- a/Zend/zend.c
++++ b/Zend/zend.c
+@@ -469,70 +469,71 @@ ZEND_API void zend_print_flat_zval_r(zval *expr)
+ static void zend_print_zval_r_to_buf(smart_str *buf, zval *expr, int indent) /* {{{ */
+ {
+ 	switch (Z_TYPE_P(expr)) {
+ 		case IS_ARRAY:
+ 			smart_str_appends(buf, "Array\n");
+ 			if (!(GC_FLAGS(Z_ARRVAL_P(expr)) & GC_IMMUTABLE)) {
+ 				if (GC_IS_RECURSIVE(Z_ARRVAL_P(expr))) {
+ 					smart_str_appends(buf, " *RECURSION*");
+ 					return;
+ 				}
+ 				GC_PROTECT_RECURSION(Z_ARRVAL_P(expr));
+ 			}
+ 			print_hash(buf, Z_ARRVAL_P(expr), indent, 0);
+ 			GC_TRY_UNPROTECT_RECURSION(Z_ARRVAL_P(expr));
+ 			break;
+ 		case IS_OBJECT:
+ 			{
+ 				HashTable *properties;
+ 
+ 				zend_object *zobj = Z_OBJ_P(expr);
+ 				zend_string *class_name = Z_OBJ_HANDLER_P(expr, get_class_name)(zobj);
+ 				smart_str_appends(buf, ZSTR_VAL(class_name));
+ 				zend_string_release_ex(class_name, 0);
+ 
+ 				if (!(zobj->ce->ce_flags & ZEND_ACC_ENUM)) {
+ 					smart_str_appends(buf, " Object\n");
+ 				} else {
+ 					smart_str_appends(buf, " Enum");
+ 					if (zobj->ce->enum_backing_type != IS_UNDEF) {
+ 						smart_str_appendc(buf, ':');
+ 						smart_str_appends(buf, zend_get_type_by_const(zobj->ce->enum_backing_type));
+ 					}
+ 					smart_str_appendc(buf, '\n');
+ 				}
+ 
+ 				if (GC_IS_RECURSIVE(Z_OBJ_P(expr))) {
+ 					smart_str_appends(buf, " *RECURSION*");
+ 					return;
+ 				}
+ 
+ 				if ((properties = zend_get_properties_for(expr, ZEND_PROP_PURPOSE_DEBUG)) == NULL) {
++					print_hash(buf, (HashTable*) &zend_empty_array, indent, 1);
+ 					break;
+ 				}
+ 
+ 				GC_PROTECT_RECURSION(Z_OBJ_P(expr));
+ 				print_hash(buf, properties, indent, 1);
+ 				GC_UNPROTECT_RECURSION(Z_OBJ_P(expr));
+ 
+ 				zend_release_properties(properties);
+ 				break;
+ 			}
+ 		case IS_LONG:
+ 			smart_str_append_long(buf, Z_LVAL_P(expr));
+ 			break;
+ 		case IS_REFERENCE:
+ 			zend_print_zval_r_to_buf(buf, Z_REFVAL_P(expr), indent);
+ 			break;
+ 		case IS_STRING:
+ 			smart_str_append(buf, Z_STR_P(expr));
+ 			break;
+ 		default:
+ 			{
+ 				zend_string *str = zval_get_string_func(expr);
+ 				smart_str_append(buf, str);
+ 				zend_string_release_ex(str, 0);
+ 			}
+ 			break;
+ 	}
+ }
+ /* }}} */
+diff --git a/ext/spl/spl_fixedarray.c b/ext/spl/spl_fixedarray.c
+index f5a056558a..465c649e98 100644
+--- a/ext/spl/spl_fixedarray.c
++++ b/ext/spl/spl_fixedarray.c
+@@ -47,9 +47,7 @@ ZEND_GET_MODULE(spl_fixedarray)
+ typedef struct _spl_fixedarray {
+ 	zend_long size;
+ 	/* It is possible to resize this, so this can't be combined with the object */
+ 	zval *elements;
+-	/* True if this was modified after the last call to get_properties or the hash table wasn't rebuilt. */
+-	bool                 should_rebuild_properties;
+ } spl_fixedarray;
+ 
+ typedef struct _spl_fixedarray_object {
+@@ -105,9 +103,8 @@ static void spl_fixedarray_init_elems(spl_fixedarray *array, zend_long from, zen
+ static void spl_fixedarray_init_non_empty_struct(spl_fixedarray *array, zend_long size)
+ {
+ 	array->size = 0; /* reset size in case ecalloc() fails */
+ 	array->elements = size ? safe_emalloc(size, sizeof(zval), 0) : NULL;
+ 	array->size = size;
+-	array->should_rebuild_properties = true;
+ }
+ 
+ static void spl_fixedarray_init(spl_fixedarray *array, zend_long size)
+@@ -174,28 +171,27 @@ static void spl_fixedarray_dtor(spl_fixedarray *array)
+ static void spl_fixedarray_resize(spl_fixedarray *array, zend_long size)
+ {
+ 	if (size == array->size) {
+ 		/* nothing to do */
+ 		return;
+ 	}
+-	array->should_rebuild_properties = true;
+ 
+ 	/* first initialization */
+ 	if (array->size == 0) {
+ 		spl_fixedarray_init(array, size);
+ 		return;
+ 	}
+ 
+ 	/* clearing the array */
+ 	if (size == 0) {
+ 		spl_fixedarray_dtor(array);
+ 		array->elements = NULL;
+ 	} else if (size > array->size) {
+ 		array->elements = safe_erealloc(array->elements, size, sizeof(zval), 0);
+ 		spl_fixedarray_init_elems(array, array->size, size);
+ 	} else { /* size < array->size */
+ 		spl_fixedarray_dtor_range(array, size, array->size);
+ 		array->elements = erealloc(array->elements, sizeof(zval) * size);
+ 	}
+ 
+ 	array->size = size;
+ }
+@@ -211,48 +207,42 @@ static HashTable* spl_fixedarray_object_get_gc(zend_object *obj, zval **table, i
+ 	return ht;
+ }
+ 
+-static HashTable* spl_fixedarray_object_get_properties(zend_object *obj)
++static HashTable* spl_fixedarray_object_get_properties_for(zend_object *obj, zend_prop_purpose purpose)
+ {
+-	spl_fixedarray_object *intern = spl_fixed_array_from_obj(obj);
+-	HashTable *ht = zend_std_get_properties(obj);
+-
+-	if (!spl_fixedarray_empty(&intern->array)) {
+-		/*
+-		 * Usually, the reference count of the hash table is 1,
+-		 * except during cyclic reference cycles.
+-		 *
+-		 * Maintain the DEBUG invariant that a hash table isn't modified during iteration,
+-		 * and avoid unnecessary work rebuilding a hash table for unmodified properties.
+-		 *
+-		 * See https://github.com/php/php-src/issues/8079 and ext/spl/tests/fixedarray_022.phpt
+-		 * Also see https://github.com/php/php-src/issues/8044 for alternate considered approaches.
+-		 */
+-		if (!intern->array.should_rebuild_properties) {
+-			/* Return the same hash table so that recursion cycle detection works in internal functions. */
+-			return ht;
+-		}
+-		intern->array.should_rebuild_properties = false;
++	/* This has __serialize, so the purpose is not ZEND_PROP_PURPOSE_SERIALIZE, which would expect a non-null return value */
++	ZEND_ASSERT(purpose != ZEND_PROP_PURPOSE_SERIALIZE);
+ 
+-		zend_long j = zend_hash_num_elements(ht);
++	const spl_fixedarray_object *intern = spl_fixed_array_from_obj(obj);
++	/*
++	 * SplFixedArray can be subclassed or have dynamic properties (With or without AllowDynamicProperties in subclasses).
++	 * Instances of subclasses with declared properties may have properties but not yet have a property table.
++	 */
++	HashTable *source_properties = obj->properties ? obj->properties : (obj->ce->default_properties_count ? zend_std_get_properties(obj) : NULL);
+ 
+-		if (GC_REFCOUNT(ht) > 1) {
+-			intern->std.properties = zend_array_dup(ht);
+-			GC_TRY_DELREF(ht);
+-		}
+-		for (zend_long i = 0; i < intern->array.size; i++) {
+-			zend_hash_index_update(ht, i, &intern->array.elements[i]);
+-			Z_TRY_ADDREF(intern->array.elements[i]);
+-		}
+-		if (j > intern->array.size) {
+-			for (zend_long i = intern->array.size; i < j; ++i) {
+-				zend_hash_index_del(ht, i);
++	const zend_long size = intern->array.size;
++	if (size == 0 && (!source_properties || !zend_hash_num_elements(source_properties))) {
++		return NULL;
++	}
++	zval *const elements = intern->array.elements;
++	HashTable *ht = zend_new_array(size);
++
++	for (zend_long i = 0; i < size; i++) {
++		Z_TRY_ADDREF_P(&elements[i]);
++		zend_hash_next_index_insert(ht, &elements[i]);
++	}
++	if (source_properties && zend_hash_num_elements(source_properties) > 0) {
++		zend_long nkey;
++		zend_string *skey;
++		zval *value;
++		ZEND_HASH_MAP_FOREACH_KEY_VAL_IND(source_properties, nkey, skey, value) {
++			Z_TRY_ADDREF_P(value);
++			if (skey) {
++				zend_hash_add_new(ht, skey, value);
++			} else {
++				zend_hash_index_update(ht, nkey, value);
+ 			}
+-		}
+-		if (HT_IS_PACKED(ht)) {
+-			/* Engine doesn't expet packed array */
+-			zend_hash_packed_to_hash(ht);
+-		}
++		} ZEND_HASH_FOREACH_END();
+ 	}
+ 
+ 	return ht;
+ }
+@@ -377,55 +367,51 @@ static int spl_fixedarray_object_has_dimension(zend_object *object, zval *offset
+ static zval *spl_fixedarray_object_read_dimension(zend_object *object, zval *offset, int type, zval *rv)
+ {
+ 	if (type == BP_VAR_IS && !spl_fixedarray_object_has_dimension(object, offset, 0)) {
+ 		return &EG(uninitialized_zval);
+ 	}
+ 
+ 	if (HAS_FIXEDARRAY_ARRAYACCESS_OVERRIDE(object, zf_offsetget)) {
+ 		zval tmp;
+ 		if (!offset) {
+ 			ZVAL_NULL(&tmp);
+ 			offset = &tmp;
+ 		}
+ 		zend_call_known_instance_method_with_1_params(object->ce->arrayaccess_funcs_ptr->zf_offsetget, object, rv, offset);
+ 		if (!Z_ISUNDEF_P(rv)) {
+ 			return rv;
+ 		}
+ 		return &EG(uninitialized_zval);
+ 	}
+ 
+ 	spl_fixedarray_object *intern = spl_fixed_array_from_obj(object);
+-	if (type != BP_VAR_IS && type != BP_VAR_R) {
+-		intern->array.should_rebuild_properties = true;
+-	}
+ 	return spl_fixedarray_object_read_dimension_helper(intern, offset);
+ }
+ 
+ static void spl_fixedarray_object_write_dimension_helper(spl_fixedarray_object *intern, zval *offset, zval *value)
+ {
+ 	zend_long index;
+ 
+ 	if (!offset) {
+ 		/* '$array[] = value' syntax is not supported */
+ 		zend_throw_error(NULL, "[] operator not supported for SplFixedArray");
+ 		return;
+ 	}
+ 
+ 	index = spl_offset_convert_to_long(offset);
+ 	if (EG(exception)) {
+ 		return;
+ 	}
+ 
+ 	if (index < 0 || index >= intern->array.size) {
+ 		// TODO Change error message and use OutOfBound SPL Exception?
+ 		zend_throw_exception(spl_ce_RuntimeException, "Index invalid or out of range", 0);
+ 		return;
+ 	} else {
+-		intern->array.should_rebuild_properties = true;
+ 		/* Fix #81429 */
+ 		zval *ptr = &(intern->array.elements[index]);
+ 		zval tmp;
+ 		ZVAL_COPY_VALUE(&tmp, ptr);
+ 		ZVAL_COPY_DEREF(ptr, value);
+ 		zval_ptr_dtor(&tmp);
+ 	}
+ }
+@@ -450,19 +436,18 @@ static void spl_fixedarray_object_write_dimension(zend_object *object, zval *off
+ static void spl_fixedarray_object_unset_dimension_helper(spl_fixedarray_object *intern, zval *offset)
+ {
+ 	zend_long index;
+ 
+ 	index = spl_offset_convert_to_long(offset);
+ 	if (EG(exception)) {
+ 		return;
+ 	}
+ 
+ 	if (index < 0 || index >= intern->array.size) {
+ 		// TODO Change error message and use OutOfBound SPL Exception?
+ 		zend_throw_exception(spl_ce_RuntimeException, "Index invalid or out of range", 0);
+ 		return;
+ 	} else {
+-		intern->array.should_rebuild_properties = true;
+ 		zval_ptr_dtor(&(intern->array.elements[index]));
+ 		ZVAL_NULL(&intern->array.elements[index]);
+ 	}
+ }
+@@ -959,23 +944,23 @@ zend_object_iterator *spl_fixedarray_get_iterator(zend_class_entry *ce, zval *ob
+ PHP_MINIT_FUNCTION(spl_fixedarray)
+ {
+ 	spl_ce_SplFixedArray = register_class_SplFixedArray(
+ 		zend_ce_aggregate, zend_ce_arrayaccess, zend_ce_countable, php_json_serializable_ce);
+ 	spl_ce_SplFixedArray->create_object = spl_fixedarray_new;
+ 	spl_ce_SplFixedArray->default_object_handlers = &spl_handler_SplFixedArray;
+ 	spl_ce_SplFixedArray->get_iterator = spl_fixedarray_get_iterator;
+ 
+ 	memcpy(&spl_handler_SplFixedArray, &std_object_handlers, sizeof(zend_object_handlers));
+ 
+ 	spl_handler_SplFixedArray.offset          = XtOffsetOf(spl_fixedarray_object, std);
+ 	spl_handler_SplFixedArray.clone_obj       = spl_fixedarray_object_clone;
+ 	spl_handler_SplFixedArray.read_dimension  = spl_fixedarray_object_read_dimension;
+ 	spl_handler_SplFixedArray.write_dimension = spl_fixedarray_object_write_dimension;
+ 	spl_handler_SplFixedArray.unset_dimension = spl_fixedarray_object_unset_dimension;
+ 	spl_handler_SplFixedArray.has_dimension   = spl_fixedarray_object_has_dimension;
+ 	spl_handler_SplFixedArray.count_elements  = spl_fixedarray_object_count_elements;
+-	spl_handler_SplFixedArray.get_properties  = spl_fixedarray_object_get_properties;
++	spl_handler_SplFixedArray.get_properties_for = spl_fixedarray_object_get_properties_for;
+ 	spl_handler_SplFixedArray.get_gc          = spl_fixedarray_object_get_gc;
+ 	spl_handler_SplFixedArray.free_obj        = spl_fixedarray_object_free_storage;
+ 
+ 	return SUCCESS;
+ }
+diff --git a/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt b/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt
+new file mode 100644
+index 0000000000..7abbd266e3
+--- /dev/null
++++ b/ext/spl/tests/ArrayObject_overloaded_SplFixedArray.phpt
+@@ -0,0 +1,28 @@
++--TEST--
++SplFixedArray properties is compatible with ArrayObject
++--FILE--
++<?php
++$ao = new ArrayObject([1, 2, 3]);
++$fixedArray = new SplFixedArray(1);
++$fixedArray[0] = new SplDoublyLinkedList();
++$ao->exchangeArray($fixedArray);
++$ao[0] = new stdClass();
++var_dump($ao);
++?>
++--EXPECT--
++object(ArrayObject)#1 (1) {
++  ["storage":"ArrayObject":private]=>
++  object(SplFixedArray)#2 (2) {
++    [0]=>
++    object(SplDoublyLinkedList)#3 (2) {
++      ["flags":"SplDoublyLinkedList":private]=>
++      int(0)
++      ["dllist":"SplDoublyLinkedList":private]=>
++      array(0) {
++      }
++    }
++    ["0"]=>
++    object(stdClass)#4 (0) {
++    }
++  }
++}
+diff --git a/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt b/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
+index 8c1121b8d0..67267f0ec6 100644
+--- a/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
++++ b/ext/spl/tests/ArrayObject_overloaded_object_incompatible.phpt
+@@ -1,27 +1,27 @@
+ --TEST--
+ Objects with overloaded get_properties are incompatible with ArrayObject
+ --FILE--
+ <?php
+ 
+ $ao = new ArrayObject([1, 2, 3]);
+ try {
+-    $ao->exchangeArray(new SplFixedArray);
++    $ao->exchangeArray(new DateInterval('P1D'));
+ } catch (Exception $e) {
+     echo $e->getMessage(), "\n";
+ }
+ var_dump($ao);
+ 
+ ?>
+ --EXPECT--
+-Overloaded object of type SplFixedArray is not compatible with ArrayObject
++Overloaded object of type DateInterval is not compatible with ArrayObject
+ object(ArrayObject)#1 (1) {
+   ["storage":"ArrayObject":private]=>
+   array(3) {
+     [0]=>
+     int(1)
+     [1]=>
+     int(2)
+     [2]=>
+     int(3)
+   }
+ }
+diff --git a/ext/spl/tests/SplFixedArray_get_properties_for.phpt b/ext/spl/tests/SplFixedArray_get_properties_for.phpt
+new file mode 100644
+index 0000000000..24fa4bf1ae
+--- /dev/null
++++ b/ext/spl/tests/SplFixedArray_get_properties_for.phpt
+@@ -0,0 +1,86 @@
++--TEST--
++SplFixedArray - get_properties_for handlers
++--FILE--
++<?php
++#[AllowDynamicProperties]
++class MySplFixedArray extends SplFixedArray {
++    public $x;
++    public int $y;
++}
++class X {}
++class Y {}
++$array = new MySplFixedArray(2);
++var_dump(get_mangled_object_vars($array));
++$array[0] = new stdClass();
++$array[1] = new Y();
++$array->x = new SplFixedArray();
++$array->{0} = new X();
++var_dump($array);
++// As of php 8.3, get_mangled_object_vars only contains object properties (dynamic properties and declared subclass properties)
++//                (Array elements in the SplFixedArray are deliberately excluded)
++// Before php 8.3, this would have array elements get removed in some cases but not others.
++var_dump(get_mangled_object_vars($array));
++echo "cast to array\n";
++var_dump((array)$array); // Adds the values from the underlying array, then the declared/dynamic object properties
++echo json_encode($array), "\n"; // From JsonSerializable::serialize()
++$ser = serialize($array);
++echo "$ser\n";
++// NOTE: The unserialize behavior for the property that is the string '0' is just because unserialize()
++// is coercing '0' to a string before calling SplFixedArray::__unserialize.
++//
++// Typical code would not use 0 as a property name, this test is just testing edge cases have proper reference counting and so on.
++var_dump(unserialize($ser));
++?>
++--EXPECT--
++array(1) {
++  ["x"]=>
++  NULL
++}
++object(MySplFixedArray)#1 (4) {
++  [0]=>
++  object(stdClass)#2 (0) {
++  }
++  [1]=>
++  object(Y)#3 (0) {
++  }
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++  ["0"]=>
++  object(X)#5 (0) {
++  }
++}
++array(2) {
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++  [0]=>
++  object(X)#5 (0) {
++  }
++}
++cast to array
++array(3) {
++  [0]=>
++  object(X)#5 (0) {
++  }
++  [1]=>
++  object(Y)#3 (0) {
++  }
++  ["x"]=>
++  object(SplFixedArray)#4 (0) {
++  }
++}
++[{},{}]
++O:15:"MySplFixedArray":5:{i:0;O:8:"stdClass":0:{}i:1;O:1:"Y":0:{}s:1:"x";i:0;s:1:"y";i:0;s:1:"0";O:1:"X":0:{}}
++object(MySplFixedArray)#6 (4) {
++  [0]=>
++  object(X)#9 (0) {
++  }
++  [1]=>
++  object(Y)#8 (0) {
++  }
++  ["x"]=>
++  int(0)
++  ["y"]=>
++  int(0)
++}
+diff --git a/ext/spl/tests/SplFixedArray_immediate_gc.phpt b/ext/spl/tests/SplFixedArray_immediate_gc.phpt
+new file mode 100644
+index 0000000000..cead2238c1
+--- /dev/null
++++ b/ext/spl/tests/SplFixedArray_immediate_gc.phpt
+@@ -0,0 +1,35 @@
++--TEST--
++SplFixedArray - values should be gced after var_export then being modified
++--FILE--
++<?php
++class HasDestructor {
++    public function __destruct() {
++        echo "In destructor\n";
++    }
++}
++$array = SplFixedArray::fromArray([new HasDestructor()]);
++var_dump($array);
++echo "Replacing\n";
++$array[0] = new stdClass();
++// As of php 8.3, this will be freed before the var_dump call
++echo "Dumping again\n";
++var_dump($array);
++// As of php 8.3, this only contain object properties (dynamic properties and declared subclass properties)
++var_dump(get_mangled_object_vars($array));
++?>
++--EXPECT--
++object(SplFixedArray)#2 (1) {
++  [0]=>
++  object(HasDestructor)#1 (0) {
++  }
++}
++Replacing
++In destructor
++Dumping again
++object(SplFixedArray)#2 (1) {
++  [0]=>
++  object(stdClass)#3 (0) {
++  }
++}
++array(0) {
++}
+diff --git a/ext/spl/tests/SplFixedArray_setSize_destruct.phpt b/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
+index 8a07b1decc..24cfd9023b 100644
+--- a/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
++++ b/ext/spl/tests/SplFixedArray_setSize_destruct.phpt
+@@ -11,45 +11,46 @@ class HasDestructor {
+     public function __destruct() {
+         global $values;
+         var_dump($values);
+         $values->setSize($values->getSize() - 1);
++        echo "After reducing size:\n";
+         var_dump($values);
+     }
+ }
+ 
+ $values->setSize(5);
+ $values->offsetSet(4, new HasDestructor());
+ echo "Done\n";
+ --EXPECT--
+ object(SplFixedArray)#1 (1) {
+   [0]=>
+   bool(false)
+ }
+-object(SplFixedArray)#1 (1) {
+-  [0]=>
+-  bool(false)
++After reducing size:
++object(SplFixedArray)#1 (0) {
+ }
+ Done
+ Done
+ object(SplFixedArray)#1 (5) {
+   [0]=>
+   NULL
+   [1]=>
+   NULL
+   [2]=>
+   NULL
+   [3]=>
+   NULL
+   [4]=>
+   object(HasDestructor)#2 (0) {
+   }
+ }
++After reducing size:
+ object(SplFixedArray)#1 (4) {
+   [0]=>
+   NULL
+   [1]=>
+   NULL
+   [2]=>
+   NULL
+   [3]=>
+   NULL
+ }

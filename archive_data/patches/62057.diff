@@ -1,0 +1,185 @@
+commit a981cefdd239ca44bfd12eb7d78dc0c0560f016d
+Author: Mirco Miranda <mirco.miranda@systemceramics.com>
+Date:   Thu Sep 7 16:22:33 2023 +0000
+
+    hdr: fix crash (oss-fuzz)
+    
+    This patch Fixes crash when RLE data is corrupted (test cases attached).
+    
+    Should also fixes (no test cases available):
+    - Issue 62044 in oss-fuzz: kimageformats:kimgio_hdr_fuzzer: Undefined-shift in RGBE_To_QRgbLine
+    - Issue 62057 in oss-fuzz: kimageformats:kimgio_hdr_fuzzer: Heap-buffer-overflow in Read_Old_Line
+    
+    
+    [crash-646a4364479f54278ff8c30c69b0c9665e5869af.hdr](/uploads/44760f0286cde4236feab8e352493556/crash-646a4364479f54278ff8c30c69b0c9665e5869af.hdr)
+    
+    [crash-88c33e2b49e57e6d1d4ec6945476f605f00e714a.hdr](/uploads/e35bf53ee717134a796c4b17cfacca42/crash-88c33e2b49e57e6d1d4ec6945476f605f00e714a.hdr)
+
+diff --git a/src/imageformats/hdr.cpp b/src/imageformats/hdr.cpp
+index 5eb5fe0..6dca6eb 100644
+--- a/src/imageformats/hdr.cpp
++++ b/src/imageformats/hdr.cpp
+@@ -36,33 +36,38 @@ static inline uchar ClipToByte(float value)
+ // read an old style line from the hdr image file
+ // if 'first' is true the first byte is already read
+ static bool Read_Old_Line(uchar *image, int width, QDataStream &s)
+ {
+     int rshift = 0;
+     int i;
+ 
++    uchar *start = image;
+     while (width > 0) {
+         s >> image[0];
+         s >> image[1];
+         s >> image[2];
+         s >> image[3];
+ 
+         if (s.atEnd()) {
+             return false;
+         }
+ 
+         if ((image[0] == 1) && (image[1] == 1) && (image[2] == 1)) {
+-            for (i = image[3] << rshift; i > 0; i--) {
++            // NOTE: we don't have an image sample that cover this code
++            for (i = image[3] << rshift; i > 0 && width > 0; i--) {
++                if (image == start) {
++                    return false; // you cannot be here at the first run
++                }
+                 // memcpy(image, image-4, 4);
+                 (uint &)image[0] = (uint &)image[0 - 4];
+                 image += 4;
+                 width--;
+             }
+             rshift += 8;
+         } else {
+             image += 4;
+             width--;
+             rshift = 0;
+         }
+     }
+     return true;
+ }
+@@ -70,113 +75,119 @@ static bool Read_Old_Line(uchar *image, int width, QDataStream &s)
+ static void RGBE_To_QRgbLine(uchar *image, QRgb *scanline, int width)
+ {
+     for (int j = 0; j < width; j++) {
+         // v = ldexp(1.0, int(image[3]) - 128);
+         float v;
+-        int e = int(image[3]) - 128;
++        int e = qBound(-31, int(image[3]) - 128, 31);
+         if (e > 0) {
+             v = float(1 << e);
+         } else {
+             v = 1.0f / float(1 << -e);
+         }
+ 
+         scanline[j] = qRgb(ClipToByte(float(image[0]) * v), ClipToByte(float(image[1]) * v), ClipToByte(float(image[2]) * v));
+ 
+         image += 4;
+     }
+ }
+ 
+ // Load the HDR image.
+ static bool LoadHDR(QDataStream &s, const int width, const int height, QImage &img)
+ {
+     uchar val;
+     uchar code;
+ 
+     // Create dst image.
+     img = imageAlloc(width, height, QImage::Format_RGB32);
+     if (img.isNull()) {
+         qCDebug(HDRPLUGIN) << "Couldn't create image with size" << width << height << "and format RGB32";
+         return false;
+     }
+ 
+     QByteArray lineArray;
+     lineArray.resize(4 * width);
+     uchar *image = (uchar *)lineArray.data();
+ 
+     for (int cline = 0; cline < height; cline++) {
+         QRgb *scanline = (QRgb *)img.scanLine(cline);
+ 
+         // determine scanline type
+         if ((width < MINELEN) || (MAXELEN < width)) {
+             Read_Old_Line(image, width, s);
+             RGBE_To_QRgbLine(image, scanline, width);
+             continue;
+         }
+ 
+         s >> val;
+ 
+         if (s.atEnd()) {
+             return true;
+         }
+ 
+         if (val != 2) {
+             s.device()->ungetChar(val);
+             Read_Old_Line(image, width, s);
+             RGBE_To_QRgbLine(image, scanline, width);
+             continue;
+         }
+ 
+         s >> image[1];
+         s >> image[2];
+         s >> image[3];
+ 
+         if (s.atEnd()) {
+             return true;
+         }
+ 
+         if ((image[1] != 2) || (image[2] & 128)) {
+             image[0] = 2;
+             Read_Old_Line(image + 4, width - 1, s);
+             RGBE_To_QRgbLine(image, scanline, width);
+             continue;
+         }
+ 
+         if ((image[2] << 8 | image[3]) != width) {
+             qCDebug(HDRPLUGIN) << "Line of pixels had width" << (image[2] << 8 | image[3]) << "instead of" << width;
+             return false;
+         }
+ 
+         // read each component
+-        for (int i = 0; i < 4; i++) {
++        for (int i = 0, len = int(lineArray.size()); i < 4; i++) {
+             for (int j = 0; j < width;) {
+                 s >> code;
+                 if (s.atEnd()) {
+                     qCDebug(HDRPLUGIN) << "Truncated HDR file";
+                     return false;
+                 }
+                 if (code > 128) {
+                     // run
+                     code &= 127;
+                     s >> val;
+                     while (code != 0) {
+-                        image[i + j * 4] = val;
++                        auto idx = i + j * 4;
++                        if (idx < len) {
++                            image[idx] = val;
++                        }
+                         j++;
+                         code--;
+                     }
+                 } else {
+                     // non-run
+                     while (code != 0) {
+-                        s >> image[i + j * 4];
++                        auto idx = i + j * 4;
++                        if (idx < len) {
++                            s >> image[idx];
++                        }
+                         j++;
+                         code--;
+                     }
+                 }
+             }
+         }
+ 
+         RGBE_To_QRgbLine(image, scanline, width);
+     }
+ 
+     return true;
+ }
+ 
+ } // namespace

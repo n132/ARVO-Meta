@@ -1,0 +1,193 @@
+commit 5dedab8cb9ec5acb94d6f9957f0f3494f59a3316
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Mon May 27 09:18:41 2019 +0200
+
+    KCompressionDevice::seek: Fix previous fix ^_^
+    
+    Summary:
+    The previous fix that made sure we returned the actual data in KCompressionDevice::readData
+    because it is sometimes buffered, didn't take into account this line
+      QByteArray dummy(qMin(bytesToRead, qint64(SEEK_BUFFER_SIZE)), 0);
+    in KCompressionDevice::seek, i.e. sometimes the dummy buffer is not as big as we need to seek,
+    basically because we don't want to be allocating lots of memory.
+    
+    The previous solution worked because never incremented the data pointer, that meant that the
+    internal QIODevice buffer might end in a bad state, so we fixed it but forgot about the case
+    where the dummy buffer we're using is not big enough and this was causing invalid memory writes.
+    
+    To fix that now we have a while loop that reads as many times over the dummy buffer to seek
+    to the correct position.
+    
+    Comes with an extended autottest, that has a big buffer and without this fix would crash.
+    
+    Reviewers: apol
+    
+    Reviewed By: apol
+    
+    Subscribers: kde-frameworks-devel
+    
+    Tags: #frameworks
+    
+    Differential Revision: https://phabricator.kde.org/D21418
+
+diff --git a/autotests/kcompressiondevicetest.cpp b/autotests/kcompressiondevicetest.cpp
+index 794de26..e161264 100644
+--- a/autotests/kcompressiondevicetest.cpp
++++ b/autotests/kcompressiondevicetest.cpp
+@@ -192,28 +192,38 @@ void KCompressionDeviceTest::testWriteErrorOnClose()
+     QCOMPARE(int(dev.error()), int(QFileDevice::WriteError));
+ }
+ 
++void KCompressionDeviceTest::testSeekReadUncompressedBuffer_data()
++{
++    QTest::addColumn<int>("dataSize");
++    QTest::addColumn<int>("realDataPos");
++    QTest::newRow("1.5buffer") << BUFFER_SIZE + BUFFER_SIZE / 2 << BUFFER_SIZE;
++    QTest::newRow("5seekbuffer") << 5 * SEEK_BUFFER_SIZE << 4 * SEEK_BUFFER_SIZE;
++}
++
+ void KCompressionDeviceTest::testSeekReadUncompressedBuffer()
+ {
+-    const int dataSize = BUFFER_SIZE + BUFFER_SIZE / 2;
++    QFETCH(int, dataSize);
++    QFETCH(int, realDataPos);
++
+     QByteArray ba(dataSize, 0);
+ 
+-    // all data is zero except after BUFFER_SIZE that it's 0 to 9
++    // all data is zero except after realDataPos that it's 0 to 9
+     for (int i = 0; i < 10; ++i) {
+-        ba[BUFFER_SIZE + i] = i;
++        ba[realDataPos + i] = i;
+     }
+ 
+     QBuffer b;
+     b.setData(ba);
+     QVERIFY(b.open(QIODevice::ReadOnly));
+ 
+     KCompressionDevice kcd(&b, false, KCompressionDevice::GZip);
+     QVERIFY(kcd.open(QIODevice::ReadOnly));
+-    QVERIFY(kcd.seek(BUFFER_SIZE));
++    QVERIFY(kcd.seek(realDataPos));
+ 
+-    // the 10 bytes after BUFFER_SIZE should be 0 to 9
++    // the 10 bytes after realDataPos should be 0 to 9
+     const QByteArray kcdData = kcd.read(10);
+     QCOMPARE(kcdData.size(), 10);
+     for (int i = 0; i < kcdData.size(); ++i) {
+         QCOMPARE(kcdData[i], i);
+     }
+ }
+diff --git a/autotests/kcompressiondevicetest.h b/autotests/kcompressiondevicetest.h
+index 64f9f6b..1ceed47 100644
+--- a/autotests/kcompressiondevicetest.h
++++ b/autotests/kcompressiondevicetest.h
+@@ -52,13 +52,14 @@ private:
+ private Q_SLOTS:
+     void regularKTarUsage();
+     void testGZipBufferedDevice();
+     void testBZip2BufferedDevice();
+     void testXzBufferedDevice();
+ 
+     void testWriteErrorOnOpen();
+     void testWriteErrorOnClose();
+ 
++    void testSeekReadUncompressedBuffer_data();
+     void testSeekReadUncompressedBuffer();
+ };
+ 
+ #endif
+diff --git a/src/kcompressiondevice.cpp b/src/kcompressiondevice.cpp
+index 2138fb8..0bc7590 100644
+--- a/src/kcompressiondevice.cpp
++++ b/src/kcompressiondevice.cpp
+@@ -206,49 +206,56 @@ QFileDevice::FileError KCompressionDevice::error() const
+ bool KCompressionDevice::seek(qint64 pos)
+ {
+     if (d->deviceReadPos == pos) {
+         return QIODevice::seek(pos);
+     }
+ 
+     //qCDebug(KArchiveLog) << "seek(" << pos << ") called, current pos=" << QIODevice::pos();
+ 
+     Q_ASSERT(d->filter->mode() == QIODevice::ReadOnly);
+ 
+     if (pos == 0) {
+         if (!QIODevice::seek(pos))
+             return false;
+ 
+         // We can forget about the cached data
+         d->bNeedHeader = !d->bSkipHeaders;
+         d->result = KFilterBase::Ok;
+         d->filter->setInBuffer(nullptr, 0);
+         d->filter->reset();
+         d->deviceReadPos = 0;
+         return d->filter->device()->reset();
+     }
+ 
+     qint64 bytesToRead;
+     if (d->deviceReadPos < pos) { // we can start from here
+         bytesToRead = pos - d->deviceReadPos;
+         // Since we're going to do a read() below
+         // we need to reset the internal QIODevice pos to the real position we are
+         // so that after read() we are indeed pointing to the pos seek
+         // asked us to be in
+         if (!QIODevice::seek(d->deviceReadPos)) {
+             return false;
+         }
+     } else {
+         // we have to start from 0 ! Ugly and slow, but better than the previous
+         // solution (KTarGz was allocating everything into memory)
+         if (!seek(0)) { // recursive
+             return false;
+         }
+         bytesToRead = pos;
+     }
+ 
+     //qCDebug(KArchiveLog) << "reading " << bytesToRead << " dummy bytes";
+-    QByteArray dummy(qMin(bytesToRead, qint64(3 * BUFFER_SIZE)), 0);
+-    const bool result = (read(dummy.data(), bytesToRead) == bytesToRead);
+-    return result;
++    QByteArray dummy(qMin(bytesToRead, qint64(SEEK_BUFFER_SIZE)), 0);
++    while (bytesToRead > 0) {
++        const qint64 bytesToReadThisTime = qMin(bytesToRead, qint64(dummy.size()));
++        const bool result = (read(dummy.data(), bytesToReadThisTime) == bytesToReadThisTime);
++        if (!result) {
++            return false;
++        }
++        bytesToRead -= bytesToReadThisTime;
++    }
++    return true;
+ }
+ 
+ bool KCompressionDevice::atEnd() const
+diff --git a/src/kcompressiondevice_p.h b/src/kcompressiondevice_p.h
+index 3048480..2d7aa29 100644
+--- a/src/kcompressiondevice_p.h
++++ b/src/kcompressiondevice_p.h
+@@ -1,24 +1,25 @@
+ /* This file is part of the KDE libraries
+    Copyright (C) 2000 David Faure <faure@kde.org>
+    Copyright (C) 2011 Mario Bensi <mbensi@ipsquad.net>
+ 
+    This library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Library General Public
+    License version 2 as published by the Free Software Foundation.
+ 
+    This library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Library General Public License for more details.
+ 
+    You should have received a copy of the GNU Library General Public License
+    along with this library; see the file COPYING.LIB.  If not, write to
+    the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+    Boston, MA 02110-1301, USA.
+ */
+ #ifndef __kcompressiondevice_p_h
+ #define __kcompressiondevice_p_h
+ 
+ #define BUFFER_SIZE 8*1024
++#define SEEK_BUFFER_SIZE 3*BUFFER_SIZE
+ 
+ #endif

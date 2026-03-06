@@ -1,0 +1,1411 @@
+commit 080e23e30ebc1940be5f503b84cb397fea1323cb
+Merge: edce5a8c ee979ac1
+Author: Luca Deri <lucaderi@users.noreply.github.com>
+Date:   Wed Feb 19 22:55:18 2020 +0100
+
+    Merge pull request #846 from catenacyber/fuzzofix
+    
+    Fix various buffer over reads
+
+diff --git a/example/reader_util.c b/example/reader_util.c
+index ec070afb..7ab060ef 100644
+--- a/example/reader_util.c
++++ b/example/reader_util.c
+@@ -1406,177 +1406,178 @@ static struct ndpi_proto packet_processing(struct ndpi_workflow * workflow,
+ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+ 					       const struct pcap_pkthdr *header,
+ 					       const u_char *packet) {
+   /*
+    * Declare pointers to packet headers
+    */
+   /* --- Ethernet header --- */
+   const struct ndpi_ethhdr *ethernet;
+   /* --- LLC header --- */
+   const struct ndpi_llc_header_snap *llc;
+ 
+   /* --- Cisco HDLC header --- */
+   const struct ndpi_chdlc *chdlc;
+ 
+   /* --- Radio Tap header --- */
+   const struct ndpi_radiotap_header *radiotap;
+   /* --- Wifi header --- */
+   const struct ndpi_wifi_header *wifi;
+ 
+   /* --- MPLS header --- */
+   union mpls {
+     uint32_t u32;
+     struct ndpi_mpls_header mpls;
+   } mpls;
+ 
+   /** --- IP header --- **/
+   struct ndpi_iphdr *iph;
+   /** --- IPv6 header --- **/
+   struct ndpi_ipv6hdr *iph6;
+ 
+   struct ndpi_proto nproto = { NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_UNKNOWN };
+   ndpi_packet_tunnel tunnel_type = ndpi_no_tunnel;
+ 
+   /* lengths and offsets */
+   u_int16_t eth_offset = 0;
+   u_int16_t radio_len;
+   u_int16_t fc;
+   u_int16_t type = 0;
+   int wifi_len = 0;
+   int pyld_eth_len = 0;
+   int check;
+   u_int64_t time;
+   u_int16_t ip_offset = 0, ip_len;
+   u_int16_t frag_off = 0, vlan_id = 0;
+   u_int8_t proto = 0, recheck_type;
+   /*u_int32_t label;*/
+ 
+   /* counters */
+   u_int8_t vlan_packet = 0;
+ 
+   /* Increment raw packet counter */
+   workflow->stats.raw_packet_count++;
+ 
+   /* setting time */
+   time = ((uint64_t) header->ts.tv_sec) * TICK_RESOLUTION + header->ts.tv_usec / (1000000 / TICK_RESOLUTION);
+ 
+   /* safety check */
+   if(workflow->last_time > time) {
+     /* printf("\nWARNING: timestamp bug in the pcap file (ts delta: %llu, repairing)\n", ndpi_thread_info[thread_id].last_time - time); */
+     time = workflow->last_time;
+   }
+   /* update last time value */
+   workflow->last_time = time;
+ 
+   /*** check Data Link type ***/
+   int datalink_type;
+ 
+ #ifdef USE_DPDK
+   datalink_type = DLT_EN10MB;
+ #else
+   datalink_type = (int)pcap_datalink(workflow->pcap_handle);
+ #endif
+ 
+-  if(header->caplen < 40)
+-    return(nproto); /* Too short */
+ 
+  datalink_check:
++  if(header->caplen < eth_offset + 40)
++    return(nproto); /* Too short */
++
+   switch(datalink_type) {
+   case DLT_NULL:
+     if(ntohl(*((u_int32_t*)&packet[eth_offset])) == 2)
+       type = ETH_P_IP;
+     else
+       type = ETH_P_IPV6;
+ 
+     ip_offset = 4 + eth_offset;
+     break;
+ 
+     /* Cisco PPP in HDLC-like framing - 50 */
+   case DLT_PPP_SERIAL:
+     chdlc = (struct ndpi_chdlc *) &packet[eth_offset];
+     ip_offset = sizeof(struct ndpi_chdlc); /* CHDLC_OFF = 4 */
+     type = ntohs(chdlc->proto_code);
+     break;
+ 
+     /* Cisco PPP - 9 or 104 */
+   case DLT_C_HDLC:
+   case DLT_PPP:
+     chdlc = (struct ndpi_chdlc *) &packet[eth_offset];
+     ip_offset = sizeof(struct ndpi_chdlc); /* CHDLC_OFF = 4 */
+     type = ntohs(chdlc->proto_code);
+     break;
+ 
+     /* IEEE 802.3 Ethernet - 1 */
+   case DLT_EN10MB:
+     ethernet = (struct ndpi_ethhdr *) &packet[eth_offset];
+     ip_offset = sizeof(struct ndpi_ethhdr) + eth_offset;
+     check = ntohs(ethernet->h_proto);
+ 
+     if(check <= 1500)
+       pyld_eth_len = check;
+     else if(check >= 1536)
+       type = check;
+ 
+     if(pyld_eth_len != 0) {
+       llc = (struct ndpi_llc_header_snap *)(&packet[ip_offset]);
+       /* check for LLC layer with SNAP extension */
+       if(llc->dsap == SNAP || llc->ssap == SNAP) {
+ 	type = llc->snap.proto_ID;
+ 	ip_offset += + 8;
+       }
+       /* No SNAP extension - Spanning Tree pkt must be discarted */
+       else if(llc->dsap == BSTP || llc->ssap == BSTP) {
+ 	goto v4_warning;
+       }
+     }
+     break;
+ 
+     /* Linux Cooked Capture - 113 */
+   case DLT_LINUX_SLL:
+     type = (packet[eth_offset+14] << 8) + packet[eth_offset+15];
+     ip_offset = 16 + eth_offset;
+     break;
+ 
+     /* Radiotap link-layer - 127 */
+   case DLT_IEEE802_11_RADIO:
+     radiotap = (struct ndpi_radiotap_header *) &packet[eth_offset];
+     radio_len = radiotap->len;
+ 
+     /* Check Bad FCS presence */
+     if((radiotap->flags & BAD_FCS) == BAD_FCS) {
+       workflow->stats.total_discarded_bytes +=  header->len;
+       return(nproto);
+     }
+ 
+     if(header->caplen < (eth_offset + radio_len + sizeof(struct ndpi_wifi_header)))
+       return(nproto);
+ 
+ 
+     /* Calculate 802.11 header length (variable) */
+     wifi = (struct ndpi_wifi_header*)( packet + eth_offset + radio_len);
+     fc = wifi->fc;
+ 
+     /* check wifi data presence */
+     if(FCF_TYPE(fc) == WIFI_DATA) {
+       if((FCF_TO_DS(fc) && FCF_FROM_DS(fc) == 0x0) ||
+ 	 (FCF_TO_DS(fc) == 0x0 && FCF_FROM_DS(fc)))
+ 	wifi_len = 26; /* + 4 byte fcs */
+     } else   /* no data frames */
+       break;
+ 
+     /* Check ether_type from LLC */
+     llc = (struct ndpi_llc_header_snap*)(packet + eth_offset + wifi_len + radio_len);
+     if(llc->dsap == SNAP)
+       type = ntohs(llc->snap.proto_ID);
+ 
+     /* Set IP header offset */
+     ip_offset = wifi_len + radio_len + sizeof(struct ndpi_llc_header_snap) + eth_offset;
+     break;
+ 
+   case DLT_RAW:
+     ip_offset = eth_offset = 0;
+     break;
+ 
+   default:
+     /* printf("Unknown datalink %d\n", datalink_type); */
+     return(nproto);
+   }
+@@ -1584,225 +1585,227 @@ struct ndpi_proto ndpi_workflow_process_packet(struct ndpi_workflow * workflow,
+ ether_type_check:
+   recheck_type = 0;
+ 
+   /* check ether type */
+   switch(type) {
+   case VLAN:
+     vlan_id = ((packet[ip_offset] << 8) + packet[ip_offset+1]) & 0xFFF;
+     type = (packet[ip_offset+2] << 8) + packet[ip_offset+3];
+     ip_offset += 4;
+     vlan_packet = 1;
+ 
+     // double tagging for 802.1Q
+     while((type == 0x8100) && (((bpf_u_int32)ip_offset) < header->caplen)) {
+       vlan_id = ((packet[ip_offset] << 8) + packet[ip_offset+1]) & 0xFFF;
+       type = (packet[ip_offset+2] << 8) + packet[ip_offset+3];
+       ip_offset += 4;
+     }
+     recheck_type = 1;
+     break;
+ 
+   case MPLS_UNI:
+   case MPLS_MULTI:
+     mpls.u32 = *((uint32_t *) &packet[ip_offset]);
+     mpls.u32 = ntohl(mpls.u32);
+     workflow->stats.mpls_count++;
+     type = ETH_P_IP, ip_offset += 4;
+ 
+     while(!mpls.mpls.s) {
+       mpls.u32 = *((uint32_t *) &packet[ip_offset]);
+       mpls.u32 = ntohl(mpls.u32);
+       ip_offset += 4;
+     }
+     recheck_type = 1;
+     break;
+ 
+   case PPPoE:
+     workflow->stats.pppoe_count++;
+     type = ETH_P_IP;
+     ip_offset += 8;
+     recheck_type = 1;
+     break;
+ 
+   default:
+     break;
+   }
+ 
+   if(recheck_type)
+     goto ether_type_check;
+ 
+   workflow->stats.vlan_count += vlan_packet;
+ 
+  iph_check:
+   /* Check and set IP header size and total packet length */
+   if (header->caplen < ip_offset + sizeof(struct ndpi_iphdr))
+     return(nproto); /* Too short for next IP header*/
+ 
+   iph = (struct ndpi_iphdr *) &packet[ip_offset];
+ 
+   /* just work on Ethernet packets that contain IP */
+   if(type == ETH_P_IP && header->caplen >= ip_offset) {
+     frag_off = ntohs(iph->frag_off);
+ 
+     proto = iph->protocol;
+     if(header->caplen < header->len) {
+       static u_int8_t cap_warning_used = 0;
+ 
+       if(cap_warning_used == 0) {
+ 	if(!workflow->prefs.quiet_mode)
+ 	  NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG,
+ 		   "\n\nWARNING: packet capture size is smaller than packet size, DETECTION MIGHT NOT WORK CORRECTLY\n\n");
+ 	cap_warning_used = 1;
+       }
+     }
+   }
+ 
+   if(iph->version == IPVERSION) {
+     ip_len = ((u_int16_t)iph->ihl * 4);
+     iph6 = NULL;
+ 
+     if(iph->protocol == IPPROTO_IPV6) {
+       ip_offset += ip_len;
+       if (ip_len > 0)
+         goto iph_check;
+     }
+ 
+     if((frag_off & 0x1FFF) != 0) {
+       static u_int8_t ipv4_frags_warning_used = 0;
+       workflow->stats.fragmented_count++;
+ 
+       if(ipv4_frags_warning_used == 0) {
+ 	if(!workflow->prefs.quiet_mode)
+ 	  NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG, "\n\nWARNING: IPv4 fragments are not handled by this demo (nDPI supports them)\n");
+ 	ipv4_frags_warning_used = 1;
+       }
+ 
+       workflow->stats.total_discarded_bytes +=  header->len;
+       return(nproto);
+     }
+   } else if(iph->version == 6) {
++    if (header->caplen < ip_offset + sizeof(struct ndpi_ipv6hdr))
++      return(nproto); /* Too short for IPv6 header*/
+     iph6 = (struct ndpi_ipv6hdr *)&packet[ip_offset];
+     proto = iph6->ip6_hdr.ip6_un1_nxt;
+     ip_len = sizeof(struct ndpi_ipv6hdr);
+ 
+     if(proto == IPPROTO_DSTOPTS /* IPv6 destination option */) {
+       u_int8_t *options = (u_int8_t*)&packet[ip_offset+ip_len];
+       proto = options[0];
+       ip_len += 8 * (options[1] + 1);
+     }
+ 
+     iph = NULL;
+   } else {
+     static u_int8_t ipv4_warning_used = 0;
+ 
+   v4_warning:
+     if(ipv4_warning_used == 0) {
+       if(!workflow->prefs.quiet_mode)
+         NDPI_LOG(0, workflow->ndpi_struct, NDPI_LOG_DEBUG,
+ 		 "\n\nWARNING: only IPv4/IPv6 packets are supported in this demo (nDPI supports both IPv4 and IPv6), all other packets will be discarded\n\n");
+       ipv4_warning_used = 1;
+     }
+     workflow->stats.total_discarded_bytes +=  header->len;
+     return(nproto);
+   }
+ 
+   if(workflow->prefs.decode_tunnels && (proto == IPPROTO_UDP)) {
+     struct ndpi_udphdr *udp = (struct ndpi_udphdr *)&packet[ip_offset+ip_len];
+     u_int16_t sport = ntohs(udp->source), dport = ntohs(udp->dest);
+ 
+     if((sport == GTP_U_V1_PORT) || (dport == GTP_U_V1_PORT)) {
+       /* Check if it's GTPv1 */
+       u_int offset = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+       u_int8_t flags = packet[offset];
+       u_int8_t message_type = packet[offset+1];
+ 
+       tunnel_type = ndpi_gtp_tunnel;
+ 
+       if((((flags & 0xE0) >> 5) == 1 /* GTPv1 */) &&
+ 	 (message_type == 0xFF /* T-PDU */)) {
+ 
+ 	ip_offset = ip_offset+ip_len+sizeof(struct ndpi_udphdr)+8; /* GTPv1 header len */
+ 	if(flags & 0x04) ip_offset += 1; /* next_ext_header is present */
+ 	if(flags & 0x02) ip_offset += 4; /* sequence_number is present (it also includes next_ext_header and pdu_number) */
+ 	if(flags & 0x01) ip_offset += 1; /* pdu_number is present */
+ 
+ 	iph = (struct ndpi_iphdr *) &packet[ip_offset];
+ 
+ 	if(iph->version != IPVERSION) {
+ 	  // printf("WARNING: not good (packet_id=%u)!\n", (unsigned int)workflow->stats.raw_packet_count);
+ 	  goto v4_warning;
+ 	}
+       }
+     } else if((sport == TZSP_PORT) || (dport == TZSP_PORT)) {
+       /* https://en.wikipedia.org/wiki/TZSP */
+       u_int offset           = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+       u_int8_t version       = packet[offset];
+       u_int8_t ts_type       = packet[offset+1];
+       u_int16_t encapsulates = ntohs(*((u_int16_t*)&packet[offset+2]));
+ 
+       tunnel_type = ndpi_tzsp_tunnel;
+ 
+       if((version == 1) && (ts_type == 0) && (encapsulates == 1)) {
+ 	u_int8_t stop = 0;
+ 
+ 	offset += 4;
+ 
+ 	while((!stop) && (offset < header->caplen)) {
+ 	  u_int8_t tag_type = packet[offset];
+ 	  u_int8_t tag_len;
+ 
+ 	  switch(tag_type) {
+ 	  case 0: /* PADDING Tag */
+ 	    tag_len = 1;
+ 	    break;
+ 	  case 1: /* END Tag */
+ 	    tag_len = 1, stop = 1;
+ 	    break;
+ 	  default:
+ 	    tag_len = packet[offset+1];
+ 	    break;
+ 	  }
+ 
+ 	  offset += tag_len;
+ 
+ 	  if(offset >= header->caplen)
+ 	    return(nproto); /* Invalid packet */
+ 	  else {
+ 	    eth_offset = offset;
+ 	    goto datalink_check;
+ 	  }
+ 	}
+       }
+     } else if(sport == NDPI_CAPWAP_DATA_PORT) {
+       /* We dissect ONLY CAPWAP traffic */
+       u_int offset           = ip_offset+ip_len+sizeof(struct ndpi_udphdr);
+ 
+       if((offset+40) < header->caplen) {
+ 	u_int16_t msg_len = packet[offset+1] >> 1;
+ 
+ 	offset += msg_len;
+ 
+ 	if(packet[offset] == 0x02) {
+ 	  /* IEEE 802.11 Data */
+ 
+ 	  offset += 24;
+ 	  /* LLC header is 8 bytes */
+ 	  type = ntohs((u_int16_t)*((u_int16_t*)&packet[offset+6]));
+ 
+ 	  ip_offset = offset + 8;
+ 
+ 	  tunnel_type = ndpi_capwap_tunnel;
+ 	  goto iph_check;
+ 	}
+       }
+     }
+   }
+ 
+   /* process the packet */
+   return(packet_processing(workflow, time, vlan_id, tunnel_type, iph, iph6,
+ 			   ip_offset, header->caplen - ip_offset,
+ 			   header->caplen, header, packet, header->ts));
+ }
+ 
+ /* ********************************************************** */
+ /*       http://home.thep.lu.se/~bjorn/crc/crc32_fast.c       */
+ /* ********************************************************** */
+diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c
+index d1507f68..af6811b2 100644
+--- a/src/lib/ndpi_main.c
++++ b/src/lib/ndpi_main.c
+@@ -3751,129 +3751,133 @@ void ndpi_apply_flow_protocol_to_packet(struct ndpi_flow_struct *flow,
+ static int ndpi_init_packet_header(struct ndpi_detection_module_struct *ndpi_str,
+ 				   struct ndpi_flow_struct *flow,
+ 				   unsigned short packetlen) {
+   const struct ndpi_iphdr *decaps_iph = NULL;
+   u_int16_t l3len;
+   u_int16_t l4len;
+   const u_int8_t *l4ptr;
+   u_int8_t l4protocol;
+   u_int8_t l4_result;
+ 
+   if (!flow)
+     return(1);
+ 
+   /* reset payload_packet_len, will be set if ipv4 tcp or udp */
+   flow->packet.payload_packet_len = 0;
+   flow->packet.l4_packet_len = 0;
+   flow->packet.l3_packet_len = packetlen;
+ 
+   flow->packet.tcp = NULL, flow->packet.udp = NULL;
+   flow->packet.generic_l4_ptr = NULL;
+ #ifdef NDPI_DETECTION_SUPPORT_IPV6
+   flow->packet.iphv6 = NULL;
+ #endif							/* NDPI_DETECTION_SUPPORT_IPV6 */
+ 
+   ndpi_apply_flow_protocol_to_packet(flow, &flow->packet);
+ 
+   l3len = flow->packet.l3_packet_len;
+ 
+ #ifdef NDPI_DETECTION_SUPPORT_IPV6
+   if(flow->packet.iph != NULL) {
+ #endif							/* NDPI_DETECTION_SUPPORT_IPV6 */
+ 
+     decaps_iph = flow->packet.iph;
+ 
+ #ifdef NDPI_DETECTION_SUPPORT_IPV6
+   }
+ #endif							/* NDPI_DETECTION_SUPPORT_IPV6 */
+ 
+   if(decaps_iph && decaps_iph->version == IPVERSION && decaps_iph->ihl >= 5) {
+     NDPI_LOG_DBG2(ndpi_str, "ipv4 header\n");
+   }
+ #ifdef NDPI_DETECTION_SUPPORT_IPV6
+   else if(decaps_iph && decaps_iph->version == 6 && l3len >= sizeof(struct ndpi_ipv6hdr) &&
+ 	  (ndpi_str->ip_version_limit & NDPI_DETECTION_ONLY_IPV4) == 0) {
+     NDPI_LOG_DBG2(ndpi_str, "ipv6 header\n");
+     flow->packet.iphv6 = (struct ndpi_ipv6hdr *)flow->packet.iph;
+     flow->packet.iph = NULL;
+   }
+ #endif
+   else {
+     flow->packet.iph = NULL;
+     return(1);
+   }
+ 
+   /* needed:
+    *  - unfragmented packets
+    *  - ip header <= packet len
+    *  - ip total length >= packet len
+    */
+ 
+   l4ptr = NULL;
+   l4len = 0;
+   l4protocol = 0;
+ 
+   l4_result =
+     ndpi_detection_get_l4_internal(ndpi_str, (const u_int8_t *) decaps_iph, l3len, &l4ptr, &l4len, &l4protocol, 0);
+ 
+   if(l4_result != 0) {
+     return(1);
+   }
+ 
+   flow->packet.l4_protocol = l4protocol;
+   flow->packet.l4_packet_len = l4len;
+   flow->l4_proto = l4protocol;
+ 
+   /* tcp / udp detection */
+   if(l4protocol == IPPROTO_TCP && flow->packet.l4_packet_len >= 20 /* min size of tcp */ ) {
+     /* tcp */
+     flow->packet.tcp = (struct ndpi_tcphdr *) l4ptr;
+     if(flow->packet.l4_packet_len >=flow->packet.tcp->doff * 4) {
+       flow->packet.payload_packet_len =
+ 	flow->packet.l4_packet_len -flow->packet.tcp->doff * 4;
+       flow->packet.actual_payload_len = flow->packet.payload_packet_len;
+       flow->packet.payload = ((u_int8_t *)flow->packet.tcp) + (flow->packet.tcp->doff * 4);
+ 
+       /* check for new tcp syn packets, here
+        * idea: reset detection state if a connection is unknown
+        */
+       if(flow->packet.tcp->syn != 0
+ 	 && flow->packet.tcp->ack == 0
+ 	 && flow->init_finished != 0
+ 	 && flow->detected_protocol_stack[0] == NDPI_PROTOCOL_UNKNOWN) {
+ 	u_int8_t backup;
+ 	u_int16_t backup1, backup2;
+ 
+ 	if(flow->http.url)                  { ndpi_free(flow->http.url); flow->http.url = NULL; }
+ 	if(flow->http.content_type)         { ndpi_free(flow->http.content_type); flow->http.content_type = NULL; }
+ 	if(flow->http.user_agent)           { ndpi_free(flow->http.user_agent); flow->http.user_agent = NULL; }
++	if(flow->kerberos_buf.pktbuf) {
++		ndpi_free(flow->kerberos_buf.pktbuf);
++		flow->kerberos_buf.pktbuf = NULL;
++	}
+ 	if(flow->l4.tcp.tls.message.buffer) {
+ 	    ndpi_free(flow->l4.tcp.tls.message.buffer);
+ 	    flow->l4.tcp.tls.message.buffer = NULL;
+ 	    flow->l4.tcp.tls.message.buffer_len = flow->l4.tcp.tls.message.buffer_used = 0;
+ 	}
+ 
+ 	backup  = flow->num_processed_pkts;
+ 	backup1 = flow->guessed_protocol_id;
+ 	backup2 = flow->guessed_host_protocol_id;
+ 	memset(flow, 0, sizeof(*(flow)));
+ 	flow->num_processed_pkts = backup;
+ 	flow->guessed_protocol_id      = backup1;
+ 	flow->guessed_host_protocol_id = backup2;
+ 
+ 	NDPI_LOG_DBG(ndpi_str,
+ 		     "tcp syn packet for unknown protocol, reset detection state\n");
+       }
+     } else {
+       /* tcp header not complete */
+       flow->packet.tcp = NULL;
+     }
+   } else if(l4protocol == IPPROTO_UDP && flow->packet.l4_packet_len >= 8 /* size of udp */ ) {
+     flow->packet.udp = (struct ndpi_udphdr *) l4ptr;
+     flow->packet.payload_packet_len =flow->packet.l4_packet_len - 8;
+     flow->packet.payload = ((u_int8_t *)flow->packet.udp) + 8;
+   } else {
+     flow->packet.generic_l4_ptr = l4ptr;
+   }
+ 
+   return(0);
+ }
+diff --git a/src/lib/protocols/dns.c b/src/lib/protocols/dns.c
+index 924e7eb8..2f8fd561 100644
+--- a/src/lib/protocols/dns.c
++++ b/src/lib/protocols/dns.c
+@@ -83,139 +83,142 @@ static uint32_t dns_validchar[8] =
+ static int search_valid_dns(struct ndpi_detection_module_struct *ndpi_struct,
+ 			    struct ndpi_flow_struct *flow,
+ 			    struct ndpi_dns_packet_header *dns_header,
+ 			    int payload_offset, u_int8_t *is_query) {
+   int x = payload_offset;
+ 
+   memcpy(dns_header, (struct ndpi_dns_packet_header*)&flow->packet.payload[x],
+ 	 sizeof(struct ndpi_dns_packet_header));
+ 
+   dns_header->tr_id = ntohs(dns_header->tr_id);
+   dns_header->flags = ntohs(dns_header->flags);
+   dns_header->num_queries = ntohs(dns_header->num_queries);
+   dns_header->num_answers = ntohs(dns_header->num_answers);
+   dns_header->authority_rrs = ntohs(dns_header->authority_rrs);
+   dns_header->additional_rrs = ntohs(dns_header->additional_rrs);
+ 
+   x += sizeof(struct ndpi_dns_packet_header);
+ 
+   /* 0x0000 QUERY */
+   if((dns_header->flags & FLAGS_MASK) == 0x0000)
+     *is_query = 1;
+   /* 0x8000 RESPONSE */
+   else if((dns_header->flags & FLAGS_MASK) == 0x8000)
+     *is_query = 0;
+   else
+     return(1 /* invalid */);
+ 
+   if(*is_query) {
+     /* DNS Request */
+     if((dns_header->num_queries > 0) && (dns_header->num_queries <= NDPI_MAX_DNS_REQUESTS)
+        && (((dns_header->flags & 0x2800) == 0x2800 /* Dynamic DNS Update */)
+ 	   || ((dns_header->num_answers == 0) && (dns_header->authority_rrs == 0)))) {
+       /* This is a good query */
+       while(x < flow->packet.payload_packet_len) {
+         if(flow->packet.payload[x] == '\0') {
+           x++;
+           flow->protos.dns.query_type = get16(&x, flow->packet.payload);
+ #ifdef DNS_DEBUG
+           NDPI_LOG_DBG2(ndpi_struct, "query_type=%2d\n", flow->protos.dns.query_type);
+ 	  printf("[DNS] query_type=%d\n", flow->protos.dns.query_type);
+ #endif
+ 	  break;
+ 	} else
+ 	  x++;
+       }
+     } else
+       return(1 /* invalid */);
+   } else {
+     /* DNS Reply */
+     flow->protos.dns.reply_code = dns_header->flags & 0x0F;
+ 
+     if((dns_header->num_queries > 0) && (dns_header->num_queries <= NDPI_MAX_DNS_REQUESTS) /* Don't assume that num_queries must be zero */
+        && (((dns_header->num_answers > 0) && (dns_header->num_answers <= NDPI_MAX_DNS_REQUESTS))
+ 	   || ((dns_header->authority_rrs > 0) && (dns_header->authority_rrs <= NDPI_MAX_DNS_REQUESTS))
+ 	   || ((dns_header->additional_rrs > 0) && (dns_header->additional_rrs <= NDPI_MAX_DNS_REQUESTS)))
+        ) {
+       /* This is a good reply: we dissect it both for request and response */
+ 
+       /* Leave the statement below commented necessary in case of call to ndpi_get_partial_detection() */
+       x++;
+ 
+       if(flow->packet.payload[x] != '\0') {
+ 	while((x < flow->packet.payload_packet_len)
+ 	      && (flow->packet.payload[x] != '\0')) {
+ 	  x++;
+ 	}
+ 
+ 	x++;
+       }
+ 
+       x += 4;
+ 
+       if(dns_header->num_answers > 0) {
+ 	u_int16_t rsp_type;
+ 	u_int16_t num;
+ 
+ 	for(num = 0; num < dns_header->num_answers; num++) {
+ 	  u_int16_t data_len;
+ 
+ 	  if((x+6) >= flow->packet.payload_packet_len) {
+ 	    break;
+ 	  }
+ 
+ 	  if((data_len = getNameLength(x, flow->packet.payload, flow->packet.payload_packet_len)) == 0) {
+ 	    break;
+ 	  } else
+ 	    x += data_len;
+ 
++	  if((x+2) >= flow->packet.payload_packet_len) {
++	    break;
++	  }
+ 	  rsp_type = get16(&x, flow->packet.payload);
+ 	  flow->protos.dns.rsp_type = rsp_type;
+ 
+ 	  /* here x points to the response "class" field */
+ 	  if((x+12) <= flow->packet.payload_packet_len) {
+ 	    x += 6;
+ 	    data_len = get16(&x, flow->packet.payload);
+ 	    
+ 	    if((x + data_len) <= flow->packet.payload_packet_len) {
+ 	      // printf("[rsp_type: %u][data_len: %u]\n", rsp_type, data_len);
+ 
+ 	      if(rsp_type == 0x05 /* CNAME */) {
+ 		x += data_len;
+ 		continue; /* Skip CNAME */
+ 	      }
+ 	      
+ 	      if((((rsp_type == 0x1) && (data_len == 4)) /* A */
+ #ifdef NDPI_DETECTION_SUPPORT_IPV6
+ 		  || ((rsp_type == 0x1c) && (data_len == 16)) /* AAAA */
+ #endif
+ 		  )) {
+ 		memcpy(&flow->protos.dns.rsp_addr, flow->packet.payload + x, data_len);
+ 	      }
+ 	    }
+ 	  }
+ 	  
+ 	  break;
+ 	}
+       }
+      
+       if((flow->packet.detected_protocol_stack[0] == NDPI_PROTOCOL_DNS)
+ 	 || (flow->packet.detected_protocol_stack[1] == NDPI_PROTOCOL_DNS)) {
+ 	/* Request already set the protocol */
+ 	// flow->extra_packets_func = NULL; /* Removed so the caller can keep dissecting DNS flows */
+       } else {
+ 	/* We missed the request */
+ 	u_int16_t s_port = flow->packet.udp ? ntohs(flow->packet.udp->source) : ntohs(flow->packet.tcp->source);
+ 	
+ 	ndpi_set_detected_protocol(ndpi_struct, flow,
+ 				   (s_port == 5355) ? NDPI_PROTOCOL_LLMNR : NDPI_PROTOCOL_DNS,
+ 				   NDPI_PROTOCOL_UNKNOWN);
+       }
+     } else
+       return(1 /* invalid */);
+   }
+ 
+   /* Valid */
+   return(0);
+ }
+ 
+ /* *********************************************** */
+diff --git a/src/lib/protocols/oscar.c b/src/lib/protocols/oscar.c
+index a24b9441..cba0c3bc 100644
+--- a/src/lib/protocols/oscar.c
++++ b/src/lib/protocols/oscar.c
+@@ -97,698 +97,698 @@ static void ndpi_int_oscar_add_connection(struct ndpi_detection_module_struct *n
+    FLAP is a low-level communications protocol that facilitates the development of higher-level, datagram-oriented, communications layers.
+    It is used on the TCP connection between all clients and servers.
+    Here is format of FLAP datagram
+ **/
+ static void ndpi_search_oscar_tcp_connect(struct ndpi_detection_module_struct
+ 					  *ndpi_struct, struct ndpi_flow_struct *flow)
+ {
+ 
+   int excluded = 0;
+ //  u_int8_t channel;
+   u_int16_t family;
+   u_int16_t type;
+   u_int16_t flag;
+   struct ndpi_packet_struct * packet = &flow->packet;
+   struct ndpi_id_struct * src = flow->src;
+   struct ndpi_id_struct * dst = flow->dst;
+ 
+   /* FLAP__Header
+    *
+    * [ 6 byte FLAP header ]
+    * +-----------+--------------+-------------+--------------+
+    * | 0x2a (1B) | Channel (1B) | SeqNum (2B) | PyldLen (2B) |
+    * +-----------+--------------+-------------+--------------+
+    *
+    * [ 4 byte of data ]
+    *
+    * */
+   if(packet->payload_packet_len >= 6 && packet->payload[0] == 0x2a)
+     {
+ 
+       /* FLAP__FRAME_TYPE (Channel)*/
+       u_int8_t channel = get_u_int8_t(packet->payload, 1);
+ 
+       /*
+ 	 Initialize the FLAP connection.
+ 
+ 	 SIGNON -> FLAP__SIGNON_FRAME
+ 	 +--------------------------------------------------+
+ 	 + FLAP__Header | 6 byte                            +
+ 	 + FlapVersion  | 4 byte  (Always 1 = 0x00000001)   +
+ 	 + TLVs         | [Class: FLAP__SIGNON_TAGS] TLVs   +
+ 	 +--------------------------------------------------+
+       */
+-      if(channel == SIGNON &&
++      if(channel == SIGNON && packet->payload_packet_len >= 10 &&
+ 	  get_u_int16_t(packet->payload, 4) == htons(packet->payload_packet_len - 6) &&
+ 	  get_u_int32_t(packet->payload, 6) == htonl(FLAPVERSION))
+ 	{
+ 
+ 	  /* No TLVs */
+ 	  if(packet->payload_packet_len == 10)
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Sign In \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* /\* SCREEN_NAME *\/ */
+ 	  /* if(get_u_int16_t(packet->payload, 10) == htons(SCREEN_NAME)) /\* packet->payload[10] == 0x00 && packet->payload[11] == 0x01 *\/ */
+ 	  /*   { */
+ 	  /*     NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Screen Name \n"); */
+ 	  /*     ndpi_int_oscar_add_connection(ndpi_struct, flow); */
+ 	  /*     return; */
+ 	  /*   } */
+ 	  /* /\* PASSWD *\/ */
+ 	  /* if(get_u_int16_t(packet->payload, 10) == htons(PASSWD)) /\* packet->payload[10] == 0x00 && packet->payload[11] == 0x02 *\/ */
+ 	  /*   { */
+ 	  /*     NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Password (roasted) \n"); */
+ 	  /*     ndpi_int_oscar_add_connection(ndpi_struct, flow); */
+ 	  /*     return; */
+ 	  /*   } */
+ 	  /* CLIENT_NAME */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(CLIENT_NAME)) /* packet->payload[10] == 0x00 && packet->payload[11] == 0x03 */
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Client Name \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* LOGIN_COOKIE */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(LOGIN_COOKIE) &&
+ 	      get_u_int16_t(packet->payload, 12) == htons(0x0100))
+ 	    {
+ 	      if(get_u_int16_t(packet->payload, packet->payload_packet_len - 5) == htons(MULTICONN_FLAGS)) /* MULTICONN_FLAGS */
+ 		{
+ 		  if(get_u_int16_t(packet->payload, packet->payload_packet_len - 3) == htons(0x0001))
+ 		    if((get_u_int8_t(packet->payload, packet->payload_packet_len - 1) == 0x00) ||
+ 		       (get_u_int8_t(packet->payload, packet->payload_packet_len - 1) == 0x01) ||
+ 		       (get_u_int8_t(packet->payload, packet->payload_packet_len - 1) == 0x03))
+ 		      {
+ 			NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Login \n");
+ 			ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 			return;
+ 		      }
+ 		}
+ 	    }
+ 	  /* MAJOR_VERSION */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(MAJOR_VERSION))
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Major_Version \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* MINOR_VERSION */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(MINOR_VERSION))
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Minor_Version \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* POINT_VERSION */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(POINT_VERSION))
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Point_Version \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* BUILD_NUM */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(BUILD_NUM))
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Build_Num \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	  /* CLIENT_RECONNECT */
+ 	  if(get_u_int16_t(packet->payload, 10) == htons(CLIENT_RECONNECT))
+ 	    {
+ 	      NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Client_Reconnect \n");
+ 	      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	      return;
+ 	    }
+ 	}
+ 
+       /*
+ 	 Messages using the FLAP connection, usually a SNAC message.
+ 
+ 	 DATA -> FLAP__DATA_FRAME
+ 	 +-------------------------+
+ 	 + FLAP__Header | 6 byte   +
+ 	 + SNAC__Header | 10 byte  +
+ 	 + snac         |          +
+ 	 +-------------------------+
+ 
+ 	 SNAC__Header
+ 	 +----------------------------------------------+
+ 	 + ID           | 4 byte (2 foodgroup + 2 type) +
+ 	 + FLAGS        | 2 byte                        +
+ 	 + requestId    | 4 byte                        +
+ 	 +----------------------------------------------+
+       */
+       if(channel == DATA)
+ 	{
+ 	  if(packet->payload_packet_len >= 8)
+ 	    family = get_u_int16_t(packet->payload, 6);
+ 	  else
+ 	    family = 0;
+ 	  if(packet->payload_packet_len >= 10)
+ 	    type = get_u_int16_t(packet->payload, 8);
+ 	  else
+ 	    type = 0;
+ 	  if(family == 0 || type == 0)
+ 	  {
+ 	      NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+ 	      return;
+ 	  }
+ 
+ 	  /* Family 0x0001 */
+ 	  if(family == htons(GE_SE_CTL))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      case  (0x000c): break;
+ 	      case  (0x000d): break;
+ 	      case  (0x000e): break;
+ 	      case  (0x000f): break;
+ 	      case  (0x0010): break;
+ 	      case  (0x0011): break;
+ 	      case  (0x0012): break;
+ 	      case  (0x0013): break;
+ 	      case  (0x0014): break;
+ 	      case  (0x0015): break;
+ 	      case  (0x0016): break;
+ 	      case  (0x0017): break;
+ 	      case  (0x0018): break;
+ 	      case  (0x001e): break;
+ 	      case  (0x001f): break;
+ 	      case  (0x0020): break;
+ 	      case  (0x0021): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0002 */
+ 	  if(family == htons(LOC_SRV))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      case  (0x000c): break;
+ 	      case  (0x000f): break;
+ 	      case  (0x0010): break;
+ 	      case  (0x0015): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0003 */
+ 	  if(family == htons(BUDDY_LIST))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      case  (0x000c): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0004 */
+ 	  if(family == htons(IM))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      case  (0x000c): break;
+ 	      case  (0x0014): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0006 */
+ 	  if(family == htons(IS))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0007 */
+ 	  if(family == htons(ACC_ADM))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0008 */
+ 	  if(family == htons(POPUP))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0009 */
+ 	  if(family == htons(PMS))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x000b */
+ 	  if(family == htons(USS))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x000d */
+ 	  if(family == htons(CHAT_ROOM_SETUP))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x000e */
+ 	  if(family == htons(CHAT_ROOM_ACT))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x000f */
+ 	  if(family == htons(USER_SRCH))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0010 */
+ 	  if(family == htons(BUDDY_ICON_SERVER))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0013 */
+ 	  if(family == htons(SERVER_STORED_INFO))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x0008): break;
+ 	      case  (0x0009): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000e): break;
+ 	      case  (0x000f): break;
+ 	      case  (0x0011): break;
+ 	      case  (0x0012): break;
+ 	      case  (0x0014): break;
+ 	      case  (0x0015): break;
+ 	      case  (0x0016): break;
+ 	      case  (0x0018): break;
+ 	      case  (0x001a): break;
+ 	      case  (0x001b): break;
+ 	      case  (0x001c): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0015 */
+ 	  if(family == htons(ICQ))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0017 */
+ 	  if(family == htons(INIT_AUTH))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      case  (0x0004): break;
+ 	      case  (0x0005): break;
+ 	      case  (0x0006): break;
+ 	      case  (0x0007): break;
+ 	      case  (0x000a): break;
+ 	      case  (0x000b): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 	  /* Family 0x0018 */
+ 	  if(family == htons(EMAIL))
+ 	    {
+ 	      /* TODO */
+ 	    }
+ 	  /* Family 0x0085 */
+ 	  if(family == htons(IS_EXT))
+ 	    {
+ 	      switch (type) {
+ 
+ 	      case  (0x0001): break;
+ 	      case  (0x0002): break;
+ 	      case  (0x0003): break;
+ 	      default: excluded = 1;
+ 	      }
+ 	    }
+ 
+ 	  if(excluded == 1)
+ 	    {
+ 	      NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+ 	    }
+ 
+ 	  /* flag */
+ 	  if(packet->payload_packet_len >= 12)
+ 	  {
+ 	    flag = get_u_int16_t(packet->payload, 10);
+ 	    if(flag == htons(0x0000)|| flag == htons(0x8000) || flag == htons(0x0001))
+ 	      {
+ 	        if(packet->payload_packet_len >= 16)
+ 		{
+ 		  /* request ID */
+ 		  // u_int32_t req_ID = get_u_int32_t(packet->payload, 12);
+ 		  /* if((req_ID <= ((u_int32_t)-1))) */
+ 		    {
+ 		      NDPI_LOG_INFO(ndpi_struct, "found OSCAR\n");
+ 		      ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 		      return;
+ 		    }
+ 		}
+ 	      }
+ 	  }
+ 	}
+       /*
+ 	 ERROR -> FLAP__ERROR_CHANNEL_0x03
+ 	 A FLAP error - rare
+       */
+       if(channel == O_ERROR)
+ 	{
+ 	  NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Error frame \n");
+ 	  ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	  return;
+ 	}
+       /*
+ 	 Close down the FLAP connection gracefully.
+ 	 SIGNOFF: FLAP__SIGNOFF_CHANNEL_0x04
+       */
+       if(channel == SIGNOFF)
+ 	{
+ 	  NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Signoff frame \n");
+ 	  ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	  return;
+ 	}
+       /*
+ 	 Send a heartbeat to server to help keep connection open.
+ 	 KEEP_ALIVE: FLAP__KEEP_ALIVE_CHANNEL_0x05
+       */
+       if(channel == KEEP_ALIVE)
+ 	{
+ 	  NDPI_LOG_INFO(ndpi_struct, "found OSCAR - Keep Alive frame \n");
+ 	  ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	  return;
+ 	}
+     }
+ 
+ 
+   /* detect http connections */
+   if(packet->payload_packet_len >= 18) {
+     if((packet->payload[0] == 'P') && (memcmp(packet->payload, "POST /photo/upload", 18) == 0)) {
+       NDPI_PARSE_PACKET_LINE_INFO(ndpi_struct, flow, packet);
+       if(packet->host_line.len >= 18 && packet->host_line.ptr != NULL) {
+ 	if(memcmp(packet->host_line.ptr, "lifestream.aol.com", 18) == 0) {
+ 	  NDPI_LOG_INFO(ndpi_struct,
+ 		   "found OSCAR over HTTP, POST method\n");
+ 	  ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	  return;
+ 	}
+       }
+     }
+   }
+   if(packet->payload_packet_len > 40) {
+     if((packet->payload[0] == 'G') && (memcmp(packet->payload, "GET /", 5) == 0)) {
+       if((memcmp(&packet->payload[5], "aim/fetchEvents?aimsid=", 23) == 0) ||
+ 	  (memcmp(&packet->payload[5], "aim/startSession?", 17) == 0) ||
+ 	  (memcmp(&packet->payload[5], "aim/gromit/aim_express", 22) == 0) ||
+ 	  (memcmp(&packet->payload[5], "b/ss/aolwpaim", 13) == 0) ||
+ 	  (memcmp(&packet->payload[5], "hss/storage/aimtmpshare", 23) == 0)) {
+ 	NDPI_LOG_INFO(ndpi_struct, "found OSCAR over HTTP, GET /aim/\n");
+ 	ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+ 
+       if((memcmp(&packet->payload[5], "aim", 3) == 0) || (memcmp(&packet->payload[5], "im", 2) == 0)) {
+ 	NDPI_PARSE_PACKET_LINE_INFO(ndpi_struct, flow, packet);
+ 	if(packet->user_agent_line.len > 15 && packet->user_agent_line.ptr != NULL &&
+ 	    ((memcmp(packet->user_agent_line.ptr, "mobileAIM/", 10) == 0) ||
+ 	     (memcmp(packet->user_agent_line.ptr, "ICQ/", 4) == 0) ||
+ 	     (memcmp(packet->user_agent_line.ptr, "mobileICQ/", 10) == 0) ||
+ 	     (memcmp(packet->user_agent_line.ptr, "AIM%20Free/", NDPI_STATICSTRING_LEN("AIM%20Free/")) == 0) ||
+ 	     (memcmp(packet->user_agent_line.ptr, "AIM/", 4) == 0))) {
+ 	  NDPI_LOG_INFO(ndpi_struct, "found OSCAR over HTTP\n");
+ 	  ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	  return;
+ 	}
+       }
+       NDPI_PARSE_PACKET_LINE_INFO(ndpi_struct, flow, packet);
+       if(packet->referer_line.ptr != NULL && packet->referer_line.len >= 22) {
+ 
+ 	if(memcmp(&packet->referer_line.ptr[packet->referer_line.len - NDPI_STATICSTRING_LEN("WidgetMain.swf")],
+ 		   "WidgetMain.swf", NDPI_STATICSTRING_LEN("WidgetMain.swf")) == 0) {
+ 	  u_int16_t i;
+ 	  for (i = 0; i < (packet->referer_line.len - 22); i++) {
+ 	    if(packet->referer_line.ptr[i] == 'a') {
+ 	      if(memcmp(&packet->referer_line.ptr[i + 1], "im/gromit/aim_express", 21) == 0) {
+ 		NDPI_LOG_INFO(ndpi_struct,
+ 			 "found OSCAR over HTTP : aim/gromit/aim_express\n");
+ 		ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 		return;
+ 	      }
+ 	    }
+ 	  }
+ 	}
+       }
+     }
+     if(memcmp(packet->payload, "CONNECT ", 8) == 0) {
+       if(memcmp(packet->payload, "CONNECT login.icq.com:443 HTTP/1.", 33) == 0) {
+ 	NDPI_LOG_INFO(ndpi_struct, "found OSCAR ICQ-HTTP\n");
+ 	ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+       if(memcmp(packet->payload, "CONNECT login.oscar.aol.com:5190 HTTP/1.", 40) == 0) {
+ 	NDPI_LOG_INFO(ndpi_struct, "found OSCAR AIM-HTTP\n");
+ 	ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+ 
+     }
+   }
+ 
+   if(packet->payload_packet_len > 43
+       && memcmp(packet->payload, "GET http://http.proxy.icq.com/hello HTTP/1.", 43) == 0) {
+     NDPI_LOG_INFO(ndpi_struct, "found OSCAR ICQ-HTTP PROXY\n");
+     ndpi_int_oscar_add_connection(ndpi_struct, flow);
+     return;
+   }
+ 
+   if(packet->payload_packet_len > 46
+       && memcmp(packet->payload, "GET http://aimhttp.oscar.aol.com/hello HTTP/1.", 46) == 0) {
+     NDPI_LOG_INFO(ndpi_struct, "found OSCAR AIM-HTTP PROXY\n");
+     ndpi_int_oscar_add_connection(ndpi_struct, flow);
+     return;
+   }
+ 
+   if(packet->payload_packet_len > 5 && get_u_int32_t(packet->payload, 0) == htonl(0x05010003)) {
+     NDPI_LOG_DBG2(ndpi_struct, "Maybe OSCAR Picturetransfer\n");
+     return;
+   }
+ 
+   if(packet->payload_packet_len == 10 && get_u_int32_t(packet->payload, 0) == htonl(0x05000001) &&
+       get_u_int32_t(packet->payload, 4) == 0) {
+     NDPI_LOG_DBG2(ndpi_struct, "Maybe OSCAR Picturetransfer\n");
+     return;
+   }
+ 
+   if(packet->payload_packet_len >= 70 &&
+       memcmp(&packet->payload[packet->payload_packet_len - 26],
+ 	     "\x67\x00\x65\x00\x74\x00\x43\x00\x61\x00\x74\x00\x61\x00\x6c\x00\x6f\x00\x67", 19) == 0) {
+     NDPI_LOG_INFO(ndpi_struct, "found OSCAR PICTURE TRANSFER\n");
+     ndpi_int_oscar_add_connection(ndpi_struct, flow);
+     return;
+   }
+ 
+   if(NDPI_SRC_OR_DST_HAS_PROTOCOL(src, dst, NDPI_PROTOCOL_OSCAR) != 0) {
+ 
+     if(flow->packet_counter == 1
+ 	&&
+ 	((packet->payload_packet_len == 9
+ 	  && memcmp(packet->payload, "\x00\x09\x00\x00\x83\x01\xc0\x00\x00", 9) == 0)
+ 	 || (packet->payload_packet_len == 13
+ 	     && (memcmp(packet->payload, "\x00\x0d\x00\x87\x01\xc0", 6) == 0
+ 		 || memcmp(packet->payload, "\x00\x0d\x00\x87\x01\xc1", 6) == 0)))) {
+       flow->oscar_video_voice = 1;
+     }
+ 
+ #if 0
+     if(flow->oscar_video_voice && ntohs(get_u_int16_t(packet->payload, 0)) == packet->payload_packet_len
+ 	&& packet->payload[2] == 0x00 && packet->payload[3] == 0x00) {
+     }
+ #endif
+     
+     if(packet->payload_packet_len >= 70 && ntohs(get_u_int16_t(packet->payload, 4)) == packet->payload_packet_len) {
+       if(memcmp(packet->payload, "OFT", 3) == 0 &&
+ 	  ((packet->payload[3] == '3' && ((memcmp(&packet->payload[4], "\x01\x00\x01\x01", 4) == 0)
+ 					  || (memcmp(&packet->payload[6], "\x01\x01\x00", 3) == 0)))
+ 	   || (packet->payload[3] == '2' && ((memcmp(&packet->payload[6], "\x01\x01", 2)
+ 					      == 0)
+ 					     )))) {
+ 	// FILE TRANSFER PATTERN:: OFT3 or OFT2
+ 	NDPI_LOG_INFO(ndpi_struct, "found OSCAR FILE TRANSFER\n");
+ 	ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+ 
+       if(memcmp(packet->payload, "ODC2", 4) == 0 && memcmp(&packet->payload[6], "\x00\x01\x00\x06", 4) == 0) {
+ 	//PICTURE TRANSFER PATTERN EXMAPLE::
+ 	//4f 44 43 32 00 4c 00 01 00 06 00 00 00 00 00 00  ODC2.L..........
+ 	NDPI_LOG_INFO(ndpi_struct, "found OSCAR PICTURE TRANSFER\n");
+ 	ndpi_int_oscar_add_connection(ndpi_struct, flow);
+ 	return;
+       }
+     }
+     if(packet->payload_packet_len > 40 && (memcmp(&packet->payload[2], "\x04\x4a\x00", 3) == 0)
+ 	&& (memcmp(&packet->payload[6], "\x00\x00", 2) == 0)
+ 	&& packet->payload[packet->payload_packet_len - 15] == 'F'
+ 	&& packet->payload[packet->payload_packet_len - 12] == 'L'
+ 	&& (memcmp(&packet->payload[packet->payload_packet_len - 6], "DEST", 4) == 0)
+ 	&& (memcmp(&packet->payload[packet->payload_packet_len - 2], "\x00\x00", 2) == 0)) {
+       NDPI_LOG_INFO(ndpi_struct, "found OSCAR PICTURE TRANSFER\n");
+       ndpi_int_oscar_add_connection(ndpi_struct, flow);
+       if(ntohs(packet->tcp->dest) == 443 || ntohs(packet->tcp->source) == 443) {
+ 	flow->oscar_ssl_voice_stage = 1;
+       }
+       return;
+ 
+     }
+   }
+   if(flow->packet_counter < 3 && packet->payload_packet_len > 11 && (memcmp(packet->payload, "\x00\x37\x04\x4a", 4)
+ 								      || memcmp(packet->payload, "\x00\x0a\x04\x4a",
+ 										4))) {
+     return;
+   }
+ 
+ 
+   if(packet->detected_protocol_stack[0] != NDPI_PROTOCOL_OSCAR) {
+     NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+     return;
+   }
+ }

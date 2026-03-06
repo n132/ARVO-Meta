@@ -1,0 +1,267 @@
+commit aac6caaa22c2c6f017d3926856c54646155ff898
+Author: Michael Zillgith <michael.zillgith@mz-automation.de>
+Date:   Wed Feb 24 16:07:01 2021 +0100
+
+    - fixed oss-fuzz issues 31399, 31340, 31341, 31344, 31346
+
+diff --git a/src/mms/asn1/ber_decode.c b/src/mms/asn1/ber_decode.c
+index bcc4352c..42141a5a 100644
+--- a/src/mms/asn1/ber_decode.c
++++ b/src/mms/asn1/ber_decode.c
+@@ -28,32 +28,32 @@ static int
+ getIndefiniteLength(uint8_t* buffer, int bufPos, int maxBufPos)
+ {
+     int length = 0;
+ 
+     while (bufPos < maxBufPos) {
+-        if ((buffer[bufPos] == 0) && (buffer[bufPos+1] == 0)) {
++        if ((buffer[bufPos] == 0) && ((bufPos + 1) < maxBufPos) && (buffer[bufPos+1] == 0)) {
+             return length + 2;
+         }
+         else {
+             length++;
+ 
+             if ((buffer[bufPos++] & 0x1f) == 0x1f) {
+                 /* handle extended tags */
+                 bufPos++;
+                 length++;
+             }
+ 
+             int subLength = -1;
+ 
+             int newBufPos = BerDecoder_decodeLength(buffer, &subLength, bufPos, maxBufPos);
+ 
+             if (newBufPos == -1)
+                 return -1;
+ 
+             length += subLength + newBufPos - bufPos;
+ 
+             bufPos = newBufPos + subLength;
+         }
+     }
+ 
+     return -1;
+ }
+@@ -62,42 +62,45 @@ int
+ BerDecoder_decodeLength(uint8_t* buffer, int* length, int bufPos, int maxBufPos)
+ {
+     if (bufPos >= maxBufPos)
+         return -1;
+ 
+     uint8_t len1 = buffer[bufPos++];
+ 
+     if (len1 & 0x80) {
+         int lenLength = len1 & 0x7f;
+ 
+         if (lenLength == 0) { /* indefinite length form */
+             *length = getIndefiniteLength(buffer, bufPos, maxBufPos);
+         }
+         else {
+             *length = 0;
+ 
+             int i;
+             for (i = 0; i < lenLength; i++) {
+                 if (bufPos >= maxBufPos)
+                     return -1;
+ 
++                if (bufPos + (*length) > maxBufPos)
++                    return -1;
++
+                 *length <<= 8;
+                 *length += buffer[bufPos++];
+             }
+         }
+ 
+     }
+     else {
+         *length = len1;
+     }
+ 
+     if (*length < 0)
+         return -1;
+ 
+     if (*length > maxBufPos)
+         return -1;
+ 
+     if (bufPos + (*length) > maxBufPos)
+         return -1;
+ 
+     return bufPos;
+ }
+diff --git a/src/mms/iso_mms/server/mms_access_result.c b/src/mms/iso_mms/server/mms_access_result.c
+index 4671211f..d4d8fdae 100644
+--- a/src/mms/iso_mms/server/mms_access_result.c
++++ b/src/mms/iso_mms/server/mms_access_result.c
+@@ -156,164 +156,172 @@ MmsValue*
+ MmsValue_decodeMmsData(uint8_t* buffer, int bufPos, int bufferLength, int* endBufPos)
+ {
+     MmsValue* value = NULL;
+ 
+     int dataEndBufPos = bufferLength;
+ 
++    if (bufferLength < 1)
++        goto exit_with_error;
++
+     uint8_t tag = buffer[bufPos++];
+ 
+     int dataLength;
+ 
+     bufPos = BerDecoder_decodeLength(buffer, &dataLength, bufPos, dataEndBufPos);
+ 
+     if (bufPos < 0)
+         goto exit_with_error;
+ 
++    /* if not indefinite length end tag, data length must be > 0 */
++    if ((tag != 0) && (dataLength == 0))
++        goto exit_with_error;
++
+     switch (tag) {
+ 
+     case 0xa1: /* MMS_ARRAY */
+     case 0xa2: /* MMS_STRUCTURE */
+     {
+         int elementCount = getNumberOfElements(buffer, bufPos, dataLength);
+ 
+         if (elementCount < 0)
+             goto exit_with_error;
+ 
+         if (tag == 0xa1)
+             value = MmsValue_createEmptyArray(elementCount);
+         else
+             value = MmsValue_createEmptyStructure(elementCount);
+ 
+         int i;
+ 
+         for (i = 0; i < elementCount; i++) {
+ 
+             int elementLength;
+ 
+             int newBufPos = BerDecoder_decodeLength(buffer, &elementLength, bufPos + 1, dataEndBufPos);
+ 
+             if (newBufPos < 0)
+                 goto exit_with_error;
+ 
+             int elementBufLength = newBufPos - bufPos + elementLength;
+ 
+             MmsValue* elementValue = MmsValue_decodeMmsData(buffer, bufPos, bufPos + elementBufLength, NULL);
+ 
+             if (elementValue == NULL)
+                 goto exit_with_error;
+ 
+             MmsValue_setElement(value, i, elementValue);
+ 
+             bufPos = newBufPos + elementLength;
+         }
+ 
+         if (value == NULL)
+             goto exit_with_error;
+     }
+ 
+         break;
+ 
+     case 0x80: /* MMS_DATA_ACCESS_ERROR */
+         value = MmsValue_newDataAccessError((MmsDataAccessError) BerDecoder_decodeUint32(buffer, dataLength, bufPos));
+         bufPos += dataLength;
+         break;
+ 
+     case 0x83: /* MMS_BOOLEAN */
+         value = MmsValue_newBoolean(BerDecoder_decodeBoolean(buffer, bufPos));
+         bufPos += dataLength;
+         break;
+ 
+     case 0x84: /* MMS_BIT_STRING */
+     {
+         int padding = buffer[bufPos];
+ 
+         if (padding > 7)
+             goto exit_with_error;
+ 
+         int bitStringLength = (8 * (dataLength - 1)) - padding;
+         value = MmsValue_newBitString(bitStringLength);
+         memcpy(value->value.bitString.buf, buffer + bufPos + 1, dataLength - 1);
+         bufPos += dataLength;
+     }
+         break;
+ 
+     case 0x85: /* MMS_INTEGER */
+         if (dataLength > 8)
+             goto exit_with_error;
+ 
+         value = MmsValue_newInteger(dataLength * 8);
+         memcpy(value->value.integer->octets, buffer + bufPos, dataLength);
+         value->value.integer->size = dataLength;
+         bufPos += dataLength;
+         break;
+ 
+     case 0x86: /* MMS_UNSIGNED */
+         if (dataLength > 8)
+             goto exit_with_error;
+ 
+         value = MmsValue_newUnsigned(dataLength * 8);
+         memcpy(value->value.integer->octets, buffer + bufPos, dataLength);
+         value->value.integer->size = dataLength;
++
+         bufPos += dataLength;
+         break;
+ 
+     case 0x87: /* MMS_FLOAT */
+         if (dataLength == 9)
+             value = MmsValue_newDouble(BerDecoder_decodeDouble(buffer, bufPos));
+         else if (dataLength == 5)
+             value = MmsValue_newFloat(BerDecoder_decodeFloat(buffer, bufPos));
+         bufPos += dataLength;
+         break;
+ 
+     case 0x89: /* MMS_OCTET_STRING */
+         value = MmsValue_newOctetString(dataLength, dataLength);
+         memcpy(value->value.octetString.buf, buffer + bufPos, dataLength);
+         bufPos += dataLength;
+         break;
+ 
+     case 0x8a: /* MMS_VISIBLE_STRING */
+         value = MmsValue_newVisibleStringFromByteArray(buffer + bufPos, dataLength);
+         bufPos += dataLength;
+         break;
+ 
+     case 0x8c: /* MMS_BINARY_TIME */
+         if (dataLength == 4)
+             value = MmsValue_newBinaryTime(true);
+         else if (dataLength == 6)
+             value = MmsValue_newBinaryTime(false);
+ 
+         if ((dataLength == 4) || (dataLength == 6))
+             memcpy(value->value.binaryTime.buf, buffer + bufPos, dataLength);
+ 
+         bufPos += dataLength;
+ 
+         break;
+ 
+     case 0x90: /* MMS_STRING */
+         value = MmsValue_newVisibleStringFromByteArray(buffer + bufPos, dataLength);
+         value->type = MMS_STRING;
+         bufPos += dataLength;
+ 
+         break;
+ 
+     case 0x91: /* MMS_UTC_TIME */
+         if (dataLength == 8) {
+             value = MmsValue_newUtcTime(0);
+             MmsValue_setUtcTimeByBuffer(value, buffer + bufPos);
+             bufPos += dataLength;
+         }
+         else
+             goto exit_with_error;
+ 
+         break;
+ 
+     case 0x00: /* indefinite length end tag -> ignore */
+         break;
+ 
+     default: /* unknown tag -> decoding error */
+         goto exit_with_error;
+     }
+ 
+     if (endBufPos != NULL)
+         *endBufPos = bufPos;
+ 
+     return value;

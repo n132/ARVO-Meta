@@ -1,0 +1,184 @@
+commit e0f7ea91436dd308a094c4c101fd4169e8245a91
+Author: H.J. Lu <hjl.tools@gmail.com>
+Date:   Thu Nov 4 06:27:16 2021 -0700
+
+    bfd: Always check sections with the corrupt size
+    
+    Always check sections with the corrupt size for non-MMO files.  Skip MMO
+    files for compress_status == COMPRESS_SECTION_NONE since MMO has special
+    handling for COMPRESS_SECTION_NONE.
+    
+            PR binutils/28530
+            * compress.c (bfd_get_full_section_contents): Always check
+            sections with the corrupt size.
+
+diff --git a/bfd/compress.c b/bfd/compress.c
+index 4a2ada3e3eb..a3adb8d8250 100644
+--- a/bfd/compress.c
++++ b/bfd/compress.c
+@@ -226,138 +226,142 @@ bool
+ bfd_get_full_section_contents (bfd *abfd, sec_ptr sec, bfd_byte **ptr)
+ {
+   bfd_size_type sz;
+   bfd_byte *p = *ptr;
+   bool ret;
+   bfd_size_type save_size;
+   bfd_size_type save_rawsize;
+   bfd_byte *compressed_buffer;
+   unsigned int compression_header_size;
++  ufile_ptr filesize;
+ 
+   if (abfd->direction != write_direction && sec->rawsize != 0)
+     sz = sec->rawsize;
+   else
+     sz = sec->size;
+   if (sz == 0)
+     {
+       *ptr = NULL;
+       return true;
+     }
+ 
++  filesize = bfd_get_file_size (abfd);
++  if (filesize > 0
++      && filesize < sz
++      /* PR 24753: Linker created sections can be larger than
++	 the file size, eg if they are being used to hold stubs.  */
++      && (bfd_section_flags (sec) & SEC_LINKER_CREATED) == 0
++      /* PR 24753: Sections which have no content should also be
++	 excluded as they contain no size on disk.  */
++      && (bfd_section_flags (sec) & SEC_HAS_CONTENTS) != 0
++      /* PR 28530: Check compressed sections with the corrupt size.  */
++      && (sec->compress_status != COMPRESS_SECTION_NONE
++      /* The MMO file format supports its own special compression
++	 technique, but it uses COMPRESS_SECTION_NONE when loading
++	 a section's contents.  */
++	  || bfd_get_flavour (abfd) != bfd_target_mmo_flavour))
++    {
++      /* PR 24708: Avoid attempts to allocate a ridiculous amount
++	 of memory.  */
++      bfd_set_error (bfd_error_file_truncated);
++      _bfd_error_handler
++	/* xgettext:c-format */
++	(_("error: %pB(%pA) section size (%#" PRIx64 " bytes) is larger than file size (%#" PRIx64 " bytes)"),
++	 abfd, sec, (uint64_t) sz, (uint64_t) filesize);
++      return false;
++    }
++
+   switch (sec->compress_status)
+     {
+     case COMPRESS_SECTION_NONE:
+       if (p == NULL)
+ 	{
+-	  ufile_ptr filesize = bfd_get_file_size (abfd);
+-	  if (filesize > 0
+-	      && filesize < sz
+-	      /* PR 24753: Linker created sections can be larger than
+-		 the file size, eg if they are being used to hold stubs.  */
+-	      && (bfd_section_flags (sec) & SEC_LINKER_CREATED) == 0
+-	      /* PR 24753: Sections which have no content should also be
+-		 excluded as they contain no size on disk.  */
+-	      && (bfd_section_flags (sec) & SEC_HAS_CONTENTS) != 0
+-	      /* The MMO file format supports its own special compression
+-		 technique, but it uses COMPRESS_SECTION_NONE when loading
+-		 a section's contents.  */
+-	      && bfd_get_flavour (abfd) != bfd_target_mmo_flavour)
+-	    {
+-	      /* PR 24708: Avoid attempts to allocate a ridiculous amount
+-		 of memory.  */
+-	      bfd_set_error (bfd_error_file_truncated);
+-	      _bfd_error_handler
+-		/* xgettext:c-format */
+-		(_("error: %pB(%pA) section size (%#" PRIx64 " bytes) is larger than file size (%#" PRIx64 " bytes)"),
+-		 abfd, sec, (uint64_t) sz, (uint64_t) filesize);
+-	      return false;
+-	    }
+ 	  p = (bfd_byte *) bfd_malloc (sz);
+ 	  if (p == NULL)
+ 	    {
+ 	      /* PR 20801: Provide a more helpful error message.  */
+ 	      if (bfd_get_error () == bfd_error_no_memory)
+ 		_bfd_error_handler
+ 		  /* xgettext:c-format */
+ 		  (_("error: %pB(%pA) is too large (%#" PRIx64 " bytes)"),
+ 		  abfd, sec, (uint64_t) sz);
+ 	      return false;
+ 	    }
+ 	}
+ 
+       if (!bfd_get_section_contents (abfd, sec, p, 0, sz))
+ 	{
+ 	  if (*ptr != p)
+ 	    free (p);
+ 	  return false;
+ 	}
+       *ptr = p;
+       return true;
+ 
+     case DECOMPRESS_SECTION_SIZED:
+       /* Read in the full compressed section contents.  */
+       compressed_buffer = (bfd_byte *) bfd_malloc (sec->compressed_size);
+       if (compressed_buffer == NULL)
+ 	return false;
+       save_rawsize = sec->rawsize;
+       save_size = sec->size;
+       /* Clear rawsize, set size to compressed size and set compress_status
+ 	 to COMPRESS_SECTION_NONE.  If the compressed size is bigger than
+ 	 the uncompressed size, bfd_get_section_contents will fail.  */
+       sec->rawsize = 0;
+       sec->size = sec->compressed_size;
+       sec->compress_status = COMPRESS_SECTION_NONE;
+       ret = bfd_get_section_contents (abfd, sec, compressed_buffer,
+ 				      0, sec->compressed_size);
+       /* Restore rawsize and size.  */
+       sec->rawsize = save_rawsize;
+       sec->size = save_size;
+       sec->compress_status = DECOMPRESS_SECTION_SIZED;
+       if (!ret)
+ 	goto fail_compressed;
+ 
+       if (p == NULL)
+ 	p = (bfd_byte *) bfd_malloc (sz);
+       if (p == NULL)
+ 	goto fail_compressed;
+ 
+       compression_header_size = bfd_get_compression_header_size (abfd, sec);
+       if (compression_header_size == 0)
+ 	/* Set header size to the zlib header size if it is a
+ 	   SHF_COMPRESSED section.  */
+ 	compression_header_size = 12;
+       if (!decompress_contents (compressed_buffer + compression_header_size,
+ 				sec->compressed_size - compression_header_size, p, sz))
+ 	{
+ 	  bfd_set_error (bfd_error_bad_value);
+ 	  if (p != *ptr)
+ 	    free (p);
+ 	fail_compressed:
+ 	  free (compressed_buffer);
+ 	  return false;
+ 	}
+ 
+       free (compressed_buffer);
+       *ptr = p;
+       return true;
+ 
+     case COMPRESS_SECTION_DONE:
+       if (sec->contents == NULL)
+ 	return false;
+       if (p == NULL)
+ 	{
+ 	  p = (bfd_byte *) bfd_malloc (sz);
+ 	  if (p == NULL)
+ 	    return false;
+ 	  *ptr = p;
+ 	}
+       /* PR 17512; file: 5bc29788.  */
+       if (p != sec->contents)
+ 	memcpy (p, sec->contents, sz);
+       return true;
+ 
+     default:
+       abort ();
+     }
+ }
+ 
+ /*

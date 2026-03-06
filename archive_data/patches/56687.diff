@@ -1,0 +1,410 @@
+commit af59e30710ea72aa479e6d26ae5c6951d1954d11
+Author: Yukihiro "Matz" Matsumoto <matz@ruby.or.jp>
+Date:   Fri Dec 30 09:34:45 2022 +0900
+
+    mruby-io/io.c: implement `IO#pos` in C
+
+diff --git a/mrbgems/mruby-io/mrblib/io.rb b/mrbgems/mruby-io/mrblib/io.rb
+index ebcbf0683..f482f97e2 100644
+--- a/mrbgems/mruby-io/mrblib/io.rb
++++ b/mrbgems/mruby-io/mrblib/io.rb
+@@ -7,328 +7,324 @@ class EOFError < IOError; end
+ class IO
+   def self.open(*args, &block)
+     io = self.new(*args)
+ 
+     return io unless block
+ 
+     begin
+       yield io
+     ensure
+       begin
+         io.close unless io.closed?
+       rescue StandardError
+       end
+     end
+   end
+ 
+   def self.popen(command, mode = 'r', **opts, &block)
+     if !self.respond_to?(:_popen)
+       raise NotImplementedError, "popen is not supported on this platform"
+     end
+     io = self._popen(command, mode, **opts)
+     return io unless block
+ 
+     begin
+       yield io
+     ensure
+       begin
+         io.close unless io.closed?
+       rescue IOError
+         # nothing
+       end
+     end
+   end
+ 
+   def self.pipe(&block)
+     if !self.respond_to?(:_pipe)
+       raise NotImplementedError, "pipe is not supported on this platform"
+     end
+     if block
+       begin
+         r, w = IO._pipe
+         yield r, w
+       ensure
+         r.close unless r.closed?
+         w.close unless w.closed?
+       end
+     else
+       IO._pipe
+     end
+   end
+ 
+   def self.read(path, length=nil, offset=0, mode: "r")
+     str = ""
+     fd = -1
+     io = nil
+     begin
+       fd = IO.sysopen(path, mode)
+       io = IO.open(fd, mode)
+       io.seek(offset) if offset > 0
+       str = io.read(length)
+     ensure
+       if io
+         io.close
+       elsif fd != -1
+         IO._sysclose(fd)
+       end
+     end
+     str
+   end
+ 
+   def flush
+     # mruby-io always writes immediately (no output buffer).
+     raise IOError, "closed stream" if self.closed?
+     self
+   end
+ 
+   def hash
+     # We must define IO#hash here because IO includes Enumerable and
+     # Enumerable#hash will call IO#read() otherwise
+     self.__id__
+   end
+ 
+   def <<(str)
+     write(str)
+     self
+   end
+ 
+   def eof?
+     _check_readable
+     begin
+       _read_buf
+       return @buf.empty?
+     rescue EOFError
+       return true
+     end
+   end
+-  alias_method :eof, :eof?
+ 
+-  def pos
+-    raise IOError if closed?
+-    sysseek(0, SEEK_CUR) - @buf.bytesize
+-  end
++  alias_method :eof, :eof?
+   alias_method :tell, :pos
+ 
+   def pos=(i)
+     seek(i, SEEK_SET)
+   end
+ 
+   def rewind
+     seek(0, SEEK_SET)
+   end
+ 
+   def ungetc(substr)
+     raise TypeError.new "expect String, got #{substr.class}" unless substr.is_a?(String)
+     if @buf.empty?
+       @buf.replace(substr)
+     else
+       @buf[0,0] = substr
+     end
+     nil
+   end
+ 
+   def ungetbyte(c)
+     if c.is_a? String
+       c = c.getbyte(0)
+     else
+       c &= 0xff
+     end
+     s = " "
+     s.setbyte(0,c)
+     ungetc s
+   end
+ 
+   def read(length = nil, outbuf = "")
+     unless length.nil?
+       unless length.is_a? Integer
+         raise TypeError.new "can't convert #{length.class} into Integer"
+       end
+       if length < 0
+         raise ArgumentError.new "negative length: #{length} given"
+       end
+       if length == 0
+         return ""   # easy case
+       end
+     end
+ 
+     array = []
+     while true
+       begin
+         _read_buf
+       rescue EOFError
+         array = nil if array.empty? and (not length.nil?) and length != 0
+         break
+       end
+ 
+       if length
+         consume = (length <= @buf.bytesize) ? length : @buf.bytesize
+         array.push IO._bufread(@buf, consume)
+         length -= consume
+         break if length == 0
+       else
+         array.push @buf
+         @buf = ''
+       end
+     end
+ 
+     if array.nil?
+       outbuf.replace("")
+       nil
+     else
+       outbuf.replace(array.join)
+     end
+   end
+ 
+   def readline(arg = "\n", limit = nil)
+     case arg
+     when String
+       rs = arg
+     when Integer
+       rs = "\n"
+       limit = arg
+     else
+       raise ArgumentError
+     end
+ 
+     if rs.nil?
+       return read
+     end
+ 
+     if rs == ""
+       rs = "\n\n"
+     end
+ 
+     array = []
+     while true
+       begin
+         _read_buf
+       rescue EOFError
+         array = nil if array.empty?
+         break
+       end
+ 
+       if limit && limit <= @buf.size
+         array.push @buf[0, limit]
+         @buf[0, limit] = ""
+         break
+       elsif idx = @buf.index(rs)
+         len = idx + rs.size
+         array.push @buf[0, len]
+         @buf[0, len] = ""
+         break
+       else
+         array.push @buf
+         @buf = ''
+       end
+     end
+ 
+     raise EOFError.new "end of file reached" if array.nil?
+ 
+     array.join
+   end
+ 
+   def gets(*args)
+     begin
+       readline(*args)
+     rescue EOFError
+       nil
+     end
+   end
+ 
+   def readchar
+     _read_buf
+     _readchar
+   end
+ 
+   def getc
+     begin
+       readchar
+     rescue EOFError
+       nil
+     end
+   end
+ 
+   def readbyte
+     _read_buf
+     IO._bufread(@buf, 1).getbyte(0)
+   end
+ 
+   def getbyte
+     readbyte
+   rescue EOFError
+     nil
+   end
+ 
+   # 15.2.20.5.3
+   def each(&block)
+     return to_enum unless block
+ 
+     while line = self.gets
+       block.call(line)
+     end
+     self
+   end
+ 
+   # 15.2.20.5.4
+   def each_byte(&block)
+     return to_enum(:each_byte) unless block
+ 
+     while byte = self.getbyte
+       block.call(byte)
+     end
+     self
+   end
+ 
+   # 15.2.20.5.5
+   alias each_line each
+ 
+   def each_char(&block)
+     return to_enum(:each_char) unless block
+ 
+     while char = self.getc
+       block.call(char)
+     end
+     self
+   end
+ 
+   def readlines
+     ary = []
+     while (line = gets)
+       ary << line
+     end
+     ary
+   end
+ 
+   def puts(*args)
+     i = 0
+     len = args.size
+     while i < len
+       s = args[i]
+       if s.kind_of?(Array)
+         puts(*s)
+       else
+         s = s.to_s
+         write s
+         write "\n" if (s[-1] != "\n")
+       end
+       i += 1
+     end
+     write "\n" if len == 0
+     nil
+   end
+ 
+   def print(*args)
+     i = 0
+     len = args.size
+     while i < len
+       write args[i].to_s
+       i += 1
+     end
+   end
+ 
+   def printf(*args)
+     write sprintf(*args)
+     nil
+   end
+ 
+   alias_method :to_i, :fileno
+   alias_method :tty?, :isatty
+diff --git a/mrbgems/mruby-io/src/io.c b/mrbgems/mruby-io/src/io.c
+index 6478cd643..46b82b2d8 100644
+--- a/mrbgems/mruby-io/src/io.c
++++ b/mrbgems/mruby-io/src/io.c
+@@ -1130,6 +1130,17 @@ io_closed(mrb_state *mrb, mrb_value io)
+   return mrb_true_value();
+ }
+ 
++static mrb_value
++io_pos(mrb_state *mrb, mrb_value io)
++{
++  struct mrb_io *fptr = io_get_open_fptr(mrb, io);
++  off_t pos = lseek(fptr->fd, 0, SEEK_CUR);
++  if (pos == -1) mrb_sys_fail(mrb, 0);
++
++  mrb_value buf = mrb_iv_get(mrb, io, MRB_IVSYM(buf));
++  return mrb_int_value(mrb, pos - RSTRING_LEN(buf));
++}
++
+ static mrb_value
+ io_pid(mrb_state *mrb, mrb_value io)
+ {
+@@ -1607,46 +1618,47 @@ void
+ mrb_init_io(mrb_state *mrb)
+ {
+   struct RClass *io;
+ 
+   io      = mrb_define_class(mrb, "IO", mrb->object_class);
+   MRB_SET_INSTANCE_TT(io, MRB_TT_CDATA);
+ 
+   mrb_include_module(mrb, io, mrb_module_get(mrb, "Enumerable")); /* 15.2.20.3 */
+   mrb_define_class_method(mrb, io, "_popen",  io_s_popen,   MRB_ARGS_ARG(1,2));
+   mrb_define_class_method(mrb, io, "_sysclose",  io_s_sysclose, MRB_ARGS_REQ(1));
+   mrb_define_class_method(mrb, io, "for_fd",  io_s_for_fd,   MRB_ARGS_ARG(1,2));
+   mrb_define_class_method(mrb, io, "select",  io_s_select,  MRB_ARGS_ARG(1,3));
+   mrb_define_class_method(mrb, io, "sysopen", io_s_sysopen, MRB_ARGS_ARG(1,2));
+ #if !defined(_WIN32) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+   mrb_define_class_method(mrb, io, "_pipe", io_s_pipe, MRB_ARGS_NONE());
+ #endif
+ 
+   mrb_define_method(mrb, io, "initialize",      io_init, MRB_ARGS_ARG(1,2));    /* 15.2.20.5.21 (x)*/
+   mrb_define_method(mrb, io, "initialize_copy", io_init_copy, MRB_ARGS_REQ(1));
+   mrb_define_method(mrb, io, "_check_readable", io_check_readable, MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "isatty",     io_isatty,     MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "sync",       io_sync,       MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "sync=",      io_set_sync,   MRB_ARGS_REQ(1));
+   mrb_define_method(mrb, io, "sysread",    io_sysread,    MRB_ARGS_ARG(1,1));
+   mrb_define_method(mrb, io, "sysseek",    io_sysseek,    MRB_ARGS_ARG(1,1));
+   mrb_define_method(mrb, io, "syswrite",   io_syswrite,   MRB_ARGS_REQ(1));
+   mrb_define_method(mrb, io, "seek",       io_seek,       MRB_ARGS_ARG(1,1));
+   mrb_define_method(mrb, io, "close",      io_close,      MRB_ARGS_NONE());   /* 15.2.20.5.1 */
+   mrb_define_method(mrb, io, "close_write",    io_close_write,       MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "close_on_exec=", io_set_close_on_exec, MRB_ARGS_REQ(1));
+   mrb_define_method(mrb, io, "close_on_exec?", io_close_on_exec_p,   MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "closed?",    io_closed,     MRB_ARGS_NONE());   /* 15.2.20.5.2 */
++  mrb_define_method(mrb, io, "pos",        io_pos,        MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "pid",        io_pid,        MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "fileno",     io_fileno,     MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "write",      io_write,      MRB_ARGS_ANY());    /* 15.2.20.5.20 */
+   mrb_define_method(mrb, io, "pread",      io_pread,      MRB_ARGS_ANY());    /* ruby 2.5 feature */
+   mrb_define_method(mrb, io, "pwrite",     io_pwrite,     MRB_ARGS_ANY());    /* ruby 2.5 feature */
+ 
+   mrb_define_const_id(mrb, io, MRB_SYM(SEEK_SET), mrb_fixnum_value(SEEK_SET));
+   mrb_define_const_id(mrb, io, MRB_SYM(SEEK_CUR), mrb_fixnum_value(SEEK_CUR));
+   mrb_define_const_id(mrb, io, MRB_SYM(SEEK_END), mrb_fixnum_value(SEEK_END));
+ 
+   mrb_define_method(mrb, io, "_read_buf",  io_read_buf,   MRB_ARGS_NONE());
+   mrb_define_method(mrb, io, "_readchar",  io_readchar,   MRB_ARGS_NONE());
+   mrb_define_class_method(mrb, io, "_bufread", io_bufread_m, MRB_ARGS_REQ(2));
+ }

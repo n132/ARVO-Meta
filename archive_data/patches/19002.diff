@@ -1,0 +1,399 @@
+commit 4e2bef6a82b356772a5919c51c9be1530268bd79
+Author: James Almer <jamrial@gmail.com>
+Date:   Sun Nov 17 21:08:56 2019 -0300
+
+    avcodec/cbs_av1: keep separate reference frame state for reading and writing
+    
+    In scearios where a Temporal Unit is written right after reading it using the same
+    CBS context (av1_metadata, av1_frame_merge, etc), the reference frame state used
+    by the writer must not be the state that's the result of the reader having already
+    parsed the current frame in question.
+    
+    This fixes writing Switch frames, and frames using short ref signaling.
+    
+    Signed-off-by: James Almer <jamrial@gmail.com>
+
+diff --git a/libavcodec/cbs_av1.c b/libavcodec/cbs_av1.c
+index d132f36f93..bbe4461130 100644
+--- a/libavcodec/cbs_av1.c
++++ b/libavcodec/cbs_av1.c
+@@ -882,171 +882,173 @@ static int cbs_av1_ref_tile_data(CodedBitstreamContext *ctx,
+ static int cbs_av1_read_unit(CodedBitstreamContext *ctx,
+                              CodedBitstreamUnit *unit)
+ {
+     CodedBitstreamAV1Context *priv = ctx->priv_data;
+     AV1RawOBU *obu;
+     GetBitContext gbc;
+     int err, start_pos, end_pos;
+ 
+     err = ff_cbs_alloc_unit_content(ctx, unit, sizeof(*obu),
+                                     &cbs_av1_free_obu);
+     if (err < 0)
+         return err;
+     obu = unit->content;
+ 
+     err = init_get_bits(&gbc, unit->data, 8 * unit->data_size);
+     if (err < 0)
+         return err;
+ 
+     err = cbs_av1_read_obu_header(ctx, &gbc, &obu->header);
+     if (err < 0)
+         return err;
+     av_assert0(obu->header.obu_type == unit->type);
+ 
+     if (obu->header.obu_has_size_field) {
+         uint64_t obu_size;
+         err = cbs_av1_read_leb128(ctx, &gbc, "obu_size", &obu_size);
+         if (err < 0)
+             return err;
+         obu->obu_size = obu_size;
+     } else {
+         if (unit->data_size < 1 + obu->header.obu_extension_flag) {
+             av_log(ctx->log_ctx, AV_LOG_ERROR, "Invalid OBU length: "
+                    "unit too short (%"SIZE_SPECIFIER").\n", unit->data_size);
+             return AVERROR_INVALIDDATA;
+         }
+         obu->obu_size = unit->data_size - 1 - obu->header.obu_extension_flag;
+     }
+ 
+     start_pos = get_bits_count(&gbc);
+ 
+     if (obu->header.obu_extension_flag) {
+         priv->temporal_id = obu->header.temporal_id;
+         priv->spatial_id  = obu->header.spatial_id;
+ 
+         if (obu->header.obu_type != AV1_OBU_SEQUENCE_HEADER &&
+             obu->header.obu_type != AV1_OBU_TEMPORAL_DELIMITER &&
+             priv->operating_point_idc) {
+             int in_temporal_layer =
+                 (priv->operating_point_idc >>  priv->temporal_id    ) & 1;
+             int in_spatial_layer  =
+                 (priv->operating_point_idc >> (priv->spatial_id + 8)) & 1;
+             if (!in_temporal_layer || !in_spatial_layer) {
+                 // Decoding will drop this OBU at this operating point.
+             }
+         }
+     } else {
+         priv->temporal_id = 0;
+         priv->spatial_id  = 0;
+     }
+ 
++    priv->ref = (AV1ReferenceFrameState *)&priv->read_ref;
++
+     switch (obu->header.obu_type) {
+     case AV1_OBU_SEQUENCE_HEADER:
+         {
+             err = cbs_av1_read_sequence_header_obu(ctx, &gbc,
+                                                    &obu->obu.sequence_header);
+             if (err < 0)
+                 return err;
+ 
+             av_buffer_unref(&priv->sequence_header_ref);
+             priv->sequence_header = NULL;
+ 
+             priv->sequence_header_ref = av_buffer_ref(unit->content_ref);
+             if (!priv->sequence_header_ref)
+                 return AVERROR(ENOMEM);
+             priv->sequence_header = &obu->obu.sequence_header;
+         }
+         break;
+     case AV1_OBU_TEMPORAL_DELIMITER:
+         {
+             err = cbs_av1_read_temporal_delimiter_obu(ctx, &gbc);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_FRAME_HEADER:
+     case AV1_OBU_REDUNDANT_FRAME_HEADER:
+         {
+             err = cbs_av1_read_frame_header_obu(ctx, &gbc,
+                                                 &obu->obu.frame_header,
+                                                 obu->header.obu_type ==
+                                                 AV1_OBU_REDUNDANT_FRAME_HEADER,
+                                                 unit->data_ref);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_TILE_GROUP:
+         {
+             err = cbs_av1_read_tile_group_obu(ctx, &gbc,
+                                               &obu->obu.tile_group);
+             if (err < 0)
+                 return err;
+ 
+             err = cbs_av1_ref_tile_data(ctx, unit, &gbc,
+                                         &obu->obu.tile_group.tile_data);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_FRAME:
+         {
+             err = cbs_av1_read_frame_obu(ctx, &gbc, &obu->obu.frame,
+                                          unit->data_ref);
+             if (err < 0)
+                 return err;
+ 
+             err = cbs_av1_ref_tile_data(ctx, unit, &gbc,
+                                         &obu->obu.frame.tile_group.tile_data);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_TILE_LIST:
+         {
+             err = cbs_av1_read_tile_list_obu(ctx, &gbc,
+                                              &obu->obu.tile_list);
+             if (err < 0)
+                 return err;
+ 
+             err = cbs_av1_ref_tile_data(ctx, unit, &gbc,
+                                         &obu->obu.tile_list.tile_data);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_METADATA:
+         {
+             err = cbs_av1_read_metadata_obu(ctx, &gbc, &obu->obu.metadata);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_PADDING:
+         {
+             err = cbs_av1_read_padding_obu(ctx, &gbc, &obu->obu.padding);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     default:
+         return AVERROR(ENOSYS);
+     }
+ 
+     end_pos = get_bits_count(&gbc);
+     av_assert0(end_pos <= unit->data_size * 8);
+ 
+     if (obu->obu_size > 0 &&
+         obu->header.obu_type != AV1_OBU_TILE_GROUP &&
+         obu->header.obu_type != AV1_OBU_FRAME) {
+         int nb_bits = obu->obu_size * 8 + start_pos - end_pos;
+ 
+         if (nb_bits <= 0)
+             return AVERROR_INVALIDDATA;
+ 
+         err = cbs_av1_read_trailing_bits(ctx, &gbc, nb_bits);
+         if (err < 0)
+             return err;
+     }
+ 
+     return 0;
+ }
+@@ -1054,164 +1056,166 @@ static int cbs_av1_read_unit(CodedBitstreamContext *ctx,
+ static int cbs_av1_write_obu(CodedBitstreamContext *ctx,
+                              CodedBitstreamUnit *unit,
+                              PutBitContext *pbc)
+ {
+     CodedBitstreamAV1Context *priv = ctx->priv_data;
+     AV1RawOBU *obu = unit->content;
+     PutBitContext pbc_tmp;
+     AV1RawTileData *td;
+     size_t header_size;
+     int err, start_pos, end_pos, data_pos;
+ 
+     // OBUs in the normal bitstream format must contain a size field
+     // in every OBU (in annex B it is optional, but we don't support
+     // writing that).
+     obu->header.obu_has_size_field = 1;
+ 
+     err = cbs_av1_write_obu_header(ctx, pbc, &obu->header);
+     if (err < 0)
+         return err;
+ 
+     if (obu->header.obu_has_size_field) {
+         pbc_tmp = *pbc;
+         // Add space for the size field to fill later.
+         put_bits32(pbc, 0);
+         put_bits32(pbc, 0);
+     }
+ 
+     td = NULL;
+     start_pos = put_bits_count(pbc);
+ 
++    priv->ref = (AV1ReferenceFrameState *)&priv->write_ref;
++
+     switch (obu->header.obu_type) {
+     case AV1_OBU_SEQUENCE_HEADER:
+         {
+             err = cbs_av1_write_sequence_header_obu(ctx, pbc,
+                                                     &obu->obu.sequence_header);
+             if (err < 0)
+                 return err;
+ 
+             av_buffer_unref(&priv->sequence_header_ref);
+             priv->sequence_header = NULL;
+ 
+             priv->sequence_header_ref = av_buffer_ref(unit->content_ref);
+             if (!priv->sequence_header_ref)
+                 return AVERROR(ENOMEM);
+             priv->sequence_header = &obu->obu.sequence_header;
+         }
+         break;
+     case AV1_OBU_TEMPORAL_DELIMITER:
+         {
+             err = cbs_av1_write_temporal_delimiter_obu(ctx, pbc);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_FRAME_HEADER:
+     case AV1_OBU_REDUNDANT_FRAME_HEADER:
+         {
+             err = cbs_av1_write_frame_header_obu(ctx, pbc,
+                                                  &obu->obu.frame_header,
+                                                  obu->header.obu_type ==
+                                                  AV1_OBU_REDUNDANT_FRAME_HEADER,
+                                                  NULL);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_TILE_GROUP:
+         {
+             err = cbs_av1_write_tile_group_obu(ctx, pbc,
+                                                &obu->obu.tile_group);
+             if (err < 0)
+                 return err;
+ 
+             td = &obu->obu.tile_group.tile_data;
+         }
+         break;
+     case AV1_OBU_FRAME:
+         {
+             err = cbs_av1_write_frame_obu(ctx, pbc, &obu->obu.frame, NULL);
+             if (err < 0)
+                 return err;
+ 
+             td = &obu->obu.frame.tile_group.tile_data;
+         }
+         break;
+     case AV1_OBU_TILE_LIST:
+         {
+             err = cbs_av1_write_tile_list_obu(ctx, pbc, &obu->obu.tile_list);
+             if (err < 0)
+                 return err;
+ 
+             td = &obu->obu.tile_list.tile_data;
+         }
+         break;
+     case AV1_OBU_METADATA:
+         {
+             err = cbs_av1_write_metadata_obu(ctx, pbc, &obu->obu.metadata);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     case AV1_OBU_PADDING:
+         {
+             err = cbs_av1_write_padding_obu(ctx, pbc, &obu->obu.padding);
+             if (err < 0)
+                 return err;
+         }
+         break;
+     default:
+         return AVERROR(ENOSYS);
+     }
+ 
+     end_pos = put_bits_count(pbc);
+     header_size = (end_pos - start_pos + 7) / 8;
+     if (td) {
+         obu->obu_size = header_size + td->data_size;
+     } else if (header_size > 0) {
+         // Add trailing bits and recalculate.
+         err = cbs_av1_write_trailing_bits(ctx, pbc, 8 - end_pos % 8);
+         if (err < 0)
+             return err;
+         end_pos = put_bits_count(pbc);
+         obu->obu_size = header_size = (end_pos - start_pos + 7) / 8;
+     } else {
+         // Empty OBU.
+         obu->obu_size = 0;
+     }
+ 
+     end_pos = put_bits_count(pbc);
+     // Must now be byte-aligned.
+     av_assert0(end_pos % 8 == 0);
+     flush_put_bits(pbc);
+     start_pos /= 8;
+     end_pos   /= 8;
+ 
+     *pbc = pbc_tmp;
+     err = cbs_av1_write_leb128(ctx, pbc, "obu_size", obu->obu_size);
+     if (err < 0)
+         return err;
+ 
+     data_pos = put_bits_count(pbc) / 8;
+     flush_put_bits(pbc);
+     av_assert0(data_pos <= start_pos);
+ 
+     if (8 * obu->obu_size > put_bits_left(pbc))
+         return AVERROR(ENOSPC);
+ 
+     if (obu->obu_size > 0) {
+         memmove(pbc->buf + data_pos,
+                 pbc->buf + start_pos, header_size);
+         skip_put_bytes(pbc, header_size);
+ 
+         if (td) {
+             memcpy(pbc->buf + data_pos + header_size,
+                    td->data, td->data_size);
+             skip_put_bytes(pbc, td->data_size);
+         }
+     }
+ 
+     // OBU data must be byte-aligned.
+     av_assert0(put_bits_count(pbc) % 8 == 0);
+ 
+     return 0;
+ }
+diff --git a/libavcodec/cbs_av1.h b/libavcodec/cbs_av1.h
+index c85f58f764..9eaf5c4de6 100644
+--- a/libavcodec/cbs_av1.h
++++ b/libavcodec/cbs_av1.h
+@@ -418,31 +418,33 @@ typedef struct AV1ReferenceFrameState {
+ typedef struct CodedBitstreamAV1Context {
+     AV1RawSequenceHeader *sequence_header;
+     AVBufferRef          *sequence_header_ref;
+ 
+     int     seen_frame_header;
+     AVBufferRef *frame_header_ref;
+     uint8_t     *frame_header;
+     size_t       frame_header_size;
+ 
+     int temporal_id;
+     int spatial_id;
+     int operating_point_idc;
+ 
+     int bit_depth;
+     int frame_width;
+     int frame_height;
+     int upscaled_width;
+     int render_width;
+     int render_height;
+ 
+     int num_planes;
+     int coded_lossless;
+     int all_lossless;
+     int tile_cols;
+     int tile_rows;
+ 
+-    AV1ReferenceFrameState ref[AV1_NUM_REF_FRAMES];
++    AV1ReferenceFrameState *ref;
++    AV1ReferenceFrameState read_ref[AV1_NUM_REF_FRAMES];
++    AV1ReferenceFrameState write_ref[AV1_NUM_REF_FRAMES];
+ } CodedBitstreamAV1Context;
+ 
+ 
+ #endif /* AVCODEC_CBS_AV1_H */

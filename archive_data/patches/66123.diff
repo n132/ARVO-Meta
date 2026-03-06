@@ -1,0 +1,151 @@
+commit fe46265eda4375086374ed41a4bb7f3906ced4ca
+Author: jeanlf <jeanlf@gpac.io>
+Date:   Wed Jan 31 18:36:02 2024 +0100
+
+    fixed possible use after free in broken ogg streams
+
+diff --git a/src/filters/dmx_ogg.c b/src/filters/dmx_ogg.c
+index a0d91b456..80465f6af 100644
+--- a/src/filters/dmx_ogg.c
++++ b/src/filters/dmx_ogg.c
+@@ -373,130 +373,131 @@ GF_Err oggdmx_configure_pid(GF_Filter *filter, GF_FilterPid *pid, Bool is_remove
+ static void oggdmx_check_dur(GF_Filter *filter, GF_OGGDmxCtx *ctx)
+ {
+ 	ogg_sync_state oy;
+ 	FILE *stream;
+ 	const GF_PropertyValue *p;
+ 	OGGInfo info, the_info;
+ 	ogg_page oggpage;
+ 	ogg_packet oggpacket;
+ 	ogg_stream_state os, the_os;
+ 	u64 max_gran;
+ 	Bool has_stream = GF_FALSE;
+ 	GF_VorbisParser vp;
+ 	GF_OpusConfig op;
+ 	u64 recompute_ts;
+ 	GF_Fraction64 dur;
+ 
+ 	if (!ctx->index || ctx->duration.num || ctx->is_dash) return;
+ 
+ 	p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_FILE_CACHED);
+ 	if (p && p->value.boolean) ctx->file_loaded = GF_TRUE;
+ 
+ 	p = gf_filter_pid_get_property(ctx->ipid, GF_PROP_PID_FILEPATH);
+ 	if (!p || !p->value.string || !strncmp(p->value.string, "gmem://", 7) ) {
+ 		ctx->is_file = GF_FALSE;
+ 		ctx->duration.num=1;
+ 		return;
+ 	}
+ 	ctx->is_file = GF_TRUE;
+ 	if (!ctx->file_loaded) return;
+ 
+ 	stream = gf_fopen(p->value.string, "rb");
+ 	if (!stream) return;
+ 
+ 	ogg_sync_init(&oy);
+ 	memset(&the_info, 0, sizeof(OGGInfo));
+ 	memset(&vp, 0, sizeof(GF_VorbisParser));
+ 	recompute_ts = 0;
+ 	max_gran = 0;
+ 	while (1) {
+ 		char buf[10000];
+ 		while (ogg_sync_pageout(&oy, &oggpage) != 1 ) {
+ 			char *buffer;
+ 			u32 bytes;
+ 
+ 			if (gf_feof(stream))
+ 				break;
+ 
+ 			bytes = (u32) gf_fread(buf, 10000, stream);
+ 			if (!bytes) break;
+ 			buffer = ogg_sync_buffer(&oy, bytes);
+ 			memcpy(buffer, buf, bytes);
+ 			ogg_sync_wrote(&oy, bytes);
+ 		}
+ 		if (gf_feof(stream))
+ 			break;
+ 
+ 		if (ogg_page_bos(&oggpage)) {
+ 			ogg_stream_init(&os, ogg_page_serialno(&oggpage));
+ 			if (ogg_stream_pagein(&os, &oggpage) >= 0 ) {
+-				ogg_stream_packetpeek(&os, &oggpacket);
+-				if (ogg_stream_pagein(&os, &oggpage) >= 0 ) {
+-					ogg_stream_packetpeek(&os, &oggpacket);
+-					oggdmx_get_stream_info(&oggpacket, &info);
+-				}
+-				if (!has_stream) {
+-					has_stream = GF_TRUE;
+-					ogg_stream_init(&the_os, ogg_page_serialno(&oggpage));
+-					the_info = info;
++				if (ogg_stream_packetpeek(&os, &oggpacket)>0) {
++					if (ogg_stream_pagein(&os, &oggpage) >= 0 ) {
++						ogg_stream_packetpeek(&os, &oggpacket);
++						oggdmx_get_stream_info(&oggpacket, &info);
++					}
++					if (!has_stream) {
++						has_stream = GF_TRUE;
++						ogg_stream_init(&the_os, ogg_page_serialno(&oggpage));
++						the_info = info;
++					}
+ 				}
+ 			}
+ 			ogg_stream_clear(&os);
+ 		}
+ 		if (has_stream && (ogg_stream_pagein(&the_os, &oggpage) >= 0) ) {
+ 			while (ogg_stream_packetout(&the_os, &oggpacket ) > 0 ) {
+ 				if (the_info.type==GF_CODECID_VORBIS) {
+ 					if (the_info.num_init_headers) {
+ 						the_info.num_init_headers--;
+ 						gf_vorbis_parse_header(&vp, oggpacket.packet, oggpacket.bytes);
+ 					} else {
+ 						recompute_ts += gf_vorbis_check_frame(&vp, (char *) oggpacket.packet, oggpacket.bytes);
+ 					}
+ 				} else if (the_info.type==GF_CODECID_OPUS) {
+ 					if (the_info.num_init_headers) {
+ 						the_info.num_init_headers--;
+ 						gf_opus_parse_header(&op, oggpacket.packet, oggpacket.bytes);
+ 					} else {
+ 						recompute_ts += gf_opus_check_frame(&op, (char *) oggpacket.packet, oggpacket.bytes);
+ 					}
+ 
+ 				} else if ((oggpacket.granulepos>=0) && ((u64) oggpacket.granulepos>max_gran) ) {
+ 					max_gran = oggpacket.granulepos;
+ 				}
+ 			}
+ 		}
+ 	}
+ 	ogg_sync_clear(&oy);
+ 	ctx->file_size = gf_ftell(stream);
+ 	if (has_stream) {
+ 		ogg_stream_clear(&the_os);
+ 		if (recompute_ts) {
+ 			dur.num = (u32) recompute_ts;
+ 			dur.den = the_info.sample_rate;
+ 		} else {
+ 			//convert granule to time
+ 			if (the_info.sample_rate) {
+ 				dur.num = (s32) max_gran;
+ 			} else if (the_info.frame_rate.num) {
+ 				s64 iframe = max_gran >> the_info.theora_kgs;
+ 				s64 pframe = max_gran - (iframe << the_info.theora_kgs);
+ 				pframe += iframe;
+ 				dur.num = (s32) (pframe / the_info.frame_rate.num);
+ 			} else {
+ 				dur.num = 0;
+ 			}
+ 			if (the_info.sample_rate) dur.den = the_info.sample_rate;
+ 			else dur.den = the_info.frame_rate.den;
+ 		}
+ 
+ 		if (!ctx->duration.num || (ctx->duration.num  * dur.den != dur.num * ctx->duration.den)) {
+ 			u32 i=0;
+ 			GF_OGGStream *st;
+ 			ctx->duration = dur;
+ 			while ( (st = gf_list_enum(ctx->streams, &i)) ) {
+ 				if (st->opid)
+ 					gf_filter_pid_set_property(st->opid, GF_PROP_PID_DURATION, & PROP_FRAC64(ctx->duration));
+ 			}
+ 		}
+ 	}
+ 	gf_fclose(stream);
+ }

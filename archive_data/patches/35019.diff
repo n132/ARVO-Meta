@@ -1,0 +1,156 @@
+commit b91fc37c9a79355059b71a7421a92ccd4ce04422
+Author: Luca Versari <veluca@google.com>
+Date:   Fri Jun 11 17:23:24 2021 +0200
+
+    Fix per-rect YCbCr upsampling with late FIR.
+
+diff --git a/lib/jxl/dec_reconstruct.cc b/lib/jxl/dec_reconstruct.cc
+index 8b821043..58ec6cf4 100644
+--- a/lib/jxl/dec_reconstruct.cc
++++ b/lib/jxl/dec_reconstruct.cc
+@@ -1083,143 +1083,142 @@ Status FinalizeImageRect(
+ Status FinalizeFrameDecoding(ImageBundle* decoded,
+                              PassesDecoderState* dec_state, ThreadPool* pool,
+                              bool force_fir, bool skip_blending) {
+   const FrameHeader& frame_header = dec_state->shared->frame_header;
+   const FrameDimensions& frame_dim = dec_state->shared->frame_dim;
+ 
+   // FinalizeImageRect was not yet run, or we are forcing a run.
+   if (!dec_state->EagerFinalizeImageRect() || force_fir) {
+     std::vector<Rect> rects_to_process;
+     for (size_t y = 0; y < frame_dim.ysize_padded; y += kGroupDim) {
+       for (size_t x = 0; x < frame_dim.xsize_padded; x += kGroupDim) {
+         Rect rect(x, y, kGroupDim, kGroupDim, frame_dim.xsize_padded,
+                   frame_dim.ysize_padded);
+         if (rect.xsize() == 0 || rect.ysize() == 0) continue;
+         rects_to_process.push_back(rect);
+       }
+     }
+     const auto allocate_storage = [&](size_t num_threads) {
+       dec_state->EnsureStorage(num_threads);
+       return true;
+     };
+ 
+     {
+       std::vector<ImageF> ecs;
+       const ImageMetadata& metadata = frame_header.nonserialized_metadata->m;
+       for (size_t i = 0; i < metadata.num_extra_channels; i++) {
+         if (frame_header.extra_channel_upsampling[i] == 1) {
+           ecs.push_back(std::move(dec_state->extra_channels[i]));
+         } else {
+           ecs.emplace_back(frame_dim.xsize_upsampled_padded,
+                            frame_dim.ysize_upsampled_padded);
+         }
+       }
+       decoded->SetExtraChannels(std::move(ecs));
+     }
+ 
+     std::atomic<bool> apply_features_ok{true};
+     auto run_apply_features = [&](size_t rect_id, size_t thread) {
+-      size_t xstart = kBlockDim + dec_state->group_border_assigner.PaddingX(
+-                                      dec_state->FinalizeRectPadding());
+-      size_t ystart = dec_state->FinalizeRectPadding();
++      size_t xstart = PassesDecoderState::kGroupDataXBorder;
++      size_t ystart = PassesDecoderState::kGroupDataYBorder;
+       for (size_t c = 0; c < 3; c++) {
+         Rect rh(rects_to_process[rect_id].x0() >>
+                     frame_header.chroma_subsampling.HShift(c),
+                 rects_to_process[rect_id].y0() >>
+                     frame_header.chroma_subsampling.VShift(c),
+                 rects_to_process[rect_id].xsize() >>
+                     frame_header.chroma_subsampling.HShift(c),
+                 rects_to_process[rect_id].ysize() >>
+                     frame_header.chroma_subsampling.VShift(c));
+         Rect group_data_rect(xstart, ystart, rh.xsize(), rh.ysize());
+         CopyImageToWithPadding(
+             rh, dec_state->decoded.Plane(c), dec_state->FinalizeRectPadding(),
+             group_data_rect, &dec_state->group_data[thread].Plane(c));
+       }
+       Rect group_data_rect(xstart, ystart, rects_to_process[rect_id].xsize(),
+                            rects_to_process[rect_id].ysize());
+       std::vector<std::pair<ImageF*, Rect>> ec_rects;
+       ec_rects.reserve(decoded->extra_channels().size());
+       for (size_t i = 0; i < decoded->extra_channels().size(); i++) {
+         Rect r = ScaleRectForEC(rects_to_process[rect_id], frame_header, i);
+         if (frame_header.extra_channel_upsampling[i] != 1) {
+           Rect ec_input_rect(kBlockDim, 2, r.xsize(), r.ysize());
+           auto eti =
+               &dec_state
+                    ->ec_temp_images[thread * decoded->extra_channels().size() +
+                                     i];
+           CopyImageToWithPadding(r, dec_state->extra_channels[i],
+                                  /*padding=*/2, ec_input_rect, eti);
+           ec_rects.emplace_back(eti, ec_input_rect);
+         } else {
+           ec_rects.emplace_back(&decoded->extra_channels()[i], r);
+         }
+       }
+       if (!FinalizeImageRect(&dec_state->group_data[thread], group_data_rect,
+                              ec_rects, dec_state, thread, decoded,
+                              rects_to_process[rect_id])) {
+         apply_features_ok = false;
+       }
+     };
+ 
+     RunOnPool(pool, 0, rects_to_process.size(), allocate_storage,
+               run_apply_features, "ApplyFeatures");
+ 
+     if (!apply_features_ok) {
+       return JXL_FAILURE("FinalizeImageRect failed");
+     }
+   }
+ 
+   const size_t xsize = frame_dim.xsize_upsampled;
+   const size_t ysize = frame_dim.ysize_upsampled;
+ 
+   decoded->ShrinkTo(xsize, ysize);
+   if (dec_state->pre_color_transform_frame.xsize() != 0) {
+     dec_state->pre_color_transform_frame.ShrinkTo(xsize, ysize);
+   }
+ 
+   if (!skip_blending && ImageBlender::NeedsBlending(dec_state)) {
+     if (dec_state->pre_color_transform_frame.xsize() != 0) {
+       // Extra channels are going to be modified. Make a copy.
+       dec_state->pre_color_transform_ec.clear();
+       for (const auto& ec : decoded->extra_channels()) {
+         dec_state->pre_color_transform_ec.emplace_back(CopyImage(ec));
+       }
+     }
+     ImageBlender blender;
+     ImageBundle foreground = std::move(*decoded);
+     JXL_RETURN_IF_ERROR(blender.PrepareBlending(
+         dec_state, foreground.origin, foreground.xsize(), foreground.ysize(),
+         foreground.c_current(), /*output=*/decoded));
+ 
+     std::vector<Rect> rects_to_process;
+     for (size_t y = 0; y < frame_dim.ysize; y += kGroupDim) {
+       for (size_t x = 0; x < frame_dim.xsize; x += kGroupDim) {
+         Rect rect(x, y, kGroupDim, kGroupDim, frame_dim.xsize, frame_dim.ysize);
+         if (rect.xsize() == 0 || rect.ysize() == 0) continue;
+         rects_to_process.push_back(rect);
+       }
+     }
+ 
+     std::atomic<bool> blending_ok{true};
+     JXL_RETURN_IF_ERROR(RunOnPool(
+         pool, 0, rects_to_process.size(), ThreadPool::SkipInit(),
+         [&](size_t i, size_t /*thread*/) {
+           const Rect& rect = rects_to_process[i];
+           auto rect_blender = blender.PrepareRect(
+               rect, *foreground.color(), foreground.extra_channels(), rect);
+           for (size_t y = 0; y < rect.ysize(); ++y) {
+             if (!rect_blender.DoBlending(y)) {
+               blending_ok = false;
+               return;
+             }
+           }
+         },
+         "Blend"));
+     JXL_RETURN_IF_ERROR(blending_ok.load());
+   }
+ 
+   return true;
+ }
+ 
+ }  // namespace jxl
+ #endif  // HWY_ONCE

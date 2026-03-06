@@ -1,0 +1,1392 @@
+commit 4833cc89b2fae2e8863b46bf1dc785964847e882
+Author: Markus Scherer <markus.icu@gmail.com>
+Date:   Fri Apr 1 22:25:34 2022 +0000
+
+    ICU-20715 CollationDataBuilder reset outdated prefix+contraction values
+    
+    See #2052
+
+diff --git a/icu4c/source/i18n/collationdatabuilder.cpp b/icu4c/source/i18n/collationdatabuilder.cpp
+index b10de993c27..d6ef5171634 100644
+--- a/icu4c/source/i18n/collationdatabuilder.cpp
++++ b/icu4c/source/i18n/collationdatabuilder.cpp
+@@ -44,55 +44,67 @@ CollationDataBuilder::CEModifier::~CEModifier() {}
+ /**
+  * Build-time context and CE32 for a code point.
+  * If a code point has contextual mappings, then the default (no-context) mapping
+  * and all conditional mappings are stored in a singly-linked list
+  * of ConditionalCE32, sorted by context strings.
+  *
+  * Context strings sort by prefix length, then by prefix, then by contraction suffix.
+  * Context strings must be unique and in ascending order.
+  */
+ struct ConditionalCE32 : public UMemory {
+     ConditionalCE32()
+             : context(),
+               ce32(0), defaultCE32(Collation::NO_CE32), builtCE32(Collation::NO_CE32),
+               next(-1) {}
+     ConditionalCE32(const UnicodeString &ct, uint32_t ce)
+             : context(ct),
+               ce32(ce), defaultCE32(Collation::NO_CE32), builtCE32(Collation::NO_CE32),
+               next(-1) {}
+ 
+     inline UBool hasContext() const { return context.length() > 1; }
+     inline int32_t prefixLength() const { return context.charAt(0); }
+ 
+     /**
+      * "\0" for the first entry for any code point, with its default CE32.
+      *
+      * Otherwise one unit with the length of the prefix string,
+      * then the prefix string, then the contraction suffix.
+      */
+     UnicodeString context;
+     /**
+      * CE32 for the code point and its context.
+      * Can be special (e.g., for an expansion) but not contextual (prefix or contraction tag).
+      */
+     uint32_t ce32;
+     /**
+      * Default CE32 for all contexts with this same prefix.
+      * Initially NO_CE32. Set only while building runtime data structures,
+      * and only on one of the nodes of a sub-list with the same prefix.
+      */
+     uint32_t defaultCE32;
+     /**
+      * CE32 for the built contexts.
+      * When fetching CEs from the builder, the contexts are built into their runtime form
+      * so that the normal collation implementation can process them.
+      * The result is cached in the list head. It is reset when the contexts are modified.
++     * All of these builtCE32 are invalidated by clearContexts(),
++     * via incrementing the contextsEra.
+      */
+     uint32_t builtCE32;
++    /**
++     * The "era" of building intermediate contexts when the above builtCE32 was set.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     */
++    int32_t era = -1;
+     /**
+      * Index of the next ConditionalCE32.
+      * Negative for the end of the list.
+      */
+     int32_t next;
++    // Note: We could create a separate class for all of the contextual mappings for
++    // a code point, with the builtCE32, the era, and a list of the actual mappings.
++    // The class that represents one mapping would then not need to
++    // store those fields in each element.
+ };
+ 
+ U_CDECL_BEGIN
+@@ -257,28 +269,29 @@ uint32_t
+ DataBuilderCollationIterator::getCE32FromBuilderData(uint32_t ce32, UErrorCode &errorCode) {
+     if (U_FAILURE(errorCode)) { return 0; }
+     U_ASSERT(Collation::hasCE32Tag(ce32, Collation::BUILDER_DATA_TAG));
+     if((ce32 & CollationDataBuilder::IS_BUILDER_JAMO_CE32) != 0) {
+         UChar32 jamo = Collation::indexFromCE32(ce32);
+         return utrie2_get32(builder.trie, jamo);
+     } else {
+         ConditionalCE32 *cond = builder.getConditionalCE32ForCE32(ce32);
+         if (cond == nullptr) {
+             errorCode = U_INTERNAL_PROGRAM_ERROR;
+             // TODO: ICU-21531 figure out why this happens.
+             return 0;
+         }
+-        if(cond->builtCE32 == Collation::NO_CE32) {
++        if(cond->builtCE32 == Collation::NO_CE32 || cond->era != builder.contextsEra) {
+             // Build the context-sensitive mappings into their runtime form and cache the result.
+             cond->builtCE32 = builder.buildContext(cond, errorCode);
+             if(errorCode == U_BUFFER_OVERFLOW_ERROR) {
+                 errorCode = U_ZERO_ERROR;
+                 builder.clearContexts();
+                 cond->builtCE32 = builder.buildContext(cond, errorCode);
+             }
++            cond->era = builder.contextsEra;
+             builderData.contexts = builder.contexts.getBuffer();
+         }
+         return cond->builtCE32;
+     }
+ }
+ 
+ // ------------------------------------------------------------------------- ***
+@@ -1322,33 +1335,30 @@ CollationDataBuilder::buildMappings(CollationData &data, UErrorCode &errorCode)
+ void
+ CollationDataBuilder::clearContexts() {
+     contexts.remove();
+-    UnicodeSetIterator iter(contextChars);
+-    while(iter.next()) {
+-        U_ASSERT(!iter.isString());
+-        uint32_t ce32 = utrie2_get32(trie, iter.getCodepoint());
+-        U_ASSERT(isBuilderContextCE32(ce32));
+-        getConditionalCE32ForCE32(ce32)->builtCE32 = Collation::NO_CE32;
+-    }
++    // Incrementing the contexts build "era" invalidates all of the builtCE32
++    // from before this clearContexts() call.
++    // Simpler than finding and resetting all of those fields.
++    ++contextsEra;
+ }
+ 
+ void
+ CollationDataBuilder::buildContexts(UErrorCode &errorCode) {
+     if(U_FAILURE(errorCode)) { return; }
+     // Ignore abandoned lists and the cached builtCE32,
+     // and build all contexts from scratch.
+-    contexts.remove();
++    clearContexts();
+     UnicodeSetIterator iter(contextChars);
+     while(U_SUCCESS(errorCode) && iter.next()) {
+         U_ASSERT(!iter.isString());
+         UChar32 c = iter.getCodepoint();
+         uint32_t ce32 = utrie2_get32(trie, c);
+         if(!isBuilderContextCE32(ce32)) {
+             // Impossible: No context data for c in contextChars.
+             errorCode = U_INTERNAL_PROGRAM_ERROR;
+             return;
+         }
+         ConditionalCE32 *cond = getConditionalCE32ForCE32(ce32);
+         ce32 = buildContext(cond, errorCode);
+         utrie2_set32(trie, c, ce32, &errorCode);
+     }
+ }
+@@ -1357,109 +1367,125 @@ uint32_t
+ CollationDataBuilder::buildContext(ConditionalCE32 *head, UErrorCode &errorCode) {
+     if(U_FAILURE(errorCode)) { return 0; }
+     // The list head must have no context.
+     U_ASSERT(!head->hasContext());
+     // The list head must be followed by one or more nodes that all do have context.
+     U_ASSERT(head->next >= 0);
+     UCharsTrieBuilder prefixBuilder(errorCode);
+     UCharsTrieBuilder contractionBuilder(errorCode);
++    // This outer loop goes from each prefix to the next.
++    // For each prefix it finds the one or more same-prefix entries (firstCond..lastCond).
++    // If there are multiple suffixes for the same prefix,
++    // then an inner loop builds a contraction trie for them.
+     for(ConditionalCE32 *cond = head;; cond = getConditionalCE32(cond->next)) {
++        if(U_FAILURE(errorCode)) { return 0; }  // early out for memory allocation errors
+         // After the list head, the prefix or suffix can be empty, but not both.
+         U_ASSERT(cond == head || cond->hasContext());
+         int32_t prefixLength = cond->prefixLength();
+         UnicodeString prefix(cond->context, 0, prefixLength + 1);
+         // Collect all contraction suffixes for one prefix.
+         ConditionalCE32 *firstCond = cond;
+-        ConditionalCE32 *lastCond = cond;
+-        while(cond->next >= 0 &&
+-                (cond = getConditionalCE32(cond->next))->context.startsWith(prefix)) {
++        ConditionalCE32 *lastCond;
++        do {
+             lastCond = cond;
+-        }
++            // Clear the defaultCE32 fields as we go.
++            // They are left over from building a previous version of this list of contexts.
++            //
++            // One of the code paths below may copy a preceding defaultCE32
++            // into its emptySuffixCE32.
++            // If a new suffix has been inserted before what used to be
++            // the firstCond for its prefix, then that previous firstCond could still
++            // contain an outdated defaultCE32 from an earlier buildContext() and
++            // result in an incorrect emptySuffixCE32.
++            // So we reset all defaultCE32 before reading and setting new values.
++            cond->defaultCE32 = Collation::NO_CE32;
++        } while(cond->next >= 0 &&
++                (cond = getConditionalCE32(cond->next))->context.startsWith(prefix));
+         uint32_t ce32;
+         int32_t suffixStart = prefixLength + 1;  // == prefix.length()
+         if(lastCond->context.length() == suffixStart) {
+             // One prefix without contraction suffix.
+             U_ASSERT(firstCond == lastCond);
+             ce32 = lastCond->ce32;
+             cond = lastCond;
+         } else {
+             // Build the contractions trie.
+             contractionBuilder.clear();
+             // Entry for an empty suffix, to be stored before the trie.
+             uint32_t emptySuffixCE32 = 0;
+             uint32_t flags = 0;
+             if(firstCond->context.length() == suffixStart) {
+                 // There is a mapping for the prefix and the single character c. (p|c)
+                 // If no other suffix matches, then we return this value.
+                 emptySuffixCE32 = firstCond->ce32;
+                 cond = getConditionalCE32(firstCond->next);
+             } else {
+                 // There is no mapping for the prefix and just the single character.
+                 // (There is no p|c, only p|cd, p|ce etc.)
+                 flags |= Collation::CONTRACT_SINGLE_CP_NO_MATCH;
+                 // When the prefix matches but none of the prefix-specific suffixes,
+                 // then we fall back to the mappings with the next-longest prefix,
+                 // and ultimately to mappings with no prefix.
+                 // Each fallback might be another set of contractions.
+                 // For example, if there are mappings for ch, p|cd, p|ce, but not for p|c,
+                 // then in text "pch" we find the ch contraction.
+                 for(cond = head;; cond = getConditionalCE32(cond->next)) {
+                     int32_t length = cond->prefixLength();
+                     if(length == prefixLength) { break; }
+                     if(cond->defaultCE32 != Collation::NO_CE32 &&
+                             (length==0 || prefix.endsWith(cond->context, 1, length))) {
+                         emptySuffixCE32 = cond->defaultCE32;
+                     }
+                 }
+                 cond = firstCond;
+             }
+             // Optimization: Set a flag when
+             // the first character of every contraction suffix has lccc!=0.
+             // Short-circuits contraction matching when a normal letter follows.
+             flags |= Collation::CONTRACT_NEXT_CCC;
+             // Add all of the non-empty suffixes into the contraction trie.
+             for(;;) {
+                 UnicodeString suffix(cond->context, suffixStart);
+                 uint16_t fcd16 = nfcImpl.getFCD16(suffix.char32At(0));
+                 if(fcd16 <= 0xff) {
+                     flags &= ~Collation::CONTRACT_NEXT_CCC;
+                 }
+                 fcd16 = nfcImpl.getFCD16(suffix.char32At(suffix.length() - 1));
+                 if(fcd16 > 0xff) {
+                     // The last suffix character has lccc!=0, allowing for discontiguous contractions.
+                     flags |= Collation::CONTRACT_TRAILING_CCC;
+                 }
+                 contractionBuilder.add(suffix, (int32_t)cond->ce32, errorCode);
+                 if(cond == lastCond) { break; }
+                 cond = getConditionalCE32(cond->next);
+             }
+             int32_t index = addContextTrie(emptySuffixCE32, contractionBuilder, errorCode);
+             if(U_FAILURE(errorCode)) { return 0; }
+             if(index > Collation::MAX_INDEX) {
+                 errorCode = U_BUFFER_OVERFLOW_ERROR;
+                 return 0;
+             }
+             ce32 = Collation::makeCE32FromTagAndIndex(Collation::CONTRACTION_TAG, index) | flags;
+         }
+         U_ASSERT(cond == lastCond);
+         firstCond->defaultCE32 = ce32;
+         if(prefixLength == 0) {
+             if(cond->next < 0) {
+                 // No non-empty prefixes, only contractions.
+                 return ce32;
+             }
+         } else {
+             prefix.remove(0, 1);  // Remove the length unit.
+             prefix.reverse();
+             prefixBuilder.add(prefix, (int32_t)ce32, errorCode);
+             if(cond->next < 0) { break; }
+         }
+     }
+     U_ASSERT(head->defaultCE32 != Collation::NO_CE32);
+     int32_t index = addContextTrie(head->defaultCE32, prefixBuilder, errorCode);
+     if(U_FAILURE(errorCode)) { return 0; }
+     if(index > Collation::MAX_INDEX) {
+         errorCode = U_BUFFER_OVERFLOW_ERROR;
+         return 0;
+     }
+     return Collation::makeCE32FromTagAndIndex(Collation::PREFIX_TAG, index);
+ }
+diff --git a/icu4c/source/i18n/collationdatabuilder.h b/icu4c/source/i18n/collationdatabuilder.h
+index 6ae77772fd5..4b981118f11 100644
+--- a/icu4c/source/i18n/collationdatabuilder.h
++++ b/icu4c/source/i18n/collationdatabuilder.h
+@@ -42,213 +42,222 @@ class UCharsTrieBuilder;
+ /**
+  * Low-level CollationData builder.
+  * Takes (character, CE) pairs and builds them into runtime data structures.
+  * Supports characters with context prefixes and contraction suffixes.
+  */
+ class U_I18N_API CollationDataBuilder : public UObject {
+ public:
+     /**
+      * Collation element modifier. Interface class for a modifier
+      * that changes a tailoring builder's temporary CEs to final CEs.
+      * Called for every non-special CE32 and every expansion CE.
+      */
+     class CEModifier : public UObject {
+     public:
+         virtual ~CEModifier();
+         /** Returns a new CE to replace the non-special input CE32, or else Collation::NO_CE. */
+         virtual int64_t modifyCE32(uint32_t ce32) const = 0;
+         /** Returns a new CE to replace the input CE, or else Collation::NO_CE. */
+         virtual int64_t modifyCE(int64_t ce) const = 0;
+     };
+ 
+     CollationDataBuilder(UErrorCode &errorCode);
+ 
+     virtual ~CollationDataBuilder();
+ 
+     void initForTailoring(const CollationData *b, UErrorCode &errorCode);
+ 
+     virtual UBool isCompressibleLeadByte(uint32_t b) const;
+ 
+     inline UBool isCompressiblePrimary(uint32_t p) const {
+         return isCompressibleLeadByte(p >> 24);
+     }
+ 
+     /**
+      * @return true if this builder has mappings (e.g., add() has been called)
+      */
+     UBool hasMappings() const { return modified; }
+ 
+     /**
+      * @return true if c has CEs in this builder
+      */
+     UBool isAssigned(UChar32 c) const;
+ 
+     /**
+      * @return the three-byte primary if c maps to a single such CE and has no context data,
+      * otherwise returns 0.
+      */
+     uint32_t getLongPrimaryIfSingleCE(UChar32 c) const;
+ 
+     /**
+      * @return the single CE for c.
+      * Sets an error code if c does not have a single CE.
+      */
+     int64_t getSingleCE(UChar32 c, UErrorCode &errorCode) const;
+ 
+     void add(const UnicodeString &prefix, const UnicodeString &s,
+              const int64_t ces[], int32_t cesLength,
+              UErrorCode &errorCode);
+ 
+     /**
+      * Encodes the ces as either the returned ce32 by itself,
+      * or by storing an expansion, with the returned ce32 referring to that.
+      *
+      * add(p, s, ces, cesLength) = addCE32(p, s, encodeCEs(ces, cesLength))
+      */
+     virtual uint32_t encodeCEs(const int64_t ces[], int32_t cesLength, UErrorCode &errorCode);
+     void addCE32(const UnicodeString &prefix, const UnicodeString &s,
+                  uint32_t ce32, UErrorCode &errorCode);
+ 
+     /**
+      * Sets three-byte-primary CEs for a range of code points in code point order,
+      * if it is worth doing; otherwise no change is made.
+      * None of the code points in the range should have complex mappings so far
+      * (expansions/contractions/prefixes).
+      * @param start first code point
+      * @param end last code point (inclusive)
+      * @param primary primary weight for 'start'
+      * @param step per-code point primary-weight increment
+      * @param errorCode ICU in/out error code
+      * @return true if an OFFSET_TAG range was used for start..end
+      */
+     UBool maybeSetPrimaryRange(UChar32 start, UChar32 end,
+                                uint32_t primary, int32_t step,
+                                UErrorCode &errorCode);
+ 
+     /**
+      * Sets three-byte-primary CEs for a range of code points in code point order.
+      * Sets range values if that is worth doing, or else individual values.
+      * None of the code points in the range should have complex mappings so far
+      * (expansions/contractions/prefixes).
+      * @param start first code point
+      * @param end last code point (inclusive)
+      * @param primary primary weight for 'start'
+      * @param step per-code point primary-weight increment
+      * @param errorCode ICU in/out error code
+      * @return the next primary after 'end': start primary incremented by ((end-start)+1)*step
+      */
+     uint32_t setPrimaryRangeAndReturnNext(UChar32 start, UChar32 end,
+                                           uint32_t primary, int32_t step,
+                                           UErrorCode &errorCode);
+ 
+     /**
+      * Copies all mappings from the src builder, with modifications.
+      * This builder here must not be built yet, and should be empty.
+      */
+     void copyFrom(const CollationDataBuilder &src, const CEModifier &modifier,
+                   UErrorCode &errorCode);
+ 
+     void optimize(const UnicodeSet &set, UErrorCode &errorCode);
+     void suppressContractions(const UnicodeSet &set, UErrorCode &errorCode);
+ 
+     void enableFastLatin() { fastLatinEnabled = true; }
+     virtual void build(CollationData &data, UErrorCode &errorCode);
+ 
+     /**
+      * Looks up CEs for s and appends them to the ces array.
+      * Does not handle normalization: s should be in FCD form.
+      *
+      * Does not write completely ignorable CEs.
+      * Does not write beyond Collation::MAX_EXPANSION_LENGTH.
+      *
+      * @return incremented cesLength
+      */
+     int32_t getCEs(const UnicodeString &s, int64_t ces[], int32_t cesLength);
+     int32_t getCEs(const UnicodeString &prefix, const UnicodeString &s,
+                    int64_t ces[], int32_t cesLength);
+ 
+ protected:
+     friend class CopyHelper;
+     friend class DataBuilderCollationIterator;
+ 
+     uint32_t getCE32FromOffsetCE32(UBool fromBase, UChar32 c, uint32_t ce32) const;
+ 
+     int32_t addCE(int64_t ce, UErrorCode &errorCode);
+     int32_t addCE32(uint32_t ce32, UErrorCode &errorCode);
+     int32_t addConditionalCE32(const UnicodeString &context, uint32_t ce32, UErrorCode &errorCode);
+ 
+     inline ConditionalCE32 *getConditionalCE32(int32_t index) const {
+         return static_cast<ConditionalCE32 *>(conditionalCE32s[index]);
+     }
+     inline ConditionalCE32 *getConditionalCE32ForCE32(uint32_t ce32) const {
+         return getConditionalCE32(Collation::indexFromCE32(ce32));
+     }
+ 
+     static uint32_t makeBuilderContextCE32(int32_t index) {
+         return Collation::makeCE32FromTagAndIndex(Collation::BUILDER_DATA_TAG, index);
+     }
+     static inline UBool isBuilderContextCE32(uint32_t ce32) {
+         return Collation::hasCE32Tag(ce32, Collation::BUILDER_DATA_TAG);
+     }
+ 
+     static uint32_t encodeOneCEAsCE32(int64_t ce);
+     uint32_t encodeOneCE(int64_t ce, UErrorCode &errorCode);
+     uint32_t encodeExpansion(const int64_t ces[], int32_t length, UErrorCode &errorCode);
+     uint32_t encodeExpansion32(const int32_t newCE32s[], int32_t length, UErrorCode &errorCode);
+ 
+     uint32_t copyFromBaseCE32(UChar32 c, uint32_t ce32, UBool withContext, UErrorCode &errorCode);
+     /**
+      * Copies base contractions to a list of ConditionalCE32.
+      * Sets cond->next to the index of the first new item
+      * and returns the index of the last new item.
+      */
+     int32_t copyContractionsFromBaseCE32(UnicodeString &context, UChar32 c, uint32_t ce32,
+                                          ConditionalCE32 *cond, UErrorCode &errorCode);
+ 
+     UBool getJamoCE32s(uint32_t jamoCE32s[], UErrorCode &errorCode);
+     void setDigitTags(UErrorCode &errorCode);
+     void setLeadSurrogates(UErrorCode &errorCode);
+ 
+     void buildMappings(CollationData &data, UErrorCode &errorCode);
+ 
+     void clearContexts();
+     void buildContexts(UErrorCode &errorCode);
+     uint32_t buildContext(ConditionalCE32 *head, UErrorCode &errorCode);
+     int32_t addContextTrie(uint32_t defaultCE32, UCharsTrieBuilder &trieBuilder,
+                            UErrorCode &errorCode);
+ 
+     void buildFastLatinTable(CollationData &data, UErrorCode &errorCode);
+ 
+     int32_t getCEs(const UnicodeString &s, int32_t start, int64_t ces[], int32_t cesLength);
+ 
+     static UChar32 jamoCpFromIndex(int32_t i) {
+         // 0 <= i < CollationData::JAMO_CE32S_LENGTH = 19 + 21 + 27
+         if(i < Hangul::JAMO_L_COUNT) { return Hangul::JAMO_L_BASE + i; }
+         i -= Hangul::JAMO_L_COUNT;
+         if(i < Hangul::JAMO_V_COUNT) { return Hangul::JAMO_V_BASE + i; }
+         i -= Hangul::JAMO_V_COUNT;
+         // i < 27
+         return Hangul::JAMO_T_BASE + 1 + i;
+     }
+ 
+     /** @see Collation::BUILDER_DATA_TAG */
+     static const uint32_t IS_BUILDER_JAMO_CE32 = 0x100;
+ 
+     const Normalizer2Impl &nfcImpl;
+     const CollationData *base;
+     const CollationSettings *baseSettings;
+     UTrie2 *trie;
+     UVector32 ce32s;
+     UVector64 ce64s;
+     UVector conditionalCE32s;  // vector of ConditionalCE32
+     // Characters that have context (prefixes or contraction suffixes).
+     UnicodeSet contextChars;
+     // Serialized UCharsTrie structures for finalized contexts.
+     UnicodeString contexts;
++private:
++    /**
++     * The "era" of building intermediate contexts.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     * See ConditionalCE32::era.
++     */
++    int32_t contextsEra = 0;
++protected:
+     UnicodeSet unsafeBackwardSet;
+     UBool modified;
+ 
+     UBool fastLatinEnabled;
+     CollationFastLatinBuilder *fastLatinBuilder;
+ 
+     DataBuilderCollationIterator *collIter;
+ };
+diff --git a/icu4c/source/test/intltest/collationtest.cpp b/icu4c/source/test/intltest/collationtest.cpp
+index 4ce9ada56ca..5cc45a5423d 100644
+--- a/icu4c/source/test/intltest/collationtest.cpp
++++ b/icu4c/source/test/intltest/collationtest.cpp
+@@ -58,74 +58,75 @@ class CodePointIterator;
+ class CollationTest : public IntlTest {
+ public:
+     CollationTest()
+             : fcd(NULL), nfd(NULL),
+               fileLineNumber(0),
+               coll(NULL) {}
+ 
+     ~CollationTest() {
+         delete coll;
+     }
+ 
+     void runIndexedTest(int32_t index, UBool exec, const char *&name, char *par=NULL) override;
+ 
+     void TestMinMax();
+     void TestImplicits();
+     void TestNulTerminated();
+     void TestIllegalUTF8();
+     void TestShortFCDData();
+     void TestFCD();
+     void TestCollationWeights();
+     void TestRootElements();
+     void TestTailoredElements();
+     void TestDataDriven();
+     void TestLongLocale();
++    void TestBuilderContextsOverflow();
+ 
+ private:
+     void checkFCD(const char *name, CollationIterator &ci, CodePointIterator &cpi);
+     void checkAllocWeights(CollationWeights &cw,
+                            uint32_t lowerLimit, uint32_t upperLimit, int32_t n,
+                            int32_t someLength, int32_t minCount);
+ 
+     static UnicodeString printSortKey(const uint8_t *p, int32_t length);
+     static UnicodeString printCollationKey(const CollationKey &key);
+ 
+     // Helpers & fields for data-driven test.
+     static UBool isCROrLF(UChar c) { return c == 0xa || c == 0xd; }
+     static UBool isSpace(UChar c) { return c == 9 || c == 0x20 || c == 0x3000; }
+     static UBool isSectionStarter(UChar c) { return c == 0x25 || c == 0x2a || c == 0x40; }  // %*@
+     int32_t skipSpaces(int32_t i) {
+         while(isSpace(fileLine[i])) { ++i; }
+         return i;
+     }
+ 
+     UBool readNonEmptyLine(UCHARBUF *f, IcuTestErrorCode &errorCode);
+     void parseString(int32_t &start, UnicodeString &prefix, UnicodeString &s, UErrorCode &errorCode);
+     Collation::Level parseRelationAndString(UnicodeString &s, IcuTestErrorCode &errorCode);
+     void parseAndSetAttribute(IcuTestErrorCode &errorCode);
+     void parseAndSetReorderCodes(int32_t start, IcuTestErrorCode &errorCode);
+     void buildTailoring(UCHARBUF *f, IcuTestErrorCode &errorCode);
+     void setRootCollator(IcuTestErrorCode &errorCode);
+     void setLocaleCollator(IcuTestErrorCode &errorCode);
+ 
+     UBool needsNormalization(const UnicodeString &s, UErrorCode &errorCode) const;
+ 
+     UBool getSortKeyParts(const UChar *s, int32_t length,
+                           CharString &dest, int32_t partSize,
+                           IcuTestErrorCode &errorCode);
+     UBool getCollationKey(const char *norm, const UnicodeString &line,
+                           const UChar *s, int32_t length,
+                           CollationKey &key, IcuTestErrorCode &errorCode);
+     UBool getMergedCollationKey(const UChar *s, int32_t length,
+                                 CollationKey &key, IcuTestErrorCode &errorCode);
+     UBool checkCompareTwo(const char *norm, const UnicodeString &prevFileLine,
+                           const UnicodeString &prevString, const UnicodeString &s,
+                           UCollationResult expectedOrder, Collation::Level expectedLevel,
+                           IcuTestErrorCode &errorCode);
+     void checkCompareStrings(UCHARBUF *f, IcuTestErrorCode &errorCode);
+ 
+     const Normalizer2 *fcd, *nfd;
+     UnicodeString fileLine;
+     int32_t fileLineNumber;
+     UnicodeString fileTestName;
+     Collator *coll;
+ };
+@@ -137,19 +138,20 @@ extern IntlTest *createCollationTest() {
+ void CollationTest::runIndexedTest(int32_t index, UBool exec, const char *&name, char * /*par*/) {
+     if(exec) {
+         logln("TestSuite CollationTest: ");
+     }
+     TESTCASE_AUTO_BEGIN;
+     TESTCASE_AUTO(TestMinMax);
+     TESTCASE_AUTO(TestImplicits);
+     TESTCASE_AUTO(TestNulTerminated);
+     TESTCASE_AUTO(TestIllegalUTF8);
+     TESTCASE_AUTO(TestShortFCDData);
+     TESTCASE_AUTO(TestFCD);
+     TESTCASE_AUTO(TestCollationWeights);
+     TESTCASE_AUTO(TestRootElements);
+     TESTCASE_AUTO(TestTailoredElements);
+     TESTCASE_AUTO(TestDataDriven);
+     TESTCASE_AUTO(TestLongLocale);
++    TESTCASE_AUTO(TestBuilderContextsOverflow);
+     TESTCASE_AUTO_END;
+ }
+ 
+@@ -1857,9 +1859,37 @@ void CollationTest::TestDataDriven() {
+ void CollationTest::TestLongLocale() {
+     IcuTestErrorCode errorCode(*this, "TestLongLocale");
+     Locale longLocale("sie__1G_C_CEIE_CEZCX_CSUE_E_EIESZNI2_GB_LM_LMCSUE_LMCSX_"
+                       "LVARIANT_MMCSIE_STEU_SU1GCEIE_SU6G_SU6SU6G_U_UBGE_UC_"
+                       "UCEZCSI_UCIE_UZSIU_VARIANT_X@collation=bcs-ukvsz");
+     LocalPointer<Collator> coll(Collator::createInstance(longLocale, errorCode));
+ }
+ 
++void CollationTest::TestBuilderContextsOverflow() {
++    IcuTestErrorCode errorCode(*this, "TestBuilderContextsOverflow");
++    // ICU-20715: Bad memory access in what looks like a bogus CharsTrie after
++    // intermediate contextual-mappings data overflowed.
++    // Caused by the CollationDataBuilder using some outdated values when building
++    // contextual mappings with both prefix and contraction matching.
++    // Fixed by resetting those outdated values before code looks at them.
++    char16_t rules[] = {
++        u'&', 0x10, 0x2ff, 0x503c, 0x4617,
++        u'=', 0x80, 0x4f7f, 0xff, 0x3c3d, 0x1c4f, 0x3c3c,
++        u'<', 0, 0, 0, 0, u'|', 0, 0, 0, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f, 0xff,
++        u'=', 0, u'|', 0, 0, 0, 0, 0, 0, 0x1f00, 0xe30,
++        0x3035, 0, 0, 0xd200, 0, 0x7f00, 0xff4f, 0x3d00, 0, 0x7c00,
++        0, 0, 0, 0, 0, 0, 0, 0x301f, 0x350e, 0x30,
++        0, 0, 0xd2, 0x7c00, 0, 0, 0, 0, 0, 0,
++        0, 0x301f, 0x350e, 0x30, 0, 0, 0x52d2, 0x2f3c, 0x5552, 0x493c,
++        0x1f10, 0x1f50, 0x300, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f,
++        0xff,
++        u'=', 0, u'|', 0, 0, 0, 0, 0x5000, 0x4617,
++        u'=', 0x80, 0x4f7f, 0, 0, 0xd200, 0
++    };
++    UnicodeString s(false, rules, UPRV_LENGTHOF(rules));
++    LocalPointer<Collator> coll(new RuleBasedCollator(s, errorCode), errorCode);
++    if(errorCode.isSuccess()) {
++        logln("successfully built the Collator");
++    }
++}
++
+ #endif  // !UCONFIG_NO_COLLATION
+diff --git a/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java b/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
+index 9f424ff67e2..675dcb61069 100644
+--- a/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
++++ b/icu4j/main/classes/collate/src/com/ibm/icu/impl/coll/CollationDataBuilder.java
+@@ -38,27 +38,27 @@ final class CollationDataBuilder {  // not final in C++
+     /**
+      * Collation element modifier. Interface class for a modifier
+      * that changes a tailoring builder's temporary CEs to final CEs.
+      * Called for every non-special CE32 and every expansion CE.
+      */
+     interface CEModifier {
+         /** Returns a new CE to replace the non-special input CE32, or else Collation.NO_CE. */
+         long modifyCE32(int ce32);
+         /** Returns a new CE to replace the input CE, or else Collation.NO_CE. */
+         long modifyCE(long ce);
+     }
+ 
+     CollationDataBuilder() {
+         nfcImpl = Norm2AllModes.getNFCInstance().impl;
+         base = null;
+         baseSettings = null;
+         trie = null;
+         ce32s = new UVector32();
+         ce64s = new UVector64();
+-        conditionalCE32s = new ArrayList<ConditionalCE32>();
++        conditionalCE32s = new ArrayList<>();
+         modified = false;
+         fastLatinEnabled = false;
+         fastLatinBuilder = null;
+         collIter = null;
+         // Reserve the first CE32 for U+0000.
+         ce32s.addElement(0);
+     }
+@@ -344,54 +344,66 @@ int getCEs(CharSequence prefix, CharSequence s, long ces[], int cesLength) {
+     /**
+      * Build-time context and CE32 for a code point.
+      * If a code point has contextual mappings, then the default (no-context) mapping
+      * and all conditional mappings are stored in a singly-linked list
+      * of ConditionalCE32, sorted by context strings.
+      *
+      * Context strings sort by prefix length, then by prefix, then by contraction suffix.
+      * Context strings must be unique and in ascending order.
+      */
+     private static final class ConditionalCE32 {
+         ConditionalCE32(String ct, int ce) {
+             context = ct;
+             ce32 = ce;
+             defaultCE32 = Collation.NO_CE32;
+             builtCE32 = Collation.NO_CE32;
+             next = -1;
+         }
+ 
+         boolean hasContext() { return context.length() > 1; }
+         int prefixLength() { return context.charAt(0); }
+ 
+         /**
+          * "\0" for the first entry for any code point, with its default CE32.
+          *
+          * Otherwise one unit with the length of the prefix string,
+          * then the prefix string, then the contraction suffix.
+          */
+         String context;
+         /**
+          * CE32 for the code point and its context.
+          * Can be special (e.g., for an expansion) but not contextual (prefix or contraction tag).
+          */
+         int ce32;
+         /**
+          * Default CE32 for all contexts with this same prefix.
+          * Initially NO_CE32. Set only while building runtime data structures,
+          * and only on one of the nodes of a sub-list with the same prefix.
+          */
+         int defaultCE32;
+         /**
+          * CE32 for the built contexts.
+          * When fetching CEs from the builder, the contexts are built into their runtime form
+          * so that the normal collation implementation can process them.
+          * The result is cached in the list head. It is reset when the contexts are modified.
++         * All of these builtCE32 are invalidated by clearContexts(),
++         * via incrementing the contextsEra.
+          */
+         int builtCE32;
++        /**
++         * The "era" of building intermediate contexts when the above builtCE32 was set.
++         * When the array of cached, temporary contexts overflows, then clearContexts()
++         * removes them all and invalidates the builtCE32 that used to point to built tries.
++         */
++        int era = -1;
+         /**
+          * Index of the next ConditionalCE32.
+          * Negative for the end of the list.
+          */
+         int next;
++        // Note: We could create a separate class for all of the contextual mappings for
++        // a code point, with the builtCE32, the era, and a list of the actual mappings.
++        // The class that represents one mapping would then not need to
++        // store those fields in each element.
+     }
+ 
+     protected int getCE32FromOffsetCE32(boolean fromBase, int c, int ce32) {
+@@ -413,9 +425,9 @@ protected int addCE(long ce) {
+     protected int addCE32(int ce32) {
+         int length = ce32s.size();
+         for(int i = 0; i < length; ++i) {
+             if(ce32 == ce32s.elementAti(i)) { return i; }
+         }
+-        ce32s.addElement(ce32);  
++        ce32s.addElement(ce32);
+         return length;
+     }
+ 
+@@ -989,29 +1001,26 @@ protected void buildMappings(CollationData data) {
+ 
+     protected void clearContexts() {
+         contexts.setLength(0);
+-        UnicodeSetIterator iter = new UnicodeSetIterator(contextChars);
+-        while(iter.next()) {
+-            assert(iter.codepoint != UnicodeSetIterator.IS_STRING);
+-            int ce32 = trie.get(iter.codepoint);
+-            assert(isBuilderContextCE32(ce32));
+-            getConditionalCE32ForCE32(ce32).builtCE32 = Collation.NO_CE32;
+-        }
++        // Incrementing the contexts build "era" invalidates all of the builtCE32
++        // from before this clearContexts() call.
++        // Simpler than finding and resetting all of those fields.
++        ++contextsEra;
+     }
+ 
+     protected void buildContexts() {
+         // Ignore abandoned lists and the cached builtCE32,
+         // and build all contexts from scratch.
+-        contexts.setLength(0);
++        clearContexts();
+         UnicodeSetIterator iter = new UnicodeSetIterator(contextChars);
+         while(iter.next()) {
+             assert(iter.codepoint != UnicodeSetIterator.IS_STRING);
+             int c = iter.codepoint;
+             int ce32 = trie.get(c);
+             if(!isBuilderContextCE32(ce32)) {
+                 throw new AssertionError("Impossible: No context data for c in contextChars.");
+             }
+             ConditionalCE32 cond = getConditionalCE32ForCE32(ce32);
+             ce32 = buildContext(cond);
+             trie.set(c, ce32);
+         }
+     }
+@@ -1019,111 +1028,133 @@ protected void buildContexts() {
+     protected int buildContext(ConditionalCE32 head) {
+         // The list head must have no context.
+         assert(!head.hasContext());
+         // The list head must be followed by one or more nodes that all do have context.
+         assert(head.next >= 0);
+-        CharsTrieBuilder prefixBuilder = new CharsTrieBuilder();
+-        CharsTrieBuilder contractionBuilder = new CharsTrieBuilder();
++        CharsTrieBuilder prefixBuilder = null;
++        CharsTrieBuilder contractionBuilder = null;
++        // This outer loop goes from each prefix to the next.
++        // For each prefix it finds the one or more same-prefix entries (firstCond..lastCond).
++        // If there are multiple suffixes for the same prefix,
++        // then an inner loop builds a contraction trie for them.
+         for(ConditionalCE32 cond = head;; cond = getConditionalCE32(cond.next)) {
+             // After the list head, the prefix or suffix can be empty, but not both.
+             assert(cond == head || cond.hasContext());
+             int prefixLength = cond.prefixLength();
+             StringBuilder prefix = new StringBuilder().append(cond.context, 0, prefixLength + 1);
+             String prefixString = prefix.toString();
+             // Collect all contraction suffixes for one prefix.
+             ConditionalCE32 firstCond = cond;
+-            ConditionalCE32 lastCond = cond;
+-            while(cond.next >= 0 &&
+-                    (cond = getConditionalCE32(cond.next)).context.startsWith(prefixString)) {
++            ConditionalCE32 lastCond;
++            do {
+                 lastCond = cond;
+-            }
++                // Clear the defaultCE32 fields as we go.
++                // They are left over from building a previous version of this list of contexts.
++                //
++                // One of the code paths below may copy a preceding defaultCE32
++                // into its emptySuffixCE32.
++                // If a new suffix has been inserted before what used to be
++                // the firstCond for its prefix, then that previous firstCond could still
++                // contain an outdated defaultCE32 from an earlier buildContext() and
++                // result in an incorrect emptySuffixCE32.
++                // So we reset all defaultCE32 before reading and setting new values.
++                cond.defaultCE32 = Collation.NO_CE32;
++            } while(cond.next >= 0 &&
++                    (cond = getConditionalCE32(cond.next)).context.startsWith(prefixString));
+             int ce32;
+             int suffixStart = prefixLength + 1;  // == prefix.length()
+             if(lastCond.context.length() == suffixStart) {
+                 // One prefix without contraction suffix.
+                 assert(firstCond == lastCond);
+                 ce32 = lastCond.ce32;
+                 cond = lastCond;
+             } else {
+                 // Build the contractions trie.
+-                contractionBuilder.clear();
++                if(contractionBuilder == null) {
++                    contractionBuilder = new CharsTrieBuilder();
++                } else {
++                    contractionBuilder.clear();
++                }
+                 // Entry for an empty suffix, to be stored before the trie.
+                 int emptySuffixCE32 = Collation.NO_CE32;  // Will always be set to a real value.
+                 int flags = 0;
+                 if(firstCond.context.length() == suffixStart) {
+                     // There is a mapping for the prefix and the single character c. (p|c)
+                     // If no other suffix matches, then we return this value.
+                     emptySuffixCE32 = firstCond.ce32;
+                     cond = getConditionalCE32(firstCond.next);
+                 } else {
+                     // There is no mapping for the prefix and just the single character.
+                     // (There is no p|c, only p|cd, p|ce etc.)
+                     flags |= Collation.CONTRACT_SINGLE_CP_NO_MATCH;
+                     // When the prefix matches but none of the prefix-specific suffixes,
+                     // then we fall back to the mappings with the next-longest prefix,
+                     // and ultimately to mappings with no prefix.
+                     // Each fallback might be another set of contractions.
+                     // For example, if there are mappings for ch, p|cd, p|ce, but not for p|c,
+                     // then in text "pch" we find the ch contraction.
+                     for(cond = head;; cond = getConditionalCE32(cond.next)) {
+                         int length = cond.prefixLength();
+                         if(length == prefixLength) { break; }
+                         if(cond.defaultCE32 != Collation.NO_CE32 &&
+                                 (length==0 || prefixString.regionMatches(
+                                         prefix.length() - length, cond.context, 1, length)
+                                         /* C++: prefix.endsWith(cond.context, 1, length) */)) {
+                             emptySuffixCE32 = cond.defaultCE32;
+                         }
+                     }
+                     cond = firstCond;
+                 }
+                 // Optimization: Set a flag when
+                 // the first character of every contraction suffix has lccc!=0.
+                 // Short-circuits contraction matching when a normal letter follows.
+                 flags |= Collation.CONTRACT_NEXT_CCC;
+                 // Add all of the non-empty suffixes into the contraction trie.
+                 for(;;) {
+                     String suffix = cond.context.substring(suffixStart);
+                     int fcd16 = nfcImpl.getFCD16(suffix.codePointAt(0));
+                     if(fcd16 <= 0xff) {
+                         flags &= ~Collation.CONTRACT_NEXT_CCC;
+                     }
+                     fcd16 = nfcImpl.getFCD16(suffix.codePointBefore(suffix.length()));
+                     if(fcd16 > 0xff) {
+                         // The last suffix character has lccc!=0, allowing for discontiguous contractions.
+                         flags |= Collation.CONTRACT_TRAILING_CCC;
+                     }
+                     contractionBuilder.add(suffix, cond.ce32);
+                     if(cond == lastCond) { break; }
+                     cond = getConditionalCE32(cond.next);
+                 }
+                 int index = addContextTrie(emptySuffixCE32, contractionBuilder);
+                 if(index > Collation.MAX_INDEX) {
+                     throw new IndexOutOfBoundsException("too many context-sensitive mappings");
+                     // BufferOverflowException is a better fit
+                     // but cannot be constructed with a message string.
+                 }
+                 ce32 = Collation.makeCE32FromTagAndIndex(Collation.CONTRACTION_TAG, index) | flags;
+             }
+             assert(cond == lastCond);
+             firstCond.defaultCE32 = ce32;
+             if(prefixLength == 0) {
+                 if(cond.next < 0) {
+                     // No non-empty prefixes, only contractions.
+                     return ce32;
+                 }
+             } else {
+                 prefix.delete(0, 1);  // Remove the length unit.
+                 prefix.reverse();
++                if(prefixBuilder == null) {
++                    prefixBuilder = new CharsTrieBuilder();
++                }
+                 prefixBuilder.add(prefix, ce32);
+                 if(cond.next < 0) { break; }
+             }
+         }
+         assert(head.defaultCE32 != Collation.NO_CE32);
+         int index = addContextTrie(head.defaultCE32, prefixBuilder);
+         if(index > Collation.MAX_INDEX) {
+             throw new IndexOutOfBoundsException("too many context-sensitive mappings");
+             // BufferOverflowException is a better fit
+             // but cannot be constructed with a message string.
+         }
+         return Collation.makeCE32FromTagAndIndex(Collation.PREFIX_TAG, index);
+     }
+@@ -1299,28 +1330,29 @@ protected int getDataCE32(int c) {
+         @Override
+         protected int getCE32FromBuilderData(int ce32) {
+             assert(Collation.hasCE32Tag(ce32, Collation.BUILDER_DATA_TAG));
+             if((ce32 & CollationDataBuilder.IS_BUILDER_JAMO_CE32) != 0) {
+                 int jamo = Collation.indexFromCE32(ce32);
+                 return builder.trie.get(jamo);
+             } else {
+                 ConditionalCE32 cond = builder.getConditionalCE32ForCE32(ce32);
+-                if(cond.builtCE32 == Collation.NO_CE32) {
++                if(cond.builtCE32 == Collation.NO_CE32 || cond.era != builder.contextsEra) {
+                     // Build the context-sensitive mappings into their runtime form and cache the result.
+                     try {
+                         cond.builtCE32 = builder.buildContext(cond);
+                     } catch(IndexOutOfBoundsException e) {
+                         builder.clearContexts();
+                         cond.builtCE32 = builder.buildContext(cond);
+                     }
++                    cond.era = builder.contextsEra;
+                     builderData.contexts = builder.contexts.toString();
+                 }
+                 return cond.builtCE32;
+             }
+         }
+ 
+         protected final CollationDataBuilder builder;
+         protected final CollationData builderData;
+         protected final int[] jamoCE32s = new int[CollationData.JAMO_CE32S_LENGTH];
+         protected CharSequence s;
+         protected int pos;
+     }
+@@ -1328,28 +1360,35 @@ protected int getCE32FromBuilderData(int ce32) {
+     protected final boolean isMutable() {
+         // C++ tests !(trie == NULL || utrie2_isFrozen(trie))
+         // but Java Trie2Writable does not have an observable isFrozen() state.
+         return trie != null && unsafeBackwardSet != null && !unsafeBackwardSet.isFrozen();
+     }
+ 
+     /** @see Collation.BUILDER_DATA_TAG */
+     private static final int IS_BUILDER_JAMO_CE32 = 0x100;
+ 
+     protected Normalizer2Impl nfcImpl;
+     protected CollationData base;
+     protected CollationSettings baseSettings;
+     protected Trie2Writable trie;
+     protected UVector32 ce32s;
+     protected UVector64 ce64s;
+     protected ArrayList<ConditionalCE32> conditionalCE32s;  // vector of ConditionalCE32
+     // Characters that have context (prefixes or contraction suffixes).
+     protected UnicodeSet contextChars = new UnicodeSet();
+     // Serialized UCharsTrie structures for finalized contexts.
+     protected StringBuilder contexts = new StringBuilder();
++    /**
++     * The "era" of building intermediate contexts.
++     * When the array of cached, temporary contexts overflows, then clearContexts()
++     * removes them all and invalidates the builtCE32 that used to point to built tries.
++     * See {@link ConditionalCE32#era}.
++     */
++    private int contextsEra = 0;
+     protected UnicodeSet unsafeBackwardSet = new UnicodeSet();
+     protected boolean modified;
+ 
+     protected boolean fastLatinEnabled;
+     protected CollationFastLatinBuilder fastLatinBuilder;
+ 
+     protected DataBuilderCollationIterator collIter;
+ }
+diff --git a/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java b/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
+index 28f893a5c19..dce9312a95b 100644
+--- a/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
++++ b/icu4j/main/tests/collate/src/com/ibm/icu/dev/test/collator/CollationTest.java
+@@ -946,63 +946,63 @@ public void TestRootElements() {
+     @Test
+     public void TestTailoredElements() {
+         CollationData root = CollationRoot.getData();
+         CollationRootElements rootElements = new CollationRootElements(root.rootElements);
+ 
+-        Set<String> prevLocales = new HashSet<String>();
++        Set<String> prevLocales = new HashSet<>();
+         prevLocales.add("");
+         prevLocales.add("root");
+         prevLocales.add("root@collation=standard");
+ 
+         long[] ces;
+         ULocale[] locales = Collator.getAvailableULocales();
+         String localeID = "root";
+         int locIdx = 0;
+ 
+         for (; locIdx < locales.length; localeID = locales[locIdx++].getName()) {
+             ULocale locale = new ULocale(localeID);
+             String[] types = Collator.getKeywordValuesForLocale("collation", locale, false);
+             for (int typeIdx = 0; typeIdx < types.length; ++typeIdx) {
+                 String type = types[typeIdx];  // first: default type
+                 if (type.startsWith("private-")) {
+                     errln("Collator.getKeywordValuesForLocale(" + localeID +
+                             ") returns private collation keyword: " + type);
+                 }
+                 ULocale localeWithType = locale.setKeywordValue("collation", type);
+                 Collator coll = Collator.getInstance(localeWithType);
+                 ULocale actual = coll.getLocale(ULocale.ACTUAL_LOCALE);
+                 if (prevLocales.contains(actual.getName())) {
+                     continue;
+                 }
+                 prevLocales.add(actual.getName());
+                 logln("TestTailoredElements(): requested " + localeWithType.getName()
+                         + " -> actual " + actual.getName());
+                 if (!(coll instanceof RuleBasedCollator)) {
+                     continue;
+                 }
+                 RuleBasedCollator rbc = (RuleBasedCollator) coll;
+ 
+                 // Note: It would be better to get tailored strings such that we can
+                 // identify the prefix, and only get the CEs for the prefix+string,
+                 // not also for the prefix.
+                 // There is currently no API for that.
+                 // It would help in an unusual case where a contraction starting in the prefix
+                 // extends past its end, and we do not see the intended mapping.
+                 // For example, for a mapping p|st, if there is also a contraction ps,
+                 // then we get CEs(ps)+CEs(t), rather than CEs(p|st).
+                 UnicodeSet tailored = coll.getTailoredSet();
+                 UnicodeSetIterator iter = new UnicodeSetIterator(tailored);
+                 while (iter.next()) {
+                     String s = iter.getString();
+                     ces = rbc.internalGetCEs(s);
+                     for (int i = 0; i < ces.length; ++i) {
+                         long ce = ces[i];
+                         if (!isValidCE(rootElements, root, ce)) {
+                             logln(prettify(s));
+                             errln("invalid tailored CE 0x" + Utility.hex(ce, 16)
+                                     + " at CE index " + i + " from string:");
+                         }
+                     }
+                 }
+             }
+         }
+     }
+@@ -1104,59 +1104,59 @@ private int parseString(int start, Output<String> prefix, Output<String> s) thro
+     private int parseRelationAndString(Output<String> s) throws ParseException {
+         int relation = Collation.NO_LEVEL;
+         int start;
+         if (fileLine.charAt(0) == '<') {
+             char second = fileLine.charAt(1);
+             start = 2;
+             switch(second) {
+             case 0x31:  // <1
+                 relation = Collation.PRIMARY_LEVEL;
+                 break;
+             case 0x32:  // <2
+                 relation = Collation.SECONDARY_LEVEL;
+                 break;
+             case 0x33:  // <3
+                 relation = Collation.TERTIARY_LEVEL;
+                 break;
+             case 0x34:  // <4
+                 relation = Collation.QUATERNARY_LEVEL;
+                 break;
+             case 0x63:  // <c
+                 relation = Collation.CASE_LEVEL;
+                 break;
+             case 0x69:  // <i
+                 relation = Collation.IDENTICAL_LEVEL;
+                 break;
+             default:  // just <
+                 relation = Collation.NO_LEVEL;
+                 start = 1;
+                 break;
+             }
+         } else if (fileLine.charAt(0) == '=') {
+             relation = Collation.ZERO_LEVEL;
+             start = 1;
+         } else {
+             start = 0;
+         }
+ 
+         if (start == 0 || !isSpace(fileLine.charAt(start))) {
+             logln(fileLine);
+             throw new ParseException("no relation (= < <1 <2 <c <3 <4 <i) at beginning of line "
+                                         + fileLineNumber, fileLineNumber);
+         }
+ 
+         start = skipSpaces(start);
+-        Output<String> prefixOut = new Output<String>();
++        Output<String> prefixOut = new Output<>();
+         start = parseString(start, prefixOut, s);
+         if (prefixOut.value != null) {
+             logln(fileLine);
+             throw new ParseException("prefix string not allowed for test string: on line "
+                                         + fileLineNumber, fileLineNumber);
+         }
+         if (start < fileLine.length()) {
+             logln(fileLine);
+             throw new ParseException("unexpected line contents after test string on line "
+                                         + fileLineNumber, fileLineNumber);
+         }
+ 
+         return relation;
+     }
+@@ -1491,114 +1491,114 @@ private static int getDifferenceLevel(CollationKey prevKey, CollationKey key,
+     private boolean checkCompareTwo(String norm, String prevFileLine, String prevString, String s,
+                                     int expectedOrder, int expectedLevel) {
+         // Get the sort keys first, for error debug output.
+-        Output<CollationKey> prevKeyOut = new Output<CollationKey>();
++        Output<CollationKey> prevKeyOut = new Output<>();
+         CollationKey prevKey;
+         if (!getCollationKey(norm, fileLine, prevString, prevKeyOut)) {
+             return false;
+         }
+         prevKey = prevKeyOut.value;
+ 
+-        Output<CollationKey> keyOut = new Output<CollationKey>();
++        Output<CollationKey> keyOut = new Output<>();
+         CollationKey key;
+         if (!getCollationKey(norm, fileLine, s, keyOut)) {
+             return false;
+         }
+         key = keyOut.value;
+ 
+         int order = coll.compare(prevString, s);
+         if (order != expectedOrder) {
+             logln(fileTestName);
+             logln(prevFileLine);
+             logln(fileLine);
+             logln(printCollationKey(prevKey));
+             logln(printCollationKey(key));
+             errln("line " + fileLineNumber
+                     + " Collator(" + norm + ").compare(previous, current) wrong order: "
+                     + order + " != " + expectedOrder);
+             return false;
+         }
+         order = coll.compare(s, prevString);
+         if (order != -expectedOrder) {
+             logln(fileTestName);
+             logln(prevFileLine);
+             logln(fileLine);
+             logln(printCollationKey(prevKey));
+             logln(printCollationKey(key));
+             errln("line " + fileLineNumber
+                     + " Collator(" + norm + ").compare(current, previous) wrong order: "
+                     + order + " != " + -expectedOrder);
+             return false;
+         }
+ 
+         order = prevKey.compareTo(key);
+         if (order != expectedOrder) {
+             logln(fileTestName);
+             logln(prevFileLine);
+             logln(fileLine);
+             logln(printCollationKey(prevKey));
+             logln(printCollationKey(key));
+             errln("line " + fileLineNumber
+                     + " Collator(" + norm + ").getCollationKey(previous, current).compareTo() wrong order: "
+                     + order + " != " + expectedOrder);
+             return false;
+         }
+         boolean collHasCaseLevel = ((RuleBasedCollator)coll).isCaseLevel();
+         int level = getDifferenceLevel(prevKey, key, order, collHasCaseLevel);
+         if (order != Collation.EQUAL && expectedLevel != Collation.NO_LEVEL) {
+             if (level != expectedLevel) {
+                 logln(fileTestName);
+                 logln(prevFileLine);
+                 logln(fileLine);
+                 logln(printCollationKey(prevKey));
+                 logln(printCollationKey(key));
+                 errln("line " + fileLineNumber
+                         + " Collator(" + norm + ").getCollationKey(previous, current).compareTo()="
+                         + order + " wrong level: " + level + " != " + expectedLevel);
+                 return false;
+             }
+         }
+ 
+         // If either string contains U+FFFE, then their sort keys must compare the same as
+         // the merged sort keys of each string's between-FFFE segments.
+         //
+         // It is not required that
+         //   sortkey(str1 + "\uFFFE" + str2) == mergeSortkeys(sortkey(str1), sortkey(str2))
+         // only that those two methods yield the same order.
+         //
+         // Use bit-wise OR so that getMergedCollationKey() is always called for both strings.
+-        Output<CollationKey> outPrevKey = new Output<CollationKey>(prevKey);
+-        Output<CollationKey> outKey = new Output<CollationKey>(key);
++        Output<CollationKey> outPrevKey = new Output<>(prevKey);
++        Output<CollationKey> outKey = new Output<>(key);
+         if (getMergedCollationKey(prevString, outPrevKey) | getMergedCollationKey(s, outKey)) {
+             prevKey = outPrevKey.value;
+             key = outKey.value;
+             order = prevKey.compareTo(key);
+             if (order != expectedOrder) {
+                 logln(fileTestName);
+                 errln("line " + fileLineNumber
+                         + " Collator(" + norm + ").getCollationKey"
+                         + "(previous, current segments between U+FFFE)).merge().compareTo() wrong order: "
+                         + order + " != " + expectedOrder);
+                 logln(prevFileLine);
+                 logln(fileLine);
+                 logln(printCollationKey(prevKey));
+                 logln(printCollationKey(key));
+                 return false;
+             }
+             int mergedLevel = getDifferenceLevel(prevKey, key, order, collHasCaseLevel);
+             if (order != Collation.EQUAL && expectedLevel != Collation.NO_LEVEL) {
+                 if(mergedLevel != level) {
+                     logln(fileTestName);
+                     errln("line " + fileLineNumber
+                         + " Collator(" + norm + ").getCollationKey"
+                         + "(previous, current segments between U+FFFE)).merge().compareTo()="
+                         + order + " wrong level: " + mergedLevel + " != " + level);
+                     logln(prevFileLine);
+                     logln(fileLine);
+                     logln(printCollationKey(prevKey));
+                     logln(printCollationKey(key));
+                     return false;
+                 }
+             }
+         }
+         return true;
+     }
+@@ -1606,101 +1606,141 @@ private boolean checkCompareTwo(String norm, String prevFileLine, String prevStr
+     private void checkCompareStrings(BufferedReader in) throws IOException {
+         String prevFileLine = "(none)";
+         String prevString = "";
+-        Output<String> sOut = new Output<String>();
++        Output<String> sOut = new Output<>();
+         while (readNonEmptyLine(in) && !isSectionStarter(fileLine.charAt(0))) {
+             // Parse the line even if it will be ignored (when we do not have a Collator)
+             // in order to report syntax issues.
+             int relation;
+             try {
+                 relation = parseRelationAndString(sOut);
+             } catch (ParseException pe) {
+                 errln(pe.toString());
+                 break;
+             }
+             if(coll == null) {
+                 // We were unable to create the Collator but continue with tests.
+                 // Ignore test data for this Collator.
+                 // The next Collator creation might work.
+                 continue;
+             }
+             String s = sOut.value;
+             int expectedOrder = (relation == Collation.ZERO_LEVEL) ? Collation.EQUAL : Collation.LESS;
+             int expectedLevel = relation;
+             boolean isOk = true;
+             if (!needsNormalization(prevString) && !needsNormalization(s)) {
+                 coll.setDecomposition(Collator.NO_DECOMPOSITION);
+                 isOk = checkCompareTwo("normalization=off", prevFileLine, prevString, s,
+                                         expectedOrder, expectedLevel);
+             }
+             if (isOk) {
+                 coll.setDecomposition(Collator.CANONICAL_DECOMPOSITION);
+                 isOk = checkCompareTwo("normalization=on", prevFileLine, prevString, s,
+                                         expectedOrder, expectedLevel);
+             }
+             if (isOk && (!nfd.isNormalized(prevString) || !nfd.isNormalized(s))) {
+                 String pn = nfd.normalize(prevString);
+                 String n = nfd.normalize(s);
+                 isOk = checkCompareTwo("NFD input", prevFileLine, pn, n,
+                                         expectedOrder, expectedLevel);
+             }
+             prevFileLine = fileLine;
+             prevString = s;
+         }
+     }
+ 
+     @Test
+     public void TestDataDriven() {
+         nfd = Normalizer2.getNFDInstance();
+         fcd = Norm2AllModes.getFCDNormalizer2();
+ 
+         BufferedReader in = null;
+ 
+         try {
+             in = TestUtil.getDataReader("collationtest.txt", "UTF-8");
+ 
+             // Read a new line if necessary.
+             // Sub-parsers leave the first line set that they do not handle.
+             while (fileLine != null || readNonEmptyLine(in)) {
+                 if (!isSectionStarter(fileLine.charAt(0))) {
+                     logln(fileLine);
+                     errln("syntax error on line " + fileLineNumber);
+                     return;
+                 }
+                 if (fileLine.startsWith("** test: ")) {
+                     fileTestName = fileLine;
+                     logln(fileLine);
+                     fileLine = null;
+                 } else if (fileLine.equals("@ root")) {
+                     setRootCollator();
+                     fileLine = null;
+                 } else if (fileLine.startsWith("@ locale ")) {
+                     setLocaleCollator();
+                     fileLine = null;
+                 } else if (fileLine.equals("@ rules")) {
+                     buildTailoring(in);
+                 } else if (fileLine.charAt(0) == '%'
+                         && fileLine.length() > 1 && isSpace(fileLine.charAt(1))) {
+                     parseAndSetAttribute();
+                 } else if (fileLine.equals("* compare")) {
+                     checkCompareStrings(in);
+                 } else {
+                     logln(fileLine);
+                     errln("syntax error on line " + fileLineNumber);
+                     return;
+                 }
+             }
+         } catch (ParseException pe) {
+             errln(pe.toString());
+         } catch (IOException e) {
+             errln(e.getMessage());
+         } finally {
+             try {
+                 if (in != null) {
+                     in.close();
+                 }
+             } catch (IOException e) {
+                 e.printStackTrace();
+             }
+         }
+     }
++
++    @Test
++    public void TestBuilderContextsOverflow() {
++        // ICU-20715: ParseException caused by StringIndexOutOfBoundsException
++        // using what looks like a bogus CharsTrie after
++        // intermediate contextual-mappings data overflowed.
++        // Caused by the CollationDataBuilder using some outdated values when building
++        // contextual mappings with both prefix and contraction matching.
++        // Fixed by resetting those outdated values before code looks at them.
++        char[] rules = {
++            '&', 0x10, 0x2ff, 0x503c, 0x4617,
++            '=', 0x80, 0x4f7f, 0xff, 0x3c3d, 0x1c4f, 0x3c3c,
++            '<', 0, 0, 0, 0, '|', 0, 0, 0, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f, 0xff,
++            '=', 0, '|', 0, 0, 0, 0, 0, 0, 0x1f00, 0xe30,
++            0x3035, 0, 0, 0xd200, 0, 0x7f00, 0xff4f, 0x3d00, 0, 0x7c00,
++            0, 0, 0, 0, 0, 0, 0, 0x301f, 0x350e, 0x30,
++            0, 0, 0xd2, 0x7c00, 0, 0, 0, 0, 0, 0,
++            0, 0x301f, 0x350e, 0x30, 0, 0, 0x52d2, 0x2f3c, 0x5552, 0x493c,
++            0x1f10, 0x1f50, 0x300, 0, 0, 0xf400, 0x30ff, 0, 0, 0x4f7f,
++            0xff,
++            '=', 0, '|', 0, 0, 0, 0, 0x5000, 0x4617,
++            '=', 0x80, 0x4f7f, 0, 0, 0xd200, 0
++        };
++        String s = new String(rules);
++        try {
++            new RuleBasedCollator(s);
++            logln("successfully built the Collator");
++        } catch (StringIndexOutOfBoundsException e) {
++            errln("unhandled StringIndexOutOfBoundsException: " + e);
++        } catch (ParseException pe) {
++            Throwable cause = pe.getCause();
++            if (cause != null && cause instanceof StringIndexOutOfBoundsException) {
++                errln("internal parser error: " + pe);
++            } else {
++                logln("collation data builder overflow or similar: " + pe);
++            }
++        } catch (Exception e) {
++            errln("unexpected type of exception: " + e);
++        }
++    }
+ }

@@ -1,0 +1,178 @@
+commit b3243a754763f6df19351593781b88e277a324bc
+Author: Daiki Ueno <ueno@gnu.org>
+Date:   Sun May 23 18:28:57 2021 +0200
+
+    rpc-server: Disable parsing CKF_ARRAY_ATTRIBUTE
+    
+    This is a temporary measure to avoid oss-fuzz failure.  When the
+    attribute array is nested, the current internal API cannot determine
+    the actual size of data that need to be stored, because ulValueLen is
+    set to the attribute count times sizeof(CK_ATTRIBUTE).
+    
+    Signed-off-by: Daiki Ueno <ueno@gnu.org>
+
+diff --git a/p11-kit/rpc-client.c b/p11-kit/rpc-client.c
+index 6e9cd60..ae66375 100644
+--- a/p11-kit/rpc-client.c
++++ b/p11-kit/rpc-client.c
+@@ -202,87 +202,92 @@ static CK_RV
+ proto_read_attribute_array (p11_rpc_message *msg,
+                             CK_ATTRIBUTE_PTR arr,
+                             CK_ULONG len)
+ {
+ 	uint32_t i, num;
+ 	CK_RV ret;
+ 
+ 	assert (len != 0);
+ 	assert (msg != NULL);
+ 	assert (msg->input != NULL);
+ 
+ 	/* Make sure this is in the right order */
+ 	assert (!msg->signature || p11_rpc_message_verify_part (msg, "aA"));
+ 
+ 	/* Get the number of items. We need this value to be correct */
+ 	if (!p11_rpc_buffer_get_uint32 (msg->input, &msg->parsed, &num))
+ 		return PARSE_ERROR;
+ 
+ 	/*
+ 	 * This should never happen in normal operation. It denotes a goof up
+ 	 * on the other side of our RPC. We should be indicating the exact number
+ 	 * of attributes to the other side. And it should respond with the same
+ 	 * number.
+ 	 */
+ 	if (len != num) {
+ 		p11_message (_("received an attribute array with wrong number of attributes"));
+ 		return PARSE_ERROR;
+ 	}
+ 
+ 	ret = CKR_OK;
+ 
+ 	/* We need to go ahead and read everything in all cases */
+ 	for (i = 0; i < num; ++i) {
+ 		size_t offset = msg->parsed;
+ 		CK_ATTRIBUTE temp;
+ 
+ 		memset (&temp, 0, sizeof (temp));
+ 		if (!p11_rpc_buffer_get_attribute (msg->input, &offset, &temp)) {
+ 			msg->parsed = offset;
+ 			return PARSE_ERROR;
+ 		}
+ 
++		if (temp.type & CKF_ARRAY_ATTRIBUTE) {
++			p11_debug("recursive attribute array is not supported");
++			return PARSE_ERROR;
++		}
++
+ 		/* Try and stuff it in the output data */
+ 		if (arr) {
+ 			CK_ATTRIBUTE *attr = &(arr[i]);
+ 
+ 			if (temp.type != attr->type) {
+ 				p11_message (_("returned attributes in invalid order"));
+ 				msg->parsed = offset;
+ 				return PARSE_ERROR;
+ 			}
+ 
+ 			if (temp.ulValueLen != ((CK_ULONG)-1)) {
+ 				/* Just requesting the attribute size */
+ 				if (!attr->pValue) {
+ 					attr->ulValueLen = temp.ulValueLen;
+ 
+ 				/* Wants attribute data, but too small */
+ 				} else if (attr->ulValueLen < temp.ulValueLen) {
+ 					attr->ulValueLen = temp.ulValueLen;
+ 					ret = CKR_BUFFER_TOO_SMALL;
+ 
+ 				/* Wants attribute data, enough space */
+ 				} else {
+ 					size_t offset2 = msg->parsed;
+ 					if (!p11_rpc_buffer_get_attribute (msg->input, &offset2, attr)) {
+ 						msg->parsed = offset2;
+ 						return PARSE_ERROR;
+ 					}
+ 				}
+ 			} else {
+ 				attr->ulValueLen = temp.ulValueLen;
+ 			}
+ 		}
+ 
+ 		msg->parsed = offset;
+ 	}
+ 
+ 	if (p11_buffer_failed (msg->input))
+ 		return PARSE_ERROR;
+ 
+ 	/* Read in the code that goes along with these attributes */
+ 	if (!p11_rpc_message_read_ulong (msg, &ret))
+ 		return PARSE_ERROR;
+ 
+ 	return ret;
+ }
+diff --git a/p11-kit/rpc-server.c b/p11-kit/rpc-server.c
+index 796a674..ba7240e 100644
+--- a/p11-kit/rpc-server.c
++++ b/p11-kit/rpc-server.c
+@@ -290,58 +290,63 @@ static CK_RV
+ proto_read_attribute_array (p11_rpc_message *msg,
+                             CK_ATTRIBUTE_PTR *result,
+                             CK_ULONG *n_result)
+ {
+ 	CK_ATTRIBUTE_PTR attrs;
+ 	uint32_t n_attrs, i;
+ 
+ 	assert (msg != NULL);
+ 	assert (result != NULL);
+ 	assert (n_result != NULL);
+ 	assert (msg->input != NULL);
+ 
+ 	/* Make sure this is in the right order */
+ 	assert (!msg->signature || p11_rpc_message_verify_part (msg, "aA"));
+ 
+ 	/* Read the number of attributes */
+ 	if (!p11_rpc_buffer_get_uint32 (msg->input, &msg->parsed, &n_attrs))
+ 		return PARSE_ERROR;
+ 
+ 	/* Allocate memory for the attribute structures */
+ 	attrs = p11_rpc_message_alloc_extra_array (msg, n_attrs, sizeof (CK_ATTRIBUTE));
+ 	if (attrs == NULL)
+ 		return CKR_DEVICE_MEMORY;
+ 
+ 	/* Now go through and fill in each one */
+ 	for (i = 0; i < n_attrs; ++i) {
+ 		size_t offset = msg->parsed;
+ 		CK_ATTRIBUTE temp;
+ 
+ 		/* Check the length needed to store the value */
+ 		memset (&temp, 0, sizeof (temp));
+ 		if (!p11_rpc_buffer_get_attribute (msg->input, &offset, &temp)) {
+ 			msg->parsed = offset;
+ 			return PARSE_ERROR;
+ 		}
+ 
++		if (temp.type & CKF_ARRAY_ATTRIBUTE) {
++			p11_debug("recursive attribute array is not supported");
++			return PARSE_ERROR;
++		}
++
+ 		attrs[i].type = temp.type;
+ 
+ 		/* Whether this one is valid or not */
+ 		if (temp.ulValueLen != ((CK_ULONG)-1)) {
+ 			size_t offset2 = msg->parsed;
+ 			attrs[i].pValue = p11_rpc_message_alloc_extra (msg, temp.ulValueLen);
+ 			if (!p11_rpc_buffer_get_attribute (msg->input, &offset2, &attrs[i])) {
+ 				msg->parsed = offset2;
+ 				return PARSE_ERROR;
+ 			}
+ 		} else {
+ 			attrs[i].pValue = NULL;
+ 			attrs[i].ulValueLen = -1;
+ 		}
+ 
+ 		msg->parsed = offset;
+ 	}
+ 
+ 	*result = attrs;
+ 	*n_result = n_attrs;
+ 	return CKR_OK;
+ }

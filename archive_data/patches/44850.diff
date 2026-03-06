@@ -1,0 +1,547 @@
+commit b435d3a3baa39f1a15cd68625da085cfa16ae957
+Author: code <wbpcode@users.noreply.github.com>
+Date:   Thu Mar 10 23:27:54 2022 +0800
+
+    lazy read disable for the http1 codec (#20148)
+    
+    Signed-off-by: wbpcode <wbphub@live.com>
+
+diff --git a/docs/root/version_history/current.rst b/docs/root/version_history/current.rst
+index 53eef9cbea..865e768fc3 100644
+--- a/docs/root/version_history/current.rst
++++ b/docs/root/version_history/current.rst
+@@ -11,19 +11,20 @@ Incompatible Behavior Changes
+ Minor Behavior Changes
+ ----------------------
+ *Changes that may cause incompatibilities for some users, but should not for most*
+ 
+ * access_log: log all header values in the grpc access log.
+ * dynamic_forward_proxy: if a DNS resolution fails, failing immediately with a specific resolution error, rather than finishing up all local filters and failing to select an upstream host.
+ * ext_authz: added requested server name in ext_authz network filter for auth review.
+ * file: changed disk based files to truncate files which are not being appended to. This behavioral change can be temporarily reverted by setting runtime guard ``envoy.reloadable_features.append_or_truncate`` to false.
+ * grpc: flip runtime guard ``envoy.reloadable_features.enable_grpc_async_client_cache`` to be default enabled. async grpc client created through getOrCreateRawAsyncClient will be cached by default.
+ * health_checker: exposing `initial_metadata` to GrpcHealthCheck in a way similar to `request_headers_to_add` of HttpHealthCheck.
+ * http: avoiding delay-close for HTTP/1.0 responses framed by connection: close as well as HTTP/1.1 if the request is fully read. This means for responses to such requests, the FIN will be sent immediately after the response. This behavior can be temporarily reverted by setting ``envoy.reloadable_features.skip_delay_close`` to false.  If clients are are seen to be receiving sporadic partial responses and flipping this flag fixes it, please notify the project immediately.
++* http: lazy disable downstream connection reading in the HTTP/1 codec to reduce unnecessary system calls. This behavioral change can be temporarily reverted by setting runtime guard ``envoy.reloadable_features.http1_lazy_read_disable`` to false.
+ * http: now the max concurrent streams of http2 connection can not only be adjusted down according to the SETTINGS frame but also can be adjusted up, of course, it can not exceed the configured upper bounds. This fix is guarded by ``envoy.reloadable_features.http2_allow_capacity_increase_by_settings``.
+ * http: when writing custom filters, `injectEncodedDataToFilterChain` and `injectDecodedDataToFilterChain` now trigger sending of headers if they were not yet sent due to `StopIteration`. Previously, calling one of the inject functions in that state would trigger an assertion. See issue #19891 for more details.
+ * listener: the :ref:`ipv4_compat <envoy_api_field_core.SocketAddress.ipv4_compat>` flag can only be set on Ipv6 address and Ipv4-mapped Ipv6 address. A runtime guard is added ``envoy.reloadable_features.strict_check_on_ipv4_compat`` and the default is true.
+ * perf: ssl contexts are now tracked without scan based garbage collection and greatly improved the performance on secret update.
+ * router: record upstream request timeouts for all the cases and not just for those requests which are awaiting headers. This behavioral change can be temporarily reverted by setting runtime guard ``envoy.reloadable_features.do_not_await_headers_on_upstream_timeout_to_emit_stats`` to false.
+ * sip-proxy: add customized affinity support by adding :ref:`tra_service_config <envoy_v3_api_msg_extensions.filters.network.sip_proxy.tra.v3alpha.TraServiceConfig>` and :ref:`customized_affinity <envoy_v3_api_msg_extensions.filters.network.sip_proxy.v3alpha.CustomizedAffinity>`.
+ * sip-proxy: add support for the ``503`` response code. When there is something wrong occurred, send ``503 Service Unavailable`` back to downstream.
+ * tracing: set tracing error tag for grpc non-ok response code only when it is a upstream error. Client error will not be tagged as a grpc error. This fix is guarded by ``envoy.reloadable_features.update_grpc_response_error_tag``.
+diff --git a/source/common/http/http1/codec_impl.cc b/source/common/http/http1/codec_impl.cc
+index 7cad7ec80a..92e828f1a3 100644
+--- a/source/common/http/http1/codec_impl.cc
++++ b/source/common/http/http1/codec_impl.cc
+@@ -955,16 +955,18 @@ void ClientConnectionImpl::dumpAdditionalState(std::ostream& os, int indent_leve
+ ServerConnectionImpl::ServerConnectionImpl(
+     Network::Connection& connection, CodecStats& stats, ServerConnectionCallbacks& callbacks,
+     const Http1Settings& settings, uint32_t max_request_headers_kb,
+     const uint32_t max_request_headers_count,
+     envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+         headers_with_underscores_action)
+     : ConnectionImpl(connection, stats, settings, MessageType::Request, max_request_headers_kb,
+                      max_request_headers_count),
+       callbacks_(callbacks),
+       response_buffer_releasor_([this](const Buffer::OwnedBufferFragmentImpl* fragment) {
+         releaseOutboundResponse(fragment);
+       }),
+-      headers_with_underscores_action_(headers_with_underscores_action) {}
++      headers_with_underscores_action_(headers_with_underscores_action),
++      runtime_lazy_read_disable_(
++          Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http1_lazy_read_disable")) {}
+ 
+ uint32_t ServerConnectionImpl::getHeadersSize() {
+   // Add in the size of the request URL if processing request headers.
+@@ -1143,33 +1145,59 @@ void ServerConnectionImpl::onBody(Buffer::Instance& data) {
+   }
+ }
+ 
++Http::Status ServerConnectionImpl::dispatch(Buffer::Instance& data) {
++  if (runtime_lazy_read_disable_ && active_request_ != nullptr &&
++      active_request_->remote_complete_) {
++    // Eagerly read disable the connection if the downstream is sending pipelined requests as we
++    // serially process them. Reading from the connection will be re-enabled after the active
++    // request is completed.
++    active_request_->response_encoder_.readDisable(true);
++    return okStatus();
++  }
++
++  Http::Status status = ConnectionImpl::dispatch(data);
++
++  if (runtime_lazy_read_disable_ && active_request_ != nullptr &&
++      active_request_->remote_complete_) {
++    // Read disable the connection if the downstream is sending additional data while we are working
++    // on an existing request. Reading from the connection will be re-enabled after the active
++    // request is completed.
++    if (data.length() > 0) {
++      active_request_->response_encoder_.readDisable(true);
++    }
++  }
++  return status;
++}
++
+ ParserStatus ServerConnectionImpl::onMessageCompleteBase() {
+   ASSERT(!handling_upgrade_);
+   if (active_request_) {
+ 
+     // The request_decoder should be non-null after we've called the newStream on callbacks.
+     ASSERT(active_request_->request_decoder_);
+-    active_request_->response_encoder_.readDisable(true);
++    if (!runtime_lazy_read_disable_) {
++      active_request_->response_encoder_.readDisable(true);
++    }
+     active_request_->remote_complete_ = true;
+ 
+     if (deferred_end_stream_headers_) {
+       active_request_->request_decoder_->decodeHeaders(
+           std::move(absl::get<RequestHeaderMapPtr>(headers_or_trailers_)), true);
+       deferred_end_stream_headers_ = false;
+     } else if (processing_trailers_) {
+       active_request_->request_decoder_->decodeTrailers(
+           std::move(absl::get<RequestTrailerMapPtr>(headers_or_trailers_)));
+     } else {
+       Buffer::OwnedImpl buffer;
+       active_request_->request_decoder_->decodeData(buffer, true);
+     }
+ 
+     // Reset to ensure no information from one requests persists to the next.
+     headers_or_trailers_.emplace<RequestHeaderMapPtr>(nullptr);
+   }
+ 
+   // Always pause the parser so that the calling code can process 1 request at a time and apply
+   // back pressure. However this means that the calling code needs to detect if there is more data
+   // in the buffer and dispatch it again.
+   return parser_->pause();
+ }
+diff --git a/source/common/http/http1/codec_impl.h b/source/common/http/http1/codec_impl.h
+index 161ef63b11..9d1c6731e4 100644
+--- a/source/common/http/http1/codec_impl.h
++++ b/source/common/http/http1/codec_impl.h
+@@ -36,53 +36,51 @@ class StreamEncoderImpl : public virtual StreamEncoder,
+                           public Stream,
+                           Logger::Loggable<Logger::Id::http>,
+                           public StreamCallbackHelper,
+                           public Http1StreamEncoderOptions {
+ public:
+   ~StreamEncoderImpl() override {
+     // When the stream goes away, undo any read blocks to resume reading.
+     while (read_disable_calls_ != 0) {
+       StreamEncoderImpl::readDisable(false);
+     }
+   }
+   // Http::StreamEncoder
+   void encodeData(Buffer::Instance& data, bool end_stream) override;
+   void encodeMetadata(const MetadataMapVector&) override;
+   Stream& getStream() override { return *this; }
+   Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override { return *this; }
+ 
+   // Http::Http1StreamEncoderOptions
+   void disableChunkEncoding() override { disable_chunk_encoding_ = true; }
+ 
+   // Http::Stream
+   void addCallbacks(StreamCallbacks& callbacks) override { addCallbacksHelper(callbacks); }
+   void removeCallbacks(StreamCallbacks& callbacks) override { removeCallbacksHelper(callbacks); }
+   // After this is called, for the HTTP/1 codec, the connection should be closed, i.e. no further
+   // progress may be made with the codec.
+   void resetStream(StreamResetReason reason) override;
+   void readDisable(bool disable) override;
+   uint32_t bufferLimit() const override;
+   absl::string_view responseDetails() override { return details_; }
+   const Network::Address::InstanceConstSharedPtr& connectionLocalAddress() override;
+   void setFlushTimeout(std::chrono::milliseconds) override {
+     // HTTP/1 has one stream per connection, thus any data encoded is immediately written to the
+     // connection, invoking any watermarks as necessary. There is no internal buffering that would
+     // require a flush timeout not already covered by other timeouts.
+   }
+ 
+   void setAccount(Buffer::BufferMemoryAccountSharedPtr account) override {
+     // TODO(kbaichoo): implement account tracking for H1. Particularly, binding
+     // the account to the buffers used. The current wiring is minimal, and used
+     // to ensure the memory_account gets notified that the downstream request is
+     // closing.
+     buffer_memory_account_ = account;
+   }
+ 
+   void setIsResponseToHeadRequest(bool value) { is_response_to_head_request_ = value; }
+   void setIsResponseToConnectRequest(bool value) { is_response_to_connect_request_ = value; }
+   void setDetails(absl::string_view details) { details_ = details; }
+ 
+-  void clearReadDisableCallsForTests() { read_disable_calls_ = 0; }
+-
+   const StreamInfo::BytesMeterSharedPtr& bytesMeter() override { return bytes_meter_; }
+ 
+ protected:
+@@ -464,84 +462,87 @@ protected:
+ private:
+   /**
+    * Manipulate the request's first line, parsing the url and converting to a relative path if
+    * necessary. Compute Host / :authority headers based on 7230#5.7 and 7230#6
+    *
+    * @param is_connect true if the request has the CONNECT method
+    * @param headers the request's headers
+    * @return Status representing success or failure. This will fail if there is an invalid url in
+    * the request line.
+    */
+   Status handlePath(RequestHeaderMap& headers, absl::string_view method);
+ 
+   // ParserCallbacks.
+   Status onUrl(const char* data, size_t length) override;
+   Status onStatus(const char*, size_t) override { return okStatus(); }
+   // ConnectionImpl
++  Http::Status dispatch(Buffer::Instance& data) override;
+   void onEncodeComplete() override;
+   StreamInfo::BytesMeter& getBytesMeter() override {
+     if (active_request_) {
+       return *(active_request_->response_encoder_.getStream().bytesMeter());
+     }
+     if (bytes_meter_before_stream_ == nullptr) {
+       bytes_meter_before_stream_ = std::make_shared<StreamInfo::BytesMeter>();
+     }
+     return *bytes_meter_before_stream_;
+   }
+   Status onMessageBeginBase() override;
+   Envoy::StatusOr<ParserStatus> onHeadersCompleteBase() override;
+   // If upgrade behavior is not allowed, the HCM will have sanitized the headers out.
+   bool upgradeAllowed() const override { return true; }
+   void onBody(Buffer::Instance& data) override;
+   void onResetStream(StreamResetReason reason) override;
+   Status sendProtocolError(absl::string_view details) override;
+   void onAboveHighWatermark() override;
+   void onBelowLowWatermark() override;
+   HeaderMap& headersOrTrailers() override {
+     if (absl::holds_alternative<RequestHeaderMapPtr>(headers_or_trailers_)) {
+       return *absl::get<RequestHeaderMapPtr>(headers_or_trailers_);
+     } else {
+       return *absl::get<RequestTrailerMapPtr>(headers_or_trailers_);
+     }
+   }
+   RequestOrResponseHeaderMap& requestOrResponseHeaders() override {
+     return *absl::get<RequestHeaderMapPtr>(headers_or_trailers_);
+   }
+   void allocHeaders(StatefulHeaderKeyFormatterPtr&& formatter) override {
+     ASSERT(nullptr == absl::get<RequestHeaderMapPtr>(headers_or_trailers_));
+     ASSERT(!processing_trailers_);
+     auto headers = RequestHeaderMapImpl::create();
+     headers->setFormatter(std::move(formatter));
+     headers_or_trailers_.emplace<RequestHeaderMapPtr>(std::move(headers));
+   }
+   void allocTrailers() override {
+     ASSERT(processing_trailers_);
+     if (!absl::holds_alternative<RequestTrailerMapPtr>(headers_or_trailers_)) {
+       headers_or_trailers_.emplace<RequestTrailerMapPtr>(RequestTrailerMapImpl::create());
+     }
+   }
+   void dumpAdditionalState(std::ostream& os, int indent_level) const override;
+ 
+   void releaseOutboundResponse(const Buffer::OwnedBufferFragmentImpl* fragment);
+   void maybeAddSentinelBufferFragment(Buffer::Instance& output_buffer) override;
+ 
+   Status doFloodProtectionChecks() const;
+   Status checkHeaderNameForUnderscores() override;
+ 
+   ServerConnectionCallbacks& callbacks_;
+   std::unique_ptr<ActiveRequest> active_request_;
+   const Buffer::OwnedBufferFragmentImpl::Releasor response_buffer_releasor_;
+   uint32_t outbound_responses_{};
+   // TODO(mattklein123): This should be a member of ActiveRequest but this change needs dedicated
+   // thought as some of the reset and no header code paths make this difficult. Headers are
+   // populated on message begin. Trailers are populated on the first parsed trailer field (if
+   // trailers are enabled). The variant is reset to null headers on message complete for assertion
+   // purposes.
+   absl::variant<RequestHeaderMapPtr, RequestTrailerMapPtr> headers_or_trailers_;
+   // The action to take when a request header name contains underscore characters.
+   const envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
+       headers_with_underscores_action_;
++
++  const bool runtime_lazy_read_disable_{};
+ };
+ 
+ /**
+  * Implementation of Http::ClientConnection for HTTP/1.1.
+  */
+diff --git a/source/common/runtime/runtime_features.cc b/source/common/runtime/runtime_features.cc
+index 654fde0777..e1eeb39df4 100644
+--- a/source/common/runtime/runtime_features.cc
++++ b/source/common/runtime/runtime_features.cc
+@@ -33,6 +33,7 @@ RUNTIME_GUARD(envoy_reloadable_features_do_not_await_headers_on_upstream_timeout
+ RUNTIME_GUARD(envoy_reloadable_features_enable_grpc_async_client_cache);
+ RUNTIME_GUARD(envoy_reloadable_features_fix_added_trailers);
+ RUNTIME_GUARD(envoy_reloadable_features_handle_stream_reset_during_hcm_encoding);
++RUNTIME_GUARD(envoy_reloadable_features_http1_lazy_read_disable);
+ RUNTIME_GUARD(envoy_reloadable_features_http2_allow_capacity_increase_by_settings);
+ RUNTIME_GUARD(envoy_reloadable_features_http2_new_codec_wrapper);
+ RUNTIME_GUARD(envoy_reloadable_features_http_ext_authz_do_not_skip_direct_response_and_redirect);
+@@ -115,66 +116,67 @@ uint64_t getInteger(absl::string_view feature, uint64_t default_value) {
+ // Add additional features here to enable the new code paths by default.
+ //
+ // Per documentation in CONTRIBUTING.md is expected that new high risk code paths be guarded
+ // by runtime feature guards, i.e
+ //
+ // if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.my_feature_name")) {
+ //   [new code path]
+ // else {
+ //   [old_code_path]
+ // }
+ //
+ // Runtime features are false by default, so the old code path is exercised.
+ // To make a runtime feature true by default, add it to the array below.
+ // New features should be true-by-default for an Envoy release cycle before the
+ // old code path is removed.
+ //
+ // If issues are found that require a runtime feature to be disabled, it should be reported
+ // ASAP by filing a bug on github. Overriding non-buggy code is strongly discouraged to avoid the
+ // problem of the bugs being found after the old code path has been removed.
+ // clang-format off
+ constexpr absl::Flag<bool>* runtime_features[] = {
+   // Test flags
+   &FLAGS_envoy_reloadable_features_test_feature_false,
+   &FLAGS_envoy_reloadable_features_test_feature_true,
+   // Begin alphabetically sorted section_
+   &FLAGS_envoy_reloadable_features_allow_multiple_dns_addresses,
+   &FLAGS_envoy_reloadable_features_allow_upstream_inline_write,
+   &FLAGS_envoy_reloadable_features_append_or_truncate,
+   &FLAGS_envoy_reloadable_features_conn_pool_delete_when_idle,
+   &FLAGS_envoy_reloadable_features_conn_pool_new_stream_with_early_data_and_http3,
+   &FLAGS_envoy_reloadable_features_correct_scheme_and_xfp,
+   &FLAGS_envoy_reloadable_features_correctly_validate_alpn,
+   &FLAGS_envoy_reloadable_features_defer_processing_backedup_streams,
+   &FLAGS_envoy_reloadable_features_deprecate_global_ints,
+   &FLAGS_envoy_reloadable_features_disable_tls_inspector_injection,
+   &FLAGS_envoy_reloadable_features_do_not_await_headers_on_upstream_timeout_to_emit_stats,
+   &FLAGS_envoy_reloadable_features_enable_grpc_async_client_cache,
+   &FLAGS_envoy_reloadable_features_fix_added_trailers,
+   &FLAGS_envoy_reloadable_features_handle_stream_reset_during_hcm_encoding,
++  &FLAGS_envoy_reloadable_features_http1_lazy_read_disable,
+   &FLAGS_envoy_reloadable_features_http2_allow_capacity_increase_by_settings,
+   &FLAGS_envoy_reloadable_features_http2_new_codec_wrapper,
+   &FLAGS_envoy_reloadable_features_http_ext_authz_do_not_skip_direct_response_and_redirect,
+   &FLAGS_envoy_reloadable_features_http_reject_path_with_fragment,
+   &FLAGS_envoy_reloadable_features_http_strip_fragment_from_path_unsafe_if_disabled,
+   &FLAGS_envoy_reloadable_features_internal_address,
+   &FLAGS_envoy_reloadable_features_listener_wildcard_match_ip_family,
+   &FLAGS_envoy_reloadable_features_new_tcp_connection_pool,
+   &FLAGS_envoy_reloadable_features_postpone_h3_client_connect_to_next_loop,
+   &FLAGS_envoy_reloadable_features_proxy_102_103,
+   &FLAGS_envoy_reloadable_features_remove_legacy_json,
+   &FLAGS_envoy_reloadable_features_sanitize_http_header_referer,
+   &FLAGS_envoy_reloadable_features_skip_delay_close,
+   &FLAGS_envoy_reloadable_features_skip_dispatching_frames_for_closed_connection,
+   &FLAGS_envoy_reloadable_features_strict_check_on_ipv4_compat,
+   &FLAGS_envoy_reloadable_features_support_locality_update_on_eds_cluster_endpoints,
+   &FLAGS_envoy_reloadable_features_udp_listener_updates_filter_chain_in_place,
+   &FLAGS_envoy_reloadable_features_unified_mux,
+   &FLAGS_envoy_reloadable_features_update_expected_rq_timeout_on_retry,
+   &FLAGS_envoy_reloadable_features_update_grpc_response_error_tag,
+   &FLAGS_envoy_reloadable_features_use_dns_ttl,
+   &FLAGS_envoy_reloadable_features_validate_connect,
+   &FLAGS_envoy_restart_features_explicit_wildcard_resource,
+   &FLAGS_envoy_restart_features_use_apple_api_for_dns_lookups,
+   &FLAGS_envoy_restart_features_no_runtime_singleton,
+ };
+ // clang-format on
+diff --git a/test/common/http/http1/codec_impl_test.cc b/test/common/http/http1/codec_impl_test.cc
+index 36726e28f3..06d90dffa4 100644
+--- a/test/common/http/http1/codec_impl_test.cc
++++ b/test/common/http/http1/codec_impl_test.cc
+@@ -2997,9 +2997,162 @@ TEST_F(Http1ServerConnectionImplTest, ManyRequestHeadersAccepted) {
+ TEST_F(Http1ServerConnectionImplTest, ManyLargeRequestHeadersAccepted) {
+   max_request_headers_kb_ = 8192;
+   // Create a request with 64 headers, each header of size ~64 KiB. Total size ~4MB.
+   testRequestHeadersAccepted(createLargeHeaderFragment(64));
+ }
+ 
++TEST_F(Http1ServerConnectionImplTest, RuntimeLazyReadDisableTest) {
++  TestScopedRuntime scoped_runtime;
++  Runtime::RuntimeFeaturesDefaults::get().restoreDefaults();
++
++  // No readDisable for normal non-piped HTTP request.
++  {
++    initialize();
++
++    NiceMock<MockRequestDecoder> decoder;
++    Http::ResponseEncoder* response_encoder = nullptr;
++    EXPECT_CALL(callbacks_, newStream(_, _))
++        .WillOnce(Invoke([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
++          response_encoder = &encoder;
++          return decoder;
++        }));
++
++    EXPECT_CALL(decoder, decodeHeaders_(_, true));
++    EXPECT_CALL(decoder, decodeData(_, _)).Times(0);
++
++    EXPECT_CALL(connection_, readDisable(true)).Times(0);
++
++    Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nhost: a.com\r\n\r\n");
++    auto status = codec_->dispatch(buffer);
++    EXPECT_TRUE(status.ok());
++
++    std::string output;
++    ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output));
++    TestResponseHeaderMapImpl headers{{":status", "200"}};
++    response_encoder->encodeHeaders(headers, true);
++    EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", output);
++
++    EXPECT_CALL(connection_, readDisable(false)).Times(0);
++    // Delete active request.
++    connection_.dispatcher_.clearDeferredDeleteList();
++  }
++
++  Runtime::LoaderSingleton::getExisting()->mergeValues(
++      {{"envoy.reloadable_features.http1_lazy_read_disable", "false"}});
++
++  // Always call readDisable if lazy read disable flag is set to false.
++  {
++    initialize();
++
++    NiceMock<MockRequestDecoder> decoder;
++    Http::ResponseEncoder* response_encoder = nullptr;
++    EXPECT_CALL(callbacks_, newStream(_, _))
++        .WillOnce(Invoke([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
++          response_encoder = &encoder;
++          return decoder;
++        }));
++
++    EXPECT_CALL(decoder, decodeHeaders_(_, true));
++    EXPECT_CALL(decoder, decodeData(_, _)).Times(0);
++
++    EXPECT_CALL(connection_, readDisable(true));
++
++    Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nhost: a.com\r\n\r\n");
++
++    auto status = codec_->dispatch(buffer);
++    EXPECT_TRUE(status.ok());
++
++    std::string output;
++    ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output));
++    TestResponseHeaderMapImpl headers{{":status", "200"}};
++    response_encoder->encodeHeaders(headers, true);
++    EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", output);
++
++    EXPECT_CALL(connection_, readDisable(false));
++    // Delete active request.
++    connection_.dispatcher_.clearDeferredDeleteList();
++  }
++}
++
++// Tests the scenario where the client sends pipelined requests and the requests reach Envoy at the
++// same time.
++TEST_F(Http1ServerConnectionImplTest, PipedRequestWithSingleEvent) {
++  TestScopedRuntime scoped_runtime;
++  Runtime::RuntimeFeaturesDefaults::get().restoreDefaults();
++
++  initialize();
++
++  NiceMock<MockRequestDecoder> decoder;
++  Http::ResponseEncoder* response_encoder = nullptr;
++  EXPECT_CALL(callbacks_, newStream(_, _))
++      .WillOnce(Invoke([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
++        response_encoder = &encoder;
++        return decoder;
++      }));
++
++  EXPECT_CALL(decoder, decodeHeaders_(_, true));
++  EXPECT_CALL(decoder, decodeData(_, _)).Times(0);
++
++  EXPECT_CALL(connection_, readDisable(true));
++
++  Buffer::OwnedImpl buffer(
++      "GET / HTTP/1.1\r\nhost: a.com\r\n\r\nGET / HTTP/1.1\r\nhost: b.com\r\n\r\n");
++  auto status = codec_->dispatch(buffer);
++  EXPECT_TRUE(status.ok());
++
++  std::string output;
++  ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output));
++  TestResponseHeaderMapImpl headers{{":status", "200"}};
++  response_encoder->encodeHeaders(headers, true);
++  EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", output);
++
++  EXPECT_CALL(connection_, readDisable(false));
++  // Delete active request to re-enable connection reading.
++  connection_.dispatcher_.clearDeferredDeleteList();
++}
++
++// Tests the scenario where the client sends pipelined requests. The second request reaches Envoy
++// before the end of the first request.
++TEST_F(Http1ServerConnectionImplTest, PipedRequestWithMutipleEvent) {
++  TestScopedRuntime scoped_runtime;
++  Runtime::RuntimeFeaturesDefaults::get().restoreDefaults();
++
++  initialize();
++
++  NiceMock<MockRequestDecoder> decoder;
++  Http::ResponseEncoder* response_encoder = nullptr;
++  EXPECT_CALL(callbacks_, newStream(_, _))
++      .WillOnce(Invoke([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
++        response_encoder = &encoder;
++        return decoder;
++      }));
++
++  EXPECT_CALL(decoder, decodeHeaders_(_, true));
++  EXPECT_CALL(decoder, decodeData(_, _)).Times(0);
++
++  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nhost: a.com\r\n\r\n");
++  auto status = codec_->dispatch(buffer);
++  EXPECT_TRUE(status.ok());
++
++  Buffer::OwnedImpl second_buffer("GET / HTTP/1.1\r\nhost: a.com\r\n\r\n");
++
++  // Second request before first request complete will disable downstream connection reading.
++  EXPECT_CALL(connection_, readDisable(true));
++  auto second_status = codec_->dispatch(second_buffer);
++  EXPECT_TRUE(second_status.ok());
++  // The second request will no be consumed.
++  EXPECT_TRUE(second_buffer.length() != 0);
++
++  std::string output;
++  ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output));
++  TestResponseHeaderMapImpl headers{{":status", "200"}};
++  response_encoder->encodeHeaders(headers, true);
++  EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", output);
++
++  EXPECT_CALL(connection_, readDisable(false));
++  // Delete active request to re-enable connection reading.
++  connection_.dispatcher_.clearDeferredDeleteList();
++}
++
+ // Tests that incomplete response headers of 80 kB header value fails.
+ TEST_F(Http1ClientConnectionImplTest, ResponseHeadersWithLargeValueRejected) {
+   initialize();
+diff --git a/test/integration/fake_upstream.cc b/test/integration/fake_upstream.cc
+index 0c7eb169ad..9675e7b63e 100644
+--- a/test/integration/fake_upstream.cc
++++ b/test/integration/fake_upstream.cc
+@@ -296,31 +296,11 @@ void FakeStream::startGrpcStream(bool send_headers) {
+ void FakeStream::finishGrpcStream(Grpc::Status::GrpcStatus status) {
+   encodeTrailers(Http::TestResponseTrailerMapImpl{
+       {"grpc-status", std::to_string(static_cast<uint32_t>(status))}});
+ }
+ 
+-// The TestHttp1ServerConnectionImpl outlives its underlying Network::Connection
+-// so must not access the Connection on teardown. To achieve this, clear the
+-// read disable calls to avoid checking / editing the Connection blocked state.
+ class TestHttp1ServerConnectionImpl : public Http::Http1::ServerConnectionImpl {
+ public:
+   using Http::Http1::ServerConnectionImpl::ServerConnectionImpl;
+-
+-  Http::Http1::ParserStatus onMessageCompleteBase() override {
+-    auto rc = ServerConnectionImpl::onMessageCompleteBase();
+-
+-    if (activeRequest() && activeRequest()->request_decoder_) {
+-      // Undo the read disable from the base class - we have many tests which
+-      // waitForDisconnect after a full request has been read which will not
+-      // receive the disconnect if reading is disabled.
+-      activeRequest()->response_encoder_.readDisable(false);
+-    }
+-    return rc;
+-  }
+-  ~TestHttp1ServerConnectionImpl() override {
+-    if (activeRequest()) {
+-      activeRequest()->response_encoder_.clearReadDisableCallsForTests();
+-    }
+-  }
+ };
+ 
+ class TestHttp2ServerConnectionImpl : public Http::Http2::ServerConnectionImpl {

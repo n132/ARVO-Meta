@@ -1,0 +1,385 @@
+commit 50c87e92fc22ae3da5dda6f7340d3b786c6117a4
+Author: Nikita Popov <nikita.ppv@gmail.com>
+Date:   Fri Jun 12 14:57:08 2020 +0200
+
+    Use GC stack in nested data removal
+    
+    We should be doing this anyway to prevent stack overflow, but on
+    master this is important for an additional reason: The temporary
+    GC buffer provided for get_gc handlers may get reused if the scan
+    is performed recursively instead of indirected via the GC stack.
+    
+    This fixes oss-fuzz #23350.
+
+diff --git a/Zend/tests/gc_043.phpt b/Zend/tests/gc_043.phpt
+new file mode 100644
+index 0000000000..06b64de39a
+--- /dev/null
++++ b/Zend/tests/gc_043.phpt
+@@ -0,0 +1,44 @@
++--TEST--
++GC buffer shouldn't get reused when removing nested data
++--FILE--
++<?php
++$s = <<<'STR'
++O:8:"stdClass":2:{i:5;C:8:"SplStack":29:{i:4;:r:1;:O:8:"stdClass":0:{}}i:0;O:13:"RegexIterator":1:{i:5;C:8:"SplStack":29:{i:4;:r:1;:O:8:"stdClass":0:{}}}}
++STR;
++var_dump(unserialize($s));
++gc_collect_cycles();
++?>
++--EXPECT--
++object(stdClass)#1 (2) {
++  ["5"]=>
++  object(SplStack)#2 (2) {
++    ["flags":"SplDoublyLinkedList":private]=>
++    int(4)
++    ["dllist":"SplDoublyLinkedList":private]=>
++    array(2) {
++      [0]=>
++      *RECURSION*
++      [1]=>
++      object(stdClass)#3 (0) {
++      }
++    }
++  }
++  ["0"]=>
++  object(RegexIterator)#4 (2) {
++    ["replacement"]=>
++    NULL
++    ["5"]=>
++    object(SplStack)#5 (2) {
++      ["flags":"SplDoublyLinkedList":private]=>
++      int(4)
++      ["dllist":"SplDoublyLinkedList":private]=>
++      array(2) {
++        [0]=>
++        *RECURSION*
++        [1]=>
++        object(stdClass)#6 (0) {
++        }
++      }
++    }
++  }
++}
+diff --git a/Zend/zend_gc.c b/Zend/zend_gc.c
+index 0b895792da..5dd11f1597 100644
+--- a/Zend/zend_gc.c
++++ b/Zend/zend_gc.c
+@@ -1328,108 +1328,112 @@ static int gc_collect_roots(uint32_t *flags, gc_stack *stack)
+ 	return count;
+ }
+ 
+-static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffer *root)
++static int gc_remove_nested_data_from_buffer(zend_refcounted *ref, gc_root_buffer *root, gc_stack *stack)
+ {
+ 	HashTable *ht = NULL;
+ 	Bucket *p, *end;
+ 	zval *zv;
+ 	int count = 0;
++	GC_STACK_DCL(stack);
+ 
+-tail_call:
+ 	do {
+ 		if (root) {
+ 			root = NULL;
+ 			count++;
+ 		} else if (GC_REF_ADDRESS(ref) != 0
+ 		 && GC_REF_CHECK_COLOR(ref, GC_BLACK)) {
+ 			GC_TRACE_REF(ref, "removing from buffer");
+ 			GC_REMOVE_FROM_BUFFER(ref);
+ 			count++;
+ 		} else if (GC_TYPE(ref) == IS_REFERENCE) {
+ 			if (Z_REFCOUNTED(((zend_reference*)ref)->val)) {
+ 				ref = Z_COUNTED(((zend_reference*)ref)->val);
+-				goto tail_call;
++				continue;
+ 			}
+-			return count;
++			goto next;
+ 		} else {
+-			return count;
++			goto next;
+ 		}
+ 
+ 		if (GC_TYPE(ref) == IS_OBJECT) {
+ 			zend_object *obj = (zend_object*)ref;
+ 
+ 			if (EXPECTED(!(OBJ_FLAGS(ref) & IS_OBJ_FREE_CALLED))) {
+ 				int n;
+ 				zval *zv, *end;
+ 
+ 				ht = obj->handlers->get_gc(obj, &zv, &n);
+ 				if (EXPECTED(!ht)) {
+-					if (!n) return count;
++					if (!n) goto next;
+ 					end = zv + n;
+ 					while (!Z_REFCOUNTED_P(--end)) {
+-						if (zv == end) return count;
++						if (zv == end) goto next;
+ 					}
+ 				} else {
+ 					if (!n) goto handle_ht;
+ 					end = zv + n;
+ 				}
+ 				while (zv != end) {
+ 					if (Z_REFCOUNTED_P(zv)) {
+ 						ref = Z_COUNTED_P(zv);
+-						count += gc_remove_nested_data_from_buffer(ref, NULL);
++						GC_STACK_PUSH(ref);
+ 					}
+ 					zv++;
+ 				}
+ 				if (EXPECTED(!ht)) {
+ 					ref = Z_COUNTED_P(zv);
+-					goto tail_call;
++					continue;
+ 				}
+ handle_ht:
+ 				if (GC_REF_ADDRESS(ht) != 0 && GC_REF_CHECK_COLOR(ht, GC_BLACK)) {
+ 					GC_TRACE_REF(ht, "removing from buffer");
+ 					GC_REMOVE_FROM_BUFFER(ht);
+ 				}
+ 			} else {
+-				return count;
++				goto next;
+ 			}
+ 		} else if (GC_TYPE(ref) == IS_ARRAY) {
+ 			ht = (zend_array*)ref;
+ 		} else {
+-			return count;
++			goto next;
+ 		}
+ 
+-		if (!ht->nNumUsed) return count;
++		if (!ht->nNumUsed) goto next;
+ 		p = ht->arData;
+ 		end = p + ht->nNumUsed;
+ 		while (1) {
+ 			end--;
+ 			zv = &end->val;
+ 			if (Z_TYPE_P(zv) == IS_INDIRECT) {
+ 				zv = Z_INDIRECT_P(zv);
+ 			}
+ 			if (Z_REFCOUNTED_P(zv)) {
+ 				break;
+ 			}
+-			if (p == end) return count;
++			if (p == end) goto next;
+ 		}
+ 		while (p != end) {
+ 			zv = &p->val;
+ 			if (Z_TYPE_P(zv) == IS_INDIRECT) {
+ 				zv = Z_INDIRECT_P(zv);
+ 			}
+ 			if (Z_REFCOUNTED_P(zv)) {
+ 				ref = Z_COUNTED_P(zv);
+-				count += gc_remove_nested_data_from_buffer(ref, NULL);
++				GC_STACK_PUSH(ref);
+ 			}
+ 			p++;
+ 		}
+ 		zv = &p->val;
+ 		if (Z_TYPE_P(zv) == IS_INDIRECT) {
+ 			zv = Z_INDIRECT_P(zv);
+ 		}
+ 		ref = Z_COUNTED_P(zv);
+-		goto tail_call;
+-	} while (0);
++		continue;
++
++next:
++		ref = GC_STACK_POP();
++	} while (ref);
++	return count;
+ }
+ 
+ static void zend_get_gc_buffer_release();
+@@ -1437,184 +1441,185 @@ static void zend_get_gc_buffer_release();
+ ZEND_API int zend_gc_collect_cycles(void)
+ {
+ 	int count = 0;
+ 
+ 	if (GC_G(num_roots)) {
+ 		gc_root_buffer *current, *last;
+ 		zend_refcounted *p;
+ 		uint32_t gc_flags = 0;
+ 		uint32_t idx, end;
+ 		gc_stack stack;
+ 
+ 		stack.prev = NULL;
+ 		stack.next = NULL;
+ 
+ 		if (GC_G(gc_active)) {
+ 			return 0;
+ 		}
+ 
+ 		GC_TRACE("Collecting cycles");
+ 		GC_G(gc_runs)++;
+ 		GC_G(gc_active) = 1;
+ 
+ 		GC_TRACE("Marking roots");
+ 		gc_mark_roots(&stack);
+ 		GC_TRACE("Scanning roots");
+ 		gc_scan_roots(&stack);
+ 
+ 		GC_TRACE("Collecting roots");
+ 		count = gc_collect_roots(&gc_flags, &stack);
+ 
+-		gc_stack_free(&stack);
+-
+ 		if (!GC_G(num_roots)) {
+ 			/* nothing to free */
+ 			GC_TRACE("Nothing to free");
++			gc_stack_free(&stack);
+ 			zend_get_gc_buffer_release();
+ 			GC_G(gc_active) = 0;
+ 			return 0;
+ 		}
+ 
+ 		end = GC_G(first_unused);
+ 
+ 		if (gc_flags & GC_HAS_DESTRUCTORS) {
+ 			GC_TRACE("Calling destructors");
+ 
+ 			/* During a destructor call, new externally visible references to nested data may
+ 			 * be introduced. These references can be introduced in a way that does not
+ 			 * modify any refcounts, so we have no real way to detect this situation
+ 			 * short of rerunning full GC tracing. What we do instead is to only run
+ 			 * destructors at this point, and leave the actual freeing of the objects
+ 			 * until the next GC run. */
+ 
+ 			/* Mark all roots for which a dtor will be invoked as DTOR_GARBAGE. Additionally
+ 			 * color them purple. This serves a double purpose: First, they should be
+ 			 * considered new potential roots for the next GC run. Second, it will prevent
+ 			 * their removal from the root buffer by nested data removal. */
+ 			idx = GC_FIRST_ROOT;
+ 			current = GC_IDX2PTR(GC_FIRST_ROOT);
+ 			while (idx != end) {
+ 				if (GC_IS_GARBAGE(current->ref)) {
+ 					p = GC_GET_PTR(current->ref);
+ 					if (GC_TYPE(p) == IS_OBJECT && !(OBJ_FLAGS(p) & IS_OBJ_DESTRUCTOR_CALLED)) {
+ 						zend_object *obj = (zend_object *) p;
+ 						if (obj->handlers->dtor_obj != zend_objects_destroy_object
+ 							|| obj->ce->destructor) {
+ 							current->ref = GC_MAKE_DTOR_GARBAGE(obj);
+ 							GC_REF_SET_COLOR(obj, GC_PURPLE);
+ 						} else {
+ 							GC_ADD_FLAGS(obj, IS_OBJ_DESTRUCTOR_CALLED);
+ 						}
+ 					}
+ 				}
+ 				current++;
+ 				idx++;
+ 			}
+ 
+ 			/* Remove nested data for objects on which a destructor will be called.
+ 			 * This will not remove the objects themselves, as they have been colored
+ 			 * purple. */
+ 			idx = GC_FIRST_ROOT;
+ 			current = GC_IDX2PTR(GC_FIRST_ROOT);
+ 			while (idx != end) {
+ 				if (GC_IS_DTOR_GARBAGE(current->ref)) {
+ 					p = GC_GET_PTR(current->ref);
+-					count -= gc_remove_nested_data_from_buffer(p, current);
++					count -= gc_remove_nested_data_from_buffer(p, current, &stack);
+ 				}
+ 				current++;
+ 				idx++;
+ 			}
+ 
+ 			/* Actually call destructors.
+ 			 *
+ 			 * The root buffer might be reallocated during destructors calls,
+ 			 * make sure to reload pointers as necessary. */
+ 			idx = GC_FIRST_ROOT;
+ 			while (idx != end) {
+ 				current = GC_IDX2PTR(idx);
+ 				if (GC_IS_DTOR_GARBAGE(current->ref)) {
+ 					p = GC_GET_PTR(current->ref);
+ 					/* Mark this is as a normal root for the next GC run,
+ 					 * it's no longer garbage for this run. */
+ 					current->ref = p;
+ 					/* Double check that the destructor hasn't been called yet. It could have
+ 					 * already been invoked indirectly by some other destructor. */
+ 					if (!(OBJ_FLAGS(p) & IS_OBJ_DESTRUCTOR_CALLED)) {
+ 						zend_object *obj = (zend_object*)p;
+ 						GC_TRACE_REF(obj, "calling destructor");
+ 						GC_ADD_FLAGS(obj, IS_OBJ_DESTRUCTOR_CALLED);
+ 						GC_ADDREF(obj);
+ 						obj->handlers->dtor_obj(obj);
+ 						GC_DELREF(obj);
+ 					}
+ 				}
+ 				idx++;
+ 			}
+ 
+ 			if (GC_G(gc_protected)) {
+ 				/* something went wrong */
+ 				zend_get_gc_buffer_release();
+ 				return 0;
+ 			}
+ 		}
+ 
++		gc_stack_free(&stack);
++
+ 		/* Destroy zvals. The root buffer may be reallocated. */
+ 		GC_TRACE("Destroying zvals");
+ 		idx = GC_FIRST_ROOT;
+ 		while (idx != end) {
+ 			current = GC_IDX2PTR(idx);
+ 			if (GC_IS_GARBAGE(current->ref)) {
+ 				p = GC_GET_PTR(current->ref);
+ 				GC_TRACE_REF(p, "destroying");
+ 				if (GC_TYPE(p) == IS_OBJECT) {
+ 					zend_object *obj = (zend_object*)p;
+ 
+ 					EG(objects_store).object_buckets[obj->handle] = SET_OBJ_INVALID(obj);
+ 					GC_TYPE_INFO(obj) = IS_NULL |
+ 						(GC_TYPE_INFO(obj) & ~GC_TYPE_MASK);
+ 					/* Modify current before calling free_obj (bug #78811: free_obj() can cause the root buffer (with current) to be reallocated.) */
+ 					current->ref = GC_MAKE_GARBAGE(((char*)obj) - obj->handlers->offset);
+ 					if (!(OBJ_FLAGS(obj) & IS_OBJ_FREE_CALLED)) {
+ 						GC_ADD_FLAGS(obj, IS_OBJ_FREE_CALLED);
+ 						GC_ADDREF(obj);
+ 						obj->handlers->free_obj(obj);
+ 						GC_DELREF(obj);
+ 					}
+ 
+ 					ZEND_OBJECTS_STORE_ADD_TO_FREE_LIST(obj->handle);
+ 				} else if (GC_TYPE(p) == IS_ARRAY) {
+ 					zend_array *arr = (zend_array*)p;
+ 
+ 					GC_TYPE_INFO(arr) = IS_NULL |
+ 						(GC_TYPE_INFO(arr) & ~GC_TYPE_MASK);
+ 
+ 					/* GC may destroy arrays with rc>1. This is valid and safe. */
+ 					HT_ALLOW_COW_VIOLATION(arr);
+ 
+ 					zend_hash_destroy(arr);
+ 				}
+ 			}
+ 			idx++;
+ 		}
+ 
+ 		/* Free objects */
+ 		current = GC_IDX2PTR(GC_FIRST_ROOT);
+ 		last = GC_IDX2PTR(end);
+ 		while (current != last) {
+ 			if (GC_IS_GARBAGE(current->ref)) {
+ 				p = GC_GET_PTR(current->ref);
+ 				GC_LINK_UNUSED(current);
+ 				GC_G(num_roots)--;
+ 				efree(p);
+ 			}
+ 			current++;
+ 		}
+ 
+ 		GC_TRACE("Collection finished");
+ 		GC_G(collected) += count;
+ 		GC_G(gc_active) = 0;
+ 	}
+ 
+ 	gc_compact();
+ 	zend_get_gc_buffer_release();
+ 	return count;
+ }

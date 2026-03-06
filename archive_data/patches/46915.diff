@@ -1,0 +1,2284 @@
+commit a3bd8dfcb42a1ba7e77868ea626c07095ac7dc3e
+Author: Zoltan Szabadka <szabadka@google.com>
+Date:   Thu Jul 7 11:39:15 2022 +0200
+
+    Fixes for fuzzer bugs.
+    
+    * Initialize full image area with RenderPadding if frame is outside image
+    * Use unaligned store/load in all stages
+    * Only run per-group render pipeline if modular could decode something
+
+diff --git a/lib/jxl/dec_frame.cc b/lib/jxl/dec_frame.cc
+index 92868d4b..9fd3084c 100644
+--- a/lib/jxl/dec_frame.cc
++++ b/lib/jxl/dec_frame.cc
+@@ -448,82 +448,90 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
+ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
+                                     BitReader* JXL_RESTRICT* br,
+                                     size_t num_passes, size_t thread,
+                                     bool force_draw, bool dc_only) {
+   PROFILER_ZONE("process_group");
+   size_t group_dim = frame_dim_.group_dim;
+   const size_t gx = ac_group_id % frame_dim_.xsize_groups;
+   const size_t gy = ac_group_id / frame_dim_.xsize_groups;
+   const size_t x = gx * group_dim;
+   const size_t y = gy * group_dim;
++  JXL_DEBUG_V(3,
++              "Processing AC group %" PRIuS "(%" PRIuS ",%" PRIuS
++              ") group_dim: %" PRIuS " decoded passes: %u new passes: %" PRIuS,
++              ac_group_id, gx, gy, group_dim,
++              decoded_passes_per_ac_group_[ac_group_id], num_passes);
+ 
+   RenderPipelineInput render_pipeline_input =
+       dec_state_->render_pipeline->GetInputBuffers(ac_group_id, thread);
+ 
+   bool should_run_pipeline = true;
+ 
+   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
+     group_dec_caches_[thread].InitOnce(frame_header_.passes.num_passes,
+                                        dec_state_->used_acs);
+     JXL_RETURN_IF_ERROR(DecodeGroup(br, num_passes, ac_group_id, dec_state_,
+                                     &group_dec_caches_[thread], thread,
+                                     render_pipeline_input, decoded_,
+                                     decoded_passes_per_ac_group_[ac_group_id],
+                                     force_draw, dc_only, &should_run_pipeline));
+   }
+ 
+   // don't limit to image dimensions here (is done in DecodeGroup)
+   const Rect mrect(x, y, group_dim, group_dim);
+   for (size_t i = 0; i < frame_header_.passes.num_passes; i++) {
+     int minShift, maxShift;
+     frame_header_.passes.GetDownsamplingBracket(i, minShift, maxShift);
+     if (i >= decoded_passes_per_ac_group_[ac_group_id] &&
+         i < decoded_passes_per_ac_group_[ac_group_id] + num_passes) {
+       JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeGroup(
+           mrect, br[i - decoded_passes_per_ac_group_[ac_group_id]], minShift,
+           maxShift, ModularStreamId::ModularAC(ac_group_id, i),
+           /*zerofill=*/false, dec_state_, &render_pipeline_input, decoded_,
+-          /*allow_truncated=*/false));
++          /*allow_truncated=*/false, &should_run_pipeline));
+     } else if (i >= decoded_passes_per_ac_group_[ac_group_id] + num_passes &&
+                force_draw) {
+       JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeGroup(
+           mrect, nullptr, minShift, maxShift,
+           ModularStreamId::ModularAC(ac_group_id, i), /*zerofill=*/true,
+           dec_state_, &render_pipeline_input, decoded_,
+-          /*allow_truncated=*/false));
++          /*allow_truncated=*/false, &should_run_pipeline));
+     }
+   }
+   decoded_passes_per_ac_group_[ac_group_id] += num_passes;
+ 
+   if ((frame_header_.flags & FrameHeader::kNoise) != 0) {
+     PROFILER_ZONE("GenerateNoise");
+     size_t noise_c_start =
+         3 + frame_header_.nonserialized_metadata->m.num_extra_channels;
+     // When the color channels are downsampled, we need to generate more noise
+     // input for the current group than just the group dimensions.
+     std::pair<ImageF*, Rect> rects[3];
+     for (size_t iy = 0; iy < frame_header_.upsampling; iy++) {
+       for (size_t ix = 0; ix < frame_header_.upsampling; ix++) {
+         for (size_t c = 0; c < 3; c++) {
+           auto r = render_pipeline_input.GetBuffer(noise_c_start + c);
+           rects[c].first = r.first;
+           size_t x1 = r.second.x0() + r.second.xsize();
+           size_t y1 = r.second.y0() + r.second.ysize();
+           rects[c].second = Rect(r.second.x0() + ix * group_dim,
+                                  r.second.y0() + iy * group_dim, group_dim,
+                                  group_dim, x1, y1);
+         }
+         Random3Planes(dec_state_->visible_frame_index,
+                       dec_state_->nonvisible_frame_index,
+                       (gx * frame_header_.upsampling + ix) * group_dim,
+                       (gy * frame_header_.upsampling + iy) * group_dim,
+                       rects[0], rects[1], rects[2]);
+       }
+     }
+   }
+ 
+-  if (!modular_frame_decoder_.UsesFullImage() && !decoded_->IsJPEG() &&
+-      should_run_pipeline) {
+-    render_pipeline_input.Done();
++  if (!modular_frame_decoder_.UsesFullImage() && !decoded_->IsJPEG()) {
++    if (should_run_pipeline) {
++      render_pipeline_input.Done();
++    } else if (force_draw) {
++      return JXL_FAILURE("Modular group decoding failed.");
++    }
+   }
+   return true;
+ }
+diff --git a/lib/jxl/dec_group.cc b/lib/jxl/dec_group.cc
+index 628c932e..be85be4d 100644
+--- a/lib/jxl/dec_group.cc
++++ b/lib/jxl/dec_group.cc
+@@ -163,268 +163,270 @@ void DequantBlock(const AcStrategy& acs, float inv_global_scale, int quant,
+ Status DecodeGroupImpl(GetBlock* JXL_RESTRICT get_block,
+                        GroupDecCache* JXL_RESTRICT group_dec_cache,
+                        PassesDecoderState* JXL_RESTRICT dec_state,
+                        size_t thread, size_t group_idx,
+                        RenderPipelineInput& render_pipeline_input,
+                        ImageBundle* decoded, DrawMode draw) {
+   // TODO(veluca): investigate cache usage in this function.
+   PROFILER_FUNC;
+   const Rect block_rect = dec_state->shared->BlockGroupRect(group_idx);
+   const AcStrategyImage& ac_strategy = dec_state->shared->ac_strategy;
+ 
+   const size_t xsize_blocks = block_rect.xsize();
+   const size_t ysize_blocks = block_rect.ysize();
+ 
+   const size_t dc_stride = dec_state->shared->dc->PixelsPerRow();
+ 
+   const float inv_global_scale = dec_state->shared->quantizer.InvGlobalScale();
+ 
+   const YCbCrChromaSubsampling& cs =
+       dec_state->shared->frame_header.chroma_subsampling;
+ 
+   size_t idct_stride[3];
+   for (size_t c = 0; c < 3; c++) {
+     idct_stride[c] = render_pipeline_input.GetBuffer(c).first->PixelsPerRow();
+   }
+ 
+   HWY_ALIGN int32_t scaled_qtable[64 * 3];
+ 
+   ACType ac_type = dec_state->coefficients->Type();
+   auto dequant_block = ac_type == ACType::k16 ? DequantBlock<ACType::k16>
+                                               : DequantBlock<ACType::k32>;
+   // Whether or not coefficients should be stored for future usage, and/or read
+   // from past usage.
+   bool accumulate = !dec_state->coefficients->IsEmpty();
+   // Offset of the current block in the group.
+   size_t offset = 0;
+ 
+   std::array<int, 3> jpeg_c_map;
+   bool jpeg_is_gray = false;
+   std::array<int, 3> dcoff = {};
+ 
+   // TODO(veluca): all of this should be done only once per image.
+   if (decoded->IsJPEG()) {
+     if (!dec_state->shared->cmap.IsJPEGCompatible()) {
+       return JXL_FAILURE("The CfL map is not JPEG-compatible");
+     }
+     jpeg_is_gray = (decoded->jpeg_data->components.size() == 1);
+     jpeg_c_map = JpegOrder(dec_state->shared->frame_header.color_transform,
+                            jpeg_is_gray);
+     const std::vector<QuantEncoding>& qe =
+         dec_state->shared->matrices.encodings();
+     if (qe.empty() || qe[0].mode != QuantEncoding::Mode::kQuantModeRAW ||
+         std::abs(qe[0].qraw.qtable_den - 1.f / (8 * 255)) > 1e-8f) {
+       return JXL_FAILURE(
+           "Quantization table is not a JPEG quantization table.");
+     }
+     for (size_t c = 0; c < 3; c++) {
+       if (dec_state->shared->frame_header.color_transform ==
+           ColorTransform::kNone) {
+         dcoff[c] = 1024 / (*qe[0].qraw.qtable)[64 * c];
+       }
+       for (size_t i = 0; i < 64; i++) {
+         // Transpose the matrix, as it will be used on the transposed block.
+         int n = qe[0].qraw.qtable->at(64 + i);
+         int d = qe[0].qraw.qtable->at(64 * c + i);
+         if (n <= 0 || d <= 0 || n >= 65536 || d >= 65536) {
+           return JXL_FAILURE("Invalid JPEG quantization table");
+         }
+         scaled_qtable[64 * c + (i % 8) * 8 + (i / 8)] =
+             (1 << kCFLFixedPointPrecision) * n / d;
+       }
+     }
+   }
+ 
+   size_t hshift[3] = {cs.HShift(0), cs.HShift(1), cs.HShift(2)};
+   size_t vshift[3] = {cs.VShift(0), cs.VShift(1), cs.VShift(2)};
+   Rect r[3];
+   for (size_t i = 0; i < 3; i++) {
+     r[i] =
+         Rect(block_rect.x0() >> hshift[i], block_rect.y0() >> vshift[i],
+              block_rect.xsize() >> hshift[i], block_rect.ysize() >> vshift[i]);
+-    JXL_ASSERT(r[i].IsInside({0, 0, dec_state->shared->dc->Plane(i).xsize(),
+-                              dec_state->shared->dc->Plane(i).ysize()}));
++    if (!r[i].IsInside({0, 0, dec_state->shared->dc->Plane(i).xsize(),
++                        dec_state->shared->dc->Plane(i).ysize()})) {
++      return JXL_FAILURE("Frame dimensions are too big for the image.");
++    }
+   }
+ 
+   for (size_t by = 0; by < ysize_blocks; ++by) {
+     get_block->StartRow(by);
+     size_t sby[3] = {by >> vshift[0], by >> vshift[1], by >> vshift[2]};
+ 
+     const int32_t* JXL_RESTRICT row_quant =
+         block_rect.ConstRow(dec_state->shared->raw_quant_field, by);
+ 
+     const float* JXL_RESTRICT dc_rows[3] = {
+         r[0].ConstPlaneRow(*dec_state->shared->dc, 0, sby[0]),
+         r[1].ConstPlaneRow(*dec_state->shared->dc, 1, sby[1]),
+         r[2].ConstPlaneRow(*dec_state->shared->dc, 2, sby[2]),
+     };
+ 
+     const size_t ty = (block_rect.y0() + by) / kColorTileDimInBlocks;
+     AcStrategyRow acs_row = ac_strategy.ConstRow(block_rect, by);
+ 
+     const int8_t* JXL_RESTRICT row_cmap[3] = {
+         dec_state->shared->cmap.ytox_map.ConstRow(ty),
+         nullptr,
+         dec_state->shared->cmap.ytob_map.ConstRow(ty),
+     };
+ 
+     float* JXL_RESTRICT idct_row[3];
+     int16_t* JXL_RESTRICT jpeg_row[3];
+     for (size_t c = 0; c < 3; c++) {
+       idct_row[c] = render_pipeline_input.GetBuffer(c).second.Row(
+           render_pipeline_input.GetBuffer(c).first, sby[c] * kBlockDim);
+       if (decoded->IsJPEG()) {
+         auto& component = decoded->jpeg_data->components[jpeg_c_map[c]];
+         jpeg_row[c] =
+             component.coeffs.data() +
+             (component.width_in_blocks * (r[c].y0() + sby[c]) + r[c].x0()) *
+                 kDCTBlockSize;
+       }
+     }
+ 
+     size_t bx = 0;
+     for (size_t tx = 0; tx < DivCeil(xsize_blocks, kColorTileDimInBlocks);
+          tx++) {
+       size_t abs_tx = tx + block_rect.x0() / kColorTileDimInBlocks;
+       auto x_cc_mul =
+           Set(d, dec_state->shared->cmap.YtoXRatio(row_cmap[0][abs_tx]));
+       auto b_cc_mul =
+           Set(d, dec_state->shared->cmap.YtoBRatio(row_cmap[2][abs_tx]));
+       // Increment bx by llf_x because those iterations would otherwise
+       // immediately continue (!IsFirstBlock). Reduces mispredictions.
+       for (; bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks;) {
+         size_t sbx[3] = {bx >> hshift[0], bx >> hshift[1], bx >> hshift[2]};
+         AcStrategy acs = acs_row[bx];
+         const size_t llf_x = acs.covered_blocks_x();
+ 
+         // Can only happen in the second or lower rows of a varblock.
+         if (JXL_UNLIKELY(!acs.IsFirstBlock())) {
+           bx += llf_x;
+           continue;
+         }
+         PROFILER_ZONE("DecodeGroupImpl inner");
+         const size_t log2_covered_blocks = acs.log2_covered_blocks();
+ 
+         const size_t covered_blocks = 1 << log2_covered_blocks;
+         const size_t size = covered_blocks * kDCTBlockSize;
+ 
+         ACPtr qblock[3];
+         if (accumulate) {
+           for (size_t c = 0; c < 3; c++) {
+             qblock[c] = dec_state->coefficients->PlaneRow(c, group_idx, offset);
+           }
+         } else {
+           // No point in reading from bitstream without accumulating and not
+           // drawing.
+           JXL_ASSERT(draw == kDraw);
+           if (ac_type == ACType::k16) {
+             memset(group_dec_cache->dec_group_qblock16, 0,
+                    size * 3 * sizeof(int16_t));
+             for (size_t c = 0; c < 3; c++) {
+               qblock[c].ptr16 = group_dec_cache->dec_group_qblock16 + c * size;
+             }
+           } else {
+             memset(group_dec_cache->dec_group_qblock, 0,
+                    size * 3 * sizeof(int32_t));
+             for (size_t c = 0; c < 3; c++) {
+               qblock[c].ptr32 = group_dec_cache->dec_group_qblock + c * size;
+             }
+           }
+         }
+         JXL_RETURN_IF_ERROR(get_block->LoadBlock(
+             bx, by, acs, size, log2_covered_blocks, qblock, ac_type));
+         offset += size;
+         if (draw == kDontDraw) {
+           bx += llf_x;
+           continue;
+         }
+ 
+         if (JXL_UNLIKELY(decoded->IsJPEG())) {
+           if (acs.Strategy() != AcStrategy::Type::DCT) {
+             return JXL_FAILURE(
+                 "Can only decode to JPEG if only DCT-8 is used.");
+           }
+ 
+           HWY_ALIGN int32_t transposed_dct_y[64];
+           for (size_t c : {1, 0, 2}) {
+             // Propagate only Y for grayscale.
+             if (jpeg_is_gray && c != 1) {
+               continue;
+             }
+             if ((sbx[c] << hshift[c] != bx) || (sby[c] << vshift[c] != by)) {
+               continue;
+             }
+             int16_t* JXL_RESTRICT jpeg_pos =
+                 jpeg_row[c] + sbx[c] * kDCTBlockSize;
+             // JPEG XL is transposed, JPEG is not.
+             auto transposed_dct = qblock[c].ptr32;
+             Transpose8x8InPlace(transposed_dct);
+             // No CfL - no need to store the y block converted to integers.
+             if (!cs.Is444() ||
+                 (row_cmap[0][abs_tx] == 0 && row_cmap[2][abs_tx] == 0)) {
+               for (size_t i = 0; i < 64; i += Lanes(d)) {
+                 const auto ini = Load(di, transposed_dct + i);
+                 const auto ini16 = DemoteTo(di16, ini);
+                 StoreU(ini16, di16, jpeg_pos + i);
+               }
+             } else if (c == 1) {
+               // Y channel: save for restoring X/B, but nothing else to do.
+               for (size_t i = 0; i < 64; i += Lanes(d)) {
+                 const auto ini = Load(di, transposed_dct + i);
+                 Store(ini, di, transposed_dct_y + i);
+                 const auto ini16 = DemoteTo(di16, ini);
+                 StoreU(ini16, di16, jpeg_pos + i);
+               }
+             } else {
+               // transposed_dct_y contains the y channel block, transposed.
+               const auto scale = Set(
+                   di, dec_state->shared->cmap.RatioJPEG(row_cmap[c][abs_tx]));
+               const auto round = Set(di, 1 << (kCFLFixedPointPrecision - 1));
+               for (int i = 0; i < 64; i += Lanes(d)) {
+                 auto in = Load(di, transposed_dct + i);
+                 auto in_y = Load(di, transposed_dct_y + i);
+                 auto qt = Load(di, scaled_qtable + c * size + i);
+                 auto coeff_scale =
+                     ShiftRight<kCFLFixedPointPrecision>(qt * scale + round);
+                 auto cfl_factor = ShiftRight<kCFLFixedPointPrecision>(
+                     in_y * coeff_scale + round);
+                 StoreU(DemoteTo(di16, in + cfl_factor), di16, jpeg_pos + i);
+               }
+             }
+             jpeg_pos[0] =
+                 Clamp1<float>(dc_rows[c][sbx[c]] - dcoff[c], -2047, 2047);
+           }
+         } else {
+           HWY_ALIGN float* const block = group_dec_cache->dec_group_block;
+           // Dequantize and add predictions.
+           dequant_block(
+               acs, inv_global_scale, row_quant[bx], dec_state->x_dm_multiplier,
+               dec_state->b_dm_multiplier, x_cc_mul, b_cc_mul, acs.RawStrategy(),
+               size, dec_state->shared->quantizer,
+               acs.covered_blocks_y() * acs.covered_blocks_x(), sbx, dc_rows,
+               dc_stride,
+               dec_state->output_encoding_info.opsin_params.quant_biases, qblock,
+               block);
+ 
+           for (size_t c : {1, 0, 2}) {
+             if ((sbx[c] << hshift[c] != bx) || (sby[c] << vshift[c] != by)) {
+               continue;
+             }
+             // IDCT
+             float* JXL_RESTRICT idct_pos = idct_row[c] + sbx[c] * kBlockDim;
+             TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
+                               idct_stride[c], group_dec_cache->scratch_space);
+           }
+         }
+         bx += llf_x;
+       }
+     }
+   }
+   if (draw == kDontDraw) {
+     return true;
+   }
+   return true;
+ }
+ 
+ // NOLINTNEXTLINE(google-readability-namespace-comments)
+ }  // namespace HWY_NAMESPACE
+ }  // namespace jxl
+diff --git a/lib/jxl/dec_modular.cc b/lib/jxl/dec_modular.cc
+index 24bc8cfb..66617e3b 100644
+--- a/lib/jxl/dec_modular.cc
++++ b/lib/jxl/dec_modular.cc
+@@ -1,29 +1,30 @@
+ // Copyright (c) the JPEG XL Project Authors. All rights reserved.
+ //
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+ #include "lib/jxl/dec_modular.h"
+ 
+ #include <stdint.h>
+ 
+ #include <atomic>
++#include <sstream>
+ #include <vector>
+ 
+ #include "lib/jxl/frame_header.h"
+ 
+ #undef HWY_TARGET_INCLUDE
+ #define HWY_TARGET_INCLUDE "lib/jxl/dec_modular.cc"
+ #include <hwy/foreach_target.h>
+ #include <hwy/highway.h>
+ 
+ #include "lib/jxl/alpha.h"
+ #include "lib/jxl/base/compiler_specific.h"
+ #include "lib/jxl/base/printf_macros.h"
+ #include "lib/jxl/base/span.h"
+ #include "lib/jxl/base/status.h"
+ #include "lib/jxl/compressed_dc.h"
+ #include "lib/jxl/epf.h"
+ #include "lib/jxl/modular/encoding/encoding.h"
+ #include "lib/jxl/modular/modular_image.h"
+ #include "lib/jxl/modular/transform/transform.h"
+@@ -150,6 +151,28 @@ void int_to_float(const pixel_type* const JXL_RESTRICT row_in,
+   }
+ }
+ 
++std::string ModularStreamId::DebugString() const {
++  std::ostringstream os;
++  os << (kind == kGlobalData   ? "ModularGlobal"
++         : kind == kVarDCTDC   ? "VarDCTDC"
++         : kind == kModularDC  ? "ModularDC"
++         : kind == kACMetadata ? "ACMeta"
++         : kind == kQuantTable ? "QuantTable"
++         : kind == kModularAC  ? "ModularAC"
++                               : "");
++  if (kind == kVarDCTDC || kind == kModularDC || kind == kACMetadata ||
++      kind == kModularAC) {
++    os << " group " << group_id;
++  }
++  if (kind == kModularAC) {
++    os << " pass " << pass_id;
++  }
++  if (kind == kQuantTable) {
++    os << " " << quant_table_id;
++  }
++  return os.str();
++}
++
+ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
+                                              const FrameHeader& frame_header,
+                                              bool allow_truncated_group) {
+@@ -265,78 +288,93 @@ void ModularFrameDecoder::MaybeDropFullImage() {
+ Status ModularFrameDecoder::DecodeGroup(
+     const Rect& rect, BitReader* reader, int minShift, int maxShift,
+     const ModularStreamId& stream, bool zerofill, PassesDecoderState* dec_state,
+     RenderPipelineInput* render_pipeline_input, ImageBundle* output,
+-    bool allow_truncated) {
++    bool allow_truncated, bool* should_run_pipeline) {
++  JXL_DEBUG_V(6, "Decoding %s with rect %s and shift bracket %d..%d %s",
++              stream.DebugString().c_str(), Description(rect).c_str(), minShift,
++              maxShift, zerofill ? "using zerofill" : "");
+   JXL_DASSERT(stream.kind == ModularStreamId::kModularDC ||
+               stream.kind == ModularStreamId::kModularAC);
+   const size_t xsize = rect.xsize();
+   const size_t ysize = rect.ysize();
+   Image gi(xsize, ysize, full_image.bitdepth, 0);
+   // start at the first bigger-than-groupsize non-metachannel
+   size_t c = full_image.nb_meta_channels;
+   for (; c < full_image.channel.size(); c++) {
+     Channel& fc = full_image.channel[c];
+     if (fc.w > frame_dim.group_dim || fc.h > frame_dim.group_dim) break;
+   }
+   size_t beginc = c;
+   for (; c < full_image.channel.size(); c++) {
+     Channel& fc = full_image.channel[c];
+     int shift = std::min(fc.hshift, fc.vshift);
+     if (shift > maxShift) continue;
+     if (shift < minShift) continue;
+     Rect r(rect.x0() >> fc.hshift, rect.y0() >> fc.vshift,
+            rect.xsize() >> fc.hshift, rect.ysize() >> fc.vshift, fc.w, fc.h);
+     if (r.xsize() == 0 || r.ysize() == 0) continue;
+     if (zerofill && use_full_image) {
+       for (size_t y = 0; y < r.ysize(); ++y) {
+         pixel_type* const JXL_RESTRICT row_out = r.Row(&fc.plane, y);
+         memset(row_out, 0, r.xsize() * sizeof(*row_out));
+       }
+     } else {
+       Channel gc(r.xsize(), r.ysize());
+       if (zerofill) ZeroFillImage(&gc.plane);
+       gc.hshift = fc.hshift;
+       gc.vshift = fc.vshift;
+       gi.channel.emplace_back(std::move(gc));
+     }
+   }
+   if (zerofill && use_full_image) return true;
+   // Return early if there's nothing to decode. Otherwise there might be
+   // problems later (in ModularImageToDecodedRect).
+-  if (gi.channel.empty()) return true;
++  if (gi.channel.empty()) {
++    if (dec_state && should_run_pipeline) {
++      const auto& frame_header = dec_state->shared->frame_header;
++      const auto* metadata = frame_header.nonserialized_metadata;
++      if (do_color || metadata->m.num_extra_channels > 0) {
++        // Signal to FrameDecoder that we do not have some of the required input
++        // for the render pipeline.
++        *should_run_pipeline = false;
++      }
++    }
++    JXL_DEBUG_V(6, "Noting to decode, returning early.");
++    return true;
++  }
+   ModularOptions options;
+   if (!zerofill) {
+     auto status = ModularGenericDecompress(
+         reader, gi, /*header=*/nullptr, stream.ID(frame_dim), &options,
+         /*undo_transforms=*/true, &tree, &code, &context_map, allow_truncated);
+     if (!allow_truncated) JXL_RETURN_IF_ERROR(status);
+     if (status.IsFatalError()) return status;
+   }
+   // Undo global transforms that have been pushed to the group level
+   if (!use_full_image) {
+     JXL_ASSERT(render_pipeline_input);
+     for (auto t : global_transform) {
+       JXL_RETURN_IF_ERROR(t.Inverse(gi, global_header.wp_header));
+     }
+     JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(gi, dec_state, nullptr,
+                                                   *render_pipeline_input,
+                                                   Rect(0, 0, gi.w, gi.h)));
+     return true;
+   }
+   int gic = 0;
+   for (c = beginc; c < full_image.channel.size(); c++) {
+     Channel& fc = full_image.channel[c];
+     int shift = std::min(fc.hshift, fc.vshift);
+     if (shift > maxShift) continue;
+     if (shift < minShift) continue;
+     Rect r(rect.x0() >> fc.hshift, rect.y0() >> fc.vshift,
+            rect.xsize() >> fc.hshift, rect.ysize() >> fc.vshift, fc.w, fc.h);
+     if (r.xsize() == 0 || r.ysize() == 0) continue;
+     JXL_ASSERT(use_full_image);
+     CopyImageTo(/*rect_from=*/Rect(0, 0, r.xsize(), r.ysize()),
+                 /*from=*/gi.channel[gic].plane,
+                 /*rect_to=*/r, /*to=*/&fc.plane);
+     gic++;
+   }
+   return true;
+ }
+@@ -464,164 +502,170 @@ Status ModularFrameDecoder::DecodeAcMetadata(size_t group_id, BitReader* reader,
+ Status ModularFrameDecoder::ModularImageToDecodedRect(
+     Image& gi, PassesDecoderState* dec_state, jxl::ThreadPool* pool,
+     RenderPipelineInput& render_pipeline_input, Rect modular_rect) {
+   const auto& frame_header = dec_state->shared->frame_header;
+   const auto* metadata = frame_header.nonserialized_metadata;
+   JXL_CHECK(gi.transform.empty());
+ 
+   auto get_row = [&](size_t c, size_t y) {
+     const auto& buffer = render_pipeline_input.GetBuffer(c);
+     return buffer.second.Row(buffer.first, y);
+   };
+ 
+   size_t c = 0;
+   if (do_color) {
+     const bool rgb_from_gray =
+         metadata->m.color_encoding.IsGray() &&
+         frame_header.color_transform == ColorTransform::kNone;
+     const bool fp = metadata->m.bit_depth.floating_point_sample &&
+                     frame_header.color_transform != ColorTransform::kXYB;
+     for (; c < 3; c++) {
+       double factor = full_image.bitdepth < 32
+                           ? 1.0 / ((1u << full_image.bitdepth) - 1)
+                           : 0;
+       size_t c_in = c;
+       if (frame_header.color_transform == ColorTransform::kXYB) {
+         factor = dec_state->shared->matrices.DCQuants()[c];
+         // XYB is encoded as YX(B-Y)
+         if (c < 2) c_in = 1 - c;
+       } else if (rgb_from_gray) {
+         c_in = 0;
+       }
+       JXL_ASSERT(c_in < gi.channel.size());
+       Channel& ch_in = gi.channel[c_in];
+       // TODO(eustas): could we detect it on earlier stage?
+       if (ch_in.w == 0 || ch_in.h == 0) {
+         return JXL_FAILURE("Empty image");
+       }
+       JXL_CHECK(ch_in.hshift <= 3 && ch_in.vshift <= 3);
+       Rect r = render_pipeline_input.GetBuffer(c).second;
+       Rect mr(modular_rect.x0() >> ch_in.hshift,
+               modular_rect.y0() >> ch_in.vshift,
+               DivCeil(modular_rect.xsize(), 1 << ch_in.hshift),
+               DivCeil(modular_rect.ysize(), 1 << ch_in.vshift));
+       mr = mr.Crop(ch_in.plane);
+       size_t xsize_shifted = r.xsize();
+       size_t ysize_shifted = r.ysize();
+       if (r.ysize() != mr.ysize() || r.xsize() != mr.xsize()) {
+         return JXL_FAILURE("Dimension mismatch: trying to fit a %" PRIuS
+                            "x%" PRIuS
+                            " modular channel into "
+                            "a %" PRIuS "x%" PRIuS " rect",
+                            mr.xsize(), mr.ysize(), r.xsize(), r.ysize());
+       }
+       if (frame_header.color_transform == ColorTransform::kXYB && c == 2) {
+         JXL_ASSERT(!fp);
+         JXL_RETURN_IF_ERROR(RunOnPool(
+             pool, 0, ysize_shifted, ThreadPool::NoInit,
+             [&](const uint32_t task, size_t /* thread */) {
+               const size_t y = task;
+               const pixel_type* const JXL_RESTRICT row_in =
+                   mr.Row(&ch_in.plane, y);
+               const pixel_type* const JXL_RESTRICT row_in_Y =
+                   mr.Row(&gi.channel[0].plane, y);
+               float* const JXL_RESTRICT row_out = get_row(c, y);
+               HWY_DYNAMIC_DISPATCH(MultiplySum)
+               (xsize_shifted, row_in, row_in_Y, factor, row_out);
+             },
+             "ModularIntToFloat"));
+       } else if (fp) {
+         int bits = metadata->m.bit_depth.bits_per_sample;
+         int exp_bits = metadata->m.bit_depth.exponent_bits_per_sample;
+         JXL_RETURN_IF_ERROR(RunOnPool(
+             pool, 0, ysize_shifted, ThreadPool::NoInit,
+             [&](const uint32_t task, size_t /* thread */) {
+               const size_t y = task;
+               const pixel_type* const JXL_RESTRICT row_in =
+                   mr.Row(&ch_in.plane, y);
+               if (rgb_from_gray) {
+                 for (size_t cc = 0; cc < 3; cc++) {
+                   float* const JXL_RESTRICT row_out = get_row(cc, y);
+                   int_to_float(row_in, row_out, xsize_shifted, bits, exp_bits);
+                 }
+               } else {
+                 float* const JXL_RESTRICT row_out = get_row(c, y);
+                 int_to_float(row_in, row_out, xsize_shifted, bits, exp_bits);
+               }
+             },
+             "ModularIntToFloat_losslessfloat"));
+       } else {
+         JXL_RETURN_IF_ERROR(RunOnPool(
+             pool, 0, ysize_shifted, ThreadPool::NoInit,
+             [&](const uint32_t task, size_t /* thread */) {
+               const size_t y = task;
+               const pixel_type* const JXL_RESTRICT row_in =
+                   mr.Row(&ch_in.plane, y);
+               if (rgb_from_gray) {
+                 if (full_image.bitdepth < 23) {
+                   HWY_DYNAMIC_DISPATCH(RgbFromSingle)
+                   (xsize_shifted, row_in, factor, get_row(0, y), get_row(1, y),
+                    get_row(2, y));
+                 } else {
+                   SingleFromSingleAccurate(xsize_shifted, row_in, factor,
+                                            get_row(0, y));
+                   SingleFromSingleAccurate(xsize_shifted, row_in, factor,
+                                            get_row(1, y));
+                   SingleFromSingleAccurate(xsize_shifted, row_in, factor,
+                                            get_row(2, y));
+                 }
+               } else {
+                 float* const JXL_RESTRICT row_out = get_row(c, y);
+                 if (full_image.bitdepth < 23) {
+                   HWY_DYNAMIC_DISPATCH(SingleFromSingle)
+                   (xsize_shifted, row_in, factor, row_out);
+                 } else {
+                   SingleFromSingleAccurate(xsize_shifted, row_in, factor,
+                                            row_out);
+                 }
+               }
+             },
+             "ModularIntToFloat"));
+       }
+       if (rgb_from_gray) {
+         break;
+       }
+     }
+     if (rgb_from_gray) {
+       c = 1;
+     }
+   }
+   size_t num_extra_channels = metadata->m.num_extra_channels;
+   for (size_t ec = 0; ec < num_extra_channels; ec++, c++) {
+     const ExtraChannelInfo& eci = metadata->m.extra_channel_info[ec];
+     int bits = eci.bit_depth.bits_per_sample;
+     int exp_bits = eci.bit_depth.exponent_bits_per_sample;
+     bool fp = eci.bit_depth.floating_point_sample;
+     JXL_ASSERT(fp || bits < 32);
+     const double factor = fp ? 0 : (1.0 / ((1u << bits) - 1));
+     JXL_ASSERT(c < gi.channel.size());
+     Channel& ch_in = gi.channel[c];
+     Rect r = render_pipeline_input.GetBuffer(3 + ec).second;
+     Rect mr(modular_rect.x0() >> ch_in.hshift,
+             modular_rect.y0() >> ch_in.vshift,
+             DivCeil(modular_rect.xsize(), 1 << ch_in.hshift),
+             DivCeil(modular_rect.ysize(), 1 << ch_in.vshift));
+     mr = mr.Crop(ch_in.plane);
+-
++    if (r.ysize() != mr.ysize() || r.xsize() != mr.xsize()) {
++      return JXL_FAILURE("Dimension mismatch: trying to fit a %" PRIuS
++                         "x%" PRIuS
++                         " modular channel into "
++                         "a %" PRIuS "x%" PRIuS " rect",
++                         mr.xsize(), mr.ysize(), r.xsize(), r.ysize());
++    }
+     for (size_t y = 0; y < r.ysize(); ++y) {
+       float* const JXL_RESTRICT row_out =
+           r.Row(render_pipeline_input.GetBuffer(3 + ec).first, y);
+       const pixel_type* const JXL_RESTRICT row_in = mr.Row(&ch_in.plane, y);
+       if (fp) {
+         int_to_float(row_in, row_out, r.xsize(), bits, exp_bits);
+       } else {
+         if (full_image.bitdepth < 23) {
+           HWY_DYNAMIC_DISPATCH(SingleFromSingle)
+           (r.xsize(), row_in, factor, row_out);
+         } else {
+           SingleFromSingleAccurate(r.xsize(), row_in, factor, row_out);
+         }
+       }
+     }
+   }
+   return true;
+ }
+@@ -629,47 +673,50 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
+ Status ModularFrameDecoder::FinalizeDecoding(PassesDecoderState* dec_state,
+                                              jxl::ThreadPool* pool,
+                                              ImageBundle* output,
+                                              bool inplace) {
+   if (!use_full_image) return true;
+   Image gi = (inplace ? std::move(full_image) : full_image.clone());
+   size_t xsize = gi.w;
+   size_t ysize = gi.h;
+ 
++  JXL_DEBUG_V(3, "Finalizing decoding for modular image: %s",
++              gi.DebugString().c_str());
++
+   // Don't use threads if total image size is smaller than a group
+   if (xsize * ysize < frame_dim.group_dim * frame_dim.group_dim) pool = nullptr;
+ 
+   // Undo the global transforms
+   gi.undo_transforms(global_header.wp_header, pool);
+   for (auto t : global_transform) {
+     JXL_RETURN_IF_ERROR(t.Inverse(gi, global_header.wp_header));
+   }
+   if (gi.error) return JXL_FAILURE("Undoing transforms failed");
+ 
+   for (size_t i = 0; i < dec_state->shared->frame_dim.num_groups; i++) {
+     dec_state->render_pipeline->ClearDone(i);
+   }
+   std::atomic<bool> has_error{false};
+   JXL_RETURN_IF_ERROR(RunOnPool(
+       pool, 0, dec_state->shared->frame_dim.num_groups,
+       [&](size_t num_threads) {
+         return dec_state->render_pipeline->PrepareForThreads(
+             num_threads,
+             /*use_group_ids=*/dec_state->shared->frame_header.encoding ==
+                 FrameEncoding::kVarDCT);
+       },
+       [&](const uint32_t group, size_t thread_id) {
+         RenderPipelineInput input =
+             dec_state->render_pipeline->GetInputBuffers(group, thread_id);
+         if (!ModularImageToDecodedRect(gi, dec_state, nullptr, input,
+                                        dec_state->shared->GroupRect(group))) {
+           has_error = true;
+           return;
+         }
+         input.Done();
+       },
+       "ModularToRect"));
+   if (has_error) {
+     return JXL_FAILURE("Error producing input to render pipeline");
+   }
+   return true;
+ }
+diff --git a/lib/jxl/dec_modular.h b/lib/jxl/dec_modular.h
+index eaea1ffa..d4dd07a3 100644
+--- a/lib/jxl/dec_modular.h
++++ b/lib/jxl/dec_modular.h
+@@ -1,20 +1,22 @@
+ // Copyright (c) the JPEG XL Project Authors. All rights reserved.
+ //
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+ #ifndef LIB_JXL_DEC_MODULAR_H_
+ #define LIB_JXL_DEC_MODULAR_H_
+ 
+ #include <stddef.h>
+ 
++#include <string>
++
+ #include "lib/jxl/aux_out_fwd.h"
+ #include "lib/jxl/base/data_parallel.h"
+ #include "lib/jxl/base/status.h"
+ #include "lib/jxl/dec_bit_reader.h"
+ #include "lib/jxl/dec_cache.h"
+ #include "lib/jxl/frame_header.h"
+ #include "lib/jxl/image.h"
+ #include "lib/jxl/image_bundle.h"
+ #include "lib/jxl/modular/encoding/encoding.h"
+ #include "lib/jxl/modular/modular_image.h"
+@@ -24,116 +26,118 @@ namespace jxl {
+ struct ModularStreamId {
+   enum Kind {
+     kGlobalData,
+     kVarDCTDC,
+     kModularDC,
+     kACMetadata,
+     kQuantTable,
+     kModularAC
+   };
+   Kind kind;
+   size_t quant_table_id;
+   size_t group_id;  // DC or AC group id.
+   size_t pass_id;   // Only for kModularAC.
+   size_t ID(const FrameDimensions& frame_dim) const {
+     size_t id = 0;
+     switch (kind) {
+       case kGlobalData:
+         id = 0;
+         break;
+       case kVarDCTDC:
+         id = 1 + group_id;
+         break;
+       case kModularDC:
+         id = 1 + frame_dim.num_dc_groups + group_id;
+         break;
+       case kACMetadata:
+         id = 1 + 2 * frame_dim.num_dc_groups + group_id;
+         break;
+       case kQuantTable:
+         id = 1 + 3 * frame_dim.num_dc_groups + quant_table_id;
+         break;
+       case kModularAC:
+         id = 1 + 3 * frame_dim.num_dc_groups + DequantMatrices::kNum +
+              frame_dim.num_groups * pass_id + group_id;
+         break;
+     };
+     return id;
+   }
+   static ModularStreamId Global() {
+     return ModularStreamId{kGlobalData, 0, 0, 0};
+   }
+   static ModularStreamId VarDCTDC(size_t group_id) {
+     return ModularStreamId{kVarDCTDC, 0, group_id, 0};
+   }
+   static ModularStreamId ModularDC(size_t group_id) {
+     return ModularStreamId{kModularDC, 0, group_id, 0};
+   }
+   static ModularStreamId ACMetadata(size_t group_id) {
+     return ModularStreamId{kACMetadata, 0, group_id, 0};
+   }
+   static ModularStreamId QuantTable(size_t quant_table_id) {
+     JXL_ASSERT(quant_table_id < DequantMatrices::kNum);
+     return ModularStreamId{kQuantTable, quant_table_id, 0, 0};
+   }
+   static ModularStreamId ModularAC(size_t group_id, size_t pass_id) {
+     return ModularStreamId{kModularAC, 0, group_id, pass_id};
+   }
+   static size_t Num(const FrameDimensions& frame_dim, size_t passes) {
+     return ModularAC(0, passes).ID(frame_dim);
+   }
++  std::string DebugString() const;
+ };
+ 
+ class ModularFrameDecoder {
+  public:
+   void Init(const FrameDimensions& frame_dim) { this->frame_dim = frame_dim; }
+   Status DecodeGlobalInfo(BitReader* reader, const FrameHeader& frame_header,
+                           bool allow_truncated_group);
+   Status DecodeGroup(const Rect& rect, BitReader* reader, int minShift,
+                      int maxShift, const ModularStreamId& stream, bool zerofill,
+                      PassesDecoderState* dec_state,
+                      RenderPipelineInput* render_pipeline_input,
+-                     ImageBundle* output, bool allow_truncated);
++                     ImageBundle* output, bool allow_truncated,
++                     bool* should_run_pipeline = nullptr);
+   // Decodes a VarDCT DC group (`group_id`) from the given `reader`.
+   Status DecodeVarDCTDC(size_t group_id, BitReader* reader,
+                         PassesDecoderState* dec_state);
+   // Decodes a VarDCT AC Metadata group (`group_id`) from the given `reader`.
+   Status DecodeAcMetadata(size_t group_id, BitReader* reader,
+                           PassesDecoderState* dec_state);
+   // Decodes a RAW quant table from `br` into the given `encoding`, of size
+   // `required_size_x x required_size_y`. If `modular_frame_decoder` is passed,
+   // its global tree is used, otherwise no global tree is used.
+   static Status DecodeQuantTable(size_t required_size_x, size_t required_size_y,
+                                  BitReader* br, QuantEncoding* encoding,
+                                  size_t idx,
+                                  ModularFrameDecoder* modular_frame_decoder);
+   // if inplace is true, this can only be called once
+   // if it is false, it can be called multiple times (e.g. for progressive
+   // steps)
+   Status FinalizeDecoding(PassesDecoderState* dec_state, jxl::ThreadPool* pool,
+                           ImageBundle* output, bool inplace);
+   bool have_dc() const { return have_something; }
+   void MaybeDropFullImage();
+   bool UsesFullImage() const { return use_full_image; }
+ 
+  private:
+   Status ModularImageToDecodedRect(Image& gi, PassesDecoderState* dec_state,
+                                    jxl::ThreadPool* pool,
+                                    RenderPipelineInput& render_pipeline_input,
+                                    Rect modular_rect);
+ 
+   Image full_image;
+   std::vector<Transform> global_transform;
+   FrameDimensions frame_dim;
+   bool do_color;
+   bool have_something;
+   bool use_full_image = true;
+   bool all_same_shift;
+   Tree tree;
+   ANSCode code;
+   std::vector<uint8_t> context_map;
+   GroupHeader global_header;
+ };
+ 
+ }  // namespace jxl
+ 
+ #endif  // LIB_JXL_DEC_MODULAR_H_
+diff --git a/lib/jxl/frame_header.cc b/lib/jxl/frame_header.cc
+index fa913d73..5a154261 100644
+--- a/lib/jxl/frame_header.cc
++++ b/lib/jxl/frame_header.cc
+@@ -403,61 +403,62 @@ Status FrameHeader::VisitFields(Visitor* JXL_RESTRICT visitor) {
+ std::string FrameHeader::DebugString() const {
+   std::ostringstream os;
+   os << (encoding == FrameEncoding::kVarDCT ? "VarDCT" : "Modular");
+   os << ",";
+   os << (frame_type == FrameType::kRegularFrame    ? "Regular"
+          : frame_type == FrameType::kDCFrame       ? "DC"
+          : frame_type == FrameType::kReferenceOnly ? "Reference"
+                                                    : "SkipProgressive");
+   if (frame_type == FrameType::kDCFrame) {
+     os << "(lv" << dc_level << ")";
+   }
+ 
+   if (flags) {
+     os << ",";
+     uint32_t remaining = flags;
+ 
+ #define TEST_FLAG(name)           \
+   if (flags & Flags::k##name) {   \
+     remaining &= ~Flags::k##name; \
+     os << #name;                  \
+     if (remaining) os << "|";     \
+   }
+     TEST_FLAG(Noise);
+     TEST_FLAG(Patches);
+     TEST_FLAG(Splines);
+     TEST_FLAG(UseDcFrame);
+     TEST_FLAG(SkipAdaptiveDCSmoothing);
+ #undef TEST_FLAG
+   }
+ 
+   os << ",";
+   os << (color_transform == ColorTransform::kXYB     ? "XYB"
+          : color_transform == ColorTransform::kYCbCr ? "YCbCr"
+                                                      : "None");
+ 
+   if (encoding == FrameEncoding::kModular) {
+     os << ",shift=" << group_size_shift;
+   } else if (color_transform == ColorTransform::kXYB) {
+     os << ",qm=" << x_qm_scale << ";" << b_qm_scale;
+   }
+   if (frame_type != FrameType::kReferenceOnly) {
+     os << "," << passes.DebugString();
+   }
+   if (custom_size_or_origin) {
+     os << ",xs=" << frame_size.xsize;
+     os << ",ys=" << frame_size.ysize;
+-    if (frame_type == FrameType::kRegularFrame) {
++    if (frame_type == FrameType::kRegularFrame ||
++        frame_type == FrameType::kSkipProgressive) {
+       os << ",x0=" << frame_origin.x0;
+       os << ",y0=" << frame_origin.y0;
+     }
+   }
+   if (upsampling > 1) os << ",up=" << upsampling;
+   if (loop_filter.gab) os << ",Gaborish";
+   if (loop_filter.epf_iters > 0) os << ",epf=" << loop_filter.epf_iters;
+   if (animation_frame.duration > 0) os << ",dur=" << animation_frame.duration;
+   if (save_as_reference > 0) os << ",ref=" << save_as_reference;
+   if (is_last) os << ",last";
+   return os.str();
+ }
+ 
+ }  // namespace jxl
+diff --git a/lib/jxl/modular/encoding/encoding.cc b/lib/jxl/modular/encoding/encoding.cc
+index 4331a2b1..9d2c3e5c 100644
+--- a/lib/jxl/modular/encoding/encoding.cc
++++ b/lib/jxl/modular/encoding/encoding.cc
+@@ -580,42 +580,43 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
+ Status ModularGenericDecompress(BitReader *br, Image &image,
+                                 GroupHeader *header, size_t group_id,
+                                 ModularOptions *options, bool undo_transforms,
+                                 const Tree *tree, const ANSCode *code,
+                                 const std::vector<uint8_t> *ctx_map,
+                                 bool allow_truncated_group) {
+ #ifdef JXL_ENABLE_ASSERT
+   std::vector<std::pair<uint32_t, uint32_t>> req_sizes(image.channel.size());
+   for (size_t c = 0; c < req_sizes.size(); c++) {
+     req_sizes[c] = {image.channel[c].w, image.channel[c].h};
+   }
+ #endif
+   GroupHeader local_header;
+   if (header == nullptr) header = &local_header;
+   size_t bit_pos = br->TotalBitsConsumed();
+   auto dec_status = ModularDecode(br, image, *header, group_id, options, tree,
+                                   code, ctx_map, allow_truncated_group);
+   if (!allow_truncated_group) JXL_RETURN_IF_ERROR(dec_status);
+   if (dec_status.IsFatalError()) return dec_status;
+   if (undo_transforms) image.undo_transforms(header->wp_header);
+   if (image.error) return JXL_FAILURE("Corrupt file. Aborting.");
+   JXL_DEBUG_V(4,
+               "Modular-decoded a %" PRIuS "x%" PRIuS " nbchans=%" PRIuS
+               " image from %" PRIuS " bytes",
+               image.w, image.h, image.channel.size(),
+               (br->TotalBitsConsumed() - bit_pos) / 8);
++  JXL_DEBUG_V(5, "Modular image: %s", image.DebugString().c_str());
+   (void)bit_pos;
+ #ifdef JXL_ENABLE_ASSERT
+   // Check that after applying all transforms we are back to the requested image
+   // sizes, otherwise there's a programming error with the transformations.
+   if (undo_transforms) {
+     JXL_ASSERT(image.channel.size() == req_sizes.size());
+     for (size_t c = 0; c < req_sizes.size(); c++) {
+       JXL_ASSERT(req_sizes[c].first == image.channel[c].w);
+       JXL_ASSERT(req_sizes[c].second == image.channel[c].h);
+     }
+   }
+ #endif
+   return dec_status;
+ }
+ 
+ }  // namespace jxl
+diff --git a/lib/jxl/modular/modular_image.cc b/lib/jxl/modular/modular_image.cc
+index 6cfdf715..71a66fe8 100644
+--- a/lib/jxl/modular/modular_image.cc
++++ b/lib/jxl/modular/modular_image.cc
+@@ -1,10 +1,12 @@
+ // Copyright (c) the JPEG XL Project Authors. All rights reserved.
+ //
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+ #include "lib/jxl/modular/modular_image.h"
+ 
++#include <sstream>
++
+ #include "lib/jxl/base/status.h"
+ #include "lib/jxl/common.h"
+ #include "lib/jxl/modular/transform/transform.h"
+@@ -48,14 +50,28 @@ Image &Image::operator=(Image &&other) noexcept {
+ Image Image::clone() {
+   Image c(w, h, bitdepth, 0);
+   c.nb_meta_channels = nb_meta_channels;
+   c.error = error;
+   c.transform = transform;
+   for (Channel &ch : channel) {
+     Channel a(ch.w, ch.h, ch.hshift, ch.vshift);
+     CopyImageTo(ch.plane, &a.plane);
+     c.channel.push_back(std::move(a));
+   }
+   return c;
+ }
+ 
++std::string Image::DebugString() const {
++  std::ostringstream os;
++  os << w << "x" << h << " depth: " << bitdepth;
++  if (!channel.empty()) {
++    os << " channels:";
++    for (size_t i = 0; i < channel.size(); ++i) {
++      os << " " << channel[i].w << "x" << channel[i].h
++         << "(shift: " << channel[i].hshift << "," << channel[i].vshift << ")";
++      if (i < nb_meta_channels) os << "*";
++    }
++  }
++  return os.str();
++}
++
+ }  // namespace jxl
+diff --git a/lib/jxl/modular/modular_image.h b/lib/jxl/modular/modular_image.h
+index 4d11e7ab..2ea6a0c3 100644
+--- a/lib/jxl/modular/modular_image.h
++++ b/lib/jxl/modular/modular_image.h
+@@ -1,21 +1,22 @@
+ // Copyright (c) the JPEG XL Project Authors. All rights reserved.
+ //
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+ #ifndef LIB_JXL_MODULAR_MODULAR_IMAGE_H_
+ #define LIB_JXL_MODULAR_MODULAR_IMAGE_H_
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+ #include "lib/jxl/base/compiler_specific.h"
+ #include "lib/jxl/base/data_parallel.h"
+ #include "lib/jxl/base/status.h"
+ #include "lib/jxl/image.h"
+ #include "lib/jxl/image_ops.h"
+@@ -77,32 +78,34 @@ class Transform;
+ class Image {
+  public:
+   // image data, transforms can dramatically change the number of channels and
+   // their semantics
+   std::vector<Channel> channel;
+   // transforms that have been applied (and that have to be undone)
+   std::vector<Transform> transform;
+ 
+   // image dimensions (channels may have different dimensions due to transforms)
+   size_t w, h;
+   int bitdepth;
+   size_t nb_meta_channels;  // first few channels might contain palette(s)
+   bool error;               // true if a fatal error occurred, false otherwise
+ 
+   Image(size_t iw, size_t ih, int bitdepth, int nb_chans);
+   Image();
+ 
+   Image(const Image& other) = delete;
+   Image& operator=(const Image& other) = delete;
+ 
+   Image& operator=(Image&& other) noexcept;
+   Image(Image&& other) noexcept = default;
+ 
+   Image clone();
+ 
+   void undo_transforms(const weighted::Header& wp_header,
+                        jxl::ThreadPool* pool = nullptr);
++
++  std::string DebugString() const;
+ };
+ 
+ }  // namespace jxl
+ 
+ #endif  // LIB_JXL_MODULAR_MODULAR_IMAGE_H_
+diff --git a/lib/jxl/render_pipeline/low_memory_render_pipeline.cc b/lib/jxl/render_pipeline/low_memory_render_pipeline.cc
+index 7f464b28..dc2aed8f 100644
+--- a/lib/jxl/render_pipeline/low_memory_render_pipeline.cc
++++ b/lib/jxl/render_pipeline/low_memory_render_pipeline.cc
+@@ -768,79 +768,95 @@ void LowMemoryRenderPipeline::RenderPadding(size_t thread_id, Rect rect) {
+ void LowMemoryRenderPipeline::ProcessBuffers(size_t group_id,
+                                              size_t thread_id) {
+   std::vector<ImageF>& input_data =
+       group_data_[use_group_ids_ ? group_id : thread_id];
+ 
+   // Copy the group borders to the border storage.
+   for (size_t c = 0; c < input_data.size(); c++) {
+     SaveBorders(group_id, c, input_data[c]);
+   }
+ 
+   size_t gy = group_id / frame_dimensions_.xsize_groups;
+   size_t gx = group_id % frame_dimensions_.xsize_groups;
+ 
+   if (first_image_dim_stage_ != stages_.size()) {
+     size_t group_dim = frame_dimensions_.group_dim << base_color_shift_;
+     RectT<ssize_t> group_rect(gx * group_dim, gy * group_dim, group_dim,
+                               group_dim);
+     RectT<ssize_t> image_rect(0, 0, frame_dimensions_.xsize_upsampled,
+                               frame_dimensions_.ysize_upsampled);
+     RectT<ssize_t> full_image_rect(0, 0, full_image_xsize_, full_image_ysize_);
+     group_rect = group_rect.Translate(frame_origin_.x0, frame_origin_.y0);
+     image_rect = image_rect.Translate(frame_origin_.x0, frame_origin_.y0);
+-    group_rect =
+-        group_rect.Intersection(image_rect).Intersection(full_image_rect);
++    image_rect = image_rect.Intersection(full_image_rect);
++    group_rect = group_rect.Intersection(image_rect);
+     size_t x0 = group_rect.x0();
+     size_t y0 = group_rect.y0();
+     size_t x1 = group_rect.x1();
+     size_t y1 = group_rect.y1();
+-
+-    if (gx == 0 && gy == 0) {
+-      RenderPadding(thread_id, Rect(0, 0, x0, y0));
+-    }
+-    if (gy == 0) {
+-      RenderPadding(thread_id, Rect(x0, 0, x1 - x0, y0));
+-    }
+-    if (gx == 0) {
+-      RenderPadding(thread_id, Rect(0, y0, x0, y1 - y0));
+-    }
+-    if (gx == 0 && gy + 1 == frame_dimensions_.ysize_groups) {
+-      RenderPadding(thread_id, Rect(0, y1, x0, full_image_ysize_ - y1));
+-    }
+-    if (gy + 1 == frame_dimensions_.ysize_groups) {
+-      RenderPadding(thread_id, Rect(x0, y1, x1 - x0, full_image_ysize_ - y1));
+-    }
+-    if (gy == 0 && gx + 1 == frame_dimensions_.xsize_groups) {
+-      RenderPadding(thread_id, Rect(x1, 0, full_image_xsize_ - x1, y0));
+-    }
+-    if (gx + 1 == frame_dimensions_.xsize_groups) {
+-      RenderPadding(thread_id, Rect(x1, y0, full_image_xsize_ - x1, y1 - y0));
+-    }
+-    if (gy + 1 == frame_dimensions_.ysize_groups &&
+-        gx + 1 == frame_dimensions_.xsize_groups) {
+-      RenderPadding(thread_id, Rect(x1, y1, full_image_xsize_ - x1,
+-                                    full_image_ysize_ - y1));
++    JXL_DEBUG_V(6,
++                "Rendering padding for full image rect %s "
++                "outside group rect %s",
++                Description(full_image_rect).c_str(),
++                Description(group_rect).c_str());
++
++    if (group_id == 0 && (image_rect.xsize() == 0 || image_rect.ysize() == 0)) {
++      // If this frame does not intersect with the full image, we have to
++      // initialize the whole image area with RenderPadding.
++      RenderPadding(thread_id,
++                    Rect(0, 0, full_image_xsize_, full_image_ysize_));
++    }
++
++    // Render padding for groups that intersect with the full image. The case
++    // where no groups intersect was handled above.
++    if (group_rect.xsize() > 0 && group_rect.ysize() > 0) {
++      if (gx == 0 && gy == 0) {
++        RenderPadding(thread_id, Rect(0, 0, x0, y0));
++      }
++      if (gy == 0) {
++        RenderPadding(thread_id, Rect(x0, 0, x1 - x0, y0));
++      }
++      if (gx == 0) {
++        RenderPadding(thread_id, Rect(0, y0, x0, y1 - y0));
++      }
++      if (gx == 0 && gy + 1 == frame_dimensions_.ysize_groups) {
++        RenderPadding(thread_id, Rect(0, y1, x0, full_image_ysize_ - y1));
++      }
++      if (gy + 1 == frame_dimensions_.ysize_groups) {
++        RenderPadding(thread_id, Rect(x0, y1, x1 - x0, full_image_ysize_ - y1));
++      }
++      if (gy == 0 && gx + 1 == frame_dimensions_.xsize_groups) {
++        RenderPadding(thread_id, Rect(x1, 0, full_image_xsize_ - x1, y0));
++      }
++      if (gx + 1 == frame_dimensions_.xsize_groups) {
++        RenderPadding(thread_id, Rect(x1, y0, full_image_xsize_ - x1, y1 - y0));
++      }
++      if (gy + 1 == frame_dimensions_.ysize_groups &&
++          gx + 1 == frame_dimensions_.xsize_groups) {
++        RenderPadding(thread_id, Rect(x1, y1, full_image_xsize_ - x1,
++                                      full_image_ysize_ - y1));
++      }
+     }
+   }
+ 
+   Rect ready_rects[GroupBorderAssigner::kMaxToFinalize];
+   size_t num_ready_rects = 0;
+   group_border_assigner_.GroupDone(group_id, group_border_.first,
+                                    group_border_.second, ready_rects,
+                                    &num_ready_rects);
+   for (size_t i = 0; i < num_ready_rects; i++) {
+     const Rect& image_max_color_channel_rect = ready_rects[i];
+     for (size_t c = 0; c < input_data.size(); c++) {
+       LoadBorders(group_id, c, image_max_color_channel_rect, &input_data[c]);
+     }
+     Rect data_max_color_channel_rect(
+         group_data_x_border_ + image_max_color_channel_rect.x0() -
+             gx * frame_dimensions_.group_dim,
+         group_data_y_border_ + image_max_color_channel_rect.y0() -
+             gy * frame_dimensions_.group_dim,
+         image_max_color_channel_rect.xsize(),
+         image_max_color_channel_rect.ysize());
+     RenderRect(thread_id, input_data, data_max_color_channel_rect,
+                image_max_color_channel_rect);
+   }
+ }
+ }  // namespace jxl
+diff --git a/lib/jxl/render_pipeline/render_pipeline.cc b/lib/jxl/render_pipeline/render_pipeline.cc
+index 0b50bbb3..68b6ef61 100644
+--- a/lib/jxl/render_pipeline/render_pipeline.cc
++++ b/lib/jxl/render_pipeline/render_pipeline.cc
+@@ -106,12 +106,12 @@ RenderPipelineInput RenderPipeline::GetInputBuffers(size_t group_id,
+ void RenderPipeline::InputReady(
+     size_t group_id, size_t thread_id,
+     const std::vector<std::pair<ImageF*, Rect>>& buffers) {
+   JXL_DASSERT(group_id < group_completed_passes_.size());
+   group_completed_passes_[group_id]++;
+-  for (const auto& buf : buffers) {
+-    (void)buf;
+-    JXL_CHECK_IMAGE_INITIALIZED(*buf.first, buf.second);
++  for (size_t i = 0; i < buffers.size(); ++i) {
++    (void)i;
++    JXL_CHECK_PLANE_INITIALIZED(*buffers[i].first, buffers[i].second, i);
+   }
+ 
+   ProcessBuffers(group_id, thread_id);
+ }
+diff --git a/lib/jxl/render_pipeline/simple_render_pipeline.cc b/lib/jxl/render_pipeline/simple_render_pipeline.cc
+index 9e4e90fa..6e6bcb76 100644
+--- a/lib/jxl/render_pipeline/simple_render_pipeline.cc
++++ b/lib/jxl/render_pipeline/simple_render_pipeline.cc
+@@ -62,203 +62,204 @@ std::vector<std::pair<ImageF*, Rect>> SimpleRenderPipeline::PrepareBuffers(
+ void SimpleRenderPipeline::ProcessBuffers(size_t group_id, size_t thread_id) {
+   for (size_t c = 0; c < channel_data_.size(); c++) {
+     Rect r = MakeChannelRect(group_id, c);
+     (void)r;
+-    JXL_CHECK_IMAGE_INITIALIZED(channel_data_[c], r);
++    JXL_CHECK_PLANE_INITIALIZED(channel_data_[c], r, c);
+   }
+ 
+   if (PassesWithAllInput() <= processed_passes_) return;
+   processed_passes_++;
+ 
+   for (size_t stage_id = 0; stage_id < stages_.size(); stage_id++) {
+     const auto& stage = stages_[stage_id];
+     // Prepare buffers for kInOut channels.
+     std::vector<ImageF> new_channels(channel_data_.size());
+     std::vector<ImageF*> output_channels(channel_data_.size());
+ 
+     std::vector<std::pair<size_t, size_t>> input_sizes(channel_data_.size());
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       input_sizes[c] =
+           std::make_pair(channel_data_[c].xsize() - kRenderPipelineXOffset * 2,
+                          channel_data_[c].ysize() - kRenderPipelineXOffset * 2);
+     }
+ 
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       if (stage->GetChannelMode(c) != RenderPipelineChannelMode::kInOut) {
+         continue;
+       }
+       // Ensure that the newly allocated channels are large enough to avoid
+       // problems with padding.
+       new_channels[c] =
+           ImageF(frame_dimensions_.xsize_upsampled_padded +
+                      kRenderPipelineXOffset * 2 + hwy::kMaxVectorSize * 8,
+                  frame_dimensions_.ysize_upsampled_padded +
+                      kRenderPipelineXOffset * 2);
+       new_channels[c].ShrinkTo(
+           (input_sizes[c].first << stage->settings_.shift_x) +
+               kRenderPipelineXOffset * 2,
+           (input_sizes[c].second << stage->settings_.shift_y) +
+               kRenderPipelineXOffset * 2);
+       output_channels[c] = &new_channels[c];
+     }
+ 
+     auto get_row = [&](size_t c, int64_t y) {
+       return channel_data_[c].Row(kRenderPipelineXOffset + y) +
+              kRenderPipelineXOffset;
+     };
+ 
+     // Add mirrored pixes to all kInOut channels.
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       if (stage->GetChannelMode(c) != RenderPipelineChannelMode::kInOut) {
+         continue;
+       }
+       // Horizontal mirroring.
+       for (size_t y = 0; y < input_sizes[c].second; y++) {
+         float* row = get_row(c, y);
+         for (size_t ix = 0; ix < stage->settings_.border_x; ix++) {
+           *(row - ix - 1) = row[Mirror(-ssize_t(ix) - 1, input_sizes[c].first)];
+         }
+         for (size_t ix = 0; ix < stage->settings_.border_x; ix++) {
+           *(row + ix + input_sizes[c].first) =
+               row[Mirror(ix + input_sizes[c].first, input_sizes[c].first)];
+         }
+       }
+       // Vertical mirroring.
+       for (int y = 0; y < static_cast<int>(stage->settings_.border_y); y++) {
+         memcpy(get_row(c, -y - 1) - stage->settings_.border_x,
+                get_row(c, Mirror(-ssize_t(y) - 1, input_sizes[c].second)) -
+                    stage->settings_.border_x,
+                sizeof(float) *
+                    (input_sizes[c].first + 2 * stage->settings_.border_x));
+       }
+       for (int y = 0; y < static_cast<int>(stage->settings_.border_y); y++) {
+         memcpy(
+             get_row(c, input_sizes[c].second + y) - stage->settings_.border_x,
+             get_row(c,
+                     Mirror(input_sizes[c].second + y, input_sizes[c].second)) -
+                 stage->settings_.border_x,
+             sizeof(float) *
+                 (input_sizes[c].first + 2 * stage->settings_.border_x));
+       }
+     }
+ 
+     size_t ysize = 0;
+     size_t xsize = 0;
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       if (stage->GetChannelMode(c) == RenderPipelineChannelMode::kIgnored) {
+         continue;
+       }
+       ysize = std::max(input_sizes[c].second, ysize);
+       xsize = std::max(input_sizes[c].first, xsize);
+     }
+ 
+     JXL_ASSERT(ysize != 0);
+     JXL_ASSERT(xsize != 0);
+ 
+     RenderPipelineStage::RowInfo input_rows(channel_data_.size());
+     RenderPipelineStage::RowInfo output_rows(channel_data_.size());
+ 
+     // Run the pipeline.
+     {
+       stage->SetInputSizes(input_sizes);
+       int border_y = stage->settings_.border_y;
+       for (size_t y = 0; y < ysize; y++) {
+         // Prepare input rows.
+         for (size_t c = 0; c < channel_data_.size(); c++) {
+           if (stage->GetChannelMode(c) == RenderPipelineChannelMode::kIgnored) {
+             continue;
+           }
+           input_rows[c].resize(2 * border_y + 1);
+           for (int iy = -border_y; iy <= border_y; iy++) {
+             input_rows[c][iy + border_y] =
+                 channel_data_[c].Row(y + kRenderPipelineXOffset + iy);
+           }
+         }
+         // Prepare output rows.
+         for (size_t c = 0; c < channel_data_.size(); c++) {
+           if (!output_channels[c]) continue;
+           output_rows[c].resize(1 << stage->settings_.shift_y);
+           for (size_t iy = 0; iy < output_rows[c].size(); iy++) {
+             output_rows[c][iy] = output_channels[c]->Row(
+                 (y << stage->settings_.shift_y) + iy + kRenderPipelineXOffset);
+           }
+         }
+         stage->ProcessRow(input_rows, output_rows, /*xextra=*/0, xsize,
+                           /*xpos=*/0, y, thread_id);
+       }
+     }
+ 
+     // Move new channels to current channels.
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       if (stage->GetChannelMode(c) != RenderPipelineChannelMode::kInOut) {
+         continue;
+       }
+       channel_data_[c] = std::move(new_channels[c]);
+     }
+     for (size_t c = 0; c < channel_data_.size(); c++) {
+       size_t next_stage = std::min(stage_id + 1, channel_shifts_.size() - 1);
+       size_t xsize = DivCeil(frame_dimensions_.xsize_upsampled,
+                              1 << channel_shifts_[next_stage][c].first);
+       size_t ysize = DivCeil(frame_dimensions_.ysize_upsampled,
+                              1 << channel_shifts_[next_stage][c].second);
+       channel_data_[c].ShrinkTo(xsize + 2 * kRenderPipelineXOffset,
+                                 ysize + 2 * kRenderPipelineXOffset);
+-      JXL_CHECK_IMAGE_INITIALIZED(
++      JXL_CHECK_PLANE_INITIALIZED(
+           channel_data_[c],
+-          Rect(kRenderPipelineXOffset, kRenderPipelineXOffset, xsize, ysize));
++          Rect(kRenderPipelineXOffset, kRenderPipelineXOffset, xsize, ysize),
++          c);
+     }
+ 
+     if (stage->SwitchToImageDimensions()) {
+       size_t image_xsize, image_ysize;
+       FrameOrigin frame_origin;
+       stage->GetImageDimensions(&image_xsize, &image_ysize, &frame_origin);
+       frame_dimensions_.Set(image_xsize, image_ysize, 0, 0, 0, false, 1);
+       std::vector<ImageF> old_channels = std::move(channel_data_);
+       channel_data_.clear();
+       channel_data_.reserve(old_channels.size());
+       for (size_t c = 0; c < old_channels.size(); c++) {
+         channel_data_.emplace_back(2 * kRenderPipelineXOffset + image_xsize,
+                                    2 * kRenderPipelineXOffset + image_ysize);
+       }
+       for (size_t y = 0; y < image_ysize; ++y) {
+         for (size_t c = 0; c < channel_data_.size(); c++) {
+           output_rows[c].resize(1);
+           output_rows[c][0] = channel_data_[c].Row(kRenderPipelineXOffset + y);
+         }
+         // TODO(sboukortt): consider doing this only on the parts of the
+         // background that won't be occluded.
+         stage->ProcessPaddingRow(output_rows, image_xsize, 0, y);
+       }
+       ssize_t x0 = frame_origin.x0;
+       ssize_t y0 = frame_origin.y0;
+       size_t x0_fg = 0;
+       size_t y0_fg = 0;
+       if (x0 < 0) {
+         xsize += x0;
+         x0_fg -= x0;
+         x0 = 0;
+       }
+       if (x0 + xsize > image_xsize) {
+         xsize = image_xsize - x0;
+       }
+       if (y0 < 0) {
+         ysize += y0;
+         y0_fg -= x0;
+         y0 = 0;
+       }
+       if (y0 + ysize > image_ysize) {
+         ysize = image_ysize - y0;
+       }
+       const Rect rect_fg_relative_to_image =
+           Rect(x0, y0, xsize, ysize)
+               .Translate(kRenderPipelineXOffset, kRenderPipelineXOffset);
+       const Rect rect_fg =
+           Rect(x0_fg, y0_fg, xsize, ysize)
+               .Translate(kRenderPipelineXOffset, kRenderPipelineXOffset);
+       for (size_t c = 0; c < channel_data_.size(); c++) {
+         CopyImageTo(rect_fg, old_channels[c], rect_fg_relative_to_image,
+                     &channel_data_[c]);
+       }
+     }
+   }
+ }
+ }  // namespace jxl
+diff --git a/lib/jxl/render_pipeline/stage_epf.cc b/lib/jxl/render_pipeline/stage_epf.cc
+index 6795b873..750edf16 100644
+--- a/lib/jxl/render_pipeline/stage_epf.cc
++++ b/lib/jxl/render_pipeline/stage_epf.cc
+@@ -31,138 +31,138 @@ JXL_INLINE Vec<DF> Weight(Vec<DF> sad, Vec<DF> inv_sigma, Vec<DF> thres) {
+ // 5x5 plus-shaped kernel with 5 SADs per pixel (3x3 plus-shaped). So this makes
+ // this filter a 7x7 filter.
+ class EPF0Stage : public RenderPipelineStage {
+  public:
+   EPF0Stage(const LoopFilter& lf, const ImageF& sigma)
+       : RenderPipelineStage(RenderPipelineStage::Settings::Symmetric(
+             /*shift=*/0, /*border=*/3)),
+         lf_(lf),
+         sigma_(&sigma) {}
+ 
+   template <bool aligned>
+   JXL_INLINE void AddPixel(int row, float* JXL_RESTRICT rows[3][7], ssize_t x,
+                            Vec<DF> sad, Vec<DF> inv_sigma,
+                            Vec<DF>* JXL_RESTRICT X, Vec<DF>* JXL_RESTRICT Y,
+                            Vec<DF>* JXL_RESTRICT B,
+                            Vec<DF>* JXL_RESTRICT w) const {
+     auto cx = aligned ? Load(DF(), rows[0][3 + row] + x)
+                       : LoadU(DF(), rows[0][3 + row] + x);
+     auto cy = aligned ? Load(DF(), rows[1][3 + row] + x)
+                       : LoadU(DF(), rows[1][3 + row] + x);
+     auto cb = aligned ? Load(DF(), rows[2][3 + row] + x)
+                       : LoadU(DF(), rows[2][3 + row] + x);
+ 
+     auto weight = Weight(sad, inv_sigma, Set(DF(), lf_.epf_pass1_zeroflush));
+     *w += weight;
+     *X = MulAdd(weight, cx, *X);
+     *Y = MulAdd(weight, cy, *Y);
+     *B = MulAdd(weight, cb, *B);
+   }
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     DF df;
+     xextra = RoundUpTo(xextra, Lanes(df));
+     const float* JXL_RESTRICT row_sigma =
+         sigma_->Row(ypos / kBlockDim + kSigmaPadding);
+ 
+     float sm = lf_.epf_pass0_sigma_scale * 1.65;
+     float bsm = sm * lf_.epf_border_sad_mul;
+ 
+     HWY_ALIGN float sad_mul_center[kBlockDim] = {bsm, sm, sm, sm,
+                                                  sm,  sm, sm, bsm};
+     HWY_ALIGN float sad_mul_border[kBlockDim] = {bsm, bsm, bsm, bsm,
+                                                  bsm, bsm, bsm, bsm};
+     float* JXL_RESTRICT rows[3][7];
+     for (size_t c = 0; c < 3; c++) {
+       for (int i = 0; i < 7; i++) {
+         rows[c][i] = GetInputRow(input_rows, c, i - 3);
+       }
+     }
+ 
+     const float* sad_mul =
+         (ypos % kBlockDim == 0 || ypos % kBlockDim == kBlockDim - 1)
+             ? sad_mul_border
+             : sad_mul_center;
+ 
+     for (ssize_t x = -xextra; x < static_cast<ssize_t>(xsize + xextra);
+          x += Lanes(df)) {
+       size_t bx = (x + xpos + kSigmaPadding * kBlockDim) / kBlockDim;
+       size_t ix = (x + xpos) % kBlockDim;
+ 
+       if (row_sigma[bx] < kMinSigma) {
+         for (size_t c = 0; c < 3; c++) {
+           auto px = Load(df, rows[c][3 + 0] + x);
+-          Store(px, df, GetOutputRow(output_rows, c, 0) + x);
++          StoreU(px, df, GetOutputRow(output_rows, c, 0) + x);
+         }
+         continue;
+       }
+ 
+       const auto sm = Load(df, sad_mul + ix);
+       const auto inv_sigma = Set(df, row_sigma[bx]) * sm;
+ 
+       decltype(Zero(df)) sads[12];
+       for (size_t i = 0; i < 12; i++) sads[i] = Zero(df);
+       constexpr std::array<int, 2> sads_off[12] = {
+           {{-2, 0}}, {{-1, -1}}, {{-1, 0}}, {{-1, 1}}, {{0, -2}}, {{0, -1}},
+           {{0, 1}},  {{0, 2}},   {{1, -1}}, {{1, 0}},  {{1, 1}},  {{2, 0}},
+       };
+ 
+       // compute sads
+       // TODO(veluca): consider unrolling and optimizing this.
+       for (size_t c = 0; c < 3; c++) {
+         auto scale = Set(df, lf_.epf_channel_scale[c]);
+         for (size_t i = 0; i < 12; i++) {
+           auto sad = Zero(df);
+           constexpr std::array<int, 2> plus_off[] = {
+               {{0, 0}}, {{-1, 0}}, {{0, -1}}, {{1, 0}}, {{0, 1}}};
+           for (size_t j = 0; j < 5; j++) {
+             const auto r11 =
+                 LoadU(df, rows[c][3 + plus_off[j][0]] + x + plus_off[j][1]);
+             const auto c11 =
+                 LoadU(df, rows[c][3 + sads_off[i][0] + plus_off[j][0]] + x +
+                               sads_off[i][1] + plus_off[j][1]);
+             sad += AbsDiff(r11, c11);
+           }
+           sads[i] = MulAdd(sad, scale, sads[i]);
+         }
+       }
+       const auto x_cc = Load(df, rows[0][3 + 0] + x);
+       const auto y_cc = Load(df, rows[1][3 + 0] + x);
+       const auto b_cc = Load(df, rows[2][3 + 0] + x);
+ 
+       auto w = Set(df, 1);
+       auto X = x_cc;
+       auto Y = y_cc;
+       auto B = b_cc;
+ 
+       for (size_t i = 0; i < 12; i++) {
+         AddPixel</*aligned=*/false>(/*row=*/sads_off[i][0], rows,
+                                     x + sads_off[i][1], sads[i], inv_sigma, &X,
+                                     &Y, &B, &w);
+       }
+ #if JXL_HIGH_PRECISION
+       auto inv_w = Set(df, 1.0f) / w;
+ #else
+       auto inv_w = ApproximateReciprocal(w);
+ #endif
+-      Store(X * inv_w, df, GetOutputRow(output_rows, 0, 0) + x);
+-      Store(Y * inv_w, df, GetOutputRow(output_rows, 1, 0) + x);
+-      Store(B * inv_w, df, GetOutputRow(output_rows, 2, 0) + x);
++      StoreU(X * inv_w, df, GetOutputRow(output_rows, 0, 0) + x);
++      StoreU(Y * inv_w, df, GetOutputRow(output_rows, 1, 0) + x);
++      StoreU(B * inv_w, df, GetOutputRow(output_rows, 2, 0) + x);
+     }
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 ? RenderPipelineChannelMode::kInOut
+                  : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "EPF0"; }
+ 
+  private:
+   LoopFilter lf_;
+   const ImageF* sigma_;
+ };
+ 
+ // 3x3 plus-shaped kernel with 5 SADs per pixel (also 3x3 plus-shaped). So this
+ // makes this filter a 5x5 filter.
+diff --git a/lib/jxl/render_pipeline/stage_from_linear.cc b/lib/jxl/render_pipeline/stage_from_linear.cc
+index f56f6545..0d58a97a 100644
+--- a/lib/jxl/render_pipeline/stage_from_linear.cc
++++ b/lib/jxl/render_pipeline/stage_from_linear.cc
+@@ -95,46 +95,45 @@ template <typename Op>
+ class FromLinearStage : public RenderPipelineStage {
+  public:
+   explicit FromLinearStage(Op op)
+       : RenderPipelineStage(RenderPipelineStage::Settings()),
+         op_(std::move(op)) {}
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     PROFILER_ZONE("FromLinear");
+-
+     const HWY_FULL(float) d;
+     const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
+     float* JXL_RESTRICT row0 = GetInputRow(input_rows, 0, 0);
+     float* JXL_RESTRICT row1 = GetInputRow(input_rows, 1, 0);
+     float* JXL_RESTRICT row2 = GetInputRow(input_rows, 2, 0);
+     // All calculations are lane-wise, still some might require
+     // value-dependent behaviour (e.g. NearestInt). Temporary unpoison last
+     // vector tail.
+     msan::UnpoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+     for (ssize_t x = -xextra; x < (ssize_t)(xsize + xextra); x += Lanes(d)) {
+-      auto r = Load(d, row0 + x);
+-      auto g = Load(d, row1 + x);
+-      auto b = Load(d, row2 + x);
++      auto r = LoadU(d, row0 + x);
++      auto g = LoadU(d, row1 + x);
++      auto b = LoadU(d, row2 + x);
+       op_.Transform(d, &r, &g, &b);
+-      Store(r, d, row0 + x);
+-      Store(g, d, row1 + x);
+-      Store(b, d, row2 + x);
++      StoreU(r, d, row0 + x);
++      StoreU(g, d, row1 + x);
++      StoreU(b, d, row2 + x);
+     }
+     msan::PoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 ? RenderPipelineChannelMode::kInPlace
+                  : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "FromLinear"; }
+ 
+  private:
+   Op op_;
+ };
+diff --git a/lib/jxl/render_pipeline/stage_noise.cc b/lib/jxl/render_pipeline/stage_noise.cc
+index f29e0d7e..d23aaedd 100644
+--- a/lib/jxl/render_pipeline/stage_noise.cc
++++ b/lib/jxl/render_pipeline/stage_noise.cc
+@@ -113,103 +113,103 @@ template <class D>
+ void AddNoiseToRGB(const D d, const Vec<D> rnd_noise_r,
+                    const Vec<D> rnd_noise_g, const Vec<D> rnd_noise_cor,
+                    const Vec<D> noise_strength_g, const Vec<D> noise_strength_r,
+                    float ytox, float ytob, float* JXL_RESTRICT out_x,
+                    float* JXL_RESTRICT out_y, float* JXL_RESTRICT out_b) {
+   const auto kRGCorr = Set(d, 0.9921875f);   // 127/128
+   const auto kRGNCorr = Set(d, 0.0078125f);  // 1/128
+ 
+   const auto red_noise = kRGNCorr * rnd_noise_r * noise_strength_r +
+                          kRGCorr * rnd_noise_cor * noise_strength_r;
+   const auto green_noise = kRGNCorr * rnd_noise_g * noise_strength_g +
+                            kRGCorr * rnd_noise_cor * noise_strength_g;
+ 
+-  auto vx = Load(d, out_x);
+-  auto vy = Load(d, out_y);
+-  auto vb = Load(d, out_b);
++  auto vx = LoadU(d, out_x);
++  auto vy = LoadU(d, out_y);
++  auto vb = LoadU(d, out_b);
+ 
+   vx += red_noise - green_noise + Set(d, ytox) * (red_noise + green_noise);
+   vy += red_noise + green_noise;
+   vb += Set(d, ytob) * (red_noise + green_noise);
+ 
+-  Store(vx, d, out_x);
+-  Store(vy, d, out_y);
+-  Store(vb, d, out_b);
++  StoreU(vx, d, out_x);
++  StoreU(vy, d, out_y);
++  StoreU(vb, d, out_b);
+ }
+ 
+ class AddNoiseStage : public RenderPipelineStage {
+  public:
+   AddNoiseStage(const NoiseParams& noise_params,
+                 const ColorCorrelationMap& cmap, size_t first_c)
+       : RenderPipelineStage(RenderPipelineStage::Settings::Symmetric(
+             /*shift=*/0, /*border=*/0)),
+         noise_params_(noise_params),
+         cmap_(cmap),
+         first_c_(first_c) {}
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     PROFILER_ZONE("Noise apply");
+ 
+     if (!noise_params_.HasAny()) return;
+     const StrengthEvalLut noise_model(noise_params_);
+     D d;
+     const auto half = Set(d, 0.5f);
+ 
+     // With the prior subtract-random Laplacian approximation, rnd_* ranges were
+     // about [-1.5, 1.6]; Laplacian3 about doubles this to [-3.6, 3.6], so the
+     // normalizer is half of what it was before (0.5).
+     const auto norm_const = Set(d, 0.22f);
+ 
+     float ytox = cmap_.YtoXRatio(0);
+     float ytob = cmap_.YtoBRatio(0);
+ 
+     const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
+ 
+     float* JXL_RESTRICT row_x = GetInputRow(input_rows, 0, 0);
+     float* JXL_RESTRICT row_y = GetInputRow(input_rows, 1, 0);
+     float* JXL_RESTRICT row_b = GetInputRow(input_rows, 2, 0);
+     const float* JXL_RESTRICT row_rnd_r =
+         GetInputRow(input_rows, first_c_ + 0, 0);
+     const float* JXL_RESTRICT row_rnd_g =
+         GetInputRow(input_rows, first_c_ + 1, 0);
+     const float* JXL_RESTRICT row_rnd_c =
+         GetInputRow(input_rows, first_c_ + 2, 0);
+     // Needed by the calls to Floor() in StrengthEvalLut. Only arithmetic and
+     // shuffles are otherwise done on the data, so this is safe.
+     msan::UnpoisonMemory(row_x + xsize, (xsize_v - xsize) * sizeof(float));
+     msan::UnpoisonMemory(row_y + xsize, (xsize_v - xsize) * sizeof(float));
+     for (size_t x = 0; x < xsize_v; x += Lanes(d)) {
+-      const auto vx = Load(d, row_x + x);
+-      const auto vy = Load(d, row_y + x);
++      const auto vx = LoadU(d, row_x + x);
++      const auto vy = LoadU(d, row_y + x);
+       const auto in_g = vy - vx;
+       const auto in_r = vy + vx;
+       const auto noise_strength_g = NoiseStrength(noise_model, in_g * half);
+       const auto noise_strength_r = NoiseStrength(noise_model, in_r * half);
+-      const auto addit_rnd_noise_red = Load(d, row_rnd_r + x) * norm_const;
+-      const auto addit_rnd_noise_green = Load(d, row_rnd_g + x) * norm_const;
++      const auto addit_rnd_noise_red = LoadU(d, row_rnd_r + x) * norm_const;
++      const auto addit_rnd_noise_green = LoadU(d, row_rnd_g + x) * norm_const;
+       const auto addit_rnd_noise_correlated =
+-          Load(d, row_rnd_c + x) * norm_const;
++          LoadU(d, row_rnd_c + x) * norm_const;
+       AddNoiseToRGB(D(), addit_rnd_noise_red, addit_rnd_noise_green,
+                     addit_rnd_noise_correlated, noise_strength_g,
+                     noise_strength_r, ytox, ytob, row_x + x, row_y + x,
+                     row_b + x);
+     }
+     msan::PoisonMemory(row_x + xsize, (xsize_v - xsize) * sizeof(float));
+     msan::PoisonMemory(row_y + xsize, (xsize_v - xsize) * sizeof(float));
+     msan::PoisonMemory(row_b + xsize, (xsize_v - xsize) * sizeof(float));
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c >= first_c_ ? RenderPipelineChannelMode::kInput
+            : c < 3       ? RenderPipelineChannelMode::kInPlace
+                          : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "AddNoise"; }
+ 
+  private:
+   const NoiseParams& noise_params_;
+   const ColorCorrelationMap& cmap_;
+   size_t first_c_;
+ };
+@@ -223,50 +223,50 @@ std::unique_ptr<RenderPipelineStage> GetAddNoiseStage(
+ class ConvolveNoiseStage : public RenderPipelineStage {
+  public:
+   explicit ConvolveNoiseStage(size_t first_c)
+       : RenderPipelineStage(RenderPipelineStage::Settings::Symmetric(
+             /*shift=*/0, /*border=*/2)),
+         first_c_(first_c) {}
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     PROFILER_ZONE("Noise convolve");
+ 
+     const HWY_FULL(float) d;
+     for (size_t c = first_c_; c < first_c_ + 3; c++) {
+       float* JXL_RESTRICT rows[5];
+       for (size_t i = 0; i < 5; i++) {
+         rows[i] = GetInputRow(input_rows, c, i - 2);
+       }
+       float* JXL_RESTRICT row_out = GetOutputRow(output_rows, c, 0);
+       for (ssize_t x = -RoundUpTo(xextra, Lanes(d));
+            x < (ssize_t)(xsize + xextra); x += Lanes(d)) {
+-        const auto p00 = Load(d, rows[2] + x);
++        const auto p00 = LoadU(d, rows[2] + x);
+         auto others = Zero(d);
+         for (ssize_t i = -2; i <= 2; i++) {
+           others += LoadU(d, rows[0] + x + i);
+           others += LoadU(d, rows[1] + x + i);
+           others += LoadU(d, rows[3] + x + i);
+           others += LoadU(d, rows[4] + x + i);
+         }
+         others += LoadU(d, rows[2] + x - 2);
+         others += LoadU(d, rows[2] + x - 1);
+         others += LoadU(d, rows[2] + x + 1);
+         others += LoadU(d, rows[2] + x + 2);
+         // 4 * (1 - box kernel)
+         auto pixels = MulAdd(others, Set(d, 0.16), p00 * Set(d, -3.84));
+-        Store(pixels, d, row_out + x);
++        StoreU(pixels, d, row_out + x);
+       }
+     }
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c >= first_c_ ? RenderPipelineChannelMode::kInOut
+                          : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "ConvNoise"; }
+ 
+  private:
+   size_t first_c_;
+ };
+diff --git a/lib/jxl/render_pipeline/stage_to_linear.cc b/lib/jxl/render_pipeline/stage_to_linear.cc
+index 5337afbb..3d579242 100644
+--- a/lib/jxl/render_pipeline/stage_to_linear.cc
++++ b/lib/jxl/render_pipeline/stage_to_linear.cc
+@@ -101,52 +101,52 @@ template <typename Op>
+ class ToLinearStage : public RenderPipelineStage {
+  public:
+   explicit ToLinearStage(Op op)
+       : RenderPipelineStage(RenderPipelineStage::Settings()),
+         op_(std::move(op)) {}
+ 
+   explicit ToLinearStage()
+       : RenderPipelineStage(RenderPipelineStage::Settings()), valid_(false) {}
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     PROFILER_ZONE("ToLinear");
+ 
+     const HWY_FULL(float) d;
+     const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
+     float* JXL_RESTRICT row0 = GetInputRow(input_rows, 0, 0);
+     float* JXL_RESTRICT row1 = GetInputRow(input_rows, 1, 0);
+     float* JXL_RESTRICT row2 = GetInputRow(input_rows, 2, 0);
+     // All calculations are lane-wise, still some might require
+     // value-dependent behaviour (e.g. NearestInt). Temporary unpoison last
+     // vector tail.
+     msan::UnpoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+     for (ssize_t x = -xextra; x < (ssize_t)(xsize + xextra); x += Lanes(d)) {
+-      auto r = Load(d, row0 + x);
+-      auto g = Load(d, row1 + x);
+-      auto b = Load(d, row2 + x);
++      auto r = LoadU(d, row0 + x);
++      auto g = LoadU(d, row1 + x);
++      auto b = LoadU(d, row2 + x);
+       op_.Transform(d, &r, &g, &b);
+-      Store(r, d, row0 + x);
+-      Store(g, d, row1 + x);
+-      Store(b, d, row2 + x);
++      StoreU(r, d, row0 + x);
++      StoreU(g, d, row1 + x);
++      StoreU(b, d, row2 + x);
+     }
+     msan::PoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 ? RenderPipelineChannelMode::kInPlace
+                  : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "ToLinear"; }
+ 
+  private:
+   Status IsInitialized() const override { return valid_; }
+ 
+   Op op_;
+   bool valid_ = true;
+ };
+diff --git a/lib/jxl/render_pipeline/stage_tone_mapping.cc b/lib/jxl/render_pipeline/stage_tone_mapping.cc
+index 89994b11..84ab43ab 100644
+--- a/lib/jxl/render_pipeline/stage_tone_mapping.cc
++++ b/lib/jxl/render_pipeline/stage_tone_mapping.cc
+@@ -22,112 +22,112 @@ namespace HWY_NAMESPACE {
+ class ToneMappingStage : public RenderPipelineStage {
+  public:
+   explicit ToneMappingStage(OutputEncodingInfo output_encoding_info)
+       : RenderPipelineStage(RenderPipelineStage::Settings()),
+         output_encoding_info_(std::move(output_encoding_info)) {
+     if (output_encoding_info_.desired_intensity_target ==
+         output_encoding_info_.orig_intensity_target) {
+       // No tone mapping requested.
+       return;
+     }
+     if (output_encoding_info_.orig_color_encoding.tf.IsPQ() &&
+         output_encoding_info_.desired_intensity_target <
+             output_encoding_info_.orig_intensity_target) {
+       tone_mapper_storage_ = AllocateArray(sizeof(ToneMapper));
+       tone_mapper_ = reinterpret_cast<ToneMapper*>(tone_mapper_storage_.get());
+       new (tone_mapper_)
+           ToneMapper(std::pair<float, float>(
+                          0, output_encoding_info_.orig_intensity_target),
+                      std::pair<float, float>(
+                          0, output_encoding_info_.desired_intensity_target),
+                      output_encoding_info_.luminances);
+     } else if (output_encoding_info_.orig_color_encoding.tf.IsHLG() &&
+                !output_encoding_info_.color_encoding.tf.IsHLG()) {
+       hlg_ootf_ = jxl::make_unique<HlgOOTF>(
+           /*source_luminance=*/output_encoding_info_.orig_intensity_target,
+           /*target_luminance=*/output_encoding_info_.desired_intensity_target,
+           output_encoding_info_.luminances);
+     }
+ 
+     if (output_encoding_info_.color_encoding.tf.IsPQ() &&
+         (tone_mapper_ || hlg_ootf_)) {
+       to_intensity_target_ =
+           10000.f / output_encoding_info_.orig_intensity_target;
+       from_desired_intensity_target_ =
+           output_encoding_info_.desired_intensity_target / 10000.f;
+     }
+   }
+   ~ToneMappingStage() override {
+     if (tone_mapper_) {
+       tone_mapper_->~ToneMapper();
+     }
+   }
+ 
+   bool IsNeeded() const { return tone_mapper_ || hlg_ootf_; }
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     PROFILER_ZONE("ToneMapping");
+ 
+     if (!(tone_mapper_ || hlg_ootf_)) return;
+ 
+     const HWY_FULL(float) d;
+     const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
+     float* JXL_RESTRICT row0 = GetInputRow(input_rows, 0, 0);
+     float* JXL_RESTRICT row1 = GetInputRow(input_rows, 1, 0);
+     float* JXL_RESTRICT row2 = GetInputRow(input_rows, 2, 0);
+     // All calculations are lane-wise, still some might require
+     // value-dependent behaviour (e.g. NearestInt). Temporary unpoison last
+     // vector tail.
+     msan::UnpoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::UnpoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+     for (ssize_t x = -xextra; x < (ssize_t)(xsize + xextra); x += Lanes(d)) {
+-      auto r = Load(d, row0 + x);
+-      auto g = Load(d, row1 + x);
+-      auto b = Load(d, row2 + x);
++      auto r = LoadU(d, row0 + x);
++      auto g = LoadU(d, row1 + x);
++      auto b = LoadU(d, row2 + x);
+       if (tone_mapper_ || hlg_ootf_) {
+         r *= Set(d, to_intensity_target_);
+         g *= Set(d, to_intensity_target_);
+         b *= Set(d, to_intensity_target_);
+         if (tone_mapper_) {
+           tone_mapper_->ToneMap(&r, &g, &b);
+         } else {
+           JXL_ASSERT(hlg_ootf_);
+           hlg_ootf_->Apply(&r, &g, &b);
+         }
+         if (tone_mapper_ || hlg_ootf_->WarrantsGamutMapping()) {
+           GamutMap(&r, &g, &b, output_encoding_info_.luminances);
+         }
+         r *= Set(d, from_desired_intensity_target_);
+         g *= Set(d, from_desired_intensity_target_);
+         b *= Set(d, from_desired_intensity_target_);
+       }
+-      Store(r, d, row0 + x);
+-      Store(g, d, row1 + x);
+-      Store(b, d, row2 + x);
++      StoreU(r, d, row0 + x);
++      StoreU(g, d, row1 + x);
++      StoreU(b, d, row2 + x);
+     }
+     msan::PoisonMemory(row0 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row1 + xsize, sizeof(float) * (xsize_v - xsize));
+     msan::PoisonMemory(row2 + xsize, sizeof(float) * (xsize_v - xsize));
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 ? RenderPipelineChannelMode::kInPlace
+                  : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "ToneMapping"; }
+ 
+  private:
+   using ToneMapper = Rec2408ToneMapper<HWY_FULL(float)>;
+   OutputEncodingInfo output_encoding_info_;
+   CacheAlignedUniquePtr tone_mapper_storage_;
+   ToneMapper* tone_mapper_ = nullptr;
+   std::unique_ptr<HlgOOTF> hlg_ootf_;
+   // When the target colorspace is PQ, 1 represents 10000 nits instead of
+   // orig_intensity_target. This temporarily changes this if the tone mappers
+   // require it.
+   float to_intensity_target_ = 1.f;
+   float from_desired_intensity_target_ = 1.f;
+ };
+diff --git a/lib/jxl/render_pipeline/stage_write.cc b/lib/jxl/render_pipeline/stage_write.cc
+index fafa7c40..6a821300 100644
+--- a/lib/jxl/render_pipeline/stage_write.cc
++++ b/lib/jxl/render_pipeline/stage_write.cc
+@@ -23,53 +23,53 @@ template <typename D, typename V>
+ void StoreRGBA(D d, V r, V g, V b, V a, bool alpha, size_t n, size_t extra,
+                uint8_t* buf) {
+ #if HWY_TARGET == HWY_SCALAR
+   buf[0] = r.raw;
+   buf[1] = g.raw;
+   buf[2] = b.raw;
+   if (alpha) {
+     buf[3] = a.raw;
+   }
+ #elif HWY_TARGET == HWY_NEON
+   if (alpha) {
+     uint8x8x4_t data = {r.raw, g.raw, b.raw, a.raw};
+     if (extra >= 8) {
+       vst4_u8(buf, data);
+     } else {
+       uint8_t tmp[8 * 4];
+       vst4_u8(tmp, data);
+       memcpy(buf, tmp, n * 4);
+     }
+   } else {
+     uint8x8x3_t data = {r.raw, g.raw, b.raw};
+     if (extra >= 8) {
+       vst3_u8(buf, data);
+     } else {
+       uint8_t tmp[8 * 3];
+       vst3_u8(tmp, data);
+       memcpy(buf, tmp, n * 3);
+     }
+   }
+ #else
+   // TODO(veluca): implement this for x86.
+   size_t mul = alpha ? 4 : 3;
+   HWY_ALIGN uint8_t bytes[16];
+-  Store(r, d, bytes);
++  StoreU(r, d, bytes);
+   for (size_t i = 0; i < n; i++) {
+     buf[mul * i] = bytes[i];
+   }
+-  Store(g, d, bytes);
++  StoreU(g, d, bytes);
+   for (size_t i = 0; i < n; i++) {
+     buf[mul * i + 1] = bytes[i];
+   }
+-  Store(b, d, bytes);
++  StoreU(b, d, bytes);
+   for (size_t i = 0; i < n; i++) {
+     buf[mul * i + 2] = bytes[i];
+   }
+   if (alpha) {
+-    Store(a, d, bytes);
++    StoreU(a, d, bytes);
+     for (size_t i = 0; i < n; i++) {
+       buf[4 * i + 3] = bytes[i];
+     }
+   }
+ #endif
+ }
+@@ -77,78 +77,78 @@ void StoreRGBA(D d, V r, V g, V b, V a, bool alpha, size_t n, size_t extra,
+ class WriteToU8Stage : public RenderPipelineStage {
+  public:
+   WriteToU8Stage(uint8_t* rgb, size_t stride, size_t height, bool rgba,
+                  bool has_alpha, size_t alpha_c)
+       : RenderPipelineStage(RenderPipelineStage::Settings()),
+         rgb_(rgb),
+         stride_(stride),
+         height_(height),
+         rgba_(rgba),
+         has_alpha_(has_alpha),
+         alpha_c_(alpha_c) {}
+ 
+   void ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                   size_t xextra, size_t xsize, size_t xpos, size_t ypos,
+                   size_t thread_id) const final {
+     if (ypos >= height_) return;
+     JXL_DASSERT(xextra == 0);
+     size_t bytes = rgba_ ? 4 : 3;
+     const float* JXL_RESTRICT row_in_r = GetInputRow(input_rows, 0, 0);
+     const float* JXL_RESTRICT row_in_g = GetInputRow(input_rows, 1, 0);
+     const float* JXL_RESTRICT row_in_b = GetInputRow(input_rows, 2, 0);
+     const float* JXL_RESTRICT row_in_a =
+         has_alpha_ ? GetInputRow(input_rows, alpha_c_, 0) : nullptr;
+     size_t base_ptr = ypos * stride_ + bytes * (xpos - xextra);
+     using D = HWY_CAPPED(float, 4);
+     const D d;
+     D::Rebind<uint32_t> du;
+     auto zero = Zero(d);
+     auto one = Set(d, 1.0f);
+     auto mul = Set(d, 255.0f);
+ 
+     ssize_t x1 = RoundUpTo(xsize, Lanes(d));
+ 
+     msan::UnpoisonMemory(row_in_r + xsize, sizeof(float) * (x1 - xsize));
+     msan::UnpoisonMemory(row_in_g + xsize, sizeof(float) * (x1 - xsize));
+     msan::UnpoisonMemory(row_in_b + xsize, sizeof(float) * (x1 - xsize));
+     if (row_in_a) {
+       msan::UnpoisonMemory(row_in_a + xsize, sizeof(float) * (x1 - xsize));
+     }
+ 
+     for (ssize_t x = 0; x < x1; x += Lanes(d)) {
+-      auto rf = Clamp(zero, Load(d, row_in_r + x), one) * mul;
+-      auto gf = Clamp(zero, Load(d, row_in_g + x), one) * mul;
+-      auto bf = Clamp(zero, Load(d, row_in_b + x), one) * mul;
+-      auto af = row_in_a ? Clamp(zero, Load(d, row_in_a + x), one) * mul
++      auto rf = Clamp(zero, LoadU(d, row_in_r + x), one) * mul;
++      auto gf = Clamp(zero, LoadU(d, row_in_g + x), one) * mul;
++      auto bf = Clamp(zero, LoadU(d, row_in_b + x), one) * mul;
++      auto af = row_in_a ? Clamp(zero, LoadU(d, row_in_a + x), one) * mul
+                          : Set(d, 255.0f);
+       auto r8 = U8FromU32(BitCast(du, NearestInt(rf)));
+       auto g8 = U8FromU32(BitCast(du, NearestInt(gf)));
+       auto b8 = U8FromU32(BitCast(du, NearestInt(bf)));
+       auto a8 = U8FromU32(BitCast(du, NearestInt(af)));
+       size_t n = xsize - x;
+       if (JXL_LIKELY(n >= Lanes(d))) {
+         StoreRGBA(D::Rebind<uint8_t>(), r8, g8, b8, a8, rgba_, Lanes(d), n,
+                   rgb_ + base_ptr + bytes * x);
+       } else {
+         StoreRGBA(D::Rebind<uint8_t>(), r8, g8, b8, a8, rgba_, n, n,
+                   rgb_ + base_ptr + bytes * x);
+       }
+     }
+   }
+ 
+   RenderPipelineChannelMode GetChannelMode(size_t c) const final {
+     return c < 3 || (has_alpha_ && c == alpha_c_)
+                ? RenderPipelineChannelMode::kInput
+                : RenderPipelineChannelMode::kIgnored;
+   }
+ 
+   const char* GetName() const override { return "WriteToU8"; }
+ 
+  private:
+   uint8_t* rgb_;
+   size_t stride_;
+   size_t height_;
+   bool rgba_;
+   bool has_alpha_;
+   size_t alpha_c_;
+   std::vector<float> opaque_alpha_;
+ };
+diff --git a/lib/jxl/sanitizers.h b/lib/jxl/sanitizers.h
+index 5cd50179..ce0bd8dc 100644
+--- a/lib/jxl/sanitizers.h
++++ b/lib/jxl/sanitizers.h
+@@ -169,32 +169,33 @@ static JXL_INLINE JXL_MAYBE_UNUSED void PrintImageUninitialized(
+ // (not poisoned). If any of the values is poisoned it will abort.
+ template <typename T>
+ static JXL_INLINE JXL_MAYBE_UNUSED void CheckImageInitialized(
+-    const Plane<T>& im, const Rect& r, const char* message) {
++    const Plane<T>& im, const Rect& r, size_t c, const char* message) {
+   JXL_ASSERT(r.x0() <= im.xsize());
+   JXL_ASSERT(r.x0() + r.xsize() <= im.xsize());
+   JXL_ASSERT(r.y0() <= im.ysize());
+   JXL_ASSERT(r.y0() + r.ysize() <= im.ysize());
+   for (size_t y = r.y0(); y < r.y0() + r.ysize(); y++) {
+     const auto* row = im.Row(y);
+     intptr_t ret = __msan_test_shadow(row + r.x0(), sizeof(*row) * r.xsize());
+     if (ret != -1) {
+       JXL_DEBUG(
+           1,
+           "Checking an image of %" PRIu64 " x %" PRIu64 ", rect x0=%" PRIu64
+           ", y0=%" PRIu64
+           ", "
+           "xsize=%" PRIu64 ", ysize=%" PRIu64,
+           static_cast<uint64_t>(im.xsize()), static_cast<uint64_t>(im.ysize()),
+           static_cast<uint64_t>(r.x0()), static_cast<uint64_t>(r.y0()),
+           static_cast<uint64_t>(r.xsize()), static_cast<uint64_t>(r.ysize()));
+       size_t x = ret / sizeof(*row);
+-      JXL_DEBUG(
+-          1, "CheckImageInitialized failed at x=%" PRIu64 ", y=%" PRIu64 ": %s",
+-          static_cast<uint64_t>(r.x0() + x), static_cast<uint64_t>(y),
+-          message ? message : "");
++      JXL_DEBUG(1,
++                "CheckImageInitialized failed at x=%" PRIu64 ", y=%" PRIu64
++                ", c=%" PRIu64 ": %s",
++                static_cast<uint64_t>(r.x0() + x), static_cast<uint64_t>(y),
++                static_cast<uint64_t>(c), message ? message : "");
+       PrintImageUninitialized(im);
+     }
+     // This will report an error if memory is not initialized.
+     __msan_check_mem_is_initialized(row + r.x0(), sizeof(*row) * r.xsize());
+   }
+ }
+@@ -203,16 +204,19 @@ template <typename T>
+ static JXL_INLINE JXL_MAYBE_UNUSED void CheckImageInitialized(
+     const Image3<T>& im, const Rect& r, const char* message) {
+   for (size_t c = 0; c < 3; c++) {
+     std::string str_message(message);
+     str_message += " c=" + std::to_string(c);
+-    CheckImageInitialized(im.Plane(c), r, str_message.c_str());
++    CheckImageInitialized(im.Plane(c), r, c, str_message.c_str());
+   }
+ }
+ 
+ #define JXL_CHECK_IMAGE_INITIALIZED(im, r) \
+   ::jxl::msan::CheckImageInitialized(im, r, "im=" #im ", r=" #r);
+ 
++#define JXL_CHECK_PLANE_INITIALIZED(im, r, c) \
++  ::jxl::msan::CheckImageInitialized(im, r, c, "im=" #im ", r=" #r ", c=" #c);
++
+ #else  // JXL_MEMORY_SANITIZER
+ 
+ // In non-msan mode these functions don't use volatile since it is not needed
+ // for the empty functions.
+@@ -228,10 +232,11 @@ template <typename T>
+ static JXL_INLINE JXL_MAYBE_UNUSED void PoisonImage(const Plane<T>& im) {}
+ 
+ #define JXL_CHECK_IMAGE_INITIALIZED(im, r)
++#define JXL_CHECK_PLANE_INITIALIZED(im, r, c)
+ 
+ #endif
+ 
+ }  // namespace msan
+ }  // namespace jxl
+ 
+ #endif  // LIB_JXL_SANITIZERS_H_

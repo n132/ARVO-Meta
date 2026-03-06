@@ -1,0 +1,303 @@
+commit 847a3a1181d59dc49c1b446d646d344d0543af3e
+Author: Nick Wellnhofer <wellnhofer@aevum.de>
+Date:   Mon Sep 28 12:28:29 2020 +0200
+
+    Fix use-after-free when XIncluding text from Reader
+    
+    The XML Reader can free text nodes coming from the XInclude engine
+    before parsing has finished. Cache a copy of the text string, not the
+    included node to avoid use after free.
+    
+    Found by OSS-Fuzz.
+
+diff --git a/xinclude.c b/xinclude.c
+index f48e0af5..1636caff 100644
+--- a/xinclude.c
++++ b/xinclude.c
+@@ -66,26 +66,26 @@ struct _xmlXIncludeRef {
+ struct _xmlXIncludeCtxt {
+     xmlDocPtr             doc; /* the source document */
+     int               incBase; /* the first include for this document */
+     int                 incNr; /* number of includes */
+     int                incMax; /* size of includes tab */
+     xmlXIncludeRefPtr *incTab; /* array of included references */
+ 
+     int                 txtNr; /* number of unparsed documents */
+     int                txtMax; /* size of unparsed documents tab */
+-    xmlNodePtr        *txtTab; /* array of unparsed text nodes */
++    xmlChar *         *txtTab; /* array of unparsed text strings */
+     xmlURL         *txturlTab; /* array of unparsed text URLs */
+ 
+     xmlChar *             url; /* the current URL processed */
+     int                 urlNr; /* number of URLs stacked */
+     int                urlMax; /* size of URL stack */
+     xmlChar *         *urlTab; /* URL stack */
+ 
+     int              nbErrors; /* the number of errors detected */
+     int                legacy; /* using XINCLUDE_OLD_NS */
+     int            parseFlags; /* the flags used for parsing XML documents */
+     xmlChar *		 base; /* the current xml:base */
+ 
+     void            *_private; /* application data */
+ 
+     unsigned long    incTotal; /* total number of processed inclusions */
+ };
+@@ -380,41 +380,45 @@ void
+ xmlXIncludeFreeContext(xmlXIncludeCtxtPtr ctxt) {
+     int i;
+ 
+ #ifdef DEBUG_XINCLUDE
+     xmlGenericError(xmlGenericErrorContext, "Freeing context\n");
+ #endif
+     if (ctxt == NULL)
+ 	return;
+     while (ctxt->urlNr > 0)
+ 	xmlXIncludeURLPop(ctxt);
+     if (ctxt->urlTab != NULL)
+ 	xmlFree(ctxt->urlTab);
+     for (i = 0;i < ctxt->incNr;i++) {
+ 	if (ctxt->incTab[i] != NULL)
+ 	    xmlXIncludeFreeRef(ctxt->incTab[i]);
+     }
++    if (ctxt->incTab != NULL)
++	xmlFree(ctxt->incTab);
++    if (ctxt->txtTab != NULL) {
++	for (i = 0;i < ctxt->txtNr;i++) {
++	    if (ctxt->txtTab[i] != NULL)
++		xmlFree(ctxt->txtTab[i]);
++	}
++	xmlFree(ctxt->txtTab);
++    }
+     if (ctxt->txturlTab != NULL) {
+ 	for (i = 0;i < ctxt->txtNr;i++) {
+ 	    if (ctxt->txturlTab[i] != NULL)
+ 		xmlFree(ctxt->txturlTab[i]);
+ 	}
+-    }
+-    if (ctxt->incTab != NULL)
+-	xmlFree(ctxt->incTab);
+-    if (ctxt->txtTab != NULL)
+-	xmlFree(ctxt->txtTab);
+-    if (ctxt->txturlTab != NULL)
+ 	xmlFree(ctxt->txturlTab);
++    }
+     if (ctxt->base != NULL) {
+         xmlFree(ctxt->base);
+     }
+     xmlFree(ctxt);
+ }
+ 
+ /**
+  * xmlXIncludeParseFile:
+  * @ctxt:  the XInclude context
+  * @URL:  the URL or file path
+  *
+  * parse a document for XInclude
+  */
+@@ -764,47 +768,48 @@ xmlXIncludeRecurseDoc(xmlXIncludeCtxtPtr ctxt, xmlDocPtr doc,
+  * Add a new text node to the list
+  */
+ static void
+-xmlXIncludeAddTxt(xmlXIncludeCtxtPtr ctxt, xmlNodePtr txt, const xmlURL url) {
++xmlXIncludeAddTxt(xmlXIncludeCtxtPtr ctxt, const xmlChar *txt,
++                  const xmlURL url) {
+ #ifdef DEBUG_XINCLUDE
+     xmlGenericError(xmlGenericErrorContext, "Adding text %s\n", url);
+ #endif
+     if (ctxt->txtMax == 0) {
+ 	ctxt->txtMax = 4;
+-        ctxt->txtTab = (xmlNodePtr *) xmlMalloc(ctxt->txtMax *
++        ctxt->txtTab = (xmlChar **) xmlMalloc(ctxt->txtMax *
+ 		                          sizeof(ctxt->txtTab[0]));
+         if (ctxt->txtTab == NULL) {
+ 	    xmlXIncludeErrMemory(ctxt, NULL, "processing text");
+ 	    return;
+ 	}
+         ctxt->txturlTab = (xmlURL *) xmlMalloc(ctxt->txtMax *
+ 		                          sizeof(ctxt->txturlTab[0]));
+         if (ctxt->txturlTab == NULL) {
+ 	    xmlXIncludeErrMemory(ctxt, NULL, "processing text");
+ 	    return;
+ 	}
+     }
+     if (ctxt->txtNr >= ctxt->txtMax) {
+ 	ctxt->txtMax *= 2;
+-        ctxt->txtTab = (xmlNodePtr *) xmlRealloc(ctxt->txtTab,
++        ctxt->txtTab = (xmlChar **) xmlRealloc(ctxt->txtTab,
+ 	             ctxt->txtMax * sizeof(ctxt->txtTab[0]));
+         if (ctxt->txtTab == NULL) {
+ 	    xmlXIncludeErrMemory(ctxt, NULL, "processing text");
+ 	    return;
+ 	}
+         ctxt->txturlTab = (xmlURL *) xmlRealloc(ctxt->txturlTab,
+ 	             ctxt->txtMax * sizeof(ctxt->txturlTab[0]));
+         if (ctxt->txturlTab == NULL) {
+ 	    xmlXIncludeErrMemory(ctxt, NULL, "processing text");
+ 	    return;
+ 	}
+     }
+-    ctxt->txtTab[ctxt->txtNr] = txt;
++    ctxt->txtTab[ctxt->txtNr] = xmlStrdup(txt);
+     ctxt->txturlTab[ctxt->txtNr] = xmlStrdup(url);
+     ctxt->txtNr++;
+ }
+ 
+ /************************************************************************
+  *									*
+  *			Node copy with specific semantic		*
+  *									*
+  ************************************************************************/
+@@ -1791,151 +1796,151 @@ static int
+ xmlXIncludeLoadTxt(xmlXIncludeCtxtPtr ctxt, const xmlChar *url, int nr) {
+     xmlParserInputBufferPtr buf;
+     xmlNodePtr node;
+     xmlURIPtr uri;
+     xmlChar *URL;
+     int i;
+     xmlChar *encoding = NULL;
+     xmlCharEncoding enc = (xmlCharEncoding) 0;
+     xmlParserCtxtPtr pctxt;
+     xmlParserInputPtr inputStream;
+     int xinclude_multibyte_fallback_used = 0;
+ 
+     /* Don't read from stdin. */
+     if (xmlStrcmp(url, BAD_CAST "-") == 0)
+         url = BAD_CAST "./-";
+ 
+     /*
+      * Check the URL and remove any fragment identifier
+      */
+     uri = xmlParseURI((const char *)url);
+     if (uri == NULL) {
+ 	xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref, XML_XINCLUDE_HREF_URI,
+ 	               "invalid value URI %s\n", url);
+ 	return(-1);
+     }
+     if (uri->fragment != NULL) {
+ 	xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref, XML_XINCLUDE_TEXT_FRAGMENT,
+ 	               "fragment identifier forbidden for text: %s\n",
+ 		       (const xmlChar *) uri->fragment);
+ 	xmlFreeURI(uri);
+ 	return(-1);
+     }
+     URL = xmlSaveUri(uri);
+     xmlFreeURI(uri);
+     if (URL == NULL) {
+ 	xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref, XML_XINCLUDE_HREF_URI,
+ 	               "invalid value URI %s\n", url);
+ 	return(-1);
+     }
+ 
+     /*
+      * Handling of references to the local document are done
+      * directly through ctxt->doc.
+      */
+     if (URL[0] == 0) {
+ 	xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+ 	               XML_XINCLUDE_TEXT_DOCUMENT,
+ 		       "text serialization of document not available\n", NULL);
+ 	xmlFree(URL);
+ 	return(-1);
+     }
+ 
+     /*
+      * Prevent reloading twice the document.
+      */
+     for (i = 0; i < ctxt->txtNr; i++) {
+ 	if (xmlStrEqual(URL, ctxt->txturlTab[i])) {
+-	    node = xmlCopyNode(ctxt->txtTab[i], 1);
++            node = xmlNewText(ctxt->txtTab[i]);
+ 	    goto loaded;
+ 	}
+     }
+     /*
+      * Try to get the encoding if available
+      */
+     if ((ctxt->incTab[nr] != NULL) && (ctxt->incTab[nr]->ref != NULL)) {
+ 	encoding = xmlGetProp(ctxt->incTab[nr]->ref, XINCLUDE_PARSE_ENCODING);
+     }
+     if (encoding != NULL) {
+ 	/*
+ 	 * TODO: we should not have to remap to the xmlCharEncoding
+ 	 *       predefined set, a better interface than
+ 	 *       xmlParserInputBufferCreateFilename should allow any
+ 	 *       encoding supported by iconv
+ 	 */
+         enc = xmlParseCharEncoding((const char *) encoding);
+ 	if (enc == XML_CHAR_ENCODING_ERROR) {
+ 	    xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+ 	                   XML_XINCLUDE_UNKNOWN_ENCODING,
+ 			   "encoding %s not supported\n", encoding);
+ 	    xmlFree(encoding);
+ 	    xmlFree(URL);
+ 	    return(-1);
+ 	}
+ 	xmlFree(encoding);
+     }
+ 
+     /*
+      * Load it.
+      */
+     pctxt = xmlNewParserCtxt();
+     inputStream = xmlLoadExternalEntity((const char*)URL, NULL, pctxt);
+     if(inputStream == NULL) {
+ 	xmlFreeParserCtxt(pctxt);
+ 	xmlFree(URL);
+ 	return(-1);
+     }
+     buf = inputStream->buf;
+     if (buf == NULL) {
+ 	xmlFreeInputStream (inputStream);
+ 	xmlFreeParserCtxt(pctxt);
+ 	xmlFree(URL);
+ 	return(-1);
+     }
+     if (buf->encoder)
+ 	xmlCharEncCloseFunc(buf->encoder);
+     buf->encoder = xmlGetCharEncodingHandler(enc);
+     node = xmlNewText(NULL);
+ 
+     /*
+      * Scan all chars from the resource and add the to the node
+      */
+ xinclude_multibyte_fallback:
+     while (xmlParserInputBufferRead(buf, 128) > 0) {
+ 	int len;
+ 	const xmlChar *content;
+ 
+ 	content = xmlBufContent(buf->buffer);
+ 	len = xmlBufLength(buf->buffer);
+ 	for (i = 0;i < len;) {
+ 	    int cur;
+ 	    int l;
+ 
+ 	    cur = xmlStringCurrentChar(NULL, &content[i], &l);
+ 	    if (!IS_CHAR(cur)) {
+ 		/* Handle split multibyte char at buffer boundary */
+ 		if (((len - i) < 4) && (!xinclude_multibyte_fallback_used)) {
+ 		    xinclude_multibyte_fallback_used = 1;
+ 		    xmlBufShrink(buf->buffer, i);
+ 		    goto xinclude_multibyte_fallback;
+ 		} else {
+ 		    xmlXIncludeErr(ctxt, ctxt->incTab[nr]->ref,
+ 				   XML_XINCLUDE_INVALID_CHAR,
+ 				   "%s contains invalid char\n", URL);
+ 		    xmlFreeParserCtxt(pctxt);
+ 		    xmlFreeParserInputBuffer(buf);
+ 		    xmlFree(URL);
+ 		    return(-1);
+ 		}
+ 	    } else {
+ 		xinclude_multibyte_fallback_used = 0;
+ 		xmlNodeAddContentLen(node, &content[i], l);
+ 	    }
+ 	    i += l;
+ 	}
+ 	xmlBufShrink(buf->buffer, len);
+     }
+     xmlFreeParserCtxt(pctxt);
+-    xmlXIncludeAddTxt(ctxt, node, URL);
++    xmlXIncludeAddTxt(ctxt, node->content, URL);
+     xmlFreeInputStream(inputStream);
+ 
+ loaded:

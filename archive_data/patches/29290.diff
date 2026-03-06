@@ -1,0 +1,226 @@
+commit c72c9f577b08991e5a3ee299afb3a6a986d58036
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Tue Jan 5 21:20:35 2021 +0100
+
+    ani: Make sure riffSizeData is of the correct size before doing the quint32_le cast dance
+    
+    oss-fuzz/29290
+
+diff --git a/src/imageformats/ani.cpp b/src/imageformats/ani.cpp
+index 47d89a9..72eb09e 100644
+--- a/src/imageformats/ani.cpp
++++ b/src/imageformats/ani.cpp
+@@ -303,210 +303,213 @@ QVariant ANIHandler::option(ImageOption option) const
+ bool ANIHandler::ensureScanned() const
+ {
+     if (m_scanned) {
+         return true;
+     }
+ 
+     if (device()->isSequential()) {
+         return false;
+     }
+ 
+     auto *mutableThis = const_cast<ANIHandler *>(this);
+ 
+     const auto oldPos = device()->pos();
+     auto cleanup = qScopeGuard([this, oldPos] {
+         device()->seek(oldPos);
+     });
+ 
+     device()->seek(0);
+ 
+     const QByteArray riffIntro = device()->read(4);
+     if (riffIntro != "RIFF") {
+         return false;
+     }
+ 
+     const auto riffSizeData = device()->read(sizeof(quint32_le));
++    if (riffSizeData.size() != sizeof(quint32_le)) {
++        return false;
++    }
+     const auto riffSize = *(reinterpret_cast<const quint32_le *>(riffSizeData.data()));
+     // TODO do a basic sanity check if the size is enough to hold some metadata and a frame?
+     if (riffSize == 0) {
+         return false;
+     }
+ 
+     mutableThis->m_displayRates.clear();
+     mutableThis->m_imageSequence.clear();
+ 
+     while (device()->pos() < riffSize) {
+         const QByteArray chunkId = device()->read(4);
+         if (chunkId.length() != 4) {
+             return false;
+         }
+ 
+         if (chunkId == "ACON") {
+             continue;
+         }
+ 
+         const QByteArray chunkSizeData = device()->read(sizeof(quint32_le));
+         if (chunkSizeData.length() != sizeof(quint32_le)) {
+             return false;
+         }
+         auto chunkSize = *(reinterpret_cast<const quint32_le *>(chunkSizeData.data()));
+ 
+         if (chunkId == "anih") {
+             if (chunkSize != sizeof(AniHeader)) {
+                 qWarning() << "anih chunk size does not match ANIHEADER size";
+                 return false;
+             }
+ 
+             const QByteArray anihData = device()->read(sizeof(AniHeader));
+             if (anihData.size() != sizeof(AniHeader)) {
+                 return false;
+             }
+ 
+             auto *aniHeader = reinterpret_cast<const AniHeader *>(anihData.data());
+ 
+             // The size in the ani header is usually 0 unfortunately,
+             // so we'll also check the first frame for its size further below
+             mutableThis->m_size = QSize(aniHeader->iWidth, aniHeader->iHeight);
+             mutableThis->m_frameCount = aniHeader->nFrames;
+             mutableThis->m_imageCount = aniHeader->nSteps;
+             mutableThis->m_displayRate = aniHeader->iDispRate;
+         } else if (chunkId == "rate" || chunkId == "seq ") {
+             const QByteArray data = device()->read(chunkSize);
+             if (static_cast<quint32_le>(data.size()) != chunkSize
+                     || data.size() % sizeof(quint32_le) != 0) {
+                 return false;
+             }
+ 
+             // TODO should we check that the number of rate entries matches nSteps?
+             auto *dataPtr = data.data();
+             QVector<int> list;
+             for (int i = 0; i < data.count(); i += sizeof(quint32_le)) {
+                 const auto entry = *(reinterpret_cast<const quint32_le *>(dataPtr + i));
+                 list.append(entry);
+             }
+ 
+             if (chunkId == "rate") {
+                 // should we check that the number of rate entries matches nSteps?
+                 mutableThis->m_displayRates = list;
+             } else if (chunkId == "seq ") {
+                 // Check if it's just an ascending sequence, don't bother with it then
+                 bool isAscending = true;
+                 for (int i = 0; i < list.count(); ++i) {
+                     if (list.at(i) != i) {
+                         isAscending = false;
+                         break;
+                     }
+                 }
+ 
+                 if (!isAscending) {
+                     mutableThis->m_imageSequence = list;
+                 }
+             }
+         // IART and INAM are technically inside LIST->INFO but "INFO" is supposedly optional
+         // so just handle those two attributes wherever we encounter them
+         } else if (chunkId == "INAM" || chunkId == "IART") {
+             const QByteArray value = device()->read(chunkSize);
+ 
+             if (static_cast<quint32_le>(value.size()) != chunkSize) {
+                 return false;
+             }
+ 
+             // DWORDs are aligned to even sizes
+             if (chunkSize % 2 != 0) {
+                 device()->read(1);
+             }
+ 
+             // FIXME encoding
+             const QString stringValue = QString::fromLocal8Bit(value);
+             if (chunkId == "INAM") {
+                 mutableThis->m_name = stringValue;
+             } else if (chunkId == "IART") {
+                 mutableThis->m_artist = stringValue;
+             }
+         } else if (chunkId == "LIST") {
+             const QByteArray listType = device()->read(4);
+ 
+             if (listType == "INFO") {
+                 // Technically would contain INAM and IART but we handle them anywhere above
+             } else if (listType == "fram") {
+                 quint64 read = 0;
+                 while (read < chunkSize) {
+                     const QByteArray chunkType = device()->read(4);
+                     read += 4;
+                     if (chunkType != "icon") {
+                         break;
+                     }
+ 
+                     if (!m_firstFrameOffset) {
+                         mutableThis->m_firstFrameOffset = device()->pos() - 4;
+                         mutableThis->m_currentImageNumber = 0;
+ 
+                         // If size in header isn't valid, use the first frame's size instead
+                         if (!m_size.isValid() || m_size.isEmpty()) {
+                             const auto oldPos = device()->pos();
+ 
+                             device()->read(sizeof(quint32_le));
+ 
+                             const QByteArray curHeaderData = device()->read(sizeof(CurHeader));
+                             const QByteArray cursorDirEntryData = device()->read(sizeof(CursorDirEntry));
+ 
+                             if (curHeaderData.length() == sizeof(CurHeader)
+                                     && cursorDirEntryData.length() == sizeof(CursorDirEntry)) {
+                                 auto *cursorDirEntry = reinterpret_cast<const CursorDirEntry *>(cursorDirEntryData.data());
+                                 mutableThis->m_size = QSize(cursorDirEntry->bWidth, cursorDirEntry->bHeight);
+                             }
+ 
+                             device()->seek(oldPos);
+                         }
+ 
+                         // If we don't have a custom image sequence we can stop scanning right here
+                         if (m_imageSequence.isEmpty()) {
+                             break;
+                         }
+                     }
+ 
+                     mutableThis->m_frameOffsets.append(device()->pos() - 4);
+ 
+                     const QByteArray frameSizeData = device()->read(sizeof(quint32_le));
+                     if (frameSizeData.size() != sizeof(quint32_le)) {
+                         return false;
+                     }
+ 
+                     const auto frameSize = *(reinterpret_cast<const quint32_le *>(frameSizeData.data()));
+                     device()->seek(device()->pos() + frameSize);
+ 
+                     read += frameSize;
+ 
+                     if (m_frameOffsets.count() == m_frameCount) {
+                         // Also record the end of frame data
+                         mutableThis->m_frameOffsets.append(device()->pos() - 4);
+                         break;
+                     }
+                 }
+                 break;
+             }
+         }
+     }
+ 
+     if (m_imageCount != m_frameCount && m_imageSequence.isEmpty()) {
+         qWarning("ANIHandler: 'nSteps' is not equal to 'nFrames' but no 'seq' entries were provided");
+         return false;
+     }
+ 
+     if (!m_imageSequence.isEmpty() && m_imageSequence.count() != m_imageCount) {
+         qWarning("ANIHandler: count of entries in 'seq' does not match 'nSteps' in anih");
+         return false;
+     }
+ 
+     if (!m_displayRates.isEmpty() && m_displayRates.count() != m_imageCount) {
+         qWarning("ANIHandler: count of entries in 'rate' does not match 'nSteps' in anih");
+         return false;
+     }
+ 
+     if (!m_frameOffsets.isEmpty() && m_frameOffsets.count() != m_frameCount + 1) {
+         qWarning("ANIHandler: number of actual frames does not match 'nFrames' in anih");
+         return false;
+     }
+ 
+     mutableThis->m_scanned = true;
+     return true;
+ }

@@ -1,0 +1,219 @@
+commit f7b91535da39550693214dbe7ae2c16d83d70a4f
+Author: Leandro Pereira <leandro@hardinfo.org>
+Date:   Sat Nov 16 09:48:57 2019 -0800
+
+    Fix heap overflow while parsing templates
+    
+    Fixes https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=18952
+    
+    Thanks to OSS-Fuzz.
+
+diff --git a/src/lib/lwan-array.h b/src/lib/lwan-array.h
+index 1ebe964c..fdf04b3f 100644
+--- a/src/lib/lwan-array.h
++++ b/src/lib/lwan-array.h
+@@ -41,87 +41,92 @@ void lwan_array_sort(struct lwan_array *a,
+                      size_t element_size,
+                      int (*cmp)(const void *a, const void *b));
+ struct lwan_array *coro_lwan_array_new(struct coro *coro, bool inline_first);
+ 
+ #define LWAN_ARRAY_FOREACH(array_, iter_)                                      \
+     for (iter_ = (array_)->base.base;                                          \
+          iter_ <                                                               \
+          ((typeof(iter_))(array_)->base.base + (array_)->base.elements);       \
+          iter_++)
+ 
+ #define LWAN_ARRAY_FOREACH_REVERSE(array_, iter_)                              \
+     if ((typeof(iter_))(array_)->base.elements)                                \
+         for (iter_ = ((typeof(iter_))(array_)->base.base +                     \
+                       (array_)->base.elements - 1);                            \
+              iter_ >= (typeof(iter_))(array_)->base.base; iter_--)
+ 
+ #define DEFINE_ARRAY_TYPE(array_type_, element_type_)                          \
+     struct array_type_ {                                                       \
+         struct lwan_array base;                                                \
+     };                                                                         \
+     __attribute__((unused)) static inline element_type_ *array_type_##_append( \
+         struct array_type_ *array)                                             \
+     {                                                                          \
+         return (element_type_ *)lwan_array_append_heap(&array->base,           \
+                                                        sizeof(element_type_)); \
+     }                                                                          \
+     __attribute__((unused)) static inline struct array_type_                   \
+         *coro_##array_type_##_new(struct coro *coro)                           \
+     {                                                                          \
+         return (struct array_type_ *)coro_lwan_array_new(coro, false);         \
+     }                                                                          \
+     DEFINE_ARRAY_TYPE_FUNCS(array_type_, element_type_, NULL)
+ 
+ #define DEFINE_ARRAY_TYPE_INLINEFIRST(array_type_, element_type_)              \
+     struct array_type_ {                                                       \
+         struct lwan_array base;                                                \
+         element_type_ storage[LWAN_ARRAY_INCREMENT];                           \
+     };                                                                         \
+     __attribute__((unused)) static inline element_type_ *array_type_##_append( \
+         struct array_type_ *array)                                             \
+     {                                                                          \
+         return (element_type_ *)lwan_array_append_inline(                      \
+             &array->base, sizeof(element_type_), &array->storage);             \
+     }                                                                          \
+     __attribute__((unused)) static inline struct array_type_                   \
+         *coro_##array_type_##_new(struct coro *coro)                           \
+     {                                                                          \
+         return (struct array_type_ *)coro_lwan_array_new(coro, true);          \
+     }                                                                          \
+     DEFINE_ARRAY_TYPE_FUNCS(array_type_, element_type_, &array->storage)
+ 
+ #define DEFINE_ARRAY_TYPE_FUNCS(array_type_, element_type_, inline_storage_)   \
+     __attribute__((unused)) static inline int array_type_##_init(              \
+         struct array_type_ *array)                                             \
+     {                                                                          \
+         return lwan_array_init(&array->base);                                  \
+     }                                                                          \
+     __attribute__((unused)) static inline int array_type_##_reset(             \
+         struct array_type_ *array)                                             \
+     {                                                                          \
+         return lwan_array_reset(&array->base, inline_storage_);                \
+     }                                                                          \
+     __attribute__((unused)) static inline element_type_                        \
+         *array_type_##_append0(struct array_type_ *array)                      \
+     {                                                                          \
+         element_type_ *element = array_type_##_append(array);                  \
+                                                                                \
+         if (element)                                                           \
+             memset(element, 0, sizeof(*element));                              \
+                                                                                \
+         return element;                                                        \
+     }                                                                          \
+     __attribute__((unused)) static inline void array_type_##_sort(             \
+         struct array_type_ *array, int (*cmp)(const void *a, const void *b))   \
+     {                                                                          \
+         lwan_array_sort(&array->base, sizeof(element_type_), cmp);             \
+     }                                                                          \
+     __attribute__((unused)) static inline size_t array_type_##_get_elem_index( \
+-        struct array_type_ *array, element_type_ *elem)                        \
++        const struct array_type_ *array, element_type_ *elem)                  \
+     {                                                                          \
+         return (size_t)(elem - (element_type_ *)array->base.base);             \
+     }                                                                          \
+     __attribute__((unused)) static inline element_type_                        \
+-        *array_type_##_get_elem(struct array_type_ *array, size_t index)       \
++        *array_type_##_get_elem(const struct array_type_ *array, size_t index) \
+     {                                                                          \
+         return &((element_type_ *)array->base.base)[index];                    \
++    }                                                                          \
++    __attribute__((unused)) static inline size_t array_type_##_len(            \
++        const struct array_type_ *array)                                       \
++    {                                                                          \
++        return array->base.elements;                                           \
+     }
+diff --git a/src/lib/lwan-template.c b/src/lib/lwan-template.c
+index 684c1c5b..3d68360c 100644
+--- a/src/lib/lwan-template.c
++++ b/src/lib/lwan-template.c
+@@ -996,94 +996,104 @@ void lwan_tpl_free(struct lwan_tpl *tpl)
+ 
+ static bool post_process_template(struct parser *parser)
+ {
++    struct chunk *last_chunk =
++        chunk_array_get_elem(&parser->chunks, chunk_array_len(&parser->chunks));
+     struct chunk *prev_chunk;
+     struct chunk *chunk;
+ 
+-    LWAN_ARRAY_FOREACH(&parser->chunks, chunk) {
++    LWAN_ARRAY_FOREACH (&parser->chunks, chunk) {
+         if (chunk->action == ACTION_IF_VARIABLE_NOT_EMPTY) {
+             for (prev_chunk = chunk;; chunk++) {
++                if (chunk > last_chunk)
++                    goto error;
+                 if (chunk->action == ACTION_LAST) {
+                     lwan_status_error("Internal error: Could not find the end "
+                                       "var not empty chunk");
+                     return false;
+                 }
+                 if (chunk->action == ACTION_END_IF_VARIABLE_NOT_EMPTY &&
+                     chunk->data == prev_chunk->data)
+                     break;
+             }
+ 
+             struct chunk_descriptor *cd = malloc(sizeof(*cd));
+             if (!cd)
+                 lwan_status_critical_perror("malloc");
+ 
+             cd->descriptor = prev_chunk->data;
+             cd->chunk = chunk;
+             prev_chunk->data = cd;
+             prev_chunk->flags &= ~FLAGS_NO_FREE;
+ 
+             chunk = prev_chunk + 1;
+         } else if (chunk->action == ACTION_START_ITER) {
+             enum flags flags = chunk->flags;
+ 
+             for (prev_chunk = chunk;; chunk++) {
++                if (chunk > last_chunk)
++                    goto error;
+                 if (chunk->action == ACTION_LAST) {
+                     lwan_status_error(
+                         "Internal error: Could not find the end iter chunk");
+                     return false;
+                 }
+                 if (chunk->action == ACTION_END_ITER) {
+                     size_t start_index = (size_t)chunk->data;
+                     size_t prev_index =
+                         chunk_array_get_elem_index(&parser->chunks, prev_chunk);
+ 
+                     if (prev_index == start_index) {
+                         chunk->flags |= flags;
+                         chunk->data =
+                             chunk_array_get_elem(&parser->chunks, start_index);
+                         break;
+                     }
+                 }
+             }
+ 
+             struct chunk_descriptor *cd = malloc(sizeof(*cd));
+             if (!cd)
+                 lwan_status_critical_perror("malloc");
+ 
+             cd->descriptor = prev_chunk->data;
+             prev_chunk->data = cd;
+             prev_chunk->flags &= ~FLAGS_NO_FREE;
+ 
+             if (chunk->action == ACTION_LAST)
+                 cd->chunk = chunk;
+             else
+                 cd->chunk = chunk + 1;
+ 
+             chunk = prev_chunk + 1;
+         } else if (chunk->action == ACTION_VARIABLE) {
+             struct lwan_var_descriptor *descriptor = chunk->data;
+             bool escape = chunk->flags & FLAGS_QUOTE;
+ 
+             if (descriptor->append_to_strbuf == lwan_append_str_to_strbuf) {
+                 if (escape)
+                     chunk->action = ACTION_VARIABLE_STR_ESCAPE;
+                 else
+                     chunk->action = ACTION_VARIABLE_STR;
+                 chunk->data = (void *)(uintptr_t)descriptor->offset;
+             } else if (escape) {
+                 lwan_status_error("Variable must be string to be escaped");
+                 return false;
+             } else if (!descriptor->append_to_strbuf) {
+                 lwan_status_error("Invalid variable descriptor");
+                 return false;
+             }
+         } else if (chunk->action == ACTION_LAST) {
+             break;
+         }
+     }
+ 
+     parser->tpl->chunks = parser->chunks;
+ 
+     return true;
++
++error:
++    lwan_status_error("Unknown error while parsing template; bug?");
++    return false;
+ }
+ 
+ static bool parser_init(struct parser *parser,

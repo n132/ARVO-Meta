@@ -1,0 +1,377 @@
+commit 7473d21494834f72f984b0e2a06346bd68fb6e1c
+Author: Roman Lebedev <lebedev.ri@gmail.com>
+Date:   Thu Oct 25 23:59:15 2018 +0300
+
+    VC5Decompressor: better handling of Optional tags. (i.e. don't assert)
+
+diff --git a/src/librawspeed/common/Optional.h b/src/librawspeed/common/Optional.h
+index 74af057a..78a03d53 100644
+--- a/src/librawspeed/common/Optional.h
++++ b/src/librawspeed/common/Optional.h
+@@ -31,20 +31,22 @@ template <class T> class Optional final {
+ public:
+   Optional() = default;
+ 
+   explicit Optional(T RHS) : data(RHS), hasData(true) {}
+ 
+   Optional& operator=(T RHS) {
+     Optional tmp(RHS);
+     *this = std::move(tmp);
+     return *this;
+   }
+ 
+   bool hasValue() const { return hasData; }
+ 
++  void reset() { hasData = false; }
++
+   T getValue() const {
+     assert(hasValue());
+     return data;
+   }
+ };
+ 
+ } // namespace rawspeed
+diff --git a/src/librawspeed/decompressors/VC5Decompressor.cpp b/src/librawspeed/decompressors/VC5Decompressor.cpp
+index 8cf7b88f..43557db1 100644
+--- a/src/librawspeed/decompressors/VC5Decompressor.cpp
++++ b/src/librawspeed/decompressors/VC5Decompressor.cpp
+@@ -378,130 +378,130 @@ const SimpleLUT<int16_t, 16> VC5Decompressor::mVC5DecompandingTable = []() {
+ void VC5Decompressor::parseVC5() {
+   mBs.setByteOrder(Endianness::big);
+ 
+   assert(mRaw->dim.x > 0);
+   assert(mRaw->dim.y > 0);
+ 
+   // All VC-5 data must start with "VC-%" (0x56432d35)
+   if (mBs.getU32() != 0x56432d35)
+     ThrowRDE("not a valid VC-5 datablock");
+ 
+   bool done = false;
+   while (!done) {
+     auto tag = static_cast<VC5Tag>(mBs.getU16());
+     ushort16 val = mBs.getU16();
+ 
+     bool optional = matches(tag, VC5Tag::Optional);
+     if (optional)
+       tag = -tag;
+ 
+     switch (tag) {
+     case VC5Tag::ChannelCount:
+       if (val != numChannels)
+         ThrowRDE("Bad channel count %u, expected %u", val, numChannels);
+       break;
+     case VC5Tag::ImageWidth:
+       if (val != mRaw->dim.x)
+         ThrowRDE("Image width mismatch: %u vs %u", val, mRaw->dim.x);
+       break;
+     case VC5Tag::ImageHeight:
+       if (val != mRaw->dim.y)
+         ThrowRDE("Image height mismatch: %u vs %u", val, mRaw->dim.y);
+       break;
+     case VC5Tag::LowpassPrecision:
+       if (val < PRECISION_MIN || val > PRECISION_MAX)
+         ThrowRDE("Invalid precision %i", val);
+       mVC5.lowpassPrecision = val;
+       break;
+     case VC5Tag::ChannelNumber:
+       if (val >= numChannels)
+         ThrowRDE("Bad channel number (%u)", val);
+       mVC5.iChannel = val;
+       break;
+     case VC5Tag::ImageFormat:
+       if (val != mVC5.imgFormat)
+         ThrowRDE("Image format %i is not 4(RAW)", val);
+       break;
+     case VC5Tag::SubbandCount:
+       if (val != numSubbands)
+         ThrowRDE("Unexpected subband count %u, expected %u", val, numSubbands);
+       break;
+     case VC5Tag::MaxBitsPerComponent:
+       if (val != VC5_LOG_TABLE_BITWIDTH) {
+         ThrowRDE("Bad bits per componend %u, not %u", val,
+                  VC5_LOG_TABLE_BITWIDTH);
+       }
+       break;
+     case VC5Tag::PatternWidth:
+       if (val != mVC5.patternWidth)
+         ThrowRDE("Bad pattern width %u, not %u", val, mVC5.patternWidth);
+       break;
+     case VC5Tag::PatternHeight:
+       if (val != mVC5.patternHeight)
+         ThrowRDE("Bad pattern height %u, not %u", val, mVC5.patternHeight);
+       break;
+     case VC5Tag::SubbandNumber:
+       if (val >= numSubbands)
+         ThrowRDE("Bad subband number %u", val);
+       mVC5.iSubband = val;
+       break;
+     case VC5Tag::Quantization:
+       mVC5.quantization = static_cast<short16>(val);
+       break;
+     case VC5Tag::ComponentsPerSample:
+       if (val != mVC5.cps)
+         ThrowRDE("Bad compnent per sample count %u, not %u", val, mVC5.cps);
+       break;
+     case VC5Tag::PrescaleShift:
+       // FIXME: something is wrong. We get this before VC5Tag::ChannelNumber.
+       // Defaulting to 'mVC5.iChannel=0' seems to work *for existing samples*.
+       for (int iWavelet = 0; iWavelet < numWaveletLevels; ++iWavelet) {
+-        auto& channel = channels[mVC5.iChannel.getValue()];
++        auto& channel = channels[mVC5.iChannel];
+         auto& wavelet = channel.wavelets[iWavelet];
+         wavelet.prescale = (val >> (14 - 2 * iWavelet)) & 0x03;
+       }
+       break;
+     default: { // A chunk.
+       unsigned int chunkSize = 0;
+       if (matches(tag, VC5Tag::LARGE_CHUNK)) {
+         chunkSize = static_cast<unsigned int>(
+             ((static_cast<std::underlying_type<VC5Tag>::type>(tag) & 0xff)
+              << 16) |
+             (val & 0xffff));
+       } else if (matches(tag, VC5Tag::SMALL_CHUNK)) {
+         chunkSize = (val & 0xffff);
+       }
+ 
+       if (is(tag, VC5Tag::LargeCodeblock)) {
+         parseLargeCodeblock(mBs.getStream(chunkSize, 4));
+         break;
+       }
+ 
+       // And finally, we got here if we didn't handle this tag/maybe-chunk.
+ 
+       // Magic, all the other 'large' chunks are actually optional,
+       // and don't specify any chunk bytes-to-be-skipped.
+       if (matches(tag, VC5Tag::LARGE_CHUNK)) {
+         optional = true;
+         chunkSize = 0;
+       }
+ 
+       if (!optional) {
+         ThrowRDE("Unknown (unhandled) non-optional Tag 0x%04hx",
+                  static_cast<std::underlying_type<VC5Tag>::type>(tag));
+       }
+ 
+       if (chunkSize)
+         mBs.skipBytes(chunkSize, 4);
+ 
+       break;
+     }
+     }
+ 
+     done = true;
+     for (int iChannel = 0; iChannel < numChannels && done; ++iChannel) {
+       Wavelet& wavelet = channels[iChannel].wavelets[0];
+       if (!wavelet.allBandsValid())
+         done = false;
+     }
+   }
+ }
+@@ -549,62 +549,73 @@ void VC5Decompressor::Wavelet::HighPassBand::decode(const Wavelet& wavelet) {
+ void VC5Decompressor::parseLargeCodeblock(const ByteStream& bs) {
+   static const auto subband_wavelet_index = []() {
+     std::array<int, numSubbands> wavelets;
+     int wavelet = 0;
+     for (auto i = wavelets.size() - 1; i > 0;) {
+       for (auto t = 0; t < numWaveletLevels; t++) {
+         wavelets[i] = wavelet;
+         i--;
+       }
+       if (i > 0)
+         wavelet++;
+     }
+     wavelets.front() = wavelet;
+     return wavelets;
+   }();
+   static const auto subband_band_index = []() {
+     std::array<int, numSubbands> bands;
+     bands.front() = 0;
+     for (auto i = 1U; i < bands.size();) {
+       for (int t = 1; t <= numWaveletLevels;) {
+         bands[i] = t;
+         t++;
+         i++;
+       }
+     }
+     return bands;
+   }();
+ 
++  if (!mVC5.iSubband.hasValue())
++    ThrowRDE("Did not see VC5Tag::SubbandNumber yet");
++
+   const int idx = subband_wavelet_index[mVC5.iSubband.getValue()];
+   const int band = subband_band_index[mVC5.iSubband.getValue()];
+ 
+-  auto& wavelets = channels[mVC5.iChannel.getValue()].wavelets;
++  auto& wavelets = channels[mVC5.iChannel].wavelets;
+ 
+   Wavelet& wavelet = wavelets[idx];
+   if (wavelet.isBandValid(band)) {
+     ThrowRDE("Band %u for wavelet %u on channel %u was already seen", band, idx,
+-             mVC5.iChannel.getValue());
++             mVC5.iChannel);
+   }
+ 
+   std::unique_ptr<Wavelet::AbstractBand>& dstBand = wavelet.bands[band];
+   if (mVC5.iSubband.getValue() == 0) {
+     assert(band == 0);
+     // low-pass band, only one, for the smallest wavelet, per channel per image
++    if (!mVC5.lowpassPrecision.hasValue())
++      ThrowRDE("Did not see VC5Tag::LowpassPrecision yet");
+     dstBand = std::make_unique<Wavelet::LowPassBand>(
+         bs, mVC5.lowpassPrecision.getValue());
++    mVC5.lowpassPrecision.reset();
+   } else {
++    if (!mVC5.quantization.hasValue())
++      ThrowRDE("Did not see VC5Tag::Quantization yet");
+     dstBand = std::make_unique<Wavelet::HighPassBand>(
+         bs, mVC5.quantization.getValue());
++    mVC5.quantization.reset();
+   }
+   wavelet.setBandValid(band);
+ 
+   // If this wavelet is fully specified, mark the low-pass band of the
+   // next lower wavelet as specified.
+   if (idx > 0 && wavelet.allBandsValid()) {
+     Wavelet& nextWavelet = wavelets[idx - 1];
+     assert(!nextWavelet.isBandValid(0));
+     nextWavelet.bands[0] = std::make_unique<Wavelet::ReconstructableBand>();
+     nextWavelet.setBandValid(0);
+   }
++
++  mVC5.iSubband.reset();
+ }
+ 
+ void VC5Decompressor::decode(unsigned int offsetX, unsigned int offsetY,
+diff --git a/src/librawspeed/decompressors/VC5Decompressor.h b/src/librawspeed/decompressors/VC5Decompressor.h
+index 13065544..882eb195 100644
+--- a/src/librawspeed/decompressors/VC5Decompressor.h
++++ b/src/librawspeed/decompressors/VC5Decompressor.h
+@@ -89,126 +89,126 @@ inline VC5Tag operator-(VC5Tag tag) {
+ class VC5Decompressor final : public AbstractDecompressor {
+   RawImage mRaw;
+   ByteStream mBs;
+ 
+   static constexpr auto VC5_LOG_TABLE_BITWIDTH = 12;
+   int outputBits;
+   SimpleLUT<unsigned, VC5_LOG_TABLE_BITWIDTH> mVC5LogTable;
+ 
+   void initVC5LogTable();
+ 
+   static const SimpleLUT<int16_t, 16> mVC5DecompandingTable;
+ 
+   static constexpr int numWaveletLevels = 3;
+   static constexpr int numHighPassBands = 3;
+   static constexpr int numLowPassBands = 1;
+   static constexpr int numSubbands =
+       numLowPassBands + numHighPassBands * numWaveletLevels;
+ 
+   struct {
+-    Optional<ushort16> iChannel{0}; // 0'th channel is the default
++    ushort16 iChannel = 0; // 0'th channel is the default
+     Optional<ushort16> iSubband;
+     Optional<ushort16> lowpassPrecision;
+     Optional<short16> quantization;
+ 
+     const ushort16 imgFormat = 4;
+     const ushort16 patternWidth = 2;
+     const ushort16 patternHeight = 2;
+     const ushort16 cps = 1;
+   } mVC5;
+ 
+   class Wavelet {
+   public:
+     uint16_t width, height;
+     int16_t prescale;
+ 
+     struct AbstractBand {
+       std::vector<int16_t> data;
+       virtual ~AbstractBand() = default;
+       virtual void decode(const Wavelet& wavelet) = 0;
+     };
+     struct ReconstructableBand final : AbstractBand {
+       bool clampUint;
+       std::vector<int16_t> lowpass_storage;
+       std::vector<int16_t> highpass_storage;
+       explicit ReconstructableBand(bool clampUint_ = false)
+           : clampUint(clampUint_) {}
+       void processLow(const Wavelet& wavelet) noexcept;
+       void processHigh(const Wavelet& wavelet) noexcept;
+       void combine(const Wavelet& wavelet) noexcept;
+       void decode(const Wavelet& wavelet) noexcept final;
+     };
+     struct AbstractDecodeableBand : AbstractBand {
+       ByteStream bs;
+       explicit AbstractDecodeableBand(ByteStream bs_) : bs(std::move(bs_)) {}
+     };
+     struct LowPassBand final : AbstractDecodeableBand {
+       ushort16 lowpassPrecision;
+       LowPassBand(ByteStream bs_, ushort16 lowpassPrecision_)
+           : AbstractDecodeableBand(std::move(bs_)),
+             lowpassPrecision(lowpassPrecision_) {}
+       void decode(const Wavelet& wavelet) final;
+     };
+     struct HighPassBand final : AbstractDecodeableBand {
+       int16_t quant;
+       HighPassBand(ByteStream bs_, int16_t quant_)
+           : AbstractDecodeableBand(std::move(bs_)), quant(quant_) {}
+       void decode(const Wavelet& wavelet) final;
+     };
+ 
+     static constexpr uint16_t numBands = 4;
+     std::array<std::unique_ptr<AbstractBand>, numBands> bands;
+ 
+     void clear() {
+       for (auto& band : bands)
+         band.reset();
+     }
+ 
+     void setBandValid(int band);
+     bool isBandValid(int band) const;
+     uint32_t getValidBandMask() const { return mDecodedBandMask; }
+     bool allBandsValid() const;
+ 
+     void reconstructPass(Array2DRef<int16_t> dst,
+                          Array2DRef<const int16_t> high,
+                          Array2DRef<const int16_t> low) const noexcept;
+ 
+     void combineLowHighPass(Array2DRef<int16_t> dest,
+                             Array2DRef<const int16_t> low,
+                             Array2DRef<const int16_t> high, int descaleShift,
+                             bool clampUint /*= false*/) const noexcept;
+ 
+     const Array2DRef<int16_t> bandAsArray2DRef(unsigned int iBand);
+     const Array2DRef<const int16_t> bandAsArray2DRef(unsigned int iBand) const;
+ 
+   protected:
+     uint32 mDecodedBandMask = 0;
+   };
+ 
+   struct Channel {
+     std::array<Wavelet, numWaveletLevels> wavelets;
+ 
+     Wavelet::ReconstructableBand band{/*clampUint*/ true};
+     // the final lowband.
+     uint16_t width, height;
+   };
+ 
+   static constexpr int numChannels = 4;
+   static constexpr int numSubbandsTotal = numSubbands * numChannels;
+   std::array<Channel, numChannels> channels;
+ 
+   struct DecodeableBand {
+     Wavelet::AbstractDecodeableBand* band;
+     const Wavelet& wavelet;
+     DecodeableBand(Wavelet::AbstractDecodeableBand* band_,
+                    const Wavelet& wavelet_)
+         : band(band_), wavelet(wavelet_) {}
+   };
+ 
+   static void getRLV(BitPumpMSB* bits, int* value, unsigned int* count);
+ 
+   void parseLargeCodeblock(const ByteStream& bs);
+ 
+   // FIXME: this *should* be threadedable nicely.
+   void combineFinalLowpassBands() const noexcept;
+ 
+   void parseVC5();

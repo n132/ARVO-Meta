@@ -1,0 +1,203 @@
+commit 386a1ac6eecf01231b7839deba7e24dd50f5d718
+Author: Albert Astals Cid <aacid@kde.org>
+Date:   Sat May 25 23:55:47 2019 +0200
+
+    KCompressionDevice: Remove bIgnoreData
+    
+    Summary:
+    bIgnoreData was used in ::seek to say, we don't really care much
+    about the next readData call because we know it's coming from this read
+    call we're wrapping in bIgnoreData and we will just going to throw
+    away the data (see dummy variable).
+    
+    The problem is that it is not guaranteed that the readData call that the
+    read() originates will be over dummy, in some cases it can be over the internal
+    qiodevice ring buffer
+      https://code.qt.io/cgit/qt/qtbase.git/tree/src/corelib/io/qiodevice.cpp?h=5.12#n1129
+    so if we don't properly store the data we end up with wrong data in the ring buffer and bad things will happen
+    
+    Reviewers: apol
+    
+    Reviewed By: apol
+    
+    Subscribers: apol, kde-frameworks-devel
+    
+    Tags: #frameworks
+    
+    Differential Revision: https://phabricator.kde.org/D21388
+
+diff --git a/src/kcompressiondevice.cpp b/src/kcompressiondevice.cpp
+index 35c1e46..784c150 100644
+--- a/src/kcompressiondevice.cpp
++++ b/src/kcompressiondevice.cpp
+@@ -44,29 +44,27 @@ class KCompressionDevicePrivate
+ {
+ public:
+     KCompressionDevicePrivate(KCompressionDevice *q)
+         : bNeedHeader(true)
+         , bSkipHeaders(false)
+         , bOpenedUnderlyingDevice(false)
+-        , bIgnoreData(false)
+         , type(KCompressionDevice::None)
+         , errorCode(QFileDevice::NoError)
+         , deviceReadPos(0)
+         , q(q)
+     {
+     }
+ 
+     void propagateErrorCode();
+ 
+     bool bNeedHeader;
+     bool bSkipHeaders;
+     bool bOpenedUnderlyingDevice;
+-    bool bIgnoreData;
+     QByteArray buffer; // Used as 'input buffer' when reading, as 'output buffer' when writing
+     QByteArray origFileName;
+     KFilterBase::Result result;
+     KFilterBase *filter;
+     KCompressionDevice::CompressionType type;
+     QFileDevice::FileError errorCode;
+     qint64 deviceReadPos;
+     KCompressionDevice *q;
+ };
+@@ -209,50 +207,48 @@ QFileDevice::FileError KCompressionDevice::error() const
+ bool KCompressionDevice::seek(qint64 pos)
+ {
+     if (d->deviceReadPos == pos) {
+         return QIODevice::seek(pos);
+     }
+ 
+     //qCDebug(KArchiveLog) << "seek(" << pos << ") called, current pos=" << QIODevice::pos();
+ 
+     Q_ASSERT(d->filter->mode() == QIODevice::ReadOnly);
+ 
+     if (pos == 0) {
+         if (!QIODevice::seek(pos))
+             return false;
+ 
+         // We can forget about the cached data
+         d->bNeedHeader = !d->bSkipHeaders;
+         d->result = KFilterBase::Ok;
+         d->filter->setInBuffer(nullptr, 0);
+         d->filter->reset();
+         d->deviceReadPos = 0;
+         return d->filter->device()->reset();
+     }
+ 
+     qint64 bytesToRead;
+     if (d->deviceReadPos < pos) { // we can start from here
+         bytesToRead = pos - d->deviceReadPos;
+         // Since we're going to do a read() below
+         // we need to reset the internal QIODevice pos to the real position we are
+         // so that after read() we are indeed pointing to the pos seek
+         // asked us to be in
+         if (!QIODevice::seek(d->deviceReadPos)) {
+             return false;
+         }
+     } else {
+         // we have to start from 0 ! Ugly and slow, but better than the previous
+         // solution (KTarGz was allocating everything into memory)
+         if (!seek(0)) { // recursive
+             return false;
+         }
+         bytesToRead = pos;
+     }
+ 
+     //qCDebug(KArchiveLog) << "reading " << bytesToRead << " dummy bytes";
+     QByteArray dummy(qMin(bytesToRead, qint64(3 * BUFFER_SIZE)), 0);
+-    d->bIgnoreData = true;
+     const bool result = (read(dummy.data(), bytesToRead) == bytesToRead);
+-    d->bIgnoreData = false;
+     return result;
+ }
+ 
+@@ -266,85 +262,74 @@ bool KCompressionDevice::atEnd() const
+ qint64 KCompressionDevice::readData(char *data, qint64 maxlen)
+ {
+     Q_ASSERT(d->filter->mode() == QIODevice::ReadOnly);
+     //qCDebug(KArchiveLog) << "maxlen=" << maxlen;
+     KFilterBase *filter = d->filter;
+ 
+     uint dataReceived = 0;
+ 
+     // We came to the end of the stream
+     if (d->result == KFilterBase::End) {
+         return dataReceived;
+     }
+ 
+     // If we had an error, return -1.
+     if (d->result != KFilterBase::Ok) {
+         return -1;
+     }
+ 
+-    qint64 outBufferSize;
+-    if (d->bIgnoreData) {
+-        outBufferSize = qMin(maxlen, static_cast<qint64>(3 * BUFFER_SIZE));
+-    } else {
+-        outBufferSize = maxlen;
+-    }
+-    outBufferSize -= dataReceived;
+-    qint64 availOut = outBufferSize;
+-    filter->setOutBuffer(data, outBufferSize);
++    qint64 availOut = maxlen;
++    filter->setOutBuffer(data, maxlen);
+ 
+     while (dataReceived < maxlen) {
+         if (filter->inBufferEmpty()) {
+             // Not sure about the best size to set there.
+             // For sure, it should be bigger than the header size (see comment in readHeader)
+             d->buffer.resize(BUFFER_SIZE);
+             // Request data from underlying device
+             int size = filter->device()->read(d->buffer.data(),
+                                               d->buffer.size());
+             //qCDebug(KArchiveLog) << "got" << size << "bytes from device";
+             if (size) {
+                 filter->setInBuffer(d->buffer.data(), size);
+             } else {
+                 // Not enough data available in underlying device for now
+                 break;
+             }
+         }
+         if (d->bNeedHeader) {
+             (void) filter->readHeader();
+             d->bNeedHeader = false;
+         }
+ 
+         d->result = filter->uncompress();
+ 
+         if (d->result == KFilterBase::Error) {
+             //qCWarning(KArchiveLog) << "KCompressionDevice: Error when uncompressing data";
+             break;
+         }
+ 
+         // We got that much data since the last time we went here
+         uint outReceived = availOut - filter->outBufferAvailable();
+         //qCDebug(KArchiveLog) << "avail_out = " << filter->outBufferAvailable() << " result=" << d->result << " outReceived=" << outReceived;
+         if (availOut < uint(filter->outBufferAvailable())) {
+             //qCWarning(KArchiveLog) << " last availOut " << availOut << " smaller than new avail_out=" << filter->outBufferAvailable() << " !";
+         }
+ 
+         dataReceived += outReceived;
+-        if (!d->bIgnoreData) {  // Move on in the output buffer
+-            data += outReceived;
+-            availOut = maxlen - dataReceived;
+-        } else if (maxlen - dataReceived < outBufferSize) {
+-            availOut = maxlen - dataReceived;
+-        }
++        data += outReceived;
++        availOut = maxlen - dataReceived;
+         if (d->result == KFilterBase::End) {
+             // We're actually at the end, no more data to check
+             if (filter->device()->atEnd()) {
+                 break;
+             }
+ 
+             // Still not done, re-init and try again
+             filter->init(filter->mode());
+         }
+         filter->setOutBuffer(data, availOut);
+     }
+ 
+     d->deviceReadPos += dataReceived;
+     return dataReceived;
+ }

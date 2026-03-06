@@ -1,0 +1,396 @@
+commit c8051ae666672cb7ca39531e28ec85636e1ce6d5
+Author: Chris Liddell <chris.liddell@artifex.com>
+Date:   Mon Feb 21 10:18:52 2022 +0000
+
+    oss-fuzz 44855: Don't ignore Freetype error code
+    
+    In one of the "in extremis" fallback cases, the return code from Freetype
+    wasn't being acted upon, leaving a partially initialised glyph bitmap, that we
+    subsequently attempt to use, resulting in a crash.
+
+diff --git a/base/fapi_ft.c b/base/fapi_ft.c
+index b4111993a..f02018eca 100644
+--- a/base/fapi_ft.c
++++ b/base/fapi_ft.c
+@@ -548,377 +548,381 @@ static gs_fapi_retcode
+ load_glyph(gs_fapi_server * a_server, gs_fapi_font * a_fapi_font,
+            const gs_fapi_char_ref * a_char_ref, gs_fapi_metrics * a_metrics,
+            FT_Glyph * a_glyph, bool a_bitmap, int max_bitmap)
+ {
+     ff_server *s = (ff_server *) a_server;
+     FT_Error ft_error = 0;
+     FT_Error ft_error_fb = 1;
+     ff_face *face = (ff_face *) a_fapi_font->server_font_data;
+     FT_Face ft_face = face->ft_face;
+     int index = a_char_ref->char_codes[0];
+     FT_Long w;
+     FT_Long h;
+     FT_Long fflags;
+     FT_Int32 load_flags = 0;
+     FT_Vector  delta = {0,0};
+ 
+     /* Save a_fapi_font->char_data, which is set to null by FAPI_FF_get_glyph as part of a hack to
+      * make the deprecated Type 2 endchar ('seac') work, so that it can be restored
+      * after the first call to FT_Load_Glyph.
+      */
+     const void *saved_char_data = a_fapi_font->char_data;
+     const int saved_char_data_len = a_fapi_font->char_data_len;
+ 
+     if (s->bitmap_glyph) {
+         FT_Bitmap_Done(s->freetype_library, &s->bitmap_glyph->bitmap);
+         FF_free(s->ftmemory, s->bitmap_glyph);
+         s->bitmap_glyph = NULL;
+     }
+     if (s->outline_glyph) {
+         FT_Outline_Done(s->freetype_library, &s->outline_glyph->outline);
+         FF_free(s->ftmemory, s->outline_glyph);
+         s->outline_glyph = NULL;
+     }
+ 
+     if (!a_char_ref->is_glyph_index) {
+         if (ft_face->num_charmaps)
+             index = FT_Get_Char_Index(ft_face, index);
+         else {
+             /* If there are no character maps and no glyph index, loading the glyph will still work
+              * properly if both glyph data and metrics are supplied by the incremental interface.
+              * In that case we use a dummy glyph index which will be passed
+              * back to FAPI_FF_get_glyph by get_fapi_glyph_data.
+              *
+              * Type 1 fonts don't use the code and can appear to FreeType to have only one glyph,
+              * so we have to set the index to 0.
+              *
+              * For other font types, FAPI_FF_get_glyph requires the character code
+              * when getting data.
+              */
+             if (a_fapi_font->is_type1)
+                 index = 0;
+             else
+                 index = a_char_ref->char_codes[0];
+         }
+     }
+     else {
+         /* This is a heuristic to try to avoid using the TTF notdef (empty rectangle), and replace it
+            with a non-marking glyph instead. This is only required for fonts where we don't use the
+            FT incremental interface - when we are using the incremental interface, we handle it in
+            our own glyph lookup code.
+          */
+         if (!a_fapi_font->is_cid && !face->ft_inc_int &&
+             (index == 0 ||
+             (a_char_ref->client_char_code != gs_no_char &&
+             FT_Get_Char_Index(ft_face, a_char_ref->client_char_code) <= 0))) {
+             int tmp_ind;
+ 
+             if ((tmp_ind = FT_Get_Char_Index(ft_face, 32)) > 0) {
+                 index = tmp_ind;
+             }
+         }
+     }
+     /* Refresh the pointer to the FAPI_font held by the incremental interface. */
+     if (face->ft_inc_int)
+         face->ft_inc_int->object->fapi_font = a_fapi_font;
+ 
+     /* Store the overriding metrics if they have been supplied. */
+     if (face->ft_inc_int && a_char_ref->metrics_type != gs_fapi_metrics_notdef) {
+ 
+         FT_Incremental_MetricsRec *m = &face->ft_inc_int->object->glyph_metrics;
+ 
+         m->bearing_x = a_char_ref->sb_x >> 16;
+         m->bearing_y = a_char_ref->sb_y >> 16;
+         m->advance = a_char_ref->aw_x >> 16;
+ 
+         face->ft_inc_int->object->glyph_metrics_index = index;
+ 
+         /* For most font types, the original metrics come directly from the font, and
+            what we have here are customized (such as a Matrics dict in Postscript). We
+            only want to use the width, in that case, because other metrics can mess up
+            the hinting in Freetype. We'll apply custom lsb outselves, using the "delta"
+            stuff below.
+            The exception here is PCL/XL embedded TTF fonts, where the h/vmtx tables can
+            be missing, and we *have* to use the explicit metrics from the PCL/XL glyph
+            data. (NOTE: if those do not match the original font's metrics, again, the hinting
+            can be distorted)
+          */
+         if (a_char_ref->metrics_type == gs_fapi_metrics_replace && !a_fapi_font->is_mtx_skipped) {
+             face->ft_inc_int->object->glyph_metrics_index = 0xFFFFFFFF;
+             delta.x = FT_MulFix(a_char_ref->sb_x >> 16, ft_face->size->metrics.x_scale);
+             delta.y = FT_MulFix(a_char_ref->sb_y >> 16, ft_face->size->metrics.y_scale);
+             FT_Vector_Transform( &delta, &face->ft_transform);
+         }
+         else {
+             face->ft_inc_int->object->metrics_type = a_char_ref->metrics_type;
+         }
+     }
+     else if (face->ft_inc_int)
+         /* Make sure we don't leave this set to the last value, as we may then use inappropriate metrics values */
+         face->ft_inc_int->object->glyph_metrics_index = 0xFFFFFFFF;
+ 
+     /* We have to load the glyph, scale it correctly, and render it if we need a bitmap. */
+     if (!ft_error) {
+         /* We disable loading bitmaps because if we allow it then FreeType invents metrics for them, which messes up our glyph positioning */
+         /* Also the bitmaps tend to look somewhat different (though more readable) than FreeType's rendering. By disabling them we */
+         /* maintain consistency better.  (FT_LOAD_NO_BITMAP) */
+         a_fapi_font->char_data = saved_char_data;
+         if (!a_fapi_font->is_mtx_skipped && !a_fapi_font->is_type1) {
+             /* grid_fit == 1 is the default - use font's native hints
+              * with freetype, 1 & 3 are, in practice, the same.
+              */
+ 
+             if (a_server->grid_fit == 0) {
+                 load_flags = FT_LOAD_NO_HINTING | FT_LOAD_NO_AUTOHINT;
+             }
+             else if (a_server->grid_fit == 2) {
+                 load_flags = FT_LOAD_FORCE_AUTOHINT;
+             }
+             load_flags |= FT_LOAD_MONOCHROME | FT_LOAD_NO_BITMAP | FT_LOAD_LINEAR_DESIGN;
+         }
+         else {
+             /* Current FreeType hinting for type 1 fonts is so poor we are actually better off without it (fewer files render incorrectly) (FT_LOAD_NO_HINTING) */
+             /* We also need to disable hinting for XL format embedded truetypes */
+             load_flags |= FT_LOAD_MONOCHROME | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP | FT_LOAD_LINEAR_DESIGN;
+         }
+ 
+         ft_error = FT_Load_Glyph(ft_face, index, load_flags);
+         if (ft_error == FT_Err_Unknown_File_Format) {
+             return index + 1;
+         }
+     }
+ 
+     if (ft_error == FT_Err_Invalid_Argument
+         || ft_error == FT_Err_Invalid_Reference
+         || ft_error == FT_Err_Invalid_Glyph_Index
+         || (ft_error >= FT_Err_Invalid_Opcode
+             && ft_error <= FT_Err_Too_Many_Instruction_Defs)) {
+ 
+         a_fapi_font->char_data = saved_char_data;
+ 
+         /* We want to prevent hinting, even for a "tricky" font - it shouldn't matter for the notdef */
+         fflags = ft_face->face_flags;
+         ft_face->face_flags &= ~FT_FACE_FLAG_TRICKY;
+         load_flags |= FT_LOAD_NO_HINTING;
+         ft_error = FT_Load_Glyph(ft_face, index, load_flags);
+ 
+         ft_face->face_flags = fflags;
+     }
+ 
+     if (ft_error == FT_Err_Out_Of_Memory
+         || ft_error == FT_Err_Array_Too_Large) {
+         return (gs_error_VMerror);
+     }
+ 
+     /* If FT gives us an error, try to fall back to the notdef - if that doesn't work, we'll throw an error over to Ghostscript */
+     if (ft_error) {
+         gs_string notdef_str;
+ 
+         notdef_str.data = (byte *)".notdef";
+         notdef_str.size = 7;
+ 
+         a_fapi_font->char_data = (void *)(&notdef_str);
+         a_fapi_font->char_data_len = 0;
+ 
+         /* We want to prevent hinting, even for a "tricky" font - it shouldn't matter for the notdef */
+         fflags = ft_face->face_flags;
+         ft_face->face_flags &= ~FT_FACE_FLAG_TRICKY;
+ 
+         ft_error_fb = FT_Load_Glyph(ft_face, 0, load_flags);
+ 
+         ft_face->face_flags = fflags;
+ 
+         a_fapi_font->char_data = saved_char_data;
+         a_fapi_font->char_data_len = saved_char_data_len;
+     }
+ 
+     if ((!ft_error || !ft_error_fb) && (delta.x != 0 || delta.y != 0)) {
+         FT_Outline_Translate( &ft_face->glyph->outline, delta.x, delta.y);
+     }
+ 
+     /* Previously we interpreted the glyph unscaled, and derived the metrics from that. Now we only interpret it
+      * once, and work out the metrics from the scaled/hinted outline.
+      */
+     if ((!ft_error || !ft_error_fb) && a_metrics) {
+         FT_Long hx;
+         FT_Long hy;
+         FT_Long vadv;
+ 
+         /* In order to get the metrics in the form we need them, we have to remove the size scaling
+          * the resolution scaling, and convert to points.
+          */
+         hx = (FT_Long) (((double)ft_face->glyph->metrics.horiBearingX *
+                          ft_face->units_per_EM * 72.0) /
+                         ((double)face->width * face->horz_res))  + (a_fapi_font->is_mtx_skipped == 1 ? 0 : a_char_ref->sb_x >> 16);
+         hy = (FT_Long) (((double)ft_face->glyph->metrics.horiBearingY *
+                          ft_face->units_per_EM * 72.0) /
+                         ((double)face->height * face->vert_res)) + (a_fapi_font->is_mtx_skipped == 1 ? 0 : a_char_ref->sb_y >> 16);
+ 
+         w = (FT_Long) (((double)ft_face->glyph->metrics.width *
+                         ft_face->units_per_EM * 72.0) / ((double)face->width *
+                                                          face->horz_res));
+         h = (FT_Long) (((double)ft_face->glyph->metrics.height *
+                         ft_face->units_per_EM * 72.0) /
+                        ((double)face->height * face->vert_res));
+ 
+         /* Ugly. FreeType creates verticla metrics for TT fonts, normally we override them in the
+          * metrics callbacks, but those only work for incremental interface fonts, and TrueType fonts
+          * loaded as CIDFont replacements are not incrementally handled. So here, if its a CIDFont, and
+          * its not type 1 outlines, and its not a vertical mode fotn, ignore the advance.
+          */
+         if (a_fapi_font->is_type1
+            || ((a_fapi_font->full_font_buf || a_fapi_font->font_file_path)
+            && a_fapi_font->is_vertical &&  FT_HAS_VERTICAL(ft_face))) {
+ 
+             vadv = ft_face->glyph->linearVertAdvance;
+         }
+         else {
+             vadv = 0;
+         }
+ 
+         a_metrics->bbox_x0 = hx;
+         a_metrics->bbox_y0 = hy - h;
+         a_metrics->bbox_x1 = a_metrics->bbox_x0 + w;
+         a_metrics->bbox_y1 = a_metrics->bbox_y0 + h;
+         a_metrics->escapement = ft_face->glyph->linearHoriAdvance;
+         a_metrics->v_escapement = vadv;
+         a_metrics->em_x = ft_face->units_per_EM;
+         a_metrics->em_y = ft_face->units_per_EM;
+     }
+ 
+     if ((!ft_error || !ft_error_fb)) {
+ 
+         FT_BBox cbox;
+ 
+         /* compute the control box, and grid fit it - lifted from ft_raster1_render() */
+         FT_Outline_Get_CBox(&ft_face->glyph->outline, &cbox);
+ 
+         /* These round operations are only to preserve behaviour compared to the 9.00 release
+            which used the bitmap dimensions as calculated by Freetype.
+            But FT_PIX_FLOOR/FT_PIX_CEIL aren't public.
+          */
+         cbox.xMin = ((cbox.xMin) & ~63);        /* FT_PIX_FLOOR( cbox.xMin ) */
+         cbox.yMin = ((cbox.yMin) & ~63);
+         cbox.xMax = (((cbox.xMax) + 63) & ~63);
+         cbox.yMax = (((cbox.yMax) + 63) & ~63); /* FT_PIX_CEIL( cbox.yMax ) */
+ 
+         w = (FT_UInt) ((cbox.xMax - cbox.xMin) >> 6);
+         h = (FT_UInt) ((cbox.yMax - cbox.yMin) >> 6);
+ 
+         if (!a_fapi_font->metrics_only && a_bitmap == true && ft_face->glyph->format != FT_GLYPH_FORMAT_BITMAP
+             && ft_face->glyph->format != FT_GLYPH_FORMAT_COMPOSITE) {
+             if ((bitmap_raster(w) * h) < max_bitmap) {
+                 FT_Render_Mode mode = FT_RENDER_MODE_MONO;
+ 
+                 ft_error = FT_Render_Glyph(ft_face->glyph, mode);
++                if (ft_error != 0) {
++                    (*a_glyph) = NULL;
++                    return (gs_error_VMerror);
++                }
+             }
+             else {
+                 (*a_glyph) = NULL;
+                 return (gs_error_VMerror);
+             }
+         }
+     }
+ 
+     if (!a_fapi_font->metrics_only) {
+         /* The following works around the fact that at the scales we deal with
+          * these values may not fit in a 16.16 fixed point value, and thus cause
+          * freetype to error due to overflow - but we don't use these values
+          * and neither does freetype, we can set them to zero and avoid the error
+          */
+         ft_face->glyph->advance.x = ft_face->glyph->advance.y = 0;
+         if ((!ft_error || !ft_error_fb) && a_glyph) {
+             ft_error = FT_Get_Glyph(ft_face->glyph, a_glyph);
+         }
+         else {
+             if (ft_face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+                 FT_BitmapGlyph bmg;
+ 
+                 ft_error = FT_Get_Glyph(ft_face->glyph, (FT_Glyph *) & bmg);
+                 if (!ft_error) {
+                     FT_Bitmap_Done(s->freetype_library, &bmg->bitmap);
+                     FF_free(s->ftmemory, bmg);
+                 }
+             }
+             else {
+                 FT_OutlineGlyph olg;
+ 
+                 ft_error = FT_Get_Glyph(ft_face->glyph, (FT_Glyph *) & olg);
+                 if (!ft_error) {
+                     FT_Outline_Done(s->freetype_library, &olg->outline);
+                     FF_free(s->ftmemory, olg);
+                 }
+             }
+         }
+     }
+ 
+     if (ft_error == FT_Err_Too_Many_Hints) {
+ #ifdef DEBUG
+         if (gs_debug_c('1')) {
+             ft_emprintf1(a_fapi_font->memory,
+                       "TrueType glyph %"PRId64" uses more instructions than the declared maximum in the font.",
+                       a_char_ref->char_codes[0]);
+ 
+             if (!ft_error_fb) {
+                 ft_emprintf(a_fapi_font->memory,
+                          " Continuing, falling back to notdef\n\n");
+             }
+         }
+ #endif
+         if (!ft_error_fb)
+             ft_error = 0;
+     }
+     if (ft_error == FT_Err_Invalid_Argument) {
+ #ifdef DEBUG
+         if (gs_debug_c('1')) {
+             ft_emprintf1(a_fapi_font->memory,
+                       "TrueType parsing error in glyph %"PRId64" in the font.",
+                       a_char_ref->char_codes[0]);
+ 
+             if (!ft_error_fb) {
+                 ft_emprintf(a_fapi_font->memory,
+                          " Continuing, falling back to notdef\n\n");
+             }
+         }
+ #endif
+         if (!ft_error_fb)
+             ft_error = 0;
+     }
+     if (ft_error == FT_Err_Too_Many_Function_Defs) {
+ #ifdef DEBUG
+         if (gs_debug_c('1')) {
+             ft_emprintf1(a_fapi_font->memory,
+                       "TrueType instruction error in glyph %"PRId64" in the font.",
+                       a_char_ref->char_codes[0]);
+ 
+             if (!ft_error_fb) {
+                 ft_emprintf(a_fapi_font->memory,
+                          " Continuing, falling back to notdef\n\n");
+             }
+         }
+ #endif
+         if (!ft_error_fb)
+             ft_error = 0;
+     }
+     if (ft_error == FT_Err_Invalid_Glyph_Index) {
+ #ifdef DEBUG
+         if (gs_debug_c('1')) {
+             ft_emprintf1(a_fapi_font->memory,
+                       "FreeType is unable to find the glyph %"PRId64" in the font.",
+                       a_char_ref->char_codes[0]);
+ 
+             if (!ft_error_fb) {
+                 ft_emprintf(a_fapi_font->memory,
+                          " Continuing, falling back to notdef\n\n");
+             }
+         }
+ #endif
+         if (!ft_error_fb)
+             ft_error = 0;
+     }
+     return ft_to_gs_error(ft_error);
+ }
+ 
+ /*
+  * Ensure that the rasterizer is open.
+  *
+  * In the case of FreeType this means creating the FreeType library object.
+  */

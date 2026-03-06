@@ -1,0 +1,123 @@
+commit f995000834a6bbee1c2a53114e0e41b596c33431
+Author: Frederik Deweerdt <fdeweerdt@fastly.com>
+Date:   Fri Aug 26 13:58:43 2022 -0700
+
+    Avoid 0 sized VLAs
+    
+    They are undefined in C, from the c99 draft:
+    
+    > 6.7.5.2 Array declarators § 5
+    > If the size is an expression that is not an integer constant
+    > expression: if it occurs in a declaration at function prototype scope,
+    > it is treated as if it were replaced by *; otherwise, each time it is
+    > evaluated it shall have a value greater than zero.
+
+diff --git a/lib/common/socket.c b/lib/common/socket.c
+index 7b5f5ced5..9772a10e6 100644
+--- a/lib/common/socket.c
++++ b/lib/common/socket.c
+@@ -896,41 +896,44 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
+ void h2o_socket_sendvec(h2o_socket_t *sock, h2o_sendvec_t *vecs, size_t cnt, h2o_socket_cb cb)
+ {
+     assert(sock->_cb.write == NULL);
+     assert(sock->_write_buf.flattened == NULL);
+ 
+     sock->_cb.write = cb;
+ 
++    if (cnt == 0)
++        return do_write(sock, NULL, 0);
++
+     h2o_iovec_t bufs[cnt];
+     size_t pull_index = SIZE_MAX;
+ 
+     /* copy vectors to bufs, while looking for one to flatten */
+     for (size_t i = 0; i < cnt; ++i) {
+         sock->bytes_written += vecs[i].len;
+         if (vecs[i].callbacks->read_ == h2o_sendvec_read_raw || vecs[i].len == 0) {
+             bufs[i] = h2o_iovec_init(vecs[i].raw, vecs[i].len);
+         } else {
+             assert(pull_index == SIZE_MAX || !"h2o_socket_sendvec can only handle one pull vector at a time");
+             assert(vecs[i].len <= H2O_PULL_SENDVEC_MAX_SIZE); /* at the moment, this is our size limit */
+             pull_index = i;
+         }
+     }
+ 
+     if (pull_index != SIZE_MAX) {
+         /* If the pull vector has a send callback, and if we have the necessary conditions to utilize it, Let it write directly to
+          * the socket. */
+ #if !H2O_USE_LIBUV
+         if (pull_index == cnt - 1 && vecs[pull_index].callbacks != NULL &&
+             do_write_with_sendvec(sock, bufs, cnt - 1, vecs + pull_index))
+             return;
+ #endif
+         /* Load the vector onto memory now. */
+         size_t pulllen = flatten_sendvec(sock, &vecs[pull_index]);
+         if (pulllen == SIZE_MAX) {
+             report_early_write_error(sock);
+             return;
+         }
+         bufs[pull_index] = h2o_iovec_init(sock->_write_buf.flattened, pulllen);
+     }
+ 
+     do_write(sock, bufs, cnt);
+ }
+diff --git a/lib/http1.c b/lib/http1.c
+index 496e1b49c..f12e121cf 100644
+--- a/lib/http1.c
++++ b/lib/http1.c
+@@ -359,54 +359,54 @@ static int create_entity_reader(struct st_h2o_http1_conn_t *conn, const struct p
+ static const char *init_headers(h2o_mem_pool_t *pool, h2o_headers_t *headers, const struct phr_header *src, size_t len,
+                                 h2o_iovec_t *connection, h2o_iovec_t *host, h2o_iovec_t *upgrade, h2o_iovec_t *expect,
+                                 ssize_t *entity_header_index)
+ {
+     *entity_header_index = -1;
+ 
+     assert(headers->size == 0);
+ 
+     /* setup */
+     if (len != 0) {
+         size_t i;
+         h2o_vector_reserve(pool, headers, len);
+         for (i = 0; i != len; ++i) {
+             const h2o_token_t *name_token;
+-            char orig_case[src[i].name_len];
+             /* reject multiline header */
+             if (src[i].name_len == 0)
+                 return "line folding of header fields is not supported";
++            char orig_case[src[i].name_len];
+             /* preserve the original case */
+             memcpy(orig_case, src[i].name, src[i].name_len);
+             /* convert to lower-case in-place */
+             h2o_strtolower((char *)src[i].name, src[i].name_len);
+             if ((name_token = h2o_lookup_token(src[i].name, src[i].name_len)) != NULL) {
+                 if (name_token->flags.is_init_header_special) {
+                     if (name_token == H2O_TOKEN_HOST) {
+                         host->base = (char *)src[i].value;
+                         host->len = src[i].value_len;
+                     } else if (name_token == H2O_TOKEN_CONTENT_LENGTH) {
+                         if (*entity_header_index == -1)
+                             *entity_header_index = i;
+                     } else if (name_token == H2O_TOKEN_TRANSFER_ENCODING) {
+                         *entity_header_index = i;
+                     } else if (name_token == H2O_TOKEN_EXPECT) {
+                         expect->base = (char *)src[i].value;
+                         expect->len = src[i].value_len;
+                     } else if (name_token == H2O_TOKEN_UPGRADE) {
+                         upgrade->base = (char *)src[i].value;
+                         upgrade->len = src[i].value_len;
+                     } else {
+                         assert(!"logic flaw");
+                     }
+                 } else {
+                     h2o_add_header(pool, headers, name_token, orig_case, src[i].value, src[i].value_len);
+                     if (name_token == H2O_TOKEN_CONNECTION)
+                         *connection = headers->entries[headers->size - 1].value;
+                 }
+             } else {
+                 h2o_add_header_by_str(pool, headers, src[i].name, src[i].name_len, 0, orig_case, src[i].value, src[i].value_len);
+             }
+         }
+     }
+ 
+     return NULL;
+ }

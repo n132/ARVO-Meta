@@ -1,0 +1,152 @@
+commit 18ab8029d5aab6ac20c240515ad1795bd31dca1e
+Author: Garret Rieger <grieger@google.com>
+Date:   Fri Jul 31 14:40:49 2020 -0700
+
+    [ENOMEM] check vector status in cmap subsetting.
+
+diff --git a/src/hb-ot-cmap-table.hh b/src/hb-ot-cmap-table.hh
+index 418af0b53..cc48379bb 100644
+--- a/src/hb-ot-cmap-table.hh
++++ b/src/hb-ot-cmap-table.hh
+@@ -1052,134 +1052,137 @@ struct VariationSelectorRecord
+ struct CmapSubtableFormat14
+ {
+   glyph_variant_t get_glyph_variant (hb_codepoint_t codepoint,
+ 				     hb_codepoint_t variation_selector,
+ 				     hb_codepoint_t *glyph) const
+   { return record.bsearch (variation_selector).get_glyph (codepoint, glyph, this); }
+ 
+   void collect_variation_selectors (hb_set_t *out) const
+   {
+     unsigned int count = record.len;
+     for (unsigned int i = 0; i < count; i++)
+       out->add (record.arrayZ[i].varSelector);
+   }
+   void collect_variation_unicodes (hb_codepoint_t variation_selector,
+ 				   hb_set_t *out) const
+   { record.bsearch (variation_selector).collect_unicodes (out, this); }
+ 
+   void serialize (hb_serialize_context_t *c,
+ 		  const hb_set_t *unicodes,
+ 		  const hb_set_t *glyphs_requested,
+ 		  const hb_map_t *glyph_map,
+ 		  const void *base)
+   {
+     auto snap = c->snapshot ();
+     unsigned table_initpos = c->length ();
+     const char* init_tail = c->tail;
+ 
+     if (unlikely (!c->extend_min (*this))) return;
+     this->format = 14;
+ 
+     auto src_tbl = reinterpret_cast<const CmapSubtableFormat14*> (base);
+ 
+     /*
+      * Some versions of OTS require that offsets are in order. Due to the use
+      * of push()/pop_pack() serializing the variation records in order results
+      * in the offsets being in reverse order (first record has the largest
+      * offset). While this is perfectly valid, it will cause some versions of
+      * OTS to consider this table bad.
+      *
+      * So to prevent this issue we serialize the variation records in reverse
+      * order, so that the offsets are ordered from small to large. Since
+      * variation records are supposed to be in increasing order of varSelector
+      * we then have to reverse the order of the written variation selector
+      * records after everything is finalized.
+      */
+     hb_vector_t<hb_pair_t<unsigned, unsigned>> obj_indices;
+     for (int i = src_tbl->record.len - 1; i >= 0; i--)
+     {
+       hb_pair_t<unsigned, unsigned> result = src_tbl->record[i].copy (c, unicodes, glyphs_requested, glyph_map, base);
+       if (result.first || result.second)
+ 	obj_indices.push (result);
+     }
+ 
+     if (c->length () - table_initpos == CmapSubtableFormat14::min_size)
+     {
+       c->revert (snap);
+       return;
+     }
+ 
++    if (unlikely (!c->check_success (!obj_indices.in_error ())))
++      return;
++
+     int tail_len = init_tail - c->tail;
+     c->check_assign (this->length, c->length () - table_initpos + tail_len);
+     c->check_assign (this->record.len,
+ 		     (c->length () - table_initpos - CmapSubtableFormat14::min_size) /
+ 		     VariationSelectorRecord::static_size);
+ 
+     /* Correct the incorrect write order by reversing the order of the variation
+        records array. */
+     _reverse_variation_records ();
+ 
+     /* Now that records are in the right order, we can set up the offsets. */
+     _add_links_to_variation_records (c, obj_indices);
+   }
+ 
+   void _reverse_variation_records ()
+   {
+     record.as_array ().reverse ();
+   }
+ 
+   void _add_links_to_variation_records (hb_serialize_context_t *c,
+ 					const hb_vector_t<hb_pair_t<unsigned, unsigned>>& obj_indices)
+   {
+     for (unsigned i = 0; i < obj_indices.length; i++)
+     {
+       /*
+        * Since the record array has been reversed (see comments in copy())
+        * but obj_indices has not been, the indices at obj_indices[i]
+        * are for the variation record at record[j].
+        */
+       int j = obj_indices.length - 1 - i;
+       c->add_link (record[j].defaultUVS, obj_indices[i].first);
+       c->add_link (record[j].nonDefaultUVS, obj_indices[i].second);
+     }
+   }
+ 
+   void closure_glyphs (const hb_set_t      *unicodes,
+ 		       hb_set_t            *glyphset) const
+   {
+     + hb_iter (record)
+     | hb_filter (hb_bool, &VariationSelectorRecord::nonDefaultUVS)
+     | hb_map (&VariationSelectorRecord::nonDefaultUVS)
+     | hb_map (hb_add (this))
+     | hb_apply ([=] (const NonDefaultUVS& _) { _.closure_glyphs (unicodes, glyphset); })
+     ;
+   }
+ 
+   void collect_unicodes (hb_set_t *out) const
+   {
+     for (const VariationSelectorRecord& _ : record)
+       _.collect_unicodes (out, this);
+   }
+ 
+   void collect_mapping (hb_set_t *unicodes, /* OUT */
+ 			hb_map_t *mapping /* OUT */) const
+   {
+     for (const VariationSelectorRecord& _ : record)
+       _.collect_mapping (this, unicodes, mapping);
+   }
+ 
+   bool sanitize (hb_sanitize_context_t *c) const
+   {
+     TRACE_SANITIZE (this);
+     return_trace (c->check_struct (this) &&
+ 		  record.sanitize (c, this));
+   }
+ 
+   protected:
+   HBUINT16	format;		/* Format number is set to 14. */
+   HBUINT32	length;		/* Byte length of this subtable. */
+   SortedArrayOf<VariationSelectorRecord, HBUINT32>
+ 		record;		/* Variation selector records; sorted
+ 				 * in increasing order of `varSelector'. */
+   public:
+   DEFINE_SIZE_ARRAY (10, record);
+ };
+diff --git a/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6316256152780800 b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6316256152780800
+new file mode 100644
+index 000000000..b01eb8d96
+Binary files /dev/null and b/test/fuzzing/fonts/clusterfuzz-testcase-minimized-hb-subset-fuzzer-6316256152780800 differ

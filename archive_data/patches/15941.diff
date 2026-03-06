@@ -1,0 +1,167 @@
+commit 13a2d9e34ffc4170720ce417c73e396d0ac1471a
+Author: Nick Terrell <terrelln@fb.com>
+Date:   Wed Jul 17 11:50:47 2019 -0700
+
+    [LZ4_compress_destSize] Fix overflow condition
+
+diff --git a/lib/lz4.c b/lib/lz4.c
+index 461644d..74a9247 100644
+--- a/lib/lz4.c
++++ b/lib/lz4.c
+@@ -980,155 +980,155 @@ LZ4_FORCE_INLINE int LZ4_compress_generic(
+ _next_match:
+         /* at this stage, the following variables must be correctly set :
+          * - ip : at start of LZ operation
+          * - match : at start of previous pattern occurence; can be within current prefix, or within extDict
+          * - offset : if maybe_ext_memSegment==1 (constant)
+          * - lowLimit : must be == dictionary to mean "match is within extDict"; must be == source otherwise
+          * - token and *token : position to write 4-bits for match length; higher 4-bits for literal length supposed already written
+          */
+ 
+         if ((outputDirective == fillOutput) &&
+             (op + 2 /* offset */ + 1 /* token */ + MFLIMIT - MINMATCH /* min last literals so last match is <= end - MFLIMIT */ > olimit)) {
+             /* the match was too close to the end, rewind and go to last literals */
+             op = token;
+             goto _last_literals;
+         }
+ 
+         /* Encode Offset */
+         if (maybe_extMem) {   /* static test */
+             DEBUGLOG(6, "             with offset=%u  (ext if > %i)", offset, (int)(ip - (const BYTE*)source));
+             assert(offset <= LZ4_DISTANCE_MAX && offset > 0);
+             LZ4_writeLE16(op, (U16)offset); op+=2;
+         } else  {
+             DEBUGLOG(6, "             with offset=%u  (same segment)", (U32)(ip - match));
+             assert(ip-match <= LZ4_DISTANCE_MAX);
+             LZ4_writeLE16(op, (U16)(ip - match)); op+=2;
+         }
+ 
+         /* Encode MatchLength */
+         {   unsigned matchCode;
+ 
+             if ( (dictDirective==usingExtDict || dictDirective==usingDictCtx)
+               && (lowLimit==dictionary) /* match within extDict */ ) {
+                 const BYTE* limit = ip + (dictEnd-match);
+                 assert(dictEnd > match);
+                 if (limit > matchlimit) limit = matchlimit;
+                 matchCode = LZ4_count(ip+MINMATCH, match+MINMATCH, limit);
+                 ip += (size_t)matchCode + MINMATCH;
+                 if (ip==limit) {
+                     unsigned const more = LZ4_count(limit, (const BYTE*)source, matchlimit);
+                     matchCode += more;
+                     ip += more;
+                 }
+                 DEBUGLOG(6, "             with matchLength=%u starting in extDict", matchCode+MINMATCH);
+             } else {
+                 matchCode = LZ4_count(ip+MINMATCH, match+MINMATCH, matchlimit);
+                 ip += (size_t)matchCode + MINMATCH;
+                 DEBUGLOG(6, "             with matchLength=%u", matchCode+MINMATCH);
+             }
+ 
+             if ((outputDirective) &&    /* Check output buffer overflow */
+-                (unlikely(op + (1 + LASTLITERALS) + (matchCode>>8) > olimit)) ) {
++                (unlikely(op + (1 + LASTLITERALS) + (matchCode+240)/255 > olimit)) ) {
+                 if (outputDirective == fillOutput) {
+                     /* Match description too long : reduce it */
+                     U32 newMatchCode = 15 /* in token */ - 1 /* to avoid needing a zero byte */ + ((U32)(olimit - op) - 1 - LASTLITERALS) * 255;
+                     ip -= matchCode - newMatchCode;
+                     assert(newMatchCode < matchCode);
+                     matchCode = newMatchCode;
+                     if (unlikely(ip < filledIp)) {
+                         /* We have already filled up to filledIp so if ip ends up less than filledIp
+                          * we have positions in the hash table beyond the current position. This is
+                          * a problem if we reuse the hash table. So we have to remove these positions
+                          * from the hash table.
+                          */
+                         const BYTE* ptr;
+                         DEBUGLOG(5, "Clearing %u positions", (U32)(filledIp - ip));
+                         for (ptr = ip + 1; ptr <= filledIp; ++ptr) {
+                             U32 const h = LZ4_hashPosition(ptr, tableType);
+                             LZ4_clearHash(h, cctx->hashTable, tableType);
+                         }
+                     }
+                 } else {
+                     assert(outputDirective == limitedOutput);
+                     return 0;   /* cannot compress within `dst` budget. Stored indexes in hash table are nonetheless fine */
+                 }
+             }
+             if (matchCode >= ML_MASK) {
+                 *token += ML_MASK;
+                 matchCode -= ML_MASK;
+                 LZ4_write32(op, 0xFFFFFFFF);
+                 while (matchCode >= 4*255) {
+                     op+=4;
+                     LZ4_write32(op, 0xFFFFFFFF);
+                     matchCode -= 4*255;
+                 }
+                 op += matchCode / 255;
+                 *op++ = (BYTE)(matchCode % 255);
+             } else
+                 *token += (BYTE)(matchCode);
+         }
+         /* Ensure we have enough space for the last literals. */
+         assert(!(outputDirective == fillOutput && op + 1 + LASTLITERALS > olimit));
+ 
+         anchor = ip;
+ 
+         /* Test end of chunk */
+         if (ip >= mflimitPlusOne) break;
+ 
+         /* Fill table */
+         LZ4_putPosition(ip-2, cctx->hashTable, tableType, base);
+ 
+         /* Test next position */
+         if (tableType == byPtr) {
+ 
+             match = LZ4_getPosition(ip, cctx->hashTable, tableType, base);
+             LZ4_putPosition(ip, cctx->hashTable, tableType, base);
+             if ( (match+LZ4_DISTANCE_MAX >= ip)
+               && (LZ4_read32(match) == LZ4_read32(ip)) )
+             { token=op++; *token=0; goto _next_match; }
+ 
+         } else {   /* byU32, byU16 */
+ 
+             U32 const h = LZ4_hashPosition(ip, tableType);
+             U32 const current = (U32)(ip-base);
+             U32 matchIndex = LZ4_getIndexOnHash(h, cctx->hashTable, tableType);
+             assert(matchIndex < current);
+             if (dictDirective == usingDictCtx) {
+                 if (matchIndex < startIndex) {
+                     /* there was no match, try the dictionary */
+                     matchIndex = LZ4_getIndexOnHash(h, dictCtx->hashTable, byU32);
+                     match = dictBase + matchIndex;
+                     lowLimit = dictionary;   /* required for match length counter */
+                     matchIndex += dictDelta;
+                 } else {
+                     match = base + matchIndex;
+                     lowLimit = (const BYTE*)source;  /* required for match length counter */
+                 }
+             } else if (dictDirective==usingExtDict) {
+                 if (matchIndex < startIndex) {
+                     match = dictBase + matchIndex;
+                     lowLimit = dictionary;   /* required for match length counter */
+                 } else {
+                     match = base + matchIndex;
+                     lowLimit = (const BYTE*)source;   /* required for match length counter */
+                 }
+             } else {   /* single memory segment */
+                 match = base + matchIndex;
+             }
+             LZ4_putIndexOnHash(current, h, cctx->hashTable, tableType);
+             assert(matchIndex < current);
+             if ( ((dictIssue==dictSmall) ? (matchIndex >= prefixIdxLimit) : 1)
+               && (((tableType==byU16) && (LZ4_DISTANCE_MAX == LZ4_DISTANCE_ABSOLUTE_MAX)) ? 1 : (matchIndex+LZ4_DISTANCE_MAX >= current))
+               && (LZ4_read32(match) == LZ4_read32(ip)) ) {
+                 token=op++;
+                 *token=0;
+                 if (maybe_extMem) offset = current - matchIndex;
+                 DEBUGLOG(6, "seq.start:%i, literals=%u, match.start:%i",
+                             (int)(anchor-(const BYTE*)source), 0, (int)(ip-(const BYTE*)source));
+                 goto _next_match;
+             }
+         }
+ 
+         /* Prepare next loop */
+         forwardH = LZ4_hashPosition(++ip, tableType);
+ 
+     }

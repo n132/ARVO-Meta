@@ -1,0 +1,249 @@
+commit 2dbdd3b56490a1da1650d2722fb19282b2714202
+Author: Andrii Nakryiko <andrii@kernel.org>
+Date:   Fri Aug 25 13:21:52 2023 -0700
+
+    libbpf: Add basic BTF sanity validation
+    
+    Implement a simple and straightforward BTF sanity check when parsing BTF
+    data. Right now it's very basic and just validates that all the string
+    offsets and type IDs are within valid range. For FUNC we also check that
+    it points to FUNC_PROTO kinds.
+    
+    Even with such simple checks it fixes a bunch of crashes found by OSS
+    fuzzer ([0]-[5]) and will allow fuzzer to make further progress.
+    
+    Some other invariants will be checked in follow up patches (like
+    ensuring there is no infinite type loops), but this seems like a good
+    start already.
+    
+    Adding FUNC -> FUNC_PROTO check revealed that one of selftests has
+    a problem with FUNC pointing to VAR instead, so fix it up in the same
+    commit.
+    
+      [0] https://github.com/libbpf/libbpf/issues/482
+      [1] https://github.com/libbpf/libbpf/issues/483
+      [2] https://github.com/libbpf/libbpf/issues/485
+      [3] https://github.com/libbpf/libbpf/issues/613
+      [4] https://github.com/libbpf/libbpf/issues/618
+      [5] https://github.com/libbpf/libbpf/issues/619
+    
+    Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Reviewed-by: Alan Maguire <alan.maguire@oracle.com>
+    Reviewed-by: Song Liu <song@kernel.org>
+    Closes: https://github.com/libbpf/libbpf/issues/617
+    Link: https://lore.kernel.org/bpf/20230825202152.1813394-1-andrii@kernel.org
+
+diff --git a/src/btf.c b/src/btf.c
+index 8484b56..ee95fd3 100644
+--- a/src/btf.c
++++ b/src/btf.c
+@@ -448,6 +448,165 @@ static int btf_parse_type_sec(struct btf *btf)
+ 	return 0;
+ }
+ 
++static int btf_validate_str(const struct btf *btf, __u32 str_off, const char *what, __u32 type_id)
++{
++	const char *s;
++
++	s = btf__str_by_offset(btf, str_off);
++	if (!s) {
++		pr_warn("btf: type [%u]: invalid %s (string offset %u)\n", type_id, what, str_off);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int btf_validate_id(const struct btf *btf, __u32 id, __u32 ctx_id)
++{
++	const struct btf_type *t;
++
++	t = btf__type_by_id(btf, id);
++	if (!t) {
++		pr_warn("btf: type [%u]: invalid referenced type ID %u\n", ctx_id, id);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int btf_validate_type(const struct btf *btf, const struct btf_type *t, __u32 id)
++{
++	__u32 kind = btf_kind(t);
++	int err, i, n;
++
++	err = btf_validate_str(btf, t->name_off, "type name", id);
++	if (err)
++		return err;
++
++	switch (kind) {
++	case BTF_KIND_UNKN:
++	case BTF_KIND_INT:
++	case BTF_KIND_FWD:
++	case BTF_KIND_FLOAT:
++		break;
++	case BTF_KIND_PTR:
++	case BTF_KIND_TYPEDEF:
++	case BTF_KIND_VOLATILE:
++	case BTF_KIND_CONST:
++	case BTF_KIND_RESTRICT:
++	case BTF_KIND_VAR:
++	case BTF_KIND_DECL_TAG:
++	case BTF_KIND_TYPE_TAG:
++		err = btf_validate_id(btf, t->type, id);
++		if (err)
++			return err;
++		break;
++	case BTF_KIND_ARRAY: {
++		const struct btf_array *a = btf_array(t);
++
++		err = btf_validate_id(btf, a->type, id);
++		err = err ?: btf_validate_id(btf, a->index_type, id);
++		if (err)
++			return err;
++		break;
++	}
++	case BTF_KIND_STRUCT:
++	case BTF_KIND_UNION: {
++		const struct btf_member *m = btf_members(t);
++
++		n = btf_vlen(t);
++		for (i = 0; i < n; i++, m++) {
++			err = btf_validate_str(btf, m->name_off, "field name", id);
++			err = err ?: btf_validate_id(btf, m->type, id);
++			if (err)
++				return err;
++		}
++		break;
++	}
++	case BTF_KIND_ENUM: {
++		const struct btf_enum *m = btf_enum(t);
++
++		n = btf_vlen(t);
++		for (i = 0; i < n; i++, m++) {
++			err = btf_validate_str(btf, m->name_off, "enum name", id);
++			if (err)
++				return err;
++		}
++		break;
++	}
++	case BTF_KIND_ENUM64: {
++		const struct btf_enum64 *m = btf_enum64(t);
++
++		n = btf_vlen(t);
++		for (i = 0; i < n; i++, m++) {
++			err = btf_validate_str(btf, m->name_off, "enum name", id);
++			if (err)
++				return err;
++		}
++		break;
++	}
++	case BTF_KIND_FUNC: {
++		const struct btf_type *ft;
++
++		err = btf_validate_id(btf, t->type, id);
++		if (err)
++			return err;
++		ft = btf__type_by_id(btf, t->type);
++		if (btf_kind(ft) != BTF_KIND_FUNC_PROTO) {
++			pr_warn("btf: type [%u]: referenced type [%u] is not FUNC_PROTO\n", id, t->type);
++			return -EINVAL;
++		}
++		break;
++	}
++	case BTF_KIND_FUNC_PROTO: {
++		const struct btf_param *m = btf_params(t);
++
++		n = btf_vlen(t);
++		for (i = 0; i < n; i++, m++) {
++			err = btf_validate_str(btf, m->name_off, "param name", id);
++			err = err ?: btf_validate_id(btf, m->type, id);
++			if (err)
++				return err;
++		}
++		break;
++	}
++	case BTF_KIND_DATASEC: {
++		const struct btf_var_secinfo *m = btf_var_secinfos(t);
++
++		n = btf_vlen(t);
++		for (i = 0; i < n; i++, m++) {
++			err = btf_validate_id(btf, m->type, id);
++			if (err)
++				return err;
++		}
++		break;
++	}
++	default:
++		pr_warn("btf: type [%u]: unrecognized kind %u\n", id, kind);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/* Validate basic sanity of BTF. It's intentionally less thorough than
++ * kernel's validation and validates only properties of BTF that libbpf relies
++ * on to be correct (e.g., valid type IDs, valid string offsets, etc)
++ */
++static int btf_sanity_check(const struct btf *btf)
++{
++	const struct btf_type *t;
++	__u32 i, n = btf__type_cnt(btf);
++	int err;
++
++	for (i = 1; i < n; i++) {
++		t = btf_type_by_id(btf, i);
++		err = btf_validate_type(btf, t, i);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
+ __u32 btf__type_cnt(const struct btf *btf)
+ {
+ 	return btf->start_id + btf->nr_types;
+@@ -867,41 +1026,42 @@ struct btf *btf__new_empty_split(struct btf *base_btf)
+ static struct btf *btf_new(const void *data, __u32 size, struct btf *base_btf)
+ {
+ 	struct btf *btf;
+ 	int err;
+ 
+ 	btf = calloc(1, sizeof(struct btf));
+ 	if (!btf)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	btf->nr_types = 0;
+ 	btf->start_id = 1;
+ 	btf->start_str_off = 0;
+ 	btf->fd = -1;
+ 
+ 	if (base_btf) {
+ 		btf->base_btf = base_btf;
+ 		btf->start_id = btf__type_cnt(base_btf);
+ 		btf->start_str_off = base_btf->hdr->str_len;
+ 	}
+ 
+ 	btf->raw_data = malloc(size);
+ 	if (!btf->raw_data) {
+ 		err = -ENOMEM;
+ 		goto done;
+ 	}
+ 	memcpy(btf->raw_data, data, size);
+ 	btf->raw_size = size;
+ 
+ 	btf->hdr = btf->raw_data;
+ 	err = btf_parse_hdr(btf);
+ 	if (err)
+ 		goto done;
+ 
+ 	btf->strs_data = btf->raw_data + btf->hdr->hdr_len + btf->hdr->str_off;
+ 	btf->types_data = btf->raw_data + btf->hdr->hdr_len + btf->hdr->type_off;
+ 
+ 	err = btf_parse_str_sec(btf);
+ 	err = err ?: btf_parse_type_sec(btf);
++	err = err ?: btf_sanity_check(btf);
+ 	if (err)
+ 		goto done;
+ 

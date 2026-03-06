@@ -1,0 +1,266 @@
+commit f1ae13509f23a639bd47b4035e6bf74c68cef752
+Author: Dmitry Stogov <dmitry@zend.com>
+Date:   Fri Jan 28 12:38:38 2022 +0300
+
+    Fix memory leak
+    
+    Fixes oss-fuzz #43988
+
+diff --git a/Zend/tests/dynamic_prop_deprecation_002.phpt b/Zend/tests/dynamic_prop_deprecation_002.phpt
+new file mode 100644
+index 0000000000..2ab7452fed
+--- /dev/null
++++ b/Zend/tests/dynamic_prop_deprecation_002.phpt
+@@ -0,0 +1,13 @@
++--TEST--
++Dynamic properties deprecation 002 (memory leak)
++--FILE--
++<?php
++set_error_handler(function($code, $msg){
++	echo "Err: $msg\n";
++    $GLOBALS['a']=null;
++});
++$a = new class{};
++[&$a->y];
++?>
++--EXPECT--
++Err: Creation of dynamic property class@anonymous::$y is deprecated
+\ No newline at end of file
+diff --git a/Zend/zend_object_handlers.c b/Zend/zend_object_handlers.c
+index e75ff8318c..721abe4699 100644
+--- a/Zend/zend_object_handlers.c
++++ b/Zend/zend_object_handlers.c
+@@ -277,10 +277,16 @@ static ZEND_COLD zend_never_inline void zend_forbidden_dynamic_property(
+ 		ZSTR_VAL(ce->name), ZSTR_VAL(member));
+ }
+ 
+-static ZEND_COLD zend_never_inline void zend_deprecated_dynamic_property(
+-		zend_class_entry *ce, zend_string *member) {
++static ZEND_COLD zend_never_inline bool zend_deprecated_dynamic_property(
++		zend_object *obj, zend_string *member) {
++	GC_ADDREF(obj);
+ 	zend_error(E_DEPRECATED, "Creation of dynamic property %s::$%s is deprecated",
+-		ZSTR_VAL(ce->name), ZSTR_VAL(member));
++		ZSTR_VAL(obj->ce->name), ZSTR_VAL(member));
++	if (UNEXPECTED(GC_DELREF(obj) == 0)) {
++		zend_objects_store_del(obj);
++		return 0;
++	}
++	return 1;
+ }
+ 
+ static ZEND_COLD zend_never_inline void zend_readonly_property_modification_scope_error(
+@@ -772,126 +778,129 @@ static bool verify_readonly_initialization_access(
+ ZEND_API zval *zend_std_write_property(zend_object *zobj, zend_string *name, zval *value, void **cache_slot) /* {{{ */
+ {
+ 	zval *variable_ptr, tmp;
+ 	uintptr_t property_offset;
+ 	zend_property_info *prop_info = NULL;
+ 	ZEND_ASSERT(!Z_ISREF_P(value));
+ 
+ 	property_offset = zend_get_property_offset(zobj->ce, name, (zobj->ce->__set != NULL), cache_slot, &prop_info);
+ 
+ 	if (EXPECTED(IS_VALID_PROPERTY_OFFSET(property_offset))) {
+ 		variable_ptr = OBJ_PROP(zobj, property_offset);
+ 		if (Z_TYPE_P(variable_ptr) != IS_UNDEF) {
+ 			Z_TRY_ADDREF_P(value);
+ 
+ 			if (UNEXPECTED(prop_info)) {
+ 				if (UNEXPECTED(prop_info->flags & ZEND_ACC_READONLY)) {
+ 					Z_TRY_DELREF_P(value);
+ 					zend_readonly_property_modification_error(prop_info);
+ 					variable_ptr = &EG(error_zval);
+ 					goto exit;
+ 				}
+ 
+ 				ZVAL_COPY_VALUE(&tmp, value);
+ 				if (UNEXPECTED(!zend_verify_property_type(prop_info, &tmp, property_uses_strict_types()))) {
+ 					Z_TRY_DELREF_P(value);
+ 					variable_ptr = &EG(error_zval);
+ 					goto exit;
+ 				}
+ 				value = &tmp;
+ 			}
+ 
+ found:
+ 			variable_ptr = zend_assign_to_variable(
+ 				variable_ptr, value, IS_TMP_VAR, property_uses_strict_types());
+ 			goto exit;
+ 		}
+ 		if (Z_PROP_FLAG_P(variable_ptr) == IS_PROP_UNINIT) {
+ 			/* Writes to uninitialized typed properties bypass __set(). */
+ 			goto write_std_property;
+ 		}
+ 	} else if (EXPECTED(IS_DYNAMIC_PROPERTY_OFFSET(property_offset))) {
+ 		if (EXPECTED(zobj->properties != NULL)) {
+ 			if (UNEXPECTED(GC_REFCOUNT(zobj->properties) > 1)) {
+ 				if (EXPECTED(!(GC_FLAGS(zobj->properties) & IS_ARRAY_IMMUTABLE))) {
+ 					GC_DELREF(zobj->properties);
+ 				}
+ 				zobj->properties = zend_array_dup(zobj->properties);
+ 			}
+ 			if ((variable_ptr = zend_hash_find(zobj->properties, name)) != NULL) {
+ 				Z_TRY_ADDREF_P(value);
+ 				goto found;
+ 			}
+ 		}
+ 	} else if (UNEXPECTED(EG(exception))) {
+ 		variable_ptr = &EG(error_zval);
+ 		goto exit;
+ 	}
+ 
+ 	/* magic set */
+ 	if (zobj->ce->__set) {
+ 		uint32_t *guard = zend_get_property_guard(zobj, name);
+ 
+ 		if (!((*guard) & IN_SET)) {
+ 			GC_ADDREF(zobj);
+ 			(*guard) |= IN_SET; /* prevent circular setting */
+ 			zend_std_call_setter(zobj, name, value);
+ 			(*guard) &= ~IN_SET;
+ 			OBJ_RELEASE(zobj);
+ 			variable_ptr = value;
+ 		} else if (EXPECTED(!IS_WRONG_PROPERTY_OFFSET(property_offset))) {
+ 			goto write_std_property;
+ 		} else {
+ 			/* Trigger the correct error */
+ 			zend_wrong_offset(zobj->ce, name);
+ 			ZEND_ASSERT(EG(exception));
+ 			variable_ptr = &EG(error_zval);
+ 			goto exit;
+ 		}
+ 	} else {
+ 		ZEND_ASSERT(!IS_WRONG_PROPERTY_OFFSET(property_offset));
+ write_std_property:
+ 		if (EXPECTED(IS_VALID_PROPERTY_OFFSET(property_offset))) {
+ 			variable_ptr = OBJ_PROP(zobj, property_offset);
+ 
+ 			Z_TRY_ADDREF_P(value);
+ 			if (UNEXPECTED(prop_info)) {
+ 				if (UNEXPECTED((prop_info->flags & ZEND_ACC_READONLY)
+ 						&& !verify_readonly_initialization_access(prop_info, zobj->ce, name, "initialize"))) {
+ 					Z_TRY_DELREF_P(value);
+ 					variable_ptr = &EG(error_zval);
+ 					goto exit;
+ 				}
+ 
+ 				ZVAL_COPY_VALUE(&tmp, value);
+ 				if (UNEXPECTED(!zend_verify_property_type(prop_info, &tmp, property_uses_strict_types()))) {
+ 					zval_ptr_dtor(value);
+ 					goto exit;
+ 				}
+ 				value = &tmp;
+ 				Z_PROP_FLAG_P(variable_ptr) = 0;
+ 				goto found; /* might have been updated via e.g. __toString() */
+ 			}
+ 
+ 			ZVAL_COPY_VALUE(variable_ptr, value);
+ 		} else {
+ 			if (UNEXPECTED(zobj->ce->ce_flags & ZEND_ACC_NO_DYNAMIC_PROPERTIES)) {
+ 				zend_forbidden_dynamic_property(zobj->ce, name);
+ 				variable_ptr = &EG(error_zval);
+ 				goto exit;
+ 			}
+ 			if (UNEXPECTED(!(zobj->ce->ce_flags & ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES))) {
+-				zend_deprecated_dynamic_property(zobj->ce, name);
++				if (UNEXPECTED(!zend_deprecated_dynamic_property(zobj, name))) {
++					variable_ptr = &EG(error_zval);
++					goto exit;
++				}
+ 			}
+ 
+ 			Z_TRY_ADDREF_P(value);
+ 			if (!zobj->properties) {
+ 				rebuild_object_properties(zobj);
+ 			}
+ 			variable_ptr = zend_hash_add_new(zobj->properties, name, value);
+ 		}
+ 	}
+ 
+ exit:
+ 	return variable_ptr;
+ }
+ /* }}} */
+@@ -1006,79 +1015,81 @@ ZEND_API int zend_std_has_dimension(zend_object *object, zval *offset, int check
+ ZEND_API zval *zend_std_get_property_ptr_ptr(zend_object *zobj, zend_string *name, int type, void **cache_slot) /* {{{ */
+ {
+ 	zval *retval = NULL;
+ 	uintptr_t property_offset;
+ 	zend_property_info *prop_info = NULL;
+ 
+ #if DEBUG_OBJECT_HANDLERS
+ 	fprintf(stderr, "Ptr object #%d property: %s\n", zobj->handle, ZSTR_VAL(name));
+ #endif
+ 
+ 	property_offset = zend_get_property_offset(zobj->ce, name, (zobj->ce->__get != NULL), cache_slot, &prop_info);
+ 
+ 	if (EXPECTED(IS_VALID_PROPERTY_OFFSET(property_offset))) {
+ 		retval = OBJ_PROP(zobj, property_offset);
+ 		if (UNEXPECTED(Z_TYPE_P(retval) == IS_UNDEF)) {
+ 			if (EXPECTED(!zobj->ce->__get) ||
+ 			    UNEXPECTED((*zend_get_property_guard(zobj, name)) & IN_GET) ||
+ 			    UNEXPECTED(prop_info && Z_PROP_FLAG_P(retval) == IS_PROP_UNINIT)) {
+ 				if (UNEXPECTED(type == BP_VAR_RW || type == BP_VAR_R)) {
+ 					if (UNEXPECTED(prop_info)) {
+ 						zend_throw_error(NULL,
+ 							"Typed property %s::$%s must not be accessed before initialization",
+ 							ZSTR_VAL(prop_info->ce->name),
+ 							ZSTR_VAL(name));
+ 						retval = &EG(error_zval);
+ 					} else {
+ 						ZVAL_NULL(retval);
+ 						zend_error(E_WARNING, "Undefined property: %s::$%s", ZSTR_VAL(zobj->ce->name), ZSTR_VAL(name));
+ 					}
+ 				} else if (prop_info && UNEXPECTED(prop_info->flags & ZEND_ACC_READONLY)
+ 					&& !verify_readonly_initialization_access(prop_info, zobj->ce, name, "initialize")) {
+ 					retval = &EG(error_zval);
+ 				}
+ 			} else {
+ 				/* we do have getter - fail and let it try again with usual get/set */
+ 				retval = NULL;
+ 			}
+ 		} else if (prop_info && UNEXPECTED(prop_info->flags & ZEND_ACC_READONLY)) {
+ 			/* Readonly property, delegate to read_property + write_property. */
+ 			retval = NULL;
+ 		}
+ 	} else if (EXPECTED(IS_DYNAMIC_PROPERTY_OFFSET(property_offset))) {
+ 		if (EXPECTED(zobj->properties)) {
+ 			if (UNEXPECTED(GC_REFCOUNT(zobj->properties) > 1)) {
+ 				if (EXPECTED(!(GC_FLAGS(zobj->properties) & IS_ARRAY_IMMUTABLE))) {
+ 					GC_DELREF(zobj->properties);
+ 				}
+ 				zobj->properties = zend_array_dup(zobj->properties);
+ 			}
+ 		    if (EXPECTED((retval = zend_hash_find(zobj->properties, name)) != NULL)) {
+ 				return retval;
+ 		    }
+ 		}
+ 		if (EXPECTED(!zobj->ce->__get) ||
+ 		    UNEXPECTED((*zend_get_property_guard(zobj, name)) & IN_GET)) {
+ 			if (UNEXPECTED(zobj->ce->ce_flags & ZEND_ACC_NO_DYNAMIC_PROPERTIES)) {
+ 				zend_forbidden_dynamic_property(zobj->ce, name);
+ 				return &EG(error_zval);
+ 			}
+ 			if (UNEXPECTED(!(zobj->ce->ce_flags & ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES))) {
+-				zend_deprecated_dynamic_property(zobj->ce, name);
++				if (UNEXPECTED(!zend_deprecated_dynamic_property(zobj, name))) {
++					return &EG(error_zval);
++				}
+ 			}
+ 			if (UNEXPECTED(!zobj->properties)) {
+ 				rebuild_object_properties(zobj);
+ 			}
+ 			retval = zend_hash_update(zobj->properties, name, &EG(uninitialized_zval));
+ 			/* Notice is thrown after creation of the property, to avoid EG(std_property_info)
+ 			 * being overwritten in an error handler. */
+ 			if (UNEXPECTED(type == BP_VAR_RW || type == BP_VAR_R)) {
+ 				zend_error(E_WARNING, "Undefined property: %s::$%s", ZSTR_VAL(zobj->ce->name), ZSTR_VAL(name));
+ 			}
+ 		}
+ 	} else if (zobj->ce->__get == NULL) {
+ 		retval = &EG(error_zval);
+ 	}
+ 
+ 	return retval;
+ }
+ /* }}} */

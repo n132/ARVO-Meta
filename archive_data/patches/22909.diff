@@ -1,0 +1,814 @@
+commit 6b3d6e92109fff606cbb3ede28574d913f40a4eb
+Author: Brian Osman <brianosman@google.com>
+Date:   Mon Jun 1 16:33:28 2020 -0400
+
+    Rewrite SkVertices serialization to use SkReadBuffer/SkWriteBuffer
+    
+    These classes are much safer (there's no way to safely deserialize a
+    string with SkReader32 without knowledge of how it works internally).
+    Prior to this CL, SkVertices was the only complex type that had manual
+    serialization using the lower level types - now it works like everything
+    else. Additionally: the versioning can now be tied to picture versions
+    going forward (like everything else).
+    
+    Bug: oss-fuzz:22909
+    Bug: oss-fuzz:22918
+    Bug: skia:9984
+    Bug: skia:10304
+    Change-Id: I3cf537eb765b5c8ce98b554c0f200e5d67c33d14
+    Reviewed-on: https://skia-review.googlesource.com/c/skia/+/293349
+    Reviewed-by: Mike Klein <mtklein@google.com>
+    Commit-Queue: Brian Osman <brianosman@google.com>
+
+diff --git a/include/core/SkVertices.h b/include/core/SkVertices.h
+index 20a0fa811e..0f666f83c8 100644
+--- a/include/core/SkVertices.h
++++ b/include/core/SkVertices.h
+@@ -23,161 +23,150 @@ class SK_API SkVertices : public SkNVRefCnt<SkVertices> {
+     struct Desc;
+     struct Sizes;
+ public:
+     enum VertexMode {
+         kTriangles_VertexMode,
+         kTriangleStrip_VertexMode,
+         kTriangleFan_VertexMode,
+ 
+         kLast_VertexMode = kTriangleFan_VertexMode,
+     };
+ 
+     /**
+      *  Create a vertices by copying the specified arrays. texs, colors may be nullptr,
+      *  and indices is ignored if indexCount == 0.
+      */
+     static sk_sp<SkVertices> MakeCopy(VertexMode mode, int vertexCount,
+                                       const SkPoint positions[],
+                                       const SkPoint texs[],
+                                       const SkColor colors[],
+                                       int indexCount,
+                                       const uint16_t indices[]);
+ 
+     static sk_sp<SkVertices> MakeCopy(VertexMode mode, int vertexCount,
+                                       const SkPoint positions[],
+                                       const SkPoint texs[],
+                                       const SkColor colors[]) {
+         return MakeCopy(mode,
+                         vertexCount,
+                         positions,
+                         texs,
+                         colors,
+                         0,
+                         nullptr);
+     }
+ 
+     static constexpr int kMaxCustomAttributes = 8;
+ 
+     /**
+      *  EXPERIMENTAL - An SkVertices object can be constructed with a custom collection of vertex
+      *  attributes. Each attribute is described by a single Attribute struct. Type defines the CPU
+      *  type of the data. Usage determines what transformation (if any) is applied to that data in
+      *  the vertex shader. For positions or vectors, markerName identifies what matrix is used in
+      *  the vertex shader to transform the data. Those names should match a named transform on the
+      *  CTM stack, created by calling SkCanvas::markCTM().
+      */
+     struct Attribute {
+         enum class Type : uint8_t {
+             kFloat,
+             kFloat2,
+             kFloat3,
+             kFloat4,
+             kByte4_unorm,
+         };
+ 
+         enum class Usage : uint8_t {
+             // Raw values passed directly to effect
+             kRaw,
+ 
+             // sRGB unpremul colors, transformed to destination color space (3 or 4 channels)
+             // Colors are always assumed to be in RGBA order, and are automatically premultiplied.
+             kColor,
+ 
+             // Local vector, transformed via marker (2 or 3 channels)
+             kVector,
+ 
+             // Normal vector (or any other bivector), transformed via marker (2 or 3 channels)
+             kNormalVector,
+ 
+             // Local position, transformed via marker (2 or 3 channels)
+             kPosition,
+         };
+ 
+         /**
+          *  markerName is not copied by the Attribute, so it must outlive this struct.
+          *  It is copied when this Attribute is passed to the Builder constructor.
+          */
+         Attribute(Type t = Type::kFloat, Usage u = Usage::kRaw, const char* markerName = nullptr);
+ 
+         bool operator==(const Attribute& that) const {
+             return fType == that.fType && fUsage == that.fUsage && fMarkerID == that.fMarkerID;
+         }
+         bool operator!=(const Attribute& that) const { return !(*this == that); }
+ 
+         // Number of channels that will be produced for the SkRuntimeEffect to consume.
+         // May not match the number of channels in fType. For example, kVector Attributes always
+         // produce three channels, even if the input is kFloat2.
+         int channelCount() const;
+         size_t bytesPerVertex() const;
+         bool isValid() const;
+ 
+         Type        fType;
+         Usage       fUsage;
+         uint32_t    fMarkerID;
+         const char* fMarkerName;  // Preserved for serialization and debugging
+     };
+ 
+     enum BuilderFlags {
+         kHasTexCoords_BuilderFlag   = 1 << 0,
+         kHasColors_BuilderFlag      = 1 << 1,
+     };
+     class Builder {
+     public:
+         Builder(VertexMode mode, int vertexCount, int indexCount, uint32_t flags);
+ 
+         // EXPERIMENTAL -- do not call if you care what happens
+         Builder(VertexMode mode,
+                 int vertexCount,
+                 int indexCount,
+                 const Attribute* attrs,
+                 int attrCount);
+ 
+         bool isValid() const { return fVertices != nullptr; }
+ 
+         SkPoint* positions();
+         uint16_t* indices();        // returns null if there are no indices
+ 
+         // if we have texCoords or colors, this will always be null
+         void* customData();         // returns null if there are no custom attributes
+ 
+         // If we have custom attributes, these will always be null
+         SkPoint* texCoords();       // returns null if there are no texCoords
+         SkColor* colors();          // returns null if there are no colors
+ 
+         // Detach the built vertices object. After the first call, this will always return null.
+         sk_sp<SkVertices> detach();
+ 
+     private:
+         Builder(const Desc&);
+ 
+         void init(const Desc&);
+ 
+         // holds a partially complete object. only completed in detach()
+         sk_sp<SkVertices> fVertices;
+         // Extra storage for intermediate vertices in the case where the client specifies indexed
+         // triangle fans. These get converted to indexed triangles when the Builder is finalized.
+         std::unique_ptr<uint8_t[]> fIntermediateFanIndices;
+ 
+         friend class SkVertices;
++        friend class SkVerticesPriv;
+     };
+ 
+     uint32_t uniqueID() const { return fUniqueID; }
+     const SkRect& bounds() const { return fBounds; }
+ 
+     // returns approximate byte size of the vertices object
+     size_t approximateSize() const;
+ 
+-    /**
+-     *  Recreate a vertices from a buffer previously created by calling encode().
+-     *  Returns null if the data is corrupt or the length is incorrect for the contents.
+-     */
+-    static sk_sp<SkVertices> Decode(const void* buffer, size_t length);
+-
+-    /**
+-     *  Pack the vertices object into a byte buffer. This can be used to recreate the vertices
+-     *  by calling Decode() with the buffer.
+-     */
+-    sk_sp<SkData> encode() const;
+-
+     // Provides access to functions that aren't part of the public API.
+     SkVerticesPriv priv();
+     const SkVerticesPriv priv() const;
+diff --git a/src/core/SkPictureData.cpp b/src/core/SkPictureData.cpp
+index bb6d67c379..c4ae9a002e 100644
+--- a/src/core/SkPictureData.cpp
++++ b/src/core/SkPictureData.cpp
+@@ -1,24 +1,25 @@
+ /*
+  * Copyright 2011 Google Inc.
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #include "src/core/SkPictureData.h"
+ 
+ #include "include/core/SkImageGenerator.h"
+ #include "include/core/SkTypeface.h"
+ #include "include/private/SkTo.h"
+ #include "src/core/SkAutoMalloc.h"
+ #include "src/core/SkPicturePriv.h"
+ #include "src/core/SkPictureRecord.h"
+ #include "src/core/SkReadBuffer.h"
+ #include "src/core/SkTextBlobPriv.h"
++#include "src/core/SkVerticesPriv.h"
+ #include "src/core/SkWriteBuffer.h"
+ 
+ #include <new>
+ 
+ #if SK_SUPPORT_GPU
+ #include "include/gpu/GrContext.h"
+ #endif
+@@ -146,49 +147,49 @@ void SkPictureData::WriteTypefaces(SkWStream* stream, const SkRefCntSet& rec,
+ void SkPictureData::flattenToBuffer(SkWriteBuffer& buffer, bool textBlobsOnly) const {
+     int i, n;
+ 
+     if (!textBlobsOnly) {
+         if ((n = fPaints.count()) > 0) {
+             write_tag_size(buffer, SK_PICT_PAINT_BUFFER_TAG, n);
+             for (i = 0; i < n; i++) {
+                 buffer.writePaint(fPaints[i]);
+             }
+         }
+ 
+         if ((n = fPaths.count()) > 0) {
+             write_tag_size(buffer, SK_PICT_PATH_BUFFER_TAG, n);
+             buffer.writeInt(n);
+             for (int i = 0; i < n; i++) {
+                 buffer.writePath(fPaths[i]);
+             }
+         }
+     }
+ 
+     if (!fTextBlobs.empty()) {
+         write_tag_size(buffer, SK_PICT_TEXTBLOB_BUFFER_TAG, fTextBlobs.count());
+         for (const auto& blob : fTextBlobs) {
+             SkTextBlobPriv::Flatten(*blob, buffer);
+         }
+     }
+ 
+     if (!textBlobsOnly) {
+         if (!fVertices.empty()) {
+             write_tag_size(buffer, SK_PICT_VERTICES_BUFFER_TAG, fVertices.count());
+             for (const auto& vert : fVertices) {
+-                buffer.writeDataAsByteArray(vert->encode().get());
++                vert->priv().encode(buffer);
+             }
+         }
+ 
+         if (!fImages.empty()) {
+             write_tag_size(buffer, SK_PICT_IMAGE_BUFFER_TAG, fImages.count());
+             for (const auto& img : fImages) {
+                 buffer.writeImage(img.get());
+             }
+         }
+     }
+ }
+ 
+ // SkPictureData::serialize() will write out paints, and then write out an array of typefaces
+ // (unique set). However, paint's serializer will respect SerialProcs, which can cause us to
+ // call that custom typefaceproc on *every* typeface, not just on the unique ones. To avoid this,
+ // we ignore the custom proc (here) when we serialize the paints, and then do respect it when
+ // we serialize the typefaces.
+@@ -374,10 +375,6 @@ bool SkPictureData::parseStreamTag(SkStream* stream,
+ static sk_sp<SkImage> create_image_from_buffer(SkReadBuffer& buffer) {
+     return buffer.readImage();
+ }
+-static sk_sp<SkVertices> create_vertices_from_buffer(SkReadBuffer& buffer) {
+-    auto data = buffer.readByteArrayAsData();
+-    return data ? SkVertices::Decode(data->data(), data->size()) : nullptr;
+-}
+ 
+ static sk_sp<SkDrawable> create_drawable_from_buffer(SkReadBuffer& buffer) {
+     return sk_sp<SkDrawable>((SkDrawable*)buffer.readFlattenable(SkFlattenable::kSkDrawable_Type));
+@@ -411,62 +408,62 @@ bool new_array_from_buffer(SkReadBuffer& buffer, uint32_t inCount,
+ void SkPictureData::parseBufferTag(SkReadBuffer& buffer, uint32_t tag, uint32_t size) {
+     switch (tag) {
+         case SK_PICT_PAINT_BUFFER_TAG: {
+             if (!buffer.validate(SkTFitsIn<int>(size))) {
+                 return;
+             }
+             const int count = SkToInt(size);
+ 
+             for (int i = 0; i < count; ++i) {
+                 // Do we need to keep an array of fFonts for legacy draws?
+                 if (!buffer.readPaint(&fPaints.push_back(), nullptr)) {
+                     return;
+                 }
+             }
+         } break;
+         case SK_PICT_PATH_BUFFER_TAG:
+             if (size > 0) {
+                 const int count = buffer.readInt();
+                 if (!buffer.validate(count >= 0)) {
+                     return;
+                 }
+                 for (int i = 0; i < count; i++) {
+                     buffer.readPath(&fPaths.push_back());
+                     if (!buffer.isValid()) {
+                         return;
+                     }
+                 }
+             } break;
+         case SK_PICT_TEXTBLOB_BUFFER_TAG:
+             new_array_from_buffer(buffer, size, fTextBlobs, SkTextBlobPriv::MakeFromBuffer);
+             break;
+         case SK_PICT_VERTICES_BUFFER_TAG:
+-            new_array_from_buffer(buffer, size, fVertices, create_vertices_from_buffer);
++            new_array_from_buffer(buffer, size, fVertices, SkVerticesPriv::Decode);
+             break;
+         case SK_PICT_IMAGE_BUFFER_TAG:
+             new_array_from_buffer(buffer, size, fImages, create_image_from_buffer);
+             break;
+         case SK_PICT_READER_TAG: {
+             // Preflight check that we can initialize all data from the buffer
+             // before allocating it.
+             if (!buffer.validateCanReadN<uint8_t>(size)) {
+                 return;
+             }
+             auto data(SkData::MakeUninitialized(size));
+             if (!buffer.readByteArray(data->writable_data(), size) ||
+                 !buffer.validate(nullptr == fOpData)) {
+                 return;
+             }
+             SkASSERT(nullptr == fOpData);
+             fOpData = std::move(data);
+         } break;
+         case SK_PICT_PICTURE_TAG:
+             new_array_from_buffer(buffer, size, fPictures, SkPicturePriv::MakeFromBuffer);
+             break;
+         case SK_PICT_DRAWABLE_TAG:
+             new_array_from_buffer(buffer, size, fDrawables, create_drawable_from_buffer);
+             break;
+         default:
+             buffer.validate(false); // The tag was invalid.
+             break;
+     }
+ }
+diff --git a/src/core/SkPicturePriv.h b/src/core/SkPicturePriv.h
+index a14cb3225f..16f0e42e1c 100644
+--- a/src/core/SkPicturePriv.h
++++ b/src/core/SkPicturePriv.h
+@@ -17,92 +17,94 @@ class SkPicturePriv {
+ public:
+     /**
+      *  Recreate a picture that was serialized into a buffer. If the creation requires bitmap
+      *  decoding, the decoder must be set on the SkReadBuffer parameter by calling
+      *  SkReadBuffer::setBitmapDecoder() before calling SkPicture::MakeFromBuffer().
+      *  @param buffer Serialized picture data.
+      *  @return A new SkPicture representing the serialized data, or NULL if the buffer is
+      *          invalid.
+      */
+     static sk_sp<SkPicture> MakeFromBuffer(SkReadBuffer& buffer);
+ 
+     /**
+      *  Serialize to a buffer.
+      */
+     static void Flatten(const sk_sp<const SkPicture> , SkWriteBuffer& buffer);
+ 
+     // Returns NULL if this is not an SkBigPicture.
+     static const SkBigPicture* AsSkBigPicture(const sk_sp<const SkPicture> picture) {
+         return picture->asSkBigPicture();
+     }
+ 
+     // V35: Store SkRect (rather then width & height) in header
+     // V36: Remove (obsolete) alphatype from SkColorTable
+     // V37: Added shadow only option to SkDropShadowImageFilter (last version to record CLEAR)
+     // V38: Added PictureResolution option to SkPictureImageFilter
+     // V39: Added FilterLevel option to SkPictureImageFilter
+     // V40: Remove UniqueID serialization from SkImageFilter.
+     // V41: Added serialization of SkBitmapSource's filterQuality parameter
+     // V42: Added a bool to SkPictureShader serialization to indicate did-we-serialize-a-picture?
+     // V43: Added DRAW_IMAGE and DRAW_IMAGE_RECT opt codes to serialized data
+     // V44: Move annotations from paint to drawAnnotation
+     // V45: Add invNormRotation to SkLightingShader.
+     // V46: Add drawTextRSXform
+     // V47: Add occluder rect to SkBlurMaskFilter
+     // V48: Read and write extended SkTextBlobs.
+     // V49: Gradients serialized as SkColor4f + SkColorSpace
+     // V50: SkXfermode -> SkBlendMode
+     // V51: more SkXfermode -> SkBlendMode
+     // V52: Remove SkTextBlob::fRunCount
+     // V53: SaveLayerRec clip mask
+     // V54: ComposeShader can use a Mode or a Lerp
+     // V55: Drop blendmode[] from MergeImageFilter
+     // V56: Add TileMode in SkBlurImageFilter.
+     // V57: Sweep tiling info.
+     // V58: No more 2pt conical flipping.
+     // V59: No more LocalSpace option on PictureImageFilter
+     // V60: Remove flags in picture header
+     // V61: Change SkDrawPictureRec to take two colors rather than two alphas
+     // V62: Don't negate size of custom encoded images (don't write origin x,y either)
+     // V63: Store image bounds (including origin) instead of just width/height to support subsets
+     // V64: Remove occluder feature from blur maskFilter
+     // V65: Float4 paint color
+     // V66: Add saveBehind
+     // V67: Blobs serialize fonts instead of paints
+     // V68: Paint doesn't serialize font-related stuff
+     // V69: Clean up duplicated and redundant SkImageFilter related enums
+     // V70: Image filters definitions hidden, registered names updated to include "Impl"
+     // V71: Unify erode and dilate image filters
+     // V72: SkColorFilter_Matrix domain (rgba vs. hsla)
+     // V73: Use SkColor4f in per-edge AA quad API
+     // V74: MorphologyImageFilter internal radius is SkScaler
++    // V75: SkVertices switched from unsafe use of SkReader32 to SkReadBuffer (like everything else)
+ 
+     enum Version {
+         kTileModeInBlurImageFilter_Version  = 56,
+         kTileInfoInSweepGradient_Version    = 57,
+         k2PtConicalNoFlip_Version           = 58,
+         kRemovePictureImageFilterLocalSpace = 59,
+         kRemoveHeaderFlags_Version          = 60,
+         kTwoColorDrawShadow_Version         = 61,
+         kDontNegateImageSize_Version        = 62,
+         kStoreImageBounds_Version           = 63,
+         kRemoveOccluderFromBlurMaskFilter   = 64,
+         kFloat4PaintColor_Version           = 65,
+         kSaveBehind_Version                 = 66,
+         kSerializeFonts_Version             = 67,
+         kPaintDoesntSerializeFonts_Version  = 68,
+         kCleanupImageFilterEnums_Version    = 69,
+         kHideImageFilterImpls_Version       = 70,
+         kUnifyErodeDilateImpls_Version      = 71,
+         kMatrixColorFilterDomain_Version    = 72,
+         kEdgeAAQuadColor4f_Version          = 73,
+         kMorphologyTakesScalar_Version      = 74,
++        kVerticesUseReadBuffer_Version      = 75,
+ 
+         // Only SKPs within the min/current picture version range (inclusive) can be read.
+         kMin_Version     = kTileModeInBlurImageFilter_Version,
+-        kCurrent_Version = kMorphologyTakesScalar_Version
++        kCurrent_Version = kVerticesUseReadBuffer_Version
+     };
+ 
+     static_assert(kMin_Version <= 62, "Remove kFontAxes_bad from SkFontDescriptor.cpp");
+ };
+ 
+ #endif
+diff --git a/src/core/SkVertices.cpp b/src/core/SkVertices.cpp
+index 532bb4f17d..0f1a834027 100644
+--- a/src/core/SkVertices.cpp
++++ b/src/core/SkVertices.cpp
+@@ -1,21 +1,21 @@
+ /*
+  * Copyright 2017 Google Inc.
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #include "include/core/SkVertices.h"
+ 
+ #include "include/core/SkData.h"
+ #include "include/private/SkTo.h"
+ #include "src/core/SkCanvasPriv.h"
+ #include "src/core/SkOpts.h"
+-#include "src/core/SkReader32.h"
++#include "src/core/SkReadBuffer.h"
+ #include "src/core/SkSafeMath.h"
+ #include "src/core/SkSafeRange.h"
+ #include "src/core/SkVerticesPriv.h"
+-#include "src/core/SkWriter32.h"
++#include "src/core/SkWriteBuffer.h"
+ #include <atomic>
+ #include <new>
+ 
+@@ -370,173 +370,138 @@ bool SkVerticesPriv::hasUsage(SkVertices::Attribute::Usage u) const {
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-enum EncodedVerticesVersions {
+-    kNamedMarkers_Version = 4,    // Marker IDs changed to strings
+-
+-    kCurrent_Version      = kNamedMarkers_Version
+-};
+-
+-struct EncodedAttribute {
+-    SkVertices::Attribute::Type  fType;
+-    SkVertices::Attribute::Usage fUsage;
+-    bool                         fHasMarkerName;
+-};
+-
+-struct Header_v4 {
+-    uint32_t              fPacked;
+-    int32_t               fVertexCount;
+-    int32_t               fIndexCount;
+-    int32_t               fAttributeCount;
+-    // [EncodedAttributes] + [MarkerNames] + [pos] + [customData] + [texs] + [colors] + [indices]
+-};
+-
+-#define kCurrentHeaderSize    sizeof(Header_v4)
+-
+ // storage = packed | vertex_count | index_count | attr_count
+ //           | pos[] | custom[] | texs[] | colors[] | indices[]
+ 
+ #define kMode_Mask          0x0FF
+ #define kHasTexs_Mask       0x100
+ #define kHasColors_Mask     0x200
+-// new as of 3/2020
+-#define kVersion_Shift      24
+-#define kVersion_Mask       (0xFF << kVersion_Shift)
+ 
+-sk_sp<SkData> SkVertices::encode() const {
+-    // packed has room for addtional flags in the future (e.g. versioning)
+-    uint32_t packed = static_cast<uint32_t>(fMode);
++void SkVerticesPriv::encode(SkWriteBuffer& buffer) const {
++    // packed has room for additional flags in the future
++    uint32_t packed = static_cast<uint32_t>(fVertices->fMode);
+     SkASSERT((packed & ~kMode_Mask) == 0);  // our mode fits in the mask bits
+-    if (fTexs) {
++    if (fVertices->fTexs) {
+         packed |= kHasTexs_Mask;
+     }
+-    if (fColors) {
++    if (fVertices->fColors) {
+         packed |= kHasColors_Mask;
+     }
+-    packed |= kCurrent_Version << kVersion_Shift;
+-
+-    size_t attrSize = SkAlign4(sizeof(EncodedAttribute) * fAttributeCount);
+-    for (int i = 0; i < fAttributeCount; ++i) {
+-        if (fAttributes[i].fMarkerName) {
+-            attrSize += SkWriter32::WriteStringSize(fAttributes[i].fMarkerName);
+-        }
+-    }
+ 
+-    Sizes sizes = this->getSizes();
++    SkVertices::Sizes sizes = fVertices->getSizes();
+     SkASSERT(!sizes.fBuilderTriFanISize);
+-    // need to force alignment to 4 for SkWriter32 -- will pad w/ 0s as needed
+-    const size_t size = SkAlign4(kCurrentHeaderSize + attrSize + sizes.fArrays);
+-
+-    sk_sp<SkData> data = SkData::MakeUninitialized(size);
+-    SkWriter32 writer(data->writable_data(), data->size());
+ 
+     // Header
+-    writer.write32(packed);
+-    writer.write32(fVertexCount);
+-    writer.write32(fIndexCount);
+-    writer.write32(fAttributeCount);
+-
+-    // Encoded attributes (may not be 4 byte aligned)
+-    EncodedAttribute* encodedAttrs =
+-            (EncodedAttribute*)writer.reservePad(fAttributeCount * sizeof(EncodedAttribute));
+-    for (int i = 0; i < fAttributeCount; ++i) {
+-        encodedAttrs[i] = {fAttributes[i].fType, fAttributes[i].fUsage,
+-                           SkToBool(fAttributes[i].fMarkerName)};
+-    }
++    buffer.writeUInt(packed);
++    buffer.writeInt(fVertices->fVertexCount);
++    buffer.writeInt(fVertices->fIndexCount);
++    buffer.writeInt(fVertices->fAttributeCount);
+ 
+-    // Marker names
+-    for (int i = 0; i < fAttributeCount; ++i) {
+-        if (fAttributes[i].fMarkerName) {
+-            writer.writeString(fAttributes[i].fMarkerName);
+-        }
++    // Attribute metadata
++    for (int i = 0; i < fVertices->fAttributeCount; ++i) {
++        buffer.writeInt(static_cast<int>(fVertices->fAttributes[i].fType));
++        buffer.writeInt(static_cast<int>(fVertices->fAttributes[i].fUsage));
++        buffer.writeString(fVertices->fAttributes[i].fMarkerName);
+     }
+ 
+     // Data arrays
+-    writer.write(fPositions, sizes.fVSize);
+-    writer.write(fCustomData, sizes.fDSize);
+-    writer.write(fTexs, sizes.fTSize);
+-    writer.write(fColors, sizes.fCSize);
++    buffer.writeByteArray(fVertices->fPositions, sizes.fVSize);
++    buffer.writeByteArray(fVertices->fCustomData, sizes.fDSize);
++    buffer.writeByteArray(fVertices->fTexs, sizes.fTSize);
++    buffer.writeByteArray(fVertices->fColors, sizes.fCSize);
+     // if index-count is odd, we won't be 4-bytes aligned, so we call the pad version
+-    writer.writePad(fIndices, sizes.fISize);
+-
+-    return data;
++    buffer.writeByteArray(fVertices->fIndices, sizes.fISize);
+ }
+ 
+-sk_sp<SkVertices> SkVertices::Decode(const void* data, size_t length) {
+-    if (length < sizeof(Header_v4)) {
++sk_sp<SkVertices> SkVerticesPriv::Decode(SkReadBuffer& buffer) {
++    if (buffer.isVersionLT(SkPicturePriv::kVerticesUseReadBuffer_Version)) {
++        // Old versions used an embedded blob that was serialized with SkWriter32/SkReader32.
++        // We don't support loading those, but skip over the vertices to keep the buffer valid.
++        auto data = buffer.readByteArrayAsData();
++        (void)data;
+         return nullptr;
+     }
+ 
+-    SkReader32 reader(data, length);
+-    SkSafeRange safe;
+-
+-    const uint32_t packed = reader.readInt();
+-    const unsigned version = safe.checkLE<unsigned>((packed & kVersion_Mask) >> kVersion_Shift,
+-                                                    kCurrent_Version);
+-    const int vertexCount = safe.checkGE(reader.readInt(), 0);
+-    const int indexCount = safe.checkGE(reader.readInt(), 0);
+-    const int attrCount = safe.checkGE(reader.readInt(), 0);
+-    const VertexMode mode = safe.checkLE<VertexMode>(packed & kMode_Mask,
+-                                                     SkVertices::kLast_VertexMode);
+-    const bool hasTexs = SkToBool(packed & kHasTexs_Mask);
+-    const bool hasColors = SkToBool(packed & kHasColors_Mask);
+-
+-    if (!safe                                           // Invalid header fields
+-        || attrCount > kMaxCustomAttributes             // Too many custom attributes?
+-        || version < kNamedMarkers_Version              // Old (unsupported) version
+-        || (attrCount > 0 && (hasTexs || hasColors))) { // Overspecified (incompatible features)
+-        return nullptr;
+-    }
++    auto decode = [](SkReadBuffer& buffer) -> sk_sp<SkVertices> {
++        SkSafeRange safe;
++
++        const uint32_t packed = buffer.readUInt();
++        const int vertexCount = safe.checkGE(buffer.readInt(), 0);
++        const int indexCount = safe.checkGE(buffer.readInt(), 0);
++        const int attrCount = safe.checkGE(buffer.readInt(), 0);
++        const SkVertices::VertexMode mode = safe.checkLE<SkVertices::VertexMode>(
++                packed & kMode_Mask, SkVertices::kLast_VertexMode);
++        const bool hasTexs = SkToBool(packed & kHasTexs_Mask);
++        const bool hasColors = SkToBool(packed & kHasColors_Mask);
++
++        if (!safe                                           // Invalid header fields
++            || attrCount > SkVertices::kMaxCustomAttributes // Too many custom attributes?
++            || (attrCount > 0 && (hasTexs || hasColors))) { // Overspecified (incompatible features)
++            return nullptr;
++        }
+ 
+-    if (!reader.isAvailable(attrCount * sizeof(EncodedAttribute))) {
+-        return nullptr;
+-    }
++        SkVertices::Attribute attrs[SkVertices::kMaxCustomAttributes];
++        SkString attrNames[SkVertices::kMaxCustomAttributes];
++        for (int i = 0; i < attrCount; ++i) {
++            auto type = buffer.checkRange(SkVertices::Attribute::Type::kFloat,
++                                          SkVertices::Attribute::Type::kByte4_unorm);
++            auto usage = buffer.checkRange(SkVertices::Attribute::Usage::kRaw,
++                                           SkVertices::Attribute::Usage::kPosition);
++            buffer.readString(&attrNames[i]);
++            const char* markerName = attrNames[i].isEmpty() ? nullptr : attrNames[i].c_str();
++            if (markerName && !SkCanvasPriv::ValidateMarker(markerName)) {
++                return nullptr;
++            }
++            attrs[i] = SkVertices::Attribute(type, usage, markerName);
++        }
+ 
+-    Attribute attrs[kMaxCustomAttributes];
+-    const EncodedAttribute* encodedAttrs =
+-            (const EncodedAttribute*)reader.skip(attrCount * sizeof(EncodedAttribute));
+-    for (int i = 0; i < attrCount; ++i) {
+-        attrs[i] = Attribute(encodedAttrs[i].fType, encodedAttrs[i].fUsage,
+-                             encodedAttrs[i].fHasMarkerName ? reader.readString() : nullptr);
+-    }
++        // Ensure that all of the attribute metadata was valid before proceeding
++        if (!buffer.isValid()) {
++            return nullptr;
++        }
+ 
+-    const Desc desc{
+-        mode, vertexCount, indexCount, hasTexs, hasColors, attrCount ? attrs : nullptr, attrCount
+-    };
+-    Sizes sizes(desc);
+-    if (!sizes.isValid()) {
+-        return nullptr;
+-    }
+-    // logically we can be only 2-byte aligned, but our buffer is always 4-byte aligned
+-    if (reader.available() != SkAlign4(sizes.fArrays)) {
+-        return nullptr;
+-    }
++        const SkVertices::Desc desc{mode, vertexCount, indexCount, hasTexs, hasColors,
++                                    attrCount ? attrs : nullptr, attrCount};
++        SkVertices::Sizes sizes(desc);
++        if (!sizes.isValid()) {
++            return nullptr;
++        }
+ 
+-    Builder builder(desc);
+-    if (!builder.isValid()) {
+-        return nullptr;
+-    }
+-    SkSafeMath safe_math;
++        SkVertices::Builder builder(desc);
++        if (!builder.isValid()) {
++            return nullptr;
++        }
+ 
+-    reader.read(builder.positions(), sizes.fVSize);
+-    reader.read(builder.customData(), sizes.fDSize);
+-    reader.read(builder.texCoords(), sizes.fTSize);
+-    reader.read(builder.colors(), sizes.fCSize);
+-    size_t isize = (mode == kTriangleFan_VertexMode) ? sizes.fBuilderTriFanISize : sizes.fISize;
+-    reader.read(builder.indices(), isize);
+-    if (indexCount > 0) {
+-        // validate that the indices are in range
+-        const uint16_t* indices = builder.indices();
+-        for (int i = 0; i < indexCount; ++i) {
+-            if (indices[i] >= (unsigned)vertexCount) {
+-                return nullptr;
++        buffer.readByteArray(builder.positions(), sizes.fVSize);
++        buffer.readByteArray(builder.customData(), sizes.fDSize);
++        buffer.readByteArray(builder.texCoords(), sizes.fTSize);
++        buffer.readByteArray(builder.colors(), sizes.fCSize);
++        size_t isize = (mode == SkVertices::kTriangleFan_VertexMode) ? sizes.fBuilderTriFanISize
++                                                                     : sizes.fISize;
++        buffer.readByteArray(builder.indices(), isize);
++
++        if (!buffer.isValid()) {
++            return nullptr;
++        }
++
++        if (indexCount > 0) {
++            // validate that the indices are in range
++            const uint16_t* indices = builder.indices();
++            for (int i = 0; i < indexCount; ++i) {
++                if (indices[i] >= (unsigned)vertexCount) {
++                    return nullptr;
++                }
+             }
+         }
+-    }
+ 
+-    if (!safe_math.ok()) {
+-        return nullptr;
++        return builder.detach();
++    };
++
++    if (auto verts = decode(buffer)) {
++        return verts;
+     }
+-    return builder.detach();
++    buffer.validate(false);
++    return nullptr;
+ }
+ 
+ void SkVertices::operator delete(void* p) {
+diff --git a/src/core/SkVerticesPriv.h b/src/core/SkVerticesPriv.h
+index 9a998e98bb..17591d32db 100644
+--- a/src/core/SkVerticesPriv.h
++++ b/src/core/SkVerticesPriv.h
+@@ -10,8 +10,11 @@
+ 
+ #include "include/core/SkVertices.h"
+ 
+-struct SkVertices_DeprecatedBone        {    float values[6]; };
++class SkReadBuffer;
++class SkWriteBuffer;
++
++struct SkVertices_DeprecatedBone { float values[6]; };
+ 
+ /** Class that adds methods to SkVertices that are only intended for use internal to Skia.
+     This class is purely a privileged window into SkVertices. It should never have additional
+     data members or virtual methods. */
+@@ -41,6 +44,9 @@ public:
+     // Never called due to RVO in priv(), but must exist for MSVC 2017.
+     SkVerticesPriv(const SkVerticesPriv&) = default;
+ 
++    void encode(SkWriteBuffer&) const;
++    static sk_sp<SkVertices> Decode(SkReadBuffer&);
++
+ private:
+     explicit SkVerticesPriv(SkVertices* vertices) : fVertices(vertices) {}
+     SkVerticesPriv& operator=(const SkVerticesPriv&) = delete;
+diff --git a/tests/VerticesTest.cpp b/tests/VerticesTest.cpp
+index 5517e64a9a..5f2cbbc3b5 100644
+--- a/tests/VerticesTest.cpp
++++ b/tests/VerticesTest.cpp
+@@ -1,14 +1,17 @@
+ /*
+  * Copyright 2017 Google Inc.
+  *
+  * Use of this source code is governed by a BSD-style license that can be
+  * found in the LICENSE file.
+  */
+ 
+ #include "include/core/SkCanvas.h"
+ #include "include/core/SkSurface.h"
+ #include "include/core/SkVertices.h"
++#include "src/core/SkAutoMalloc.h"
++#include "src/core/SkReadBuffer.h"
+ #include "src/core/SkVerticesPriv.h"
++#include "src/core/SkWriteBuffer.h"
+ #include "tests/Test.h"
+ #include "tools/ToolUtils.h"
+ 
+@@ -73,11 +76,18 @@ static bool equal(const SkVertices* vert0, const SkVertices* vert1) {
+ }
+ 
+ static void self_test(sk_sp<SkVertices> v0, skiatest::Reporter* reporter) {
+-    sk_sp<SkData> data = v0->encode();
+-    sk_sp<SkVertices> v1 = SkVertices::Decode(data->data(), data->size());
++    SkBinaryWriteBuffer writer;
++    v0->priv().encode(writer);
+ 
++    SkAutoMalloc buf(writer.bytesWritten());
++    writer.writeToMemory(buf.get());
++    SkReadBuffer reader(buf.get(), writer.bytesWritten());
++
++    sk_sp<SkVertices> v1 = SkVerticesPriv::Decode(reader);
++
++    REPORTER_ASSERT(reporter, v1 != nullptr);
+     REPORTER_ASSERT(reporter, v0->uniqueID() != 0);
+     REPORTER_ASSERT(reporter, v1->uniqueID() != 0);
+     REPORTER_ASSERT(reporter, v0->uniqueID() != v1->uniqueID());
+     REPORTER_ASSERT(reporter, equal(v0.get(), v1.get()));
+ }

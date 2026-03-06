@@ -1,0 +1,1515 @@
+commit 7629dad94ac310a285099f488618cbebc5eb9a85
+Author: Kimball Thurston <kdt3rd@gmail.com>
+Date:   Mon Aug 1 08:36:58 2022 +1200
+
+    Address OSS Fuzz Issues (#1268)
+    
+    * Add utility function header
+    
+    Add location to extract internal helper functions to reduce code
+    duplication
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+    
+    * Fix issues with odd y_sampling numbers
+    
+    Use new compute_sampled_lines when the y_sampling is odd (sampling % 2
+    == 1), where the number of lines per chunk will oscillate.
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+    
+    * Fix integer overflow computing deep chunk index
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+    
+    * Fix decompression scratch buffer size
+    
+    Use a minimum size to handle that b44 is always 4x4 blocks
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+    
+    * Use appropriate buffer size when decompressing
+    
+    use the scratch buffer size instead of decompressed buffer size, allow
+    some extra padding in scratch buffer when appropriate
+    
+    Signed-off-by: Kimball Thurston <kdt3rd@gmail.com>
+
+diff --git a/src/lib/OpenEXRCore/chunk.c b/src/lib/OpenEXRCore/chunk.c
+index 0422acd2..c034fecb 100644
+--- a/src/lib/OpenEXRCore/chunk.c
++++ b/src/lib/OpenEXRCore/chunk.c
+@@ -1,34 +1,35 @@
+ /*
+ ** SPDX-License-Identifier: BSD-3-Clause
+ ** Copyright Contributors to the OpenEXR Project.
+ */
+ 
+ #include "openexr_chunkio.h"
+ 
+ #include "internal_coding.h"
+ #include "internal_structs.h"
++#include "internal_util.h"
+ #include "internal_xdr.h"
+ 
+ #include <limits.h>
+ #include <string.h>
+ 
+ /**************************************/
+ 
+ /* for testing, we include a bunch of internal stuff into the unit tests which are in c++ */
+ /* see internal_structs.h for details on the msvc guard. */
+ #if !defined(_MSC_VER)
+ #    if defined __has_include
+ #        if __has_include(<stdatomic.h>)
+ #            define EXR_HAS_STD_ATOMICS 1
+ #        endif
+ #    endif
+ #endif
+ 
+ #ifdef EXR_HAS_STD_ATOMICS
+ #    include <stdatomic.h>
+ #elif defined(_MSC_VER)
+ 
+ /* msvc w/ c11 support is only very new, until we know what the preprocessor checks are, provide defaults */
+ #    include <windows.h>
+ 
+ #    define atomic_load(object) InterlockedOr64 ((int64_t volatile*) object, 0)
+@@ -393,42 +394,55 @@ static exr_result_t
+ read_and_validate_chunk_leader (
+     const struct _internal_exr_context* ctxt,
+     const struct _internal_exr_part*    part,
+     int                                 partnum,
+     uint64_t                            offset,
+     int*                                indexio,
+     uint64_t*                           next_offset)
+ {
+     exr_result_t             rv = EXR_ERR_SUCCESS;
+     struct priv_chunk_leader leader;
+ 
+     rv = extract_chunk_leader (
+         ctxt, part, partnum, offset, next_offset, &leader);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     if (part->storage_mode == EXR_STORAGE_SCANLINE ||
+         part->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+     {
+-        *indexio = (leader.scanline_y - part->data_window.min.y) /
+-                   part->lines_per_chunk;
++        int64_t chunk = (int64_t) leader.scanline_y;
++        chunk -= (int64_t) part->data_window.min.y;
++        chunk /= part->lines_per_chunk;
++        if (chunk < 0 || chunk > INT32_MAX)
++            return ctxt->print_error (
++                ctxt,
++                EXR_ERR_BAD_CHUNK_LEADER,
++                "Invalid chunk index: %" PRId64
++                " reading scanline %d (datawindow min %d) with lines per chunk %d",
++                chunk,
++                leader.scanline_y,
++                part->data_window.min.y,
++                part->lines_per_chunk);
++
++        *indexio = (int) chunk;
+     }
+     else
+     {
+         // because of random order, just go with it if the coordinates look sane
+         int32_t cidx = 0;
+ 
+         rv = validate_and_compute_tile_chunk_off (
+             ctxt,
+             part,
+             leader.tile_x,
+             leader.tile_y,
+             leader.level_x,
+             leader.level_y,
+             &cidx);
+ 
+         *indexio = cidx;
+     }
+ 
+     return rv;
+ }
+ 
+ // this should behave the same as the old ImfMultiPartInputFile
+@@ -514,103 +528,100 @@ static exr_result_t
+ extract_chunk_table (
+     const struct _internal_exr_context* ctxt,
+     const struct _internal_exr_part*    part,
+     uint64_t**                          chunktable,
+     uint64_t*                           chunkminoffset)
+ {
+     uint64_t* ctable     = NULL;
+     uint64_t  chunkoff   = part->chunk_table_offset;
+     uint64_t  chunkbytes = sizeof (uint64_t) * (uint64_t) part->chunk_count;
+ 
+     *chunkminoffset = chunkoff + chunkbytes;
+ 
+     ctable = (uint64_t*) atomic_load (
+         EXR_CONST_CAST (atomic_uintptr_t*, &(part->chunk_table)));
+     if (ctable == NULL)
+     {
+-        int64_t   nread = 0;
+-        uintptr_t eptr = 0, nptr = 0;
+-        int       complete = 1;
+-        uint64_t  maxoff   = ((uint64_t) -1);
++        int64_t      nread = 0;
++        uintptr_t    eptr = 0, nptr = 0;
++        int          complete = 1;
++        uint64_t     maxoff   = ((uint64_t) -1);
+         exr_result_t rv;
+ 
+         if (part->chunk_count <= 0)
+             return ctxt->report_error (
+                 ctxt, EXR_ERR_INVALID_ARGUMENT, "Invalid file with no chunks");
+ 
+         if (ctxt->file_size > 0 &&
+             chunkbytes + chunkoff > (uint64_t) ctxt->file_size)
+             return ctxt->print_error (
+                 ctxt,
+                 EXR_ERR_INVALID_ARGUMENT,
+                 "chunk table size (%" PRIu64 ") too big for file size (%" PRId64
+                 ")",
+                 chunkbytes,
+                 ctxt->file_size);
+ 
+         ctable = (uint64_t*) ctxt->alloc_fn (chunkbytes);
+         if (ctable == NULL)
+             return ctxt->standard_error (ctxt, EXR_ERR_OUT_OF_MEMORY);
+ 
+         rv = ctxt->do_read (
+             ctxt, ctable, chunkbytes, &chunkoff, &nread, EXR_MUST_READ_ALL);
+         if (rv != EXR_ERR_SUCCESS)
+         {
+             ctxt->free_fn (ctable);
+             return rv;
+         }
+ 
+         if (!ctxt->disable_chunk_reconstruct)
+         {
+             // could convert table all at once, but need to check if the
+             // file is incomplete (i.e. crashed during write and didn't
+             // get a complete chunk table), so just do them one at a time
+             if (ctxt->file_size > 0) maxoff = (uint64_t) ctxt->file_size;
+             for (size_t ci = 0; ci < part->chunk_count; ++ci)
+             {
+                 uint64_t cchunk = one_to_native64 (ctable[ci]);
+                 if (cchunk < chunkoff || cchunk >= maxoff) complete = 0;
+                 ctable[ci] = cchunk;
+             }
+ 
+             if (!complete)
+             {
+                 // The c++ side would basically fail as soon as it
+                 // failed, but would otherwise swallow all errors, and
+                 // then just let the reads fail later. We will do
+                 // something similar, except when in strict mode, we
+                 // will fail with a corrupt chunk immediately.
+                 rv = reconstruct_chunk_table (ctxt, part, ctable);
+                 if (rv != EXR_ERR_SUCCESS && ctxt->strict_header)
+                 {
+                     ctxt->free_fn (ctable);
+                     return ctxt->report_error (
+                         ctxt,
+                         EXR_ERR_BAD_CHUNK_LEADER,
+                         "Incomplete / corrupt chunk table, unable to reconstruct");
+                 }
+             }
+         }
+-        else
+-        {
+-            priv_to_native64 (ctable, part->chunk_count);
+-        }
++        else { priv_to_native64 (ctable, part->chunk_count); }
+ 
+         nptr = (uintptr_t) ctable;
+         // see if we win or not
+         if (!atomic_compare_exchange_strong (
+                 EXR_CONST_CAST (atomic_uintptr_t*, &(part->chunk_table)),
+                 &eptr,
+                 nptr))
+         {
+             ctxt->free_fn (ctable);
+             ctable = (uint64_t*) eptr;
+             if (ctable == NULL)
+                 return ctxt->standard_error (ctxt, EXR_ERR_OUT_OF_MEMORY);
+         }
+     }
+ 
+     *chunktable = ctable;
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+@@ -658,39 +669,29 @@ static uint64_t
+ compute_chunk_unpack_size (
+     int                              y,
+     int                              width,
+     int                              height,
+     int                              lpc,
+     const struct _internal_exr_part* part)
+ {
+     uint64_t unpacksize = 0;
+     if (part->chan_has_line_sampling || height != lpc)
+     {
+         const exr_attr_chlist_t* chanlist = part->channels->chlist;
+         for (int c = 0; c < chanlist->num_channels; ++c)
+         {
+             const exr_attr_chlist_entry_t* curc = (chanlist->entries + c);
+             uint64_t chansz = ((curc->pixel_type == EXR_PIXEL_HALF) ? 2 : 4);
+-            chansz *= ((uint64_t) width);
++
++            chansz *= (uint64_t) width;
+             if (curc->x_sampling > 1) chansz /= ((uint64_t) curc->x_sampling);
+-            chansz *= ((uint64_t) height);
+-            if (curc->y_sampling > 1)
+-            {
+-                if (height > 1)
+-                {
+-                    if (curc->y_sampling > height)
+-                        chansz /= ((uint64_t) height);
+-                    else
+-                        chansz /= ((uint64_t) curc->y_sampling);
+-                }
+-                else if ((y % ((int) curc->y_sampling)) != 0)
+-                    chansz = 0;
+-            }
++            chansz *=
++                (uint64_t) compute_sampled_lines (height, curc->y_sampling, y);
+             unpacksize += chansz;
+         }
+     }
+     else
+         unpacksize = part->unpacked_size_per_chunk;
+     return unpacksize;
+ }
+ 
+ /**************************************/
+@@ -699,251 +700,249 @@ exr_result_t
+ exr_read_scanline_chunk_info (
+     exr_const_context_t ctxt, int part_index, int y, exr_chunk_info_t* cinfo)
+ {
+     exr_result_t     rv;
+     int              miny, cidx, rdcnt, lpc;
+     int32_t          data[3];
+     int64_t          ddata[3];
+     int64_t          fsize;
+     uint64_t         chunkmin, dataoff;
+     exr_attr_box2i_t dw;
+     uint64_t*        ctable;
+     EXR_PROMOTE_READ_CONST_CONTEXT_AND_PART_OR_ERROR (ctxt, part_index);
+ 
+     if (!cinfo) return pctxt->standard_error (pctxt, EXR_ERR_INVALID_ARGUMENT);
+ 
+     if (part->storage_mode == EXR_STORAGE_TILED ||
+         part->storage_mode == EXR_STORAGE_DEEP_TILED)
+     {
+         return pctxt->standard_error (pctxt, EXR_ERR_SCAN_TILE_MIXEDAPI);
+     }
+ 
+     dw = part->data_window;
+     if (y < dw.min.y || y > dw.max.y)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid request for scanline %d outside range of data window (%d - %d)",
+             y,
+             dw.min.y,
+             dw.max.y);
+     }
+ 
+     lpc  = part->lines_per_chunk;
+     cidx = (y - dw.min.y);
+     if (lpc > 1) cidx /= lpc;
+ 
+     // do we need to invert this when reading decreasing y? it appears not
+     //if (part->lineorder == EXR_LINEORDER_DECREASING_Y)
+     //    cidx = part->chunk_count - (cidx + 1);
+     miny = (dw.min.y + cidx * lpc);
+ 
+     if (cidx < 0 || cidx >= part->chunk_count)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid request for scanline %d in chunk %d outside chunk count %d",
+             y,
+             cidx,
+             part->chunk_count);
+     }
+ 
+     cinfo->idx         = cidx;
+     cinfo->type        = (uint8_t) part->storage_mode;
+     cinfo->compression = (uint8_t) part->comp_type;
+     cinfo->start_x     = dw.min.x;
+     cinfo->start_y     = miny;
+     cinfo->width       = dw.max.x - dw.min.x + 1;
+     cinfo->height      = lpc;
+     if (miny < dw.min.y)
+     {
+         cinfo->start_y = dw.min.y;
+         cinfo->height -= (dw.min.y - miny);
+     }
+-    else if ((miny + lpc) > dw.max.y)
+-    {
+-        cinfo->height = (dw.max.y - miny + 1);
+-    }
++    else if ((miny + lpc) > dw.max.y) { cinfo->height = (dw.max.y - miny + 1); }
+     cinfo->level_x = 0;
+     cinfo->level_y = 0;
+ 
+     /* need to read from the file to get the packed chunk size */
+     rv = extract_chunk_table (pctxt, part, &ctable, &chunkmin);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     fsize = pctxt->file_size;
+ 
+     dataoff = ctable[cidx];
+     if (dataoff < chunkmin || (fsize > 0 && dataoff > (uint64_t) fsize))
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_BAD_CHUNK_LEADER,
+             "Corrupt chunk offset table: scanline %d, chunk index %d recorded at file offset %" PRIu64,
+             y,
+             cidx,
+             dataoff);
+     }
+ 
+     /* TODO: Look at collapsing this into extract_chunk_leader, only
+      * issue is more concrete error messages */
+     /* multi part files have the part for validation */
+     rdcnt = (pctxt->is_multipart) ? 2 : 1;
+     /* deep has 64-bit data, so be variable about what we read */
+     if (part->storage_mode != EXR_STORAGE_DEEP_SCANLINE) ++rdcnt;
+ 
+     rv = pctxt->do_read (
+         pctxt,
+         data,
+         (size_t) (rdcnt) * sizeof (int32_t),
+         &dataoff,
+         NULL,
+         EXR_MUST_READ_ALL);
+ 
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     priv_to_native32 (data, rdcnt);
+ 
+     rdcnt = 0;
+     if (pctxt->is_multipart)
+     {
+         if (data[rdcnt] != part_index)
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing read scanline %d (chunk %d), found corrupt leader: part says %d, expected %d",
+                 y,
+                 cidx,
+                 data[rdcnt],
+                 part_index);
+         }
+         ++rdcnt;
+     }
+     if (miny != data[rdcnt])
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_BAD_CHUNK_LEADER,
+             "Preparing to read scanline %d (chunk %d), found corrupt leader: scanline says %d, expected %d",
+             y,
+             cidx,
+             data[rdcnt],
+             miny);
+     }
+ 
+     if (part->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+     {
+         rv = pctxt->do_read (
+             pctxt,
+             ddata,
+             3 * sizeof (int64_t),
+             &dataoff,
+             NULL,
+             EXR_MUST_READ_ALL);
+         if (rv != EXR_ERR_SUCCESS) { return rv; }
+         priv_to_native64 (ddata, 3);
+ 
+         if (ddata[0] < 0)
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to read scanline %d (chunk %d), found corrupt leader: invalid sample table size %" PRId64,
+                 y,
+                 cidx,
+                 ddata[0]);
+         }
+         if (ddata[1] < 0 || ddata[1] > (int64_t) INT_MAX)
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to read scanline %d (chunk %d), found corrupt leader: invalid packed data size %" PRId64,
+                 y,
+                 cidx,
+                 ddata[1]);
+         }
+         if (ddata[2] < 0 || ddata[2] > (int64_t) INT_MAX)
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to scanline %d (chunk %d), found corrupt leader: unsupported unpacked data size %" PRId64,
+                 y,
+                 cidx,
+                 ddata[2]);
+         }
+ 
+         cinfo->sample_count_data_offset = dataoff;
+         cinfo->sample_count_table_size  = (uint64_t) ddata[0];
+         cinfo->data_offset              = dataoff + (uint64_t) ddata[0];
+         cinfo->packed_size              = (uint64_t) ddata[1];
+         cinfo->unpacked_size            = (uint64_t) ddata[2];
+ 
+         if (fsize > 0 &&
+             ((cinfo->sample_count_data_offset +
+               cinfo->sample_count_table_size) > ((uint64_t) fsize) ||
+              (cinfo->data_offset + cinfo->packed_size) > ((uint64_t) fsize)))
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to scanline %d (chunk %d), found corrupt leader: sample table and data result in access past end of the file: sample table size %" PRId64
+                 " + data size %" PRId64 " larger than file %" PRId64,
+                 y,
+                 cidx,
+                 ddata[0],
+                 ddata[1],
+                 fsize);
+         }
+     }
+     else
+     {
+         uint64_t unpacksize = compute_chunk_unpack_size (
+             y, cinfo->width, cinfo->height, lpc, part);
+ 
+         ++rdcnt;
+         if (data[rdcnt] < 0 ||
+             (uint64_t) data[rdcnt] > part->unpacked_size_per_chunk)
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to read scanline %d (chunk %d), found corrupt leader: packed data size says %" PRIu64
+                 ", must be between 0 and %" PRIu64,
+                 y,
+                 cidx,
+                 (uint64_t) data[rdcnt],
+                 part->unpacked_size_per_chunk);
+         }
+ 
+         cinfo->data_offset              = dataoff;
+         cinfo->packed_size              = (uint64_t) data[rdcnt];
+         cinfo->unpacked_size            = unpacksize;
+         cinfo->sample_count_data_offset = 0;
+         cinfo->sample_count_table_size  = 0;
+ 
+         if (fsize > 0 &&
+             (cinfo->data_offset + cinfo->packed_size) > ((uint64_t) fsize))
+         {
+             return pctxt->print_error (
+                 pctxt,
+                 EXR_ERR_BAD_CHUNK_LEADER,
+                 "Preparing to read scanline %d (chunk %d), found corrupt leader: packed size %" PRIu64
+-                ", file size %" PRId64,
++                ", file offset %" PRIu64 ", size %" PRId64,
+                 y,
+                 cidx,
+-                (uint64_t) data[rdcnt],
++                cinfo->packed_size,
++                cinfo->data_offset,
+                 fsize);
+         }
+     }
+ 
+     if (cinfo->packed_size == 0 && cinfo->unpacked_size > 0)
+         return pctxt->report_error (
+             pctxt, EXR_ERR_INVALID_ARGUMENT, "Invalid packed size of 0");
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+@@ -1455,195 +1454,192 @@ static exr_result_t
+ write_scan_chunk (
+     struct _internal_exr_context* pctxt,
+     int                           part_index,
+     struct _internal_exr_part*    part,
+     int                           y,
+     const void*                   packed_data,
+     uint64_t                      packed_size,
+     uint64_t                      unpacked_size,
+     const void*                   sample_data,
+     uint64_t                      sample_data_size)
+ {
+     exr_result_t rv;
+     int32_t      data[3];
+     int32_t      psize;
+     int          cidx, lpc, miny, wrcnt;
+     uint64_t*    ctable;
+ 
+     if (pctxt->mode != EXR_CONTEXT_WRITING_DATA)
+     {
+         if (pctxt->mode == EXR_CONTEXT_WRITE)
+             return pctxt->standard_error (pctxt, EXR_ERR_HEADER_NOT_WRITTEN);
+         return pctxt->standard_error (pctxt, EXR_ERR_NOT_OPEN_WRITE);
+     }
+ 
+     if (part->storage_mode == EXR_STORAGE_TILED ||
+         part->storage_mode == EXR_STORAGE_DEEP_TILED)
+     {
+         return pctxt->standard_error (pctxt, EXR_ERR_SCAN_TILE_MIXEDAPI);
+     }
+ 
+     if (pctxt->cur_output_part != part_index)
+         return pctxt->standard_error (pctxt, EXR_ERR_INCORRECT_PART);
+ 
+     if (packed_size > 0 && !packed_data)
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid packed data argument size %" PRIu64 " pointer %p",
+             (uint64_t) packed_size,
+             packed_data);
+ 
+     if (part->storage_mode != EXR_STORAGE_DEEP_SCANLINE &&
+         packed_size > (uint64_t) INT32_MAX)
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Packed data size %" PRIu64 " too large (max %" PRIu64 ")",
+             (uint64_t) packed_size,
+             (uint64_t) INT32_MAX);
+     psize = (int32_t) packed_size;
+ 
+     if (part->storage_mode == EXR_STORAGE_DEEP_SCANLINE &&
+         (!sample_data || sample_data_size == 0))
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid sample count data argument size %" PRIu64 " pointer %p",
+             (uint64_t) sample_data_size,
+             sample_data);
+ 
+     if (y < part->data_window.min.y || y > part->data_window.max.y)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid attempt to write scanlines starting at %d outside range of data window (%d - %d)",
+             y,
+             part->data_window.min.y,
+             part->data_window.max.y);
+     }
+ 
+     lpc  = part->lines_per_chunk;
+     cidx = (y - part->data_window.min.y);
+     if (lpc > 1) cidx /= lpc;
+ 
+     //if (part->lineorder == EXR_LINEORDER_DECREASING_Y)
+     //    cidx = part->chunk_count - (cidx + 1);
+ 
+     miny = cidx * lpc + part->data_window.min.y;
+ 
+     if (y != miny)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Attempt to write scanline %d which does not align with y dims (%d) for chunk index (%d)",
+             y,
+             miny,
+             cidx);
+     }
+ 
+     if (cidx < 0 || cidx >= part->chunk_count)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Chunk index for scanline %d in chunk %d outside chunk count %d",
+             y,
+             cidx,
+             part->chunk_count);
+     }
+ 
+     if (part->lineorder != EXR_LINEORDER_RANDOM_Y &&
+         pctxt->last_output_chunk != (cidx - 1))
+     {
+         return pctxt->standard_error (pctxt, EXR_ERR_INCORRECT_CHUNK);
+     }
+ 
+     if (pctxt->is_multipart)
+     {
+         data[0] = part_index;
+         data[1] = miny;
+         if (part->storage_mode != EXR_STORAGE_DEEP_SCANLINE)
+         {
+             data[2] = psize;
+             wrcnt   = 3;
+         }
+         else
+             wrcnt = 2;
+     }
+     else
+     {
+         data[0] = miny;
+         if (part->storage_mode != EXR_STORAGE_DEEP_SCANLINE)
+         {
+             data[1] = psize;
+             wrcnt   = 2;
+         }
+         else
+             wrcnt = 1;
+     }
+     priv_from_native32 (data, wrcnt);
+ 
+     rv = alloc_chunk_table (pctxt, part, &ctable);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     ctable[cidx] = pctxt->output_file_offset;
+     rv           = pctxt->do_write (
+         pctxt,
+         data,
+         (uint64_t) (wrcnt) * sizeof (int32_t),
+         &(pctxt->output_file_offset));
+     if (rv == EXR_ERR_SUCCESS &&
+         part->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+     {
+         int64_t ddata[3];
+         ddata[0] = (int64_t) sample_data_size;
+         ddata[1] = (int64_t) packed_size;
+         ddata[2] = (int64_t) unpacked_size;
+         rv       = pctxt->do_write (
+             pctxt, ddata, 3 * sizeof (uint64_t), &(pctxt->output_file_offset));
+ 
+         if (rv == EXR_ERR_SUCCESS)
+             rv = pctxt->do_write (
+                 pctxt,
+                 sample_data,
+                 sample_data_size,
+                 &(pctxt->output_file_offset));
+     }
+     if (rv == EXR_ERR_SUCCESS && packed_size > 0)
+         rv = pctxt->do_write (
+             pctxt, packed_data, packed_size, &(pctxt->output_file_offset));
+ 
+     if (rv == EXR_ERR_SUCCESS)
+     {
+         ++(pctxt->output_chunk_count);
+         if (pctxt->output_chunk_count == part->chunk_count)
+         {
+             uint64_t chunkoff = part->chunk_table_offset;
+ 
+             ++(pctxt->cur_output_part);
+             if (pctxt->cur_output_part == pctxt->num_parts)
+                 pctxt->mode = EXR_CONTEXT_WRITE_FINISHED;
+             pctxt->last_output_chunk  = -1;
+             pctxt->output_chunk_count = 0;
+ 
+             priv_from_native64 (ctable, part->chunk_count);
+             rv = pctxt->do_write (
+                 pctxt,
+                 ctable,
+                 sizeof (uint64_t) * (uint64_t) (part->chunk_count),
+                 &chunkoff);
+             /* just in case we look at it again? */
+             priv_to_native64 (ctable, part->chunk_count);
+         }
+-        else
+-        {
+-            pctxt->last_output_chunk = cidx;
+-        }
++        else { pctxt->last_output_chunk = cidx; }
+     }
+ 
+     return rv;
+ }
+ 
+ /**************************************/
+@@ -1652,91 +1648,88 @@ exr_result_t
+ exr_write_scanline_chunk_info (
+     exr_context_t ctxt, int part_index, int y, exr_chunk_info_t* cinfo)
+ {
+     exr_attr_box2i_t dw;
+     int              lpc, miny, cidx;
+     exr_chunk_info_t nil = {0};
+ 
+     EXR_PROMOTE_LOCKED_CONTEXT_AND_PART_OR_ERROR (ctxt, part_index);
+ 
+     if (!cinfo)
+         return EXR_UNLOCK_AND_RETURN_PCTXT (
+             pctxt->standard_error (pctxt, EXR_ERR_INVALID_ARGUMENT));
+ 
+     if (part->storage_mode == EXR_STORAGE_TILED ||
+         part->storage_mode == EXR_STORAGE_DEEP_TILED)
+     {
+         return EXR_UNLOCK_AND_RETURN_PCTXT (
+             pctxt->standard_error (pctxt, EXR_ERR_SCAN_TILE_MIXEDAPI));
+     }
+ 
+     if (pctxt->mode != EXR_CONTEXT_WRITING_DATA)
+     {
+         if (pctxt->mode == EXR_CONTEXT_WRITE)
+             return EXR_UNLOCK_AND_RETURN_PCTXT (
+                 pctxt->standard_error (pctxt, EXR_ERR_HEADER_NOT_WRITTEN));
+         return EXR_UNLOCK_AND_RETURN_PCTXT (
+             pctxt->standard_error (pctxt, EXR_ERR_NOT_OPEN_WRITE));
+     }
+ 
+     dw = part->data_window;
+     if (y < dw.min.y || y > dw.max.y)
+     {
+         return EXR_UNLOCK_AND_RETURN_PCTXT (pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid request for scanline %d outside range of data window (%d - %d)",
+             y,
+             dw.min.y,
+             dw.max.y));
+     }
+ 
+     lpc  = part->lines_per_chunk;
+     cidx = (y - dw.min.y);
+     if (lpc > 1) cidx /= lpc;
+ 
+     //if (part->lineorder == EXR_LINEORDER_DECREASING_Y)
+     //    cidx = part->chunk_count - (cidx + 1);
+     miny = cidx * lpc + dw.min.y;
+ 
+     if (cidx < 0 || cidx >= part->chunk_count)
+     {
+         return EXR_UNLOCK_AND_RETURN_PCTXT (pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid request for scanline %d in chunk %d outside chunk count %d",
+             y,
+             cidx,
+             part->chunk_count));
+     }
+ 
+     *cinfo             = nil;
+     cinfo->idx         = cidx;
+     cinfo->type        = (uint8_t) part->storage_mode;
+     cinfo->compression = (uint8_t) part->comp_type;
+     cinfo->start_x     = dw.min.x;
+     cinfo->start_y     = miny;
+     cinfo->width       = dw.max.x - dw.min.x + 1;
+     cinfo->height      = lpc;
+     if (miny < dw.min.y)
+     {
+         cinfo->start_y = dw.min.y;
+         cinfo->height -= (dw.min.y - miny);
+     }
+-    else if ((miny + lpc) > dw.max.y)
+-    {
+-        cinfo->height = (dw.max.y - miny + 1);
+-    }
++    else if ((miny + lpc) > dw.max.y) { cinfo->height = (dw.max.y - miny + 1); }
+     cinfo->level_x = 0;
+     cinfo->level_y = 0;
+ 
+     cinfo->sample_count_data_offset = 0;
+     cinfo->sample_count_table_size  = 0;
+     cinfo->data_offset              = 0;
+     cinfo->packed_size              = 0;
+     cinfo->unpacked_size =
+         compute_chunk_unpack_size (y, cinfo->width, cinfo->height, lpc, part);
+ 
+     return EXR_UNLOCK_AND_RETURN_PCTXT (EXR_ERR_SUCCESS);
+ }
+ 
+ /**************************************/
+@@ -1909,164 +1902,161 @@ static exr_result_t
+ write_tile_chunk (
+     struct _internal_exr_context* pctxt,
+     int                           part_index,
+     struct _internal_exr_part*    part,
+     int                           tilex,
+     int                           tiley,
+     int                           levelx,
+     int                           levely,
+     const void*                   packed_data,
+     uint64_t                      packed_size,
+     uint64_t                      unpacked_size,
+     const void*                   sample_data,
+     uint64_t                      sample_data_size)
+ {
+     exr_result_t rv;
+     int32_t      data[6];
+     int32_t      psize;
+     int          cidx, wrcnt;
+     uint64_t*    ctable;
+ 
+     if (pctxt->mode != EXR_CONTEXT_WRITING_DATA)
+     {
+         if (pctxt->mode == EXR_CONTEXT_WRITE)
+             return pctxt->standard_error (pctxt, EXR_ERR_HEADER_NOT_WRITTEN);
+         return pctxt->standard_error (pctxt, EXR_ERR_NOT_OPEN_WRITE);
+     }
+ 
+     if (part->storage_mode == EXR_STORAGE_SCANLINE ||
+         part->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+     {
+         return pctxt->standard_error (pctxt, EXR_ERR_TILE_SCAN_MIXEDAPI);
+     }
+ 
+     if (pctxt->cur_output_part != part_index)
+         return pctxt->standard_error (pctxt, EXR_ERR_INCORRECT_PART);
+ 
+     if (!packed_data || packed_size == 0)
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid packed data argument size %" PRIu64 " pointer %p",
+             (uint64_t) packed_size,
+             packed_data);
+ 
+     if (part->storage_mode != EXR_STORAGE_DEEP_TILED &&
+         packed_size > (uint64_t) INT32_MAX)
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Packed data size %" PRIu64 " too large (max %" PRIu64 ")",
+             (uint64_t) packed_size,
+             (uint64_t) INT32_MAX);
+     psize = (int32_t) packed_size;
+ 
+     if (part->storage_mode == EXR_STORAGE_DEEP_TILED &&
+         (!sample_data || sample_data_size == 0))
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Invalid sample count data argument size %" PRIu64 " pointer %p",
+             (uint64_t) sample_data_size,
+             sample_data);
+ 
+     cidx = -1;
+     rv   = validate_and_compute_tile_chunk_off (
+         pctxt, part, tilex, tiley, levelx, levely, &cidx);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     if (cidx < 0 || cidx >= part->chunk_count)
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Chunk index for tile (%d, %d) at level (%d, %d) %d outside chunk count %d",
+             tilex,
+             tiley,
+             levelx,
+             levely,
+             cidx,
+             part->chunk_count);
+     }
+ 
+     if (part->lineorder != EXR_LINEORDER_RANDOM_Y &&
+         pctxt->last_output_chunk != (cidx - 1))
+     {
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INCORRECT_CHUNK,
+             "Chunk index %d is not the next chunk to be written (last %d)",
+             cidx,
+             pctxt->last_output_chunk);
+     }
+ 
+     wrcnt = 0;
+     if (pctxt->is_multipart) { data[wrcnt++] = part_index; }
+     data[wrcnt++] = tilex;
+     data[wrcnt++] = tiley;
+     data[wrcnt++] = levelx;
+     data[wrcnt++] = levely;
+     if (part->storage_mode != EXR_STORAGE_DEEP_TILED) data[wrcnt++] = psize;
+ 
+     priv_from_native32 (data, wrcnt);
+ 
+     rv = alloc_chunk_table (pctxt, part, &ctable);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     ctable[cidx] = pctxt->output_file_offset;
+     rv           = pctxt->do_write (
+         pctxt,
+         data,
+         (uint64_t) (wrcnt) * sizeof (int32_t),
+         &(pctxt->output_file_offset));
+     if (rv == EXR_ERR_SUCCESS && part->storage_mode == EXR_STORAGE_DEEP_TILED)
+     {
+         int64_t ddata[3];
+         ddata[0] = (int64_t) sample_data_size;
+         ddata[1] = (int64_t) packed_size;
+         ddata[2] = (int64_t) unpacked_size;
+         rv       = pctxt->do_write (
+             pctxt, ddata, 3 * sizeof (uint64_t), &(pctxt->output_file_offset));
+ 
+         if (rv == EXR_ERR_SUCCESS)
+             rv = pctxt->do_write (
+                 pctxt,
+                 sample_data,
+                 sample_data_size,
+                 &(pctxt->output_file_offset));
+     }
+     if (rv == EXR_ERR_SUCCESS)
+         rv = pctxt->do_write (
+             pctxt, packed_data, packed_size, &(pctxt->output_file_offset));
+ 
+     if (rv == EXR_ERR_SUCCESS)
+     {
+         ++(pctxt->output_chunk_count);
+         if (pctxt->output_chunk_count == part->chunk_count)
+         {
+             uint64_t chunkoff = part->chunk_table_offset;
+ 
+             ++(pctxt->cur_output_part);
+             if (pctxt->cur_output_part == pctxt->num_parts)
+                 pctxt->mode = EXR_CONTEXT_WRITE_FINISHED;
+             pctxt->last_output_chunk  = -1;
+             pctxt->output_chunk_count = 0;
+ 
+             priv_from_native64 (ctable, part->chunk_count);
+             rv = pctxt->do_write (
+                 pctxt,
+                 ctable,
+                 sizeof (uint64_t) * (uint64_t) (part->chunk_count),
+                 &chunkoff);
+             /* just in case we look at it again? */
+             priv_to_native64 (ctable, part->chunk_count);
+         }
+-        else
+-        {
+-            pctxt->last_output_chunk = cidx;
+-        }
++        else { pctxt->last_output_chunk = cidx; }
+     }
+ 
+     return rv;
+ }
+ 
+ /**************************************/
+diff --git a/src/lib/OpenEXRCore/coding.c b/src/lib/OpenEXRCore/coding.c
+index 96a97edf..104e5669 100644
+--- a/src/lib/OpenEXRCore/coding.c
++++ b/src/lib/OpenEXRCore/coding.c
+@@ -1,9 +1,10 @@
+ /*
+ ** SPDX-License-Identifier: BSD-3-Clause
+ ** Copyright Contributors to the OpenEXR Project.
+ */
+ 
+ #include "internal_coding.h"
++#include "internal_util.h"
+ 
+ #include <string.h>
+ 
+@@ -11,68 +12,60 @@ exr_result_t
+ internal_coding_fill_channel_info (
+     exr_coding_channel_info_t**         channels,
+     int16_t*                            num_chans,
+     exr_coding_channel_info_t*          builtinextras,
+     const exr_chunk_info_t*             cinfo,
+     const struct _internal_exr_context* pctxt,
+     const struct _internal_exr_part*    part)
+ {
+     int                        chans;
+     exr_attr_chlist_t*         chanlist;
+     exr_coding_channel_info_t* chanfill;
+ 
+     chanlist = part->channels->chlist;
+     chans    = chanlist->num_channels;
+     if (chans <= 5) { chanfill = builtinextras; }
+     else
+     {
+         chanfill = pctxt->alloc_fn (
+             (size_t) (chans) * sizeof (exr_coding_channel_info_t));
+         if (chanfill == NULL)
+             return pctxt->standard_error (pctxt, EXR_ERR_OUT_OF_MEMORY);
+         memset (
+             chanfill, 0, (size_t) (chans) * sizeof (exr_coding_channel_info_t));
+     }
+ 
+     for (int c = 0; c < chans; ++c)
+     {
+         const exr_attr_chlist_entry_t* curc = (chanlist->entries + c);
+         exr_coding_channel_info_t*     decc = (chanfill + c);
+ 
+         decc->channel_name = curc->name.str;
+ 
+-        if (curc->y_sampling > 1)
+-        {
+-            if (cinfo->height == 1)
+-                decc->height = ((cinfo->start_y % curc->y_sampling) == 0) ? 1
+-                                                                          : 0;
+-            else
+-                decc->height = cinfo->height / curc->y_sampling;
+-        }
+-        else
+-            decc->height = cinfo->height;
++        decc->height = compute_sampled_lines (
++            cinfo->height, curc->y_sampling, cinfo->start_y);
+ 
+         if (curc->x_sampling > 1)
+             decc->width = cinfo->width / curc->x_sampling;
+         else
+             decc->width = cinfo->width;
+ 
+         decc->x_samples         = curc->x_sampling;
+         decc->y_samples         = curc->y_sampling;
+         decc->p_linear          = curc->p_linear;
+         decc->bytes_per_element = (curc->pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+         decc->data_type         = (uint16_t) (curc->pixel_type);
+ 
+         /* initialize these so they don't trip us up during decoding
+          * when the user also chooses to skip a channel */
+         decc->user_bytes_per_element = decc->bytes_per_element;
+         decc->user_data_type         = decc->data_type;
+         /* but leave the rest as zero for the user to fill in */
+     }
+ 
+     *channels  = chanfill;
+     *num_chans = (int16_t) chans;
+ 
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+@@ -81,55 +74,47 @@ exr_result_t
+ internal_coding_update_channel_info (
+     exr_coding_channel_info_t*          channels,
+     int16_t                             num_chans,
+     const exr_chunk_info_t*             cinfo,
+     const struct _internal_exr_context* pctxt,
+     const struct _internal_exr_part*    part)
+ {
+     int                chans;
+     exr_attr_chlist_t* chanlist;
+ 
+     chanlist = part->channels->chlist;
+     chans    = chanlist->num_channels;
+ 
+     if (num_chans != chans)
+         return pctxt->print_error (
+             pctxt,
+             EXR_ERR_INVALID_ARGUMENT,
+             "Mismatch in channel counts: stored %d, incoming %d",
+             num_chans,
+             chans);
+ 
+     for (int c = 0; c < chans; ++c)
+     {
+         const exr_attr_chlist_entry_t* curc = (chanlist->entries + c);
+         exr_coding_channel_info_t*     ccic = (channels + c);
+ 
+         ccic->channel_name = curc->name.str;
+ 
+-        if (curc->y_sampling > 1)
+-        {
+-            if (cinfo->height == 1)
+-                ccic->height = ((cinfo->start_y % curc->y_sampling) == 0) ? 1
+-                                                                          : 0;
+-            else
+-                ccic->height = cinfo->height / curc->y_sampling;
+-        }
+-        else
+-            ccic->height = cinfo->height;
++        ccic->height = compute_sampled_lines (
++            cinfo->height, curc->y_sampling, cinfo->start_y);
+ 
+         if (curc->x_sampling > 1)
+             ccic->width = cinfo->width / curc->x_sampling;
+         else
+             ccic->width = cinfo->width;
+         ccic->x_samples = curc->x_sampling;
+         ccic->y_samples = curc->y_sampling;
+ 
+         ccic->p_linear          = curc->p_linear;
+         ccic->bytes_per_element = (curc->pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+         ccic->data_type         = (uint16_t) (curc->pixel_type);
+     }
+ 
+     return EXR_ERR_SUCCESS;
+ }
+ 
+ /**************************************/
+diff --git a/src/lib/OpenEXRCore/internal_b44.c b/src/lib/OpenEXRCore/internal_b44.c
+index 16400a00..ce4b43af 100644
+--- a/src/lib/OpenEXRCore/internal_b44.c
++++ b/src/lib/OpenEXRCore/internal_b44.c
+@@ -302,158 +302,155 @@ static exr_result_t
+ compress_b44_impl (exr_encode_pipeline_t* encode, int flat_field)
+ {
+     uint8_t*       out  = encode->compressed_buffer;
+     uint64_t       nOut = 0;
+     uint8_t *      scratch, *tmp;
+     const uint8_t* packed;
+     int            nx, ny, wcount;
+     uint64_t       bpl, nBytes;
+     exr_result_t   rv;
+ 
+     rv = internal_encode_alloc_buffer (
+         encode,
+         EXR_TRANSCODE_BUFFER_SCRATCH1,
+         &(encode->scratch_buffer_1),
+         &(encode->scratch_alloc_size_1),
+         encode->packed_bytes);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     nOut   = 0;
+     packed = encode->packed_buffer;
+     for (int y = 0; y < encode->chunk.height; ++y)
+     {
+         int cury = y + encode->chunk.start_y;
+ 
+         scratch = encode->scratch_buffer_1;
+         for (int c = 0; c < encode->channel_count; ++c)
+         {
+             const exr_coding_channel_info_t* curc = encode->channels + c;
+ 
+             nx     = curc->width;
+             ny     = curc->height;
+             bpl    = ((uint64_t) (nx)) * (uint64_t) (curc->bytes_per_element);
+             nBytes = ((uint64_t) (ny)) * bpl;
+ 
+             if (nBytes == 0) continue;
+ 
+             tmp = scratch;
+             if (curc->y_samples > 1)
+             {
+                 if ((cury % curc->y_samples) != 0)
+                 {
+                     scratch += nBytes;
+                     continue;
+                 }
+                 tmp += ((uint64_t) (y / curc->y_samples)) * bpl;
+             }
+-            else
+-            {
+-                tmp += ((uint64_t) y) * bpl;
+-            }
++            else { tmp += ((uint64_t) y) * bpl; }
+ 
+             memcpy (tmp, packed, bpl);
+             if (curc->data_type == EXR_PIXEL_HALF) priv_to_native16 (tmp, nx);
+             packed += bpl;
+             scratch += nBytes;
+         }
+     }
+ 
+     nOut    = 0;
+     scratch = encode->scratch_buffer_1;
+     for (int c = 0; c < encode->channel_count; ++c)
+     {
+         const exr_coding_channel_info_t* curc = encode->channels + c;
+ 
+         nx     = curc->width;
+         ny     = curc->height;
+         bpl    = (uint64_t) (nx) * (uint64_t) (curc->bytes_per_element);
+         nBytes = ((uint64_t) (ny)) * bpl;
+ 
+         if (nBytes == 0) continue;
+ 
+         if (curc->data_type != EXR_PIXEL_HALF)
+         {
+             if (nOut + nBytes > encode->compressed_alloc_size)
+                 return EXR_ERR_OUT_OF_MEMORY;
+             memcpy (out, scratch, nBytes);
+             out += nBytes;
+             scratch += nBytes;
+             nOut += nBytes;
+             continue;
+         }
+ 
+         for (int y = 0; y < ny; y += 4)
+         {
+             //
+             // Copy the next 4x4 pixel block into array s.
+             // If the width, cd.nx, or the height, cd.ny, of
+             // the pixel data in _tmpBuffer is not divisible
+             // by 4, then pad the data by repeating the
+             // rightmost column and the bottom row.
+             //
+ 
+             uint16_t* row0 = (uint16_t*) scratch;
+             row0 += y * nx;
+             uint16_t* row1 = row0 + nx;
+             uint16_t* row2 = row1 + nx;
+             uint16_t* row3 = row2 + nx;
+ 
+             if (y + 3 >= ny)
+             {
+                 if (y + 1 >= ny) row1 = row0;
+                 if (y + 2 >= ny) row2 = row1;
+ 
+                 row3 = row2;
+             }
+ 
+             for (int x = 0; x < nx; x += 4)
+             {
+                 uint16_t s[16];
+ 
+                 if (x + 3 >= nx)
+                 {
+                     int n = nx - x;
+ 
+                     for (int i = 0; i < 4; ++i)
+                     {
+                         int j = i;
+                         if (j > n - 1) j = n - 1;
+ 
+                         s[i + 0]  = row0[j];
+                         s[i + 4]  = row1[j];
+                         s[i + 8]  = row2[j];
+                         s[i + 12] = row3[j];
+                     }
+                 }
+                 else
+                 {
+                     memcpy (&s[0], row0, 4 * sizeof (uint16_t));
+                     memcpy (&s[4], row1, 4 * sizeof (uint16_t));
+                     memcpy (&s[8], row2, 4 * sizeof (uint16_t));
+                     memcpy (&s[12], row3, 4 * sizeof (uint16_t));
+                 }
+ 
+                 row0 += 4;
+                 row1 += 4;
+                 row2 += 4;
+                 row3 += 4;
+ 
+                 //
+                 // Compress the contents of array s and append the
+                 // results to the output buffer.
+                 //
+ 
+                 if (curc->p_linear) convertFromLinear (s);
+ 
+                 wcount = pack (s, out, flat_field, !(curc->p_linear));
+                 out += wcount;
+                 nOut += (uint64_t) wcount;
+                 if (nOut + 14 > encode->compressed_alloc_size)
+                     return EXR_ERR_OUT_OF_MEMORY;
+             }
+         }
+         scratch += nBytes;
+     }
+ 
+     encode->compressed_bytes = nOut;
+     return rv;
+ }
+@@ -607,27 +604,57 @@ uncompress_b44_impl (
+     return EXR_ERR_SUCCESS;
+ }
+ 
++/**************************************/
++
++static uint64_t
++compute_scratch_buffer_size (
++    exr_decode_pipeline_t* decode, uint64_t uncompressed_size)
++{
++    const exr_coding_channel_info_t* curc;
++    int                              nx, ny;
++    uint64_t                         ret  = uncompressed_size;
++    uint64_t                         comp = 0;
++
++    for (int c = 0; c < decode->channel_count; ++c)
++    {
++        curc = decode->channels + c;
++
++        nx = curc->width;
++        ny = curc->height;
++
++        if (nx % 4) nx += 4 - nx % 4;
++        if (ny % 4) ny += 4 - ny % 4;
++
++        comp += (uint64_t) (ny) * (uint64_t) (nx) *
++                (uint64_t) (curc->bytes_per_element);
++    }
++    if (comp > ret) ret = comp;
++    return ret;
++}
++
++/**************************************/
++
+ exr_result_t
+ internal_exr_undo_b44 (
+     exr_decode_pipeline_t* decode,
+     const void*            compressed_data,
+     uint64_t               comp_buf_size,
+     void*                  uncompressed_data,
+     uint64_t               uncompressed_size)
+ {
+     exr_result_t rv;
+     rv = internal_decode_alloc_buffer (
+         decode,
+         EXR_TRANSCODE_BUFFER_SCRATCH1,
+         &(decode->scratch_buffer_1),
+         &(decode->scratch_alloc_size_1),
+-        uncompressed_size);
++        compute_scratch_buffer_size (decode, uncompressed_size));
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     return uncompress_b44_impl (
+         decode,
+         compressed_data,
+         comp_buf_size,
+         uncompressed_data,
+         uncompressed_size);
+ }
+@@ -636,23 +663,23 @@ exr_result_t
+ internal_exr_undo_b44a (
+     exr_decode_pipeline_t* decode,
+     const void*            compressed_data,
+     uint64_t               comp_buf_size,
+     void*                  uncompressed_data,
+     uint64_t               uncompressed_size)
+ {
+     exr_result_t rv;
+     rv = internal_decode_alloc_buffer (
+         decode,
+         EXR_TRANSCODE_BUFFER_SCRATCH1,
+         &(decode->scratch_buffer_1),
+         &(decode->scratch_alloc_size_1),
+-        uncompressed_size);
++        compute_scratch_buffer_size (decode, uncompressed_size));
+     if (rv != EXR_ERR_SUCCESS) return rv;
+ 
+     return uncompress_b44_impl (
+         decode,
+         compressed_data,
+         comp_buf_size,
+         uncompressed_data,
+         uncompressed_size);
+ }
+diff --git a/src/lib/OpenEXRCore/internal_util.h b/src/lib/OpenEXRCore/internal_util.h
+new file mode 100644
+index 00000000..0e76b52f
+--- /dev/null
++++ b/src/lib/OpenEXRCore/internal_util.h
+@@ -0,0 +1,40 @@
++/*
++** SPDX-License-Identifier: BSD-3-Clause
++** Copyright Contributors to the OpenEXR Project.
++*/
++
++#include <stdint.h>
++
++static inline int
++compute_sampled_lines (int height, int y_sampling, int start_y)
++{
++    int nlines;
++
++    if (y_sampling <= 1) return height;
++
++    if (height == 1)
++        nlines = (start_y % y_sampling) == 0 ? 1 : 0;
++    else
++    {
++        int start, end;
++
++        /* computed the number of times y % ysampling == 0, by
++         * computing interval based on first and last time that occurs
++         * on the given range
++         */
++        start = start_y % y_sampling;
++        if (start != 0)
++            start = start_y + (y_sampling - start);
++        else
++            start = start_y;
++        end = start_y + height - 1;
++        end -= (end % y_sampling);
++
++        if (start > end)
++            nlines = 0;
++        else
++            nlines = (end - start) / y_sampling + 1;
++    }
++
++    return nlines;
++}
+diff --git a/src/lib/OpenEXRCore/internal_zip.c b/src/lib/OpenEXRCore/internal_zip.c
+index 7a1b4dc0..21e61579 100644
+--- a/src/lib/OpenEXRCore/internal_zip.c
++++ b/src/lib/OpenEXRCore/internal_zip.c
+@@ -153,40 +153,40 @@ static exr_result_t
+ undo_zip_impl (
+     const void* compressed_data,
+     uint64_t    comp_buf_size,
+     void*       uncompressed_data,
+     uint64_t    uncompressed_size,
+     void*       scratch_data,
+     uint64_t    scratch_size)
+ {
+-    uLong  outSize = (uLong) uncompressed_size;
++    uLong  outSize = (uLong) scratch_size;
+     int    rstat;
+ 
+     if (scratch_size < uncompressed_size) return EXR_ERR_INVALID_ARGUMENT;
+ 
+     rstat = uncompress (
+         (Bytef*) scratch_data,
+         &outSize,
+         (const Bytef*) compressed_data,
+         (uLong) comp_buf_size);
+     if (rstat == Z_OK)
+     {
+         if (outSize == uncompressed_size)
+         {
+             reconstruct (scratch_data, outSize);
+             interleave (uncompressed_data, scratch_data, outSize);
+             rstat = EXR_ERR_SUCCESS;
+         }
+         else
+         {
+             rstat = EXR_ERR_CORRUPT_CHUNK;
+         }
+     }
+     else
+     {
+         rstat = EXR_ERR_CORRUPT_CHUNK;
+     }
+ 
+     return (exr_result_t) rstat;
+ }
+ 
+ /**************************************/
+@@ -195,25 +195,29 @@ exr_result_t
+ internal_exr_undo_zip (
+     exr_decode_pipeline_t* decode,
+     const void*            compressed_data,
+     uint64_t               comp_buf_size,
+     void*                  uncompressed_data,
+     uint64_t               uncompressed_size)
+ {
+     exr_result_t rv;
++    uint64_t scratchbufsz = uncompressed_size;
++    if ( comp_buf_size > scratchbufsz )
++        scratchbufsz = comp_buf_size;
++
+     rv = internal_decode_alloc_buffer (
+         decode,
+         EXR_TRANSCODE_BUFFER_SCRATCH1,
+         &(decode->scratch_buffer_1),
+         &(decode->scratch_alloc_size_1),
+-        uncompressed_size);
++        scratchbufsz);
+     if (rv != EXR_ERR_SUCCESS) return rv;
+     return undo_zip_impl (
+         compressed_data,
+         comp_buf_size,
+         uncompressed_data,
+         uncompressed_size,
+         decode->scratch_buffer_1,
+         decode->scratch_alloc_size_1);
+ }
+ 
+ /**************************************/

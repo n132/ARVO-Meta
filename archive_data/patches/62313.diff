@@ -1,0 +1,299 @@
+commit 9e978c6cd1bf3b2692e44f246b904927b4982d03
+Author: Ali Mohammad Pur <mpfard@serenityos.org>
+Date:   Thu Sep 21 02:32:09 2023 +0330
+
+    Shell: Recognise the (seemingly) bash-specific <<\WORD heredoc key
+    
+    Bash eats the backslash in this format (similarly for W\ORD etc.).
+    Dr.POSIX doesn't specify this anywhere, but it's used all over the
+    place, so let's support it.
+
+diff --git a/Userland/Shell/PosixLexer.cpp b/Userland/Shell/PosixLexer.cpp
+index 848d9e891b..a9ccbcbb58 100644
+--- a/Userland/Shell/PosixLexer.cpp
++++ b/Userland/Shell/PosixLexer.cpp
+@@ -128,84 +128,85 @@ ErrorOr<Lexer::ReductionResult> Lexer::reduce_end()
+ Lexer::HeredocKeyResult Lexer::process_heredoc_key(Token const& token)
+ {
+     StringBuilder builder;
+     enum ParseState {
+         Free,
+         InDoubleQuotes,
+         InSingleQuotes,
+     };
+     Vector<ParseState, 4> parse_state;
+     parse_state.append(Free);
+     bool escaped = false;
+     bool had_a_single_quote_segment = false;
+ 
+     for (auto byte : token.value.bytes()) {
+         switch (parse_state.last()) {
+         case Free:
+             switch (byte) {
+             case '"':
+                 if (escaped) {
+                     builder.append(byte);
+                     escaped = false;
+                 } else {
+                     parse_state.append(InDoubleQuotes);
+                 }
+                 break;
+             case '\'':
+                 if (escaped) {
+                     builder.append(byte);
+                     escaped = false;
+                 } else {
+                     had_a_single_quote_segment = true;
+                     parse_state.append(InSingleQuotes);
+                 }
+                 break;
+             case '\\':
+                 if (escaped) {
+                     builder.append(byte);
+                     escaped = false;
+                 } else {
+                     escaped = true;
+                 }
+                 break;
+             default:
+-                if (escaped) {
++                // NOTE: bash eats the backslash outside quotes :shrug:
++                if (escaped && parse_state.last() != Free) {
+                     builder.append('\\');
+                     escaped = false;
+                 }
+                 builder.append(byte);
+                 break;
+             }
+             break;
+         case InDoubleQuotes:
+             if (!escaped && byte == '"') {
+                 parse_state.take_last();
+                 break;
+             }
+             if (escaped) {
+                 if (byte != '"')
+                     builder.append('\\');
+                 builder.append(byte);
+                 break;
+             }
+             if (byte == '\\')
+                 escaped = true;
+             else
+                 builder.append(byte);
+             break;
+         case InSingleQuotes:
+             if (byte == '\'') {
+                 parse_state.take_last();
+                 break;
+             }
+             builder.append(byte);
+             break;
+         }
+     }
+ 
+     // NOTE: Not checking the final state as any garbage that even partially parses is allowed to be used as a key :/
+ 
+     return {
+         .key = builder.to_string().release_value_but_fixme_should_propagate_errors(),
+         .allow_interpolation = !had_a_single_quote_segment,
+     };
+ }
+@@ -528,195 +529,197 @@ ErrorOr<Lexer::ReductionResult> Lexer::reduce_heredoc_contents()
+ ErrorOr<Lexer::ReductionResult> Lexer::reduce_start()
+ {
+     auto was_on_new_line = m_state.on_new_line;
+     m_state.on_new_line = false;
+ 
+     if (m_lexer.is_eof()) {
+         auto tokens = TRY(Token::maybe_from_state(m_state));
+         m_state.buffer.clear();
+         m_state.expansions.clear();
+         m_state.position.start_offset = m_state.position.end_offset;
+         m_state.position.start_line = m_state.position.end_line;
+ 
+         return ReductionResult {
+             .tokens = move(tokens),
+             .next_reduction = Reduction::End,
+         };
+     }
+ 
+     if (was_on_new_line && !m_state.heredoc_entries.is_empty()) {
+         auto const& entry = m_state.heredoc_entries.first();
+ 
+         auto start_index = m_lexer.tell();
+         Optional<size_t> end_index;
+ 
+         for (; !m_lexer.is_eof();) {
+             auto index = m_lexer.tell();
+             auto possible_end_index = m_lexer.tell();
+             if (m_lexer.consume_specific('\n')) {
+                 if (entry.dedent)
+                     m_lexer.ignore_while(is_any_of("\t"sv));
+                 if (m_lexer.consume_specific(entry.key.bytes_as_string_view())) {
+                     if (m_lexer.consume_specific('\n') || m_lexer.is_eof()) {
+                         end_index = possible_end_index;
+                         break;
+                     }
+                 }
+             }
+             if (m_lexer.tell() == index)
+                 m_lexer.ignore();
+         }
+ 
+         auto contents = m_lexer.input().substring_view(start_index, end_index.value_or(m_lexer.tell()) - start_index);
+         reconsume(contents);
++        if (end_index.has_value())
++            reconsume(m_lexer.input().substring_view_starting_after_substring(contents).substring_view(0, m_lexer.tell() - *end_index));
+ 
+         m_state.buffer.clear();
+         m_state.buffer.append(contents);
+ 
+         auto token = TRY(Token::maybe_from_state(m_state)).first();
+         token.relevant_heredoc_key = entry.key;
+         token.type = Token::Type::HeredocContents;
+ 
+         m_state.heredoc_entries.take_first();
+ 
+         m_state.on_new_line = true;
+ 
+         m_state.buffer.clear();
+         m_state.position.start_offset = m_state.position.end_offset;
+         m_state.position.start_line = m_state.position.end_line;
+ 
+         Vector<Token> tokens { move(token), Token::newline() };
+ 
+         return ReductionResult {
+             .tokens = move(tokens),
+             .next_reduction = Reduction::Start,
+         };
+     }
+ 
+     if (m_state.escaping && consume_specific('\n')) {
+         m_state.escaping = false;
+ 
+         auto buffer = m_state.buffer.to_deprecated_string().substring(0, m_state.buffer.length() - 1);
+         m_state.buffer.clear();
+         m_state.buffer.append(buffer);
+ 
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::Start,
+         };
+     }
+ 
+     if (!m_state.escaping && m_lexer.peek() == '#' && m_state.buffer.is_empty()) {
+         consume();
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::Comment,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('\n')) {
+         auto tokens = TRY(Token::maybe_from_state(m_state));
+         tokens.append(Token::newline());
+ 
+         m_state.on_new_line = true;
+ 
+         m_state.buffer.clear();
+         m_state.expansions.clear();
+         m_state.position.start_offset = m_state.position.end_offset;
+         m_state.position.start_line = m_state.position.end_line;
+ 
+         return ReductionResult {
+             .tokens = move(tokens),
+             .next_reduction = Reduction::Start,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('\\')) {
+         m_state.escaping = true;
+         m_state.buffer.append('\\');
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::Start,
+         };
+     }
+ 
+     if (!m_state.escaping && is_part_of_operator(""sv, m_lexer.peek())) {
+         auto tokens = TRY(Token::maybe_from_state(m_state));
+         m_state.buffer.clear();
+         m_state.buffer.append(consume());
+         m_state.expansions.clear();
+         m_state.position.start_offset = m_state.position.end_offset;
+         m_state.position.start_line = m_state.position.end_line;
+ 
+         return ReductionResult {
+             .tokens = move(tokens),
+             .next_reduction = Reduction::Operator,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('\'')) {
+         m_state.buffer.append('\'');
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::SingleQuotedString,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('"')) {
+         m_state.buffer.append('"');
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::DoubleQuotedString,
+         };
+     }
+ 
+     if (!m_state.escaping && is_ascii_space(m_lexer.peek())) {
+         consume();
+         auto tokens = TRY(Token::maybe_from_state(m_state));
+         m_state.buffer.clear();
+         m_state.expansions.clear();
+         m_state.position.start_offset = m_state.position.end_offset;
+         m_state.position.start_line = m_state.position.end_line;
+ 
+         return ReductionResult {
+             .tokens = move(tokens),
+             .next_reduction = Reduction::Start,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('$')) {
+         m_state.buffer.append('$');
+         if (m_lexer.next_is("("))
+             m_state.expansions.empend(CommandExpansion { .command = StringBuilder {}, .range = range(-1) });
+         else
+             m_state.expansions.empend(ParameterExpansion { .parameter = StringBuilder {}, .range = range(-1) });
+ 
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::Expansion,
+         };
+     }
+ 
+     if (!m_state.escaping && consume_specific('`')) {
+         m_state.buffer.append('`');
+         m_state.expansions.empend(CommandExpansion { .command = StringBuilder {}, .range = range(-1) });
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::CommandExpansion,
+         };
+     }
+ 
+     if (!m_state.escaping && is_any_of("})"sv)(m_lexer.peek())) {
+         // That's an eof for us.
+         return ReductionResult {
+             .tokens = {},
+             .next_reduction = Reduction::None,
+         };
+     }
+ 
+     m_state.escaping = false;
+     m_state.buffer.append(consume());
+     return ReductionResult {
+         .tokens = {},
+         .next_reduction = Reduction::Start,
+     };
+ }

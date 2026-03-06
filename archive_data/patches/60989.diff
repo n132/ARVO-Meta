@@ -1,0 +1,313 @@
+commit 0340adeb9e5cf73e702f81d5b79e72a4fc31d45c
+Author: James Price <jrprice@google.com>
+Date:   Thu Aug 3 14:52:16 2023 +0000
+
+    [spirv-reader] Fix crash for unreachable OpPhi
+    
+    Only try to determine the enclosing scope for an OpPhi if its used.
+    
+    Bug: oss-fuzz:60989
+    Change-Id: I44e912027787f4fc7a08d395c8cea5babdff5aa6
+    Reviewed-on: https://dawn-review.googlesource.com/c/dawn/+/144480
+    Reviewed-by: David Neto <dneto@google.com>
+    Kokoro: Kokoro <noreply+kokoro@google.com>
+    Auto-Submit: James Price <jrprice@google.com>
+    Commit-Queue: David Neto <dneto@google.com>
+
+diff --git a/src/tint/lang/spirv/reader/ast_parser/function.cc b/src/tint/lang/spirv/reader/ast_parser/function.cc
+index 60e9967ade..e7a6f53fd8 100644
+--- a/src/tint/lang/spirv/reader/ast_parser/function.cc
++++ b/src/tint/lang/spirv/reader/ast_parser/function.cc
+@@ -4948,203 +4948,206 @@ const Type* FunctionEmitter::RemapPointerProperties(const Type* type, uint32_t r
+ void FunctionEmitter::FindValuesNeedingNamedOrHoistedDefinition() {
+     // Mark vector operands of OpVectorShuffle as needing a named definition,
+     // but only if they are defined in this function as well.
+     auto require_named_const_def = [&](const spvtools::opt::Instruction& inst,
+                                        int in_operand_index) {
+         const auto id = inst.GetSingleWordInOperand(static_cast<uint32_t>(in_operand_index));
+         auto* const operand_def = GetDefInfo(id);
+         if (operand_def) {
+             operand_def->requires_named_let_def = true;
+         }
+     };
+     for (auto& id_def_info_pair : def_info_) {
+         const auto& inst = id_def_info_pair.second->inst;
+         const auto op = opcode(inst);
+         if ((op == spv::Op::OpVectorShuffle) || (op == spv::Op::OpOuterProduct)) {
+             // We might access the vector operands multiple times. Make sure they
+             // are evaluated only once.
+             require_named_const_def(inst, 0);
+             require_named_const_def(inst, 1);
+         }
+         if (parser_impl_.IsGlslExtendedInstruction(inst)) {
+             // Some emulations of GLSLstd450 instructions evaluate certain operands
+             // multiple times. Ensure their expressions are evaluated only once.
+             switch (inst.GetSingleWordInOperand(1)) {
+                 case GLSLstd450FaceForward:
+                     // The "normal" operand expression is used twice in code generation.
+                     require_named_const_def(inst, 2);
+                     break;
+                 case GLSLstd450Reflect:
+                     require_named_const_def(inst, 2);  // Incident
+                     require_named_const_def(inst, 3);  // Normal
+                     break;
+                 default:
+                     break;
+             }
+         }
+     }
+ 
+     // Scan uses of locally defined IDs, finding their first and last uses, in
+     // block order.
+ 
+     // Updates the span of block positions that this value is used in.
+     // Ignores values defined outside this function.
+     auto record_value_use = [this](uint32_t id, const BlockInfo* block_info) {
+         if (auto* def_info = GetDefInfo(id)) {
+             if (def_info->local.has_value()) {
+                 auto& local_def = def_info->local.value();
+                 // Update usage count.
+                 local_def.num_uses++;
+                 // Update usage span.
+                 local_def.first_use_pos = std::min(local_def.first_use_pos, block_info->pos);
+                 local_def.last_use_pos = std::max(local_def.last_use_pos, block_info->pos);
+ 
+                 // Determine whether this ID is defined in a different construct
+                 // from this use.
+                 const auto defining_block = block_order_[local_def.block_pos];
+                 const auto* def_in_construct = GetBlockInfo(defining_block)->construct;
+                 if (def_in_construct != block_info->construct) {
+                     local_def.used_in_another_construct = true;
+                 }
+             }
+         }
+     };
+     for (auto block_id : block_order_) {
+         const auto* block_info = GetBlockInfo(block_id);
+         for (const auto& inst : *(block_info->basic_block)) {
+             // Update bookkeeping for locally-defined IDs used by this instruction.
+             if (opcode(inst) == spv::Op::OpPhi) {
+                 // For an OpPhi defining value P, an incoming value V from parent block B is
+                 // counted as being "used" at block B, not at the block containing the Phi.
+                 // That's because we will create a variable PHI_P to hold the phi value, and
+                 // in the code generated for block B, create assignment `PHI_P = V`.
+                 // To make the WGSL scopes work, both P and V are counted as being "used"
+                 // in the parent block B.
+ 
+                 const auto phi_id = inst.result_id();
+                 auto& phi_local_def = GetDefInfo(phi_id)->local.value();
+                 phi_local_def.is_phi = true;
+ 
+                 // Track all the places where we need to mention the variable,
+                 // so we can place its declaration.  First, record the location of
+                 // the read from the variable.
+                 // Record the assignments that will propagate values from predecessor
+                 // blocks.
+                 for (uint32_t i = 0; i + 1 < inst.NumInOperands(); i += 2) {
+                     const uint32_t incoming_value_id = inst.GetSingleWordInOperand(i);
+                     const uint32_t pred_block_id = inst.GetSingleWordInOperand(i + 1);
+                     auto* pred_block_info = GetBlockInfo(pred_block_id);
+                     // The predecessor might not be in the block order at all, so we
+                     // need this guard.
+                     if (IsInBlockOrder(pred_block_info)) {
+                         // Track where the incoming value needs to be in scope.
+                         record_value_use(incoming_value_id, block_info);
+ 
+                         // Track where P needs to be in scope.  It's not an ordinary use, so don't
+                         // count it as one.
+                         const auto pred_pos = pred_block_info->pos;
+                         phi_local_def.first_use_pos =
+                             std::min(phi_local_def.first_use_pos, pred_pos);
+                         phi_local_def.last_use_pos = std::max(phi_local_def.last_use_pos, pred_pos);
+ 
+                         // Record the assignment that needs to occur at the end
+                         // of the predecessor block.
+                         pred_block_info->phi_assignments.Push({phi_id, incoming_value_id});
+                     }
+                 }
+ 
+-                // Schedule the declaration of the state variable.
+-                const auto* enclosing_construct =
+-                    GetEnclosingScope(phi_local_def.first_use_pos, phi_local_def.last_use_pos);
+-                GetBlockInfo(enclosing_construct->begin_id)->phis_needing_state_vars.Push(phi_id);
++                if (phi_local_def.first_use_pos < std::numeric_limits<uint32_t>::max()) {
++                    // Schedule the declaration of the state variable.
++                    const auto* enclosing_construct =
++                        GetEnclosingScope(phi_local_def.first_use_pos, phi_local_def.last_use_pos);
++                    GetBlockInfo(enclosing_construct->begin_id)
++                        ->phis_needing_state_vars.Push(phi_id);
++                }
+             } else {
+                 inst.ForEachInId([block_info, &record_value_use](const uint32_t* id_ptr) {
+                     record_value_use(*id_ptr, block_info);
+                 });
+             }
+         }
+     }
+ 
+     // For an ID defined in this function, determine if its evaluation and
+     // potential declaration needs special handling:
+     // - Compensate for the fact that dominance does not map directly to scope.
+     //   A definition could dominate its use, but a named definition in WGSL
+     //   at the location of the definition could go out of scope by the time
+     //   you reach the use.  In that case, we hoist the definition to a basic
+     //   block at the smallest scope enclosing both the definition and all
+     //   its uses.
+     // - If value is used in a different construct than its definition, then it
+     //   needs a named constant definition.  Otherwise we might sink an
+     //   expensive computation into control flow, and hence change performance.
+     for (auto& id_def_info_pair : def_info_) {
+         const auto def_id = id_def_info_pair.first;
+         auto* def_info = id_def_info_pair.second.get();
+         if (!def_info->local.has_value()) {
+             // Never hoist a variable declared at module scope.
+             // This occurs for builtin variables, which are mapped to module-scope
+             // private variables.
+             continue;
+         }
+         if (def_info->skip == SkipReason::kOpaqueObject) {
+             // Intermediate values are never emitted for opaque objects. So they
+             // need neither hoisted let or var declarations.
+             continue;
+         }
+         auto& local_def = def_info->local.value();
+ 
+         if (local_def.num_uses == 0) {
+             // There is no need to adjust the location of the declaration.
+             continue;
+         }
+ 
+         const auto* def_in_construct = GetBlockInfo(block_order_[local_def.block_pos])->construct;
+         // A definition in the first block of an kIfSelection or kSwitchSelection
+         // occurs before the branch, and so that definition should count as
+         // having been defined at the scope of the parent construct.
+         if (local_def.block_pos == def_in_construct->begin_pos) {
+             if ((def_in_construct->kind == Construct::kIfSelection) ||
+                 (def_in_construct->kind == Construct::kSwitchSelection)) {
+                 def_in_construct = def_in_construct->parent;
+             }
+         }
+ 
+         // We care about the earliest between the place of definition, and the first
+         // use of the value.
+         const auto first_pos = std::min(local_def.block_pos, local_def.first_use_pos);
+         const auto last_use_pos = local_def.last_use_pos;
+ 
+         bool should_hoist_to_let = false;
+         bool should_hoist_to_var = false;
+         if (local_def.is_phi) {
+             // We need to generate a variable, and assignments to that variable in
+             // all the phi parent blocks.
+             should_hoist_to_var = true;
+         } else if (!def_in_construct->ContainsPos(first_pos) ||
+                    !def_in_construct->ContainsPos(last_use_pos)) {
+             // To satisfy scoping, we have to hoist the definition out to an enclosing
+             // construct.
+             should_hoist_to_var = true;
+         } else {
+             // Avoid moving combinatorial values across constructs.  This is a
+             // simple heuristic to avoid changing the cost of an operation
+             // by moving it into or out of a loop, for example.
+             if ((def_info->pointer.address_space == builtin::AddressSpace::kUndefined) &&
+                 local_def.used_in_another_construct) {
+                 should_hoist_to_let = true;
+             }
+         }
+ 
+         if (should_hoist_to_var || should_hoist_to_let) {
+             const auto* enclosing_construct = GetEnclosingScope(first_pos, last_use_pos);
+             if (should_hoist_to_let && (enclosing_construct == def_in_construct)) {
+                 // We can use a plain 'let' declaration.
+                 def_info->requires_named_let_def = true;
+             } else {
+                 // We need to make a hoisted variable definition.
+                 // TODO(dneto): Handle non-storable types, particularly pointers.
+                 def_info->requires_hoisted_var_def = true;
+                 auto* hoist_to_block = GetBlockInfo(enclosing_construct->begin_id);
+                 hoist_to_block->hoisted_ids.Push(def_id);
+             }
+         }
+     }
+ }
+diff --git a/src/tint/lang/spirv/reader/ast_parser/function_var_test.cc b/src/tint/lang/spirv/reader/ast_parser/function_var_test.cc
+index 6b6d1cb9c0..9dee822976 100644
+--- a/src/tint/lang/spirv/reader/ast_parser/function_var_test.cc
++++ b/src/tint/lang/spirv/reader/ast_parser/function_var_test.cc
+@@ -1836,45 +1836,77 @@ return;
+ TEST_F(SpvParserFunctionVarTest, DISABLED_EmitStatement_Hoist_UsedAsPtrArg) {
+     // Spawned from crbug.com/tint/804
+     // Blocked by crbug.com/tint/98: hoisting pointer types
+     const auto assembly = Preamble() + R"(
+ 
+     %fn_int = OpTypeFunction %void %ptr_int
+ 
+     %500 = OpFunction %void None %fn_int
+     %501 = OpFunctionParameter %ptr_int
+     %502 = OpLabel
+     OpReturn
+     OpFunctionEnd
+ 
+     %100 = OpFunction %void None %voidfn
+ 
+     %10 = OpLabel
+     %199 = OpVariable %ptr_int Function
+     OpSelectionMerge %50 None
+     OpBranchConditional %true %20 %30
+ 
+       %20 = OpLabel
+       %200 = OpCopyObject %ptr_int %199
+       OpBranch %50
+ 
+       %30 = OpLabel
+       OpReturn
+ 
+     %50 = OpLabel   ; dominated by %20, but %200 needs to be hoisted
+     %201 = OpFunctionCall %void %500 %200
+     OpReturn
+     OpFunctionEnd
+ )";
+     auto p = parser(test::Assemble(assembly));
+     ASSERT_TRUE(p->BuildAndParseInternalModule()) << p->error() << assembly;
+     auto fe = p->function_emitter(100);
+     EXPECT_TRUE(fe.EmitBody()) << p->error();
+ 
+     auto ast_body = fe.ast_body();
+     const auto got = test::ToString(p->program(), ast_body);
+     const auto* expected = R"(xxxxxxxxxxxxxxxxxxxxx)";
+     EXPECT_EQ(got, expected) << got;
+ }
+ 
++TEST_F(SpvParserFunctionVarTest, EmitStatement_Phi_UnreachableLoopMerge) {
++    // A phi in an unreachable block may have no operands.
++    auto assembly = Preamble() + R"(
++%100 = OpFunction %void None %voidfn
++
++ %10 = OpLabel
++       OpBranch %99
++
++ %99 = OpLabel
++       OpLoopMerge %101 %99 None
++       OpBranch %99
++
++%101 = OpLabel
++%102 = OpPhi %uint
++       OpUnreachable
++
++OpFunctionEnd
++  )";
++    auto p = parser(test::Assemble(assembly));
++    ASSERT_TRUE(p->BuildAndParseInternalModuleExceptFunctions()) << assembly;
++    auto fe = p->function_emitter(100);
++    EXPECT_TRUE(fe.EmitBody()) << p->error();
++
++    auto ast_body = fe.ast_body();
++    auto got = test::ToString(p->program(), ast_body);
++    auto* expect = R"(loop {
++}
++return;
++)";
++    EXPECT_EQ(expect, got);
++}
++
+ }  // namespace
+ }  // namespace tint::spirv::reader

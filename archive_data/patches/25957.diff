@@ -1,0 +1,356 @@
+commit 571d48e007718321bca8adb5f100555fed0e1957
+Author: Antoine Pitrou <antoine@python.org>
+Date:   Tue Sep 29 17:56:25 2020 +0200
+
+    ARROW-10119: [C++] Fix Parquet crashes on invalid input
+    
+    Should fix the following issues (found by OSS-Fuzz):
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25901
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25933
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25955
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25957
+    - https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=25959
+    
+    Closes #8290 from pitrou/ARROW-10119-parquet-fuzz
+    
+    Authored-by: Antoine Pitrou <antoine@python.org>
+    Signed-off-by: Antoine Pitrou <antoine@python.org>
+
+diff --git a/cpp/src/parquet/arrow/schema.cc b/cpp/src/parquet/arrow/schema.cc
+index c9723e01a..16d0e1f3d 100644
+--- a/cpp/src/parquet/arrow/schema.cc
++++ b/cpp/src/parquet/arrow/schema.cc
+@@ -833,34 +833,42 @@ Status FromParquetSchema(const SchemaDescriptor* parquet_schema,
+ Status SchemaManifest::Make(const SchemaDescriptor* schema,
+                             const std::shared_ptr<const KeyValueMetadata>& metadata,
+                             const ArrowReaderProperties& properties,
+                             SchemaManifest* manifest) {
+-  RETURN_NOT_OK(
+-      GetOriginSchema(metadata, &manifest->schema_metadata, &manifest->origin_schema));
+-
+   SchemaTreeContext ctx;
+   ctx.manifest = manifest;
+   ctx.properties = properties;
+   ctx.schema = schema;
+   const GroupNode& schema_node = *schema->group_node();
+   manifest->descr = schema;
+   manifest->schema_fields.resize(schema_node.field_count());
++
++  // Try to deserialize original Arrow schema
++  RETURN_NOT_OK(
++      GetOriginSchema(metadata, &manifest->schema_metadata, &manifest->origin_schema));
++  // Ignore original schema if it's not compatible with the Parquet schema
++  if (manifest->origin_schema != nullptr &&
++      manifest->origin_schema->num_fields() != schema_node.field_count()) {
++    manifest->origin_schema = nullptr;
++  }
++
+   for (int i = 0; i < static_cast<int>(schema_node.field_count()); ++i) {
+     SchemaField* out_field = &manifest->schema_fields[i];
+     RETURN_NOT_OK(NodeToSchemaField(*schema_node.field(i), LevelInfo(), &ctx,
+                                     /*parent=*/nullptr, out_field));
+ 
+     // TODO(wesm): as follow up to ARROW-3246, we should really pass the origin
+     // schema (if any) through all functions in the schema reconstruction, but
+     // I'm being lazy and just setting dictionary fields at the top level for
+     // now
+     if (manifest->origin_schema == nullptr) {
+       continue;
+     }
++
+     auto origin_field = manifest->origin_schema->field(i);
+     RETURN_NOT_OK(ApplyOriginalMetadata(*origin_field, out_field));
+   }
+   return Status::OK();
+ }
+ 
+ }  // namespace arrow
+ }  // namespace parquet
+diff --git a/cpp/src/parquet/column_reader.cc b/cpp/src/parquet/column_reader.cc
+index 89e72ba33..44a6dcf68 100644
+--- a/cpp/src/parquet/column_reader.cc
++++ b/cpp/src/parquet/column_reader.cc
+@@ -205,75 +205,76 @@ EncodedStatistics ExtractStatsFromHeader(const H& header) {
+ // This subclass delimits pages appearing in a serialized stream, each preceded
+ // by a serialized Thrift format::PageHeader indicating the type of each page
+ // and the page metadata.
+ class SerializedPageReader : public PageReader {
+  public:
+   SerializedPageReader(std::shared_ptr<ArrowInputStream> stream, int64_t total_num_rows,
+                        Compression::type codec, ::arrow::MemoryPool* pool,
+                        const CryptoContext* crypto_ctx)
+       : stream_(std::move(stream)),
+         decompression_buffer_(AllocateBuffer(pool, 0)),
+         page_ordinal_(0),
+         seen_num_rows_(0),
+         total_num_rows_(total_num_rows),
+         decryption_buffer_(AllocateBuffer(pool, 0)) {
+     if (crypto_ctx != nullptr) {
+       crypto_ctx_ = *crypto_ctx;
+       InitDecryption();
+     }
+     max_page_header_size_ = kDefaultMaxPageHeaderSize;
+     decompressor_ = GetCodec(codec);
+   }
+ 
+   // Implement the PageReader interface
+   std::shared_ptr<Page> NextPage() override;
+ 
+   void set_max_page_header_size(uint32_t size) override { max_page_header_size_ = size; }
+ 
+  private:
+   void UpdateDecryption(const std::shared_ptr<Decryptor>& decryptor, int8_t module_type,
+                         const std::string& page_aad);
+ 
+   void InitDecryption();
+ 
+-  std::shared_ptr<Buffer> DecompressPage(int compressed_len, int uncompressed_len,
+-                                         const uint8_t* page_buffer);
++  std::shared_ptr<Buffer> DecompressIfNeeded(std::shared_ptr<Buffer> page_buffer,
++                                             int compressed_len, int uncompressed_len,
++                                             int levels_byte_len = 0);
+ 
+   std::shared_ptr<ArrowInputStream> stream_;
+ 
+   format::PageHeader current_page_header_;
+   std::shared_ptr<Page> current_page_;
+ 
+   // Compression codec to use.
+   std::unique_ptr<::arrow::util::Codec> decompressor_;
+   std::shared_ptr<ResizableBuffer> decompression_buffer_;
+ 
+   // The fields below are used for calculation of AAD (additional authenticated data)
+   // suffix which is part of the Parquet Modular Encryption.
+   // The AAD suffix for a parquet module is built internally by
+   // concatenating different parts some of which include
+   // the row group ordinal, column ordinal and page ordinal.
+   // Please refer to the encryption specification for more details:
+   // https://github.com/apache/parquet-format/blob/encryption/Encryption.md#44-additional-authenticated-data
+ 
+   // The ordinal fields in the context below are used for AAD suffix calculation.
+   CryptoContext crypto_ctx_;
+   int16_t page_ordinal_;  // page ordinal does not count the dictionary page
+ 
+   // Maximum allowed page size
+   uint32_t max_page_header_size_;
+ 
+   // Number of rows read in data pages so far
+   int64_t seen_num_rows_;
+ 
+   // Number of rows in all the data pages
+   int64_t total_num_rows_;
+ 
+   // data_page_aad_ and data_page_header_aad_ contain the AAD for data page and data page
+   // header in a single column respectively.
+   // While calculating AAD for different pages in a single column the pages AAD is
+   // updated by only the page ordinal.
+   std::string data_page_aad_;
+   std::string data_page_header_aad_;
+   // Encryption
+   std::shared_ptr<ResizableBuffer> decryption_buffer_;
+ };
+@@ -312,160 +313,173 @@ void SerializedPageReader::UpdateDecryption(const std::shared_ptr<Decryptor>& de
+ std::shared_ptr<Page> SerializedPageReader::NextPage() {
+   // Loop here because there may be unhandled page types that we skip until
+   // finding a page that we do know what to do with
+ 
+   while (seen_num_rows_ < total_num_rows_) {
+     uint32_t header_size = 0;
+     uint32_t allowed_page_size = kDefaultPageHeaderSize;
+ 
+     // Page headers can be very large because of page statistics
+     // We try to deserialize a larger buffer progressively
+     // until a maximum allowed header limit
+     while (true) {
+       PARQUET_ASSIGN_OR_THROW(auto view, stream_->Peek(allowed_page_size));
+       if (view.size() == 0) {
+         return std::shared_ptr<Page>(nullptr);
+       }
+ 
+       // This gets used, then set by DeserializeThriftMsg
+       header_size = static_cast<uint32_t>(view.size());
+       try {
+         if (crypto_ctx_.meta_decryptor != nullptr) {
+           UpdateDecryption(crypto_ctx_.meta_decryptor, encryption::kDictionaryPageHeader,
+                            data_page_header_aad_);
+         }
+         DeserializeThriftMsg(reinterpret_cast<const uint8_t*>(view.data()), &header_size,
+                              &current_page_header_, crypto_ctx_.meta_decryptor);
+         break;
+       } catch (std::exception& e) {
+         // Failed to deserialize. Double the allowed page header size and try again
+         std::stringstream ss;
+         ss << e.what();
+         allowed_page_size *= 2;
+         if (allowed_page_size > max_page_header_size_) {
+           ss << "Deserializing page header failed.\n";
+           throw ParquetException(ss.str());
+         }
+       }
+     }
+     // Advance the stream offset
+     PARQUET_THROW_NOT_OK(stream_->Advance(header_size));
+ 
+     int compressed_len = current_page_header_.compressed_page_size;
+     int uncompressed_len = current_page_header_.uncompressed_page_size;
++    if (compressed_len < 0 || uncompressed_len < 0) {
++      throw ParquetException("Invalid page header");
++    }
++
+     if (crypto_ctx_.data_decryptor != nullptr) {
+       UpdateDecryption(crypto_ctx_.data_decryptor, encryption::kDictionaryPage,
+                        data_page_aad_);
+     }
++
+     // Read the compressed data page.
+     PARQUET_ASSIGN_OR_THROW(auto page_buffer, stream_->Read(compressed_len));
+     if (page_buffer->size() != compressed_len) {
+       std::stringstream ss;
+       ss << "Page was smaller (" << page_buffer->size() << ") than expected ("
+          << compressed_len << ")";
+       ParquetException::EofException(ss.str());
+     }
+ 
+     // Decrypt it if we need to
+     if (crypto_ctx_.data_decryptor != nullptr) {
+       PARQUET_THROW_NOT_OK(decryption_buffer_->Resize(
+           compressed_len - crypto_ctx_.data_decryptor->CiphertextSizeDelta(), false));
+       compressed_len = crypto_ctx_.data_decryptor->Decrypt(
+           page_buffer->data(), compressed_len, decryption_buffer_->mutable_data());
+ 
+       page_buffer = decryption_buffer_;
+     }
+-    // Uncompress it if we need to
+-    if (decompressor_ != nullptr) {
+-      page_buffer = DecompressPage(compressed_len, uncompressed_len, page_buffer->data());
+-    }
+ 
+     const PageType::type page_type = LoadEnumSafe(&current_page_header_.type);
+ 
+     if (page_type == PageType::DICTIONARY_PAGE) {
+       crypto_ctx_.start_decrypt_with_dictionary_page = false;
+       const format::DictionaryPageHeader& dict_header =
+           current_page_header_.dictionary_page_header;
+ 
+       bool is_sorted = dict_header.__isset.is_sorted ? dict_header.is_sorted : false;
+       if (dict_header.num_values < 0) {
+         throw ParquetException("Invalid page header (negative number of values)");
+       }
+ 
++      // Uncompress if needed
++      page_buffer =
++          DecompressIfNeeded(std::move(page_buffer), compressed_len, uncompressed_len);
++
+       return std::make_shared<DictionaryPage>(page_buffer, dict_header.num_values,
+                                               LoadEnumSafe(&dict_header.encoding),
+                                               is_sorted);
+     } else if (page_type == PageType::DATA_PAGE) {
+       ++page_ordinal_;
+       const format::DataPageHeader& header = current_page_header_.data_page_header;
+ 
+       if (header.num_values < 0) {
+         throw ParquetException("Invalid page header (negative number of values)");
+       }
+       EncodedStatistics page_statistics = ExtractStatsFromHeader(header);
+       seen_num_rows_ += header.num_values;
+ 
++      // Uncompress if needed
++      page_buffer =
++          DecompressIfNeeded(std::move(page_buffer), compressed_len, uncompressed_len);
++
+       return std::make_shared<DataPageV1>(page_buffer, header.num_values,
+                                           LoadEnumSafe(&header.encoding),
+                                           LoadEnumSafe(&header.definition_level_encoding),
+                                           LoadEnumSafe(&header.repetition_level_encoding),
+                                           uncompressed_len, page_statistics);
+     } else if (page_type == PageType::DATA_PAGE_V2) {
+       ++page_ordinal_;
+       const format::DataPageHeaderV2& header = current_page_header_.data_page_header_v2;
+ 
+       if (header.num_values < 0) {
+         throw ParquetException("Invalid page header (negative number of values)");
+       }
+       if (header.definition_levels_byte_length < 0 ||
+           header.repetition_levels_byte_length < 0) {
+         throw ParquetException("Invalid page header (negative levels byte length)");
+       }
+       bool is_compressed = header.__isset.is_compressed ? header.is_compressed : false;
+       EncodedStatistics page_statistics = ExtractStatsFromHeader(header);
+       seen_num_rows_ += header.num_values;
+ 
++      // Uncompress if needed
++      int levels_byte_len;
++      if (AddWithOverflow(header.definition_levels_byte_length,
++                          header.repetition_levels_byte_length, &levels_byte_len)) {
++        throw ParquetException("Levels size too large (corrupt file?)");
++      }
++      page_buffer = DecompressIfNeeded(std::move(page_buffer), compressed_len,
++                                       uncompressed_len, levels_byte_len);
++
+       return std::make_shared<DataPageV2>(
+           page_buffer, header.num_values, header.num_nulls, header.num_rows,
+           LoadEnumSafe(&header.encoding), header.definition_levels_byte_length,
+           header.repetition_levels_byte_length, uncompressed_len, is_compressed,
+           page_statistics);
+     } else {
+       // We don't know what this page type is. We're allowed to skip non-data
+       // pages.
+       continue;
+     }
+   }
+   return std::shared_ptr<Page>(nullptr);
+ }
+ 
+-std::shared_ptr<Buffer> SerializedPageReader::DecompressPage(int compressed_len,
+-                                                             int uncompressed_len,
+-                                                             const uint8_t* page_buffer) {
++std::shared_ptr<Buffer> SerializedPageReader::DecompressIfNeeded(
++    std::shared_ptr<Buffer> page_buffer, int compressed_len, int uncompressed_len,
++    int levels_byte_len) {
++  if (decompressor_ == nullptr) {
++    return page_buffer;
++  }
+   // Grow the uncompressed buffer if we need to.
+   if (uncompressed_len > static_cast<int>(decompression_buffer_->size())) {
+     PARQUET_THROW_NOT_OK(decompression_buffer_->Resize(uncompressed_len, false));
+   }
+ 
+-  if (current_page_header_.type != format::PageType::DATA_PAGE_V2) {
+-    PARQUET_THROW_NOT_OK(
+-        decompressor_->Decompress(compressed_len, page_buffer, uncompressed_len,
+-                                  decompression_buffer_->mutable_data()));
+-  } else {
+-    // The levels are not compressed in V2 format
+-    const auto& header = current_page_header_.data_page_header_v2;
+-    int32_t levels_length =
+-        header.repetition_levels_byte_length + header.definition_levels_byte_length;
++  if (levels_byte_len > 0) {
++    // First copy the levels as-is
+     uint8_t* decompressed = decompression_buffer_->mutable_data();
+-    memcpy(decompressed, page_buffer, levels_length);
+-    decompressed += levels_length;
+-    const uint8_t* compressed_values = page_buffer + levels_length;
+-
+-    // Decompress the values
+-    PARQUET_THROW_NOT_OK(
+-        decompressor_->Decompress(compressed_len - levels_length, compressed_values,
+-                                  uncompressed_len - levels_length, decompressed));
++    memcpy(decompressed, page_buffer->data(), levels_byte_len);
+   }
+ 
++  // Decompress the values
++  PARQUET_THROW_NOT_OK(decompressor_->Decompress(
++      compressed_len - levels_byte_len, page_buffer->data() + levels_byte_len,
++      uncompressed_len - levels_byte_len,
++      decompression_buffer_->mutable_data() + levels_byte_len));
++
+   return decompression_buffer_;
+ }
+ 
+diff --git a/testing b/testing
+index d4aa70abc..ec74f0349 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit d4aa70abcd18c169194bd2355028625c871d138c
++Subproject commit ec74f03496ba100fd8497ad660909bb0261a3405

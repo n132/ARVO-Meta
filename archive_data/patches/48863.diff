@@ -1,0 +1,154 @@
+commit e2c0fd75e48a3cbf1bf48b8afe28fff50d8e0877
+Author: Guy Harris <gharris@sonic.net>
+Date:   Tue Jul 12 16:12:40 2022 -0700
+
+    Linux USB: check the captured length early in the fixup process.
+    
+    In fixup_pcap_pkthdr(), check th capture length to make sure it has a
+    full header before we start looking at fields in the header.
+    
+    The other place that calls fix_linux_usb_mmapped_length() already
+    ensures that we have at least a full USB metadata header; this change
+    means that both places that call it do, so we can remove the check from
+    fix_linux_usb_mmapped_length() itself.
+
+diff --git a/pcap-common.c b/pcap-common.c
+index b12ee215..d0f3ddf4 100644
+--- a/pcap-common.c
++++ b/pcap-common.c
+@@ -1834,30 +1834,33 @@ void
+ fixup_pcap_pkthdr(int linktype, struct pcap_pkthdr *hdr, const u_char *data)
+ {
+ 	const pcap_usb_header_mmapped *usb_hdr;
+ 
+ 	usb_hdr = (const pcap_usb_header_mmapped *) data;
+-	if (linktype == DLT_USB_LINUX_MMAPPED) {
++	if (linktype == DLT_USB_LINUX_MMAPPED &&
++	    hdr->caplen >= sizeof (pcap_usb_header_mmapped)) {
+ 		/*
+ 		 * In older versions of libpcap, in memory-mapped captures,
+ 		 * the "on-the-bus length" for completion events for
+ 		 * incoming isochronous transfers was miscalculated; it
+ 		 * needed to be calculated based on the* offsets and lengths
+ 		 * in the descriptors, not on the raw URB length, but it
+ 		 * wasn't.
+ 		 *
+ 		 * If this packet contains transferred data (yes, data_flag
+ 		 * is 0 if we *do* have data), and the total on-the-network
+ 		 * length is equal to the value calculated from the raw URB
+ 		 * length, then it might be one of those transfers.
++		 *
++		 * We only do this if we hae the full USB pseudo-header.
+ 		 */
+ 		if (!usb_hdr->data_flag &&
+ 		    hdr->len == sizeof(pcap_usb_header_mmapped) +
+ 		      (usb_hdr->ndesc * sizeof (usb_isodesc)) + usb_hdr->urb_len) {
+ 			/*
+ 			 * It might leed fixing; fix it if it's a completion
+ 			 * event for an incoming isochronous transfer.
+ 			 */
+ 			fix_linux_usb_mmapped_length(hdr, data);
+ 		}
+ 	}
+ }
+diff --git a/pcap-usb-linux-common.c b/pcap-usb-linux-common.c
+index d5d9e538..6bd044c9 100644
+--- a/pcap-usb-linux-common.c
++++ b/pcap-usb-linux-common.c
+@@ -39,92 +39,90 @@ void
+ fix_linux_usb_mmapped_length(struct pcap_pkthdr *pkth, const u_char *bp)
+ {
+ 	const pcap_usb_header_mmapped *hdr;
+ 	u_int bytes_left;
+ 
++	/*
++	 * All callers of this routine must ensure that pkth->caplen is
++	 * >= sizeof (pcap_usb_header_mmapped).
++	 */
+ 	bytes_left = pkth->caplen;
+-	if (bytes_left < sizeof (pcap_usb_header_mmapped)) {
+-		/*
+-		 * We don't have the full metadata header, so give up.
+-		 */
+-		return;
+-	}
+ 	bytes_left -= sizeof (pcap_usb_header_mmapped);
+ 
+ 	hdr = (const pcap_usb_header_mmapped *) bp;
+ 	if (!hdr->data_flag && hdr->transfer_type == URB_ISOCHRONOUS &&
+ 	    hdr->event_type == URB_COMPLETE &&
+ 	    (hdr->endpoint_number & URB_TRANSFER_IN) &&
+ 	    pkth->len == sizeof(pcap_usb_header_mmapped) +
+ 	                 (hdr->ndesc * sizeof (usb_isodesc)) + hdr->urb_len) {
+ 		usb_isodesc *descs;
+ 		u_int pre_truncation_data_len, pre_truncation_len;
+ 
+ 		descs = (usb_isodesc *) (bp + sizeof(pcap_usb_header_mmapped));
+ 
+ 		/*
+ 		 * We have data (yes, data_flag is 0 if we *do* have data),
+ 		 * and this is a "this is complete" incoming isochronous
+ 		 * transfer event, and the length was calculated based
+ 		 * on the URB length.
+ 		 *
+ 		 * That's not correct, because the data isn't contiguous,
+ 		 * and the isochronous descriptos show how it's scattered.
+ 		 *
+ 		 * Find the end of the last chunk of data in the buffer
+ 		 * referred to by the isochronous descriptors; that indicates
+ 		 * how far into the buffer the data would have gone.
+ 		 *
+ 		 * Make sure we don't run past the end of the captured data
+ 		 * while processing the isochronous descriptors.
+ 		 */
+ 		pre_truncation_data_len = 0;
+ 		for (uint32_t desc = 0;
+ 		    desc < hdr->ndesc && bytes_left >= sizeof (usb_isodesc);
+ 		    desc++, bytes_left -= sizeof (usb_isodesc)) {
+ 			u_int desc_end;
+ 
+ 			desc_end = descs[desc].offset + descs[desc].len;
+ 			if (desc_end > pre_truncation_data_len)
+ 				pre_truncation_data_len = desc_end;
+ 		}
+ 
+ 		/*
+ 		 * Now calculate the total length based on that data
+ 		 * length.
+ 		 */
+ 		pre_truncation_len = sizeof(pcap_usb_header_mmapped) +
+ 		    (hdr->ndesc * sizeof (usb_isodesc)) +
+ 		    pre_truncation_data_len;
+ 
+ 		/*
+ 		 * If that's greater than or equal to the captured length,
+ 		 * use that as the length.
+ 		 */
+ 		if (pre_truncation_len >= pkth->caplen)
+ 			pkth->len = pre_truncation_len;
+ 
+ 		/*
+ 		 * If the captured length is greater than the length,
+ 		 * use the captured length.
+ 		 *
+ 		 * For completion events for incoming isochronous transfers,
+ 		 * it's based on data_len, which is calculated the same way
+ 		 * we calculated pre_truncation_data_len above, except that
+ 		 * it has access to all the isochronous descriptors, not
+ 		 * just the ones that the kernel were able to provide us or,
+ 		 * for a capture file, that weren't sliced off by a snapshot
+ 		 * length.
+ 		 *
+ 		 * However, it might have been reduced by the USB capture
+ 		 * mechanism arbitrarily limiting the amount of data it
+ 		 * provides to userland, or by the libpcap capture code
+ 		 * limiting it to being no more than the snapshot, so
+ 		 * we don't want to just use it all the time; we only
+ 		 * do so to try to get a better estimate of the actual
+ 		 * length - and to make sure the on-the-network length
+ 		 * is always >= the captured length.
+ 		 */
+ 		if (pkth->caplen > pkth->len)
+ 			pkth->len = pkth->caplen;
+ 	}
+ }

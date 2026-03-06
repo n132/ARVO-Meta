@@ -1,0 +1,851 @@
+commit fa57f7ba406b00c7d18f123529010f63ba8da6cf
+Author: Luca Deri <deri@ntop.org>
+Date:   Tue Jan 2 17:17:29 2024 +0100
+
+    Added check to avoid memory issues (heap overflow) during DHCP packet dissection
+
+diff --git a/src/NetworkInterface.cpp b/src/NetworkInterface.cpp
+index 94d4a0c74..d0ad7804c 100644
+--- a/src/NetworkInterface.cpp
++++ b/src/NetworkInterface.cpp
+@@ -1573,790 +1573,790 @@ NetworkInterface *NetworkInterface::getDynInterface(u_int64_t criteria,
+ bool NetworkInterface::processPacket(int32_t if_index, u_int32_t bridge_iface_idx,
+ 				     int pcap_datalink_type, bool ingressPacket,
+ 				     const struct bpf_timeval *when, const u_int64_t packet_time,
+ 				     struct ndpi_ethhdr *eth, u_int16_t vlan_id, struct ndpi_iphdr *iph,
+ 				     struct ndpi_ipv6hdr *ip6, u_int16_t ip_offset,
+ 				     u_int16_t encapsulation_overhead, u_int32_t len_on_wire,
+ 				     const struct pcap_pkthdr *h, const u_char *packet, u_int16_t *ndpiProtocol,
+ 				     Host **srcHost, Host **dstHost, Flow **hostFlow) {
+   u_int16_t trusted_ip_len = max_val(0, (int)h->caplen - ip_offset);
+   u_int16_t trusted_payload_len = 0;
+   u_int32_t private_flow_id = 0;
+   bool src2dst_direction;
+   u_int8_t l4_proto;
+   Flow *flow;
+   Mac *srcMac = NULL, *dstMac = NULL;
+   IpAddress src_ip, dst_ip;
+   ICMPinfo icmp_info;
+   u_int16_t frame_padding = 0;
+   u_int16_t src_port = 0, dst_port = 0;
+   struct ndpi_tcphdr *tcph = NULL;
+   struct ndpi_udphdr *udph = NULL;
+   struct sctphdr *sctph = NULL;
+   u_int16_t trusted_l4_packet_len;
+   u_int8_t *l4, tcp_flags = 0, *payload = NULL;
+   u_int8_t *ip;
+   bool is_fragment = false, new_flow;
+   bool pass_verdict = true;
+   u_int16_t l4_len = 0, fragment_offset = 0;
+ #ifndef HAVE_NEDGE
+ #ifdef IMPLEMENT_SMART_FRAGMENTS
+   u_int16_t fragment_extra_overhead = 0;
+ #endif
+ #endif
+   u_int8_t tos;
+ 
+   *hostFlow = NULL;
+ 
+   if (!isSubInterface()) {
+     bool processed = false;
+ #ifdef NTOPNG_PRO
+ #ifndef HAVE_NEDGE
+     /* Custom disaggregation */
+     if (sub_interfaces && (sub_interfaces->getNumSubInterfaces() > 0)) {
+       processed = sub_interfaces->processPacket(if_index, bridge_iface_idx,
+ 						pcap_datalink_type, ingressPacket,
+ 						when, packet_time, eth, vlan_id, iph,
+ 						ip6, ip_offset, encapsulation_overhead, len_on_wire, h, packet,
+ 						ndpiProtocol, srcHost, dstHost, hostFlow);
+     }
+ #endif
+ #endif
+ 
+     if ((!processed) && (flowHashingMode != flowhashing_none)) {
+       /* VLAN disaggregation */
+       if ((flowHashingMode == flowhashing_vlan) && (vlan_id > 0)) {
+         NetworkInterface *vIface;
+ 
+         if ((vIface = getDynInterface((u_int32_t)vlan_id, false)) != NULL) {
+           vIface->setTimeLastPktRcvd(h->ts.tv_sec);
+           pass_verdict = vIface->processPacket(if_index, bridge_iface_idx,
+ 					       pcap_datalink_type, ingressPacket, when, packet_time, eth, vlan_id,
+ 					       iph, ip6, ip_offset, encapsulation_overhead, len_on_wire, h,
+ 					       packet, ndpiProtocol, srcHost, dstHost, hostFlow);
+           processed = true;
+         }
+       }
+     }
+ 
+     if (processed && !showDynamicInterfaceTraffic()) {
+       incStats(ingressPacket, when->tv_sec, ETHERTYPE_IP, NDPI_PROTOCOL_UNKNOWN,
+                NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+ 
+       return (pass_verdict);
+     }
+   }
+ 
+   if (eth == NULL) {
+     incStats(ingressPacket, when->tv_sec, ETHERTYPE_IP, NDPI_PROTOCOL_UNKNOWN,
+              NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+     return (pass_verdict);
+   }
+ 
+   if ((srcMac = getMac(eth->h_source, true /* Create if missing */,
+                        true /* Inline call */))) {
+     /* NOTE: in nEdge, stats are updated into Flow::update_hosts_stats */
+ #ifndef HAVE_NEDGE
+     srcMac->incSentStats(getTimeLastPktRcvd(), 1, len_on_wire);
+ #endif
+     srcMac->setSeenIface(bridge_iface_idx);
+ 
+ #ifdef HAVE_NEDGE
+     u_int16_t mac_pool = 0;
+     char bufMac[24];
+     char *mac_str;
+ 
+     /* When captive portal is disabled, use the auto_assigned_pool_id as the
+      * default MAC pool */
+     if (host_pools &&
+         (ntop->getPrefs()->get_auto_assigned_pool_id() != NO_HOST_POOL_ID) &&
+         (!ntop->getPrefs()->isCaptivePortalEnabled()) &&
+         (srcMac->locate() == located_on_lan_interface)) {
+       if (!host_pools->findMacPool(srcMac->get_mac(), &mac_pool) ||
+           (mac_pool == NO_HOST_POOL_ID)) {
+         mac_str = Utils::formatMac(srcMac->get_mac(), bufMac, sizeof(bufMac));
+         ntop->addToPool(mac_str, ntop->getPrefs()->get_auto_assigned_pool_id());
+       }
+     }
+ #endif
+   }
+ 
+   if ((dstMac = getMac(eth->h_dest, true /* Create if missing */,
+                        true /* Inline call */))) {
+     /* NOTE: in nEdge, stats are updated into Flow::update_hosts_stats */
+ #ifndef HAVE_NEDGE
+     dstMac->incRcvdStats(getTimeLastPktRcvd(), 1, len_on_wire);
+ #endif
+   }
+ 
+   if (iph != NULL) {
+     u_int16_t ip_len, ip_tot_len;
+ 
+     /* IPv4 */
+     if ((trusted_ip_len < 20) || ((ip_len = iph->ihl * 4) == 0)) {
+       incStats(ingressPacket, when->tv_sec, ETHERTYPE_IP, NDPI_PROTOCOL_UNKNOWN,
+                NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+       return (pass_verdict);
+     }
+ 
+     /* NOTE: ip_tot_len is not trusted as may be forged */
+     ip_tot_len = ntohs(iph->tot_len);
+ 
+     if(ip_tot_len > (h->caplen - ip_offset)) {
+       /* Invalid lenght */
+       incStats(ingressPacket, when->tv_sec, ETHERTYPE_IP, NDPI_PROTOCOL_UNKNOWN,
+ 	       NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0, len_on_wire, 1);
+       return (pass_verdict);
+     }
+ 
+     tos = iph->tos;
+ 
+     /* Use the actual h->len and not the h->caplen to determine
+        whether a packet is fragmented. */
+     if (ip_len > (int)h->len - ip_offset ||
+         (int)h->len - ip_offset < ip_tot_len ||
+         (iph->frag_off & htons(0x1FFF /* IP_OFFSET */)) ||
+         (iph->frag_off & htons(0x2000 /* More Fragments: set */))) {
+       is_fragment = true;
+       fragment_offset = ((ntohs(iph->frag_off) & 0x3fff) & 0x1FFF) * 8;
+ 
+ #ifdef IMPLEMENT_SMART_FRAGMENTS
+       if (fragment_offset) return (pass_verdict);
+ #endif
+     }
+ 
+     l4_proto = iph->protocol;
+     l4 = ((u_int8_t *)iph + ip_len);
+     l4_len =
+       ip_tot_len -
+       ip_len; /* use len from the ip header to compute sequence numbers */
+     ip = (u_int8_t *)iph;
+ 
+     /* An ethernet frame can contain padding at the end of the packet.
+      * Such padding can be identified by comparing the total packet length
+      * reported into the IP header with the ethernet frame size. Such padding
+      * should not be accounted in the L4 size. */
+     if (packet + h->caplen > ip + ip_tot_len)
+       frame_padding = packet + h->caplen - ip - ip_tot_len;
+ 
+     tos = iph->tos;
+   } else {
+     /* IPv6 */
+     u_int ipv6_shift = sizeof(const struct ndpi_ipv6hdr);
+     u_int32_t *tos_ptr = (u_int32_t *)ip6;
+ 
+     if (trusted_ip_len < sizeof(const struct ndpi_ipv6hdr)) {
+       incStats(ingressPacket, when->tv_sec, ETHERTYPE_IPV6,
+                NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+                len_on_wire, 1);
+       return (pass_verdict);
+     }
+ 
+     l4_proto = ip6->ip6_hdr.ip6_un1_nxt;
+ 
+     if ((l4_proto == 0x3C /* IPv6 destination option */) ||
+         (l4_proto == 0x0 /* Hop-by-hop option */)) {
+       u_int8_t *options = (u_int8_t *)ip6 + ipv6_shift;
+ 
+       l4_proto = options[0];
+       ipv6_shift += 8 * (options[1] + 1);
+ 
+       if (trusted_ip_len < ipv6_shift) {
+         incStats(ingressPacket, when->tv_sec, ETHERTYPE_IPV6,
+                  NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+                  len_on_wire, 1);
+         return (pass_verdict);
+       }
+     }
+ 
+     l4 = (u_int8_t *)ip6 + ipv6_shift;
+     l4_len = packet + h->len - l4;
+     ip = (u_int8_t *)ip6;
+ 
+     tos = ((ntohl(*tos_ptr) & 0xFF00000) >> 20) & 0xFF;
+   }
+ 
+   if((packet + h->caplen) > l4)
+     trusted_l4_packet_len = packet + h->caplen - l4;
+   else {
+     /* Invalid lenght */
+     incStats(ingressPacket, when->tv_sec, ETHERTYPE_IPV6,
+ 	     NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+ 	     len_on_wire, 1);
+     return (pass_verdict);
+   }
+ 
+   if (trusted_l4_packet_len > frame_padding)
+     trusted_l4_packet_len -= frame_padding;
+ 
+   if (l4_proto == IPPROTO_TCP) {
+     if (trusted_l4_packet_len >= sizeof(struct ndpi_tcphdr)) {
+       u_int tcp_len;
+ 
+       /* TCP */
+       tcph = (struct ndpi_tcphdr *)l4;
+       src_port = tcph->source, dst_port = tcph->dest;
+       tcp_flags = l4[13];
+       tcp_len = min_val(4 * tcph->doff, trusted_l4_packet_len);
+       payload = &l4[tcp_len];
+       trusted_payload_len = trusted_l4_packet_len - tcp_len;
+       // TODO: check if payload should be set to NULL when trusted_payload_len
+       // == 0
+     } else {
+       /* Packet too short: this is a faked packet */
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_INFO, "Invalid TCP packet received [%u bytes long]",
+ 				   trusted_l4_packet_len);
+       incStats(ingressPacket, when->tv_sec, iph ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+                NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+                len_on_wire, 1);
+       return (pass_verdict);
+     }
+   } else if (l4_proto == IPPROTO_UDP) {
+     if (trusted_l4_packet_len >= sizeof(struct ndpi_udphdr)) {
+       /* UDP */
+       udph = (struct ndpi_udphdr *)l4;
+       src_port = udph->source, dst_port = udph->dest;
+       payload = &l4[sizeof(struct ndpi_udphdr)];
+       trusted_payload_len = trusted_l4_packet_len - sizeof(struct ndpi_udphdr);
+ 
+ #ifndef HAVE_NEDGE
+ #ifdef IMPLEMENT_SMART_FRAGMENTS
+       if (is_fragment)
+         fragment_extra_overhead =
+ 	  ntohs(udph->len) - l4_len + sizeof(struct ndpi_iphdr);
+ #endif
+ #endif
+     } else {
+       /* Packet too short: this is a faked packet */
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_INFO, "Invalid UDP packet received [%u bytes long]",
+ 				   trusted_l4_packet_len);
+       incStats(ingressPacket, when->tv_sec, iph ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+                NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+                len_on_wire, 1);
+       return (pass_verdict);
+     }
+   } else if (l4_proto == IPPROTO_SCTP) {
+     if (trusted_l4_packet_len >= sizeof(struct sctphdr)) {
+       /* SCTP */
+       sctph = (struct sctphdr *)l4;
+       src_port = sctph->sport, dst_port = sctph->dport;
+ 
+       payload = &l4[sizeof(struct sctphdr)];
+       trusted_payload_len = trusted_l4_packet_len - sizeof(struct sctphdr);
+     } else {
+       /* Packet too short: this is a faked packet */
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_INFO, "Invalid SCTP packet received [%u bytes long]",
+ 				   trusted_l4_packet_len);
+       incStats(ingressPacket, when->tv_sec, iph ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+                NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED, 0,
+                len_on_wire, 1);
+       return (pass_verdict);
+     }
+   } else if (l4_proto == IPPROTO_ICMP) {
+     icmp_info.dissectICMP(trusted_l4_packet_len, l4);
+   } else {
+     /* non TCP/UDP protocols */
+   }
+ 
+   if (iph != NULL)
+     src_ip.set(iph->saddr), dst_ip.set(iph->daddr);
+   else
+     src_ip.set(&ip6->ip6_src), dst_ip.set(&ip6->ip6_dst);
+ 
+ #if defined(WIN32) && defined(DEMO_WIN32)
+   if (this->ethStats.getNumPackets() > MAX_NUM_PACKETS) {
+     static bool showMsg = false;
+ 
+     if (!showMsg) {
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_NORMAL,
+ 				   "-----------------------------------------------------------");
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_NORMAL,
+ 				   "WARNING: this demo application is a limited ntopng version able to");
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_NORMAL, "capture up to %d packets. If you are interested",
+ 				   MAX_NUM_PACKETS);
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_NORMAL, "in the full version please have a look at the ntop");
+       ntop->getTrace()->traceEvent(TRACE_NORMAL,
+                                    "home page http://www.ntop.org/.");
+       ntop->getTrace()->traceEvent(
+ 				   TRACE_NORMAL,
+ 				   "-----------------------------------------------------------");
+       ntop->getTrace()->traceEvent(TRACE_NORMAL, "");
+       showMsg = true;
+     }
+ 
+     return (pass_verdict);
+   }
+ #endif
+ 
+   /*
+     We need to populate the private_flow_id with protocol-specific
+     such as DNS....
+ 
+     Unfortunately nDPI has not yet seen this packet so we need to
+     implement a micro-DPI code here
+   */
+   if ((l4_proto == IPPROTO_UDP) && (trusted_payload_len > 20)) {
+     u_int16_t fiftythree = htons(53);
+ 
+     if ((src_port == fiftythree) || (dst_port == fiftythree)) {
+       /* Looks like DNS */
+       u_int16_t dns_transaction_id = (payload[0] << 8) + payload[1];
+ 
+       // ntop->getTrace()->traceEvent(TRACE_NORMAL, "%04X", dns_transaction_id);
+       private_flow_id = (u_int32_t)dns_transaction_id;
+     }
+   }
+ 
+   INTERFACE_PROFILING_SECTION_ENTER("NetworkInterface::processPacket: getFlow",
+                                     0);
+ 
+  pre_get_flow:
+   /* Updating Flow */
+   flow = getFlow(if_index,
+ 		 srcMac, dstMac, vlan_id, 0 /* observationPointId */, private_flow_id, 0,
+ 		 0, 0, l4_proto == IPPROTO_ICMP ? &icmp_info : NULL, &src_ip, &dst_ip,
+ 		 src_port, dst_port, l4_proto, &src2dst_direction, last_pkt_rcvd,
+ 		 last_pkt_rcvd, len_on_wire, &new_flow, true, eth->h_source,
+ 		 eth->h_dest /* Eth lvl, used just in view interfaces to add MAC */);
+   INTERFACE_PROFILING_SECTION_EXIT(0);
+ 
+   if (flow == NULL) {
+     incStats(ingressPacket, when->tv_sec, iph ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+              NDPI_PROTOCOL_UNKNOWN, NDPI_PROTOCOL_CATEGORY_UNSPECIFIED,
+              l4_proto, len_on_wire, 1);
+     return (pass_verdict);
+   } else {
+ #ifdef HAVE_NEDGE
+     if (new_flow) flow->setIngress2EgressDirection(ingressPacket);
+ #endif
+ 
+     if (flow->is_swap_requested()
+         /* This guarantees that at least a packet has been observed in both
+            directions, and that we are in the dst->src direction of the flow
+            that is being swapped
+         */
+         && (!src2dst_direction)) {
+ #if 0
+       char buf[256];
+       ntop->getTrace()->traceEvent(TRACE_NORMAL, "Swapping %s", flow->print(buf, sizeof(buf)));
+ #endif
+ 
+       flow->set_swap_done(); /* Mark the old flow with the swap done */
+       goto pre_get_flow;     /* Start over */
+     }
+ 
+     *srcHost = src2dst_direction ? flow->get_cli_host() : flow->get_srv_host();
+     *dstHost = src2dst_direction ? flow->get_srv_host() : flow->get_cli_host();
+     *hostFlow = flow;
+ 
+     flow->setTOS(tos, src2dst_direction);
+ 
+     switch (l4_proto) {
+     case IPPROTO_TCP:
+       flow->updateTcpFlags(when, tcp_flags, src2dst_direction);
+ 
+       /*
+ 	This is the heuristic "For TCP flows for which the 3WH has not been
+ 	observed..." at https://github.com/ntop/ntopng/issues/5058
+ 
+ 	So, only for the first packet check if this flow is a swap candidate.
+ 	The only condition that should NOT be checked for swap is when there's
+ 	a SYN and not an ACK, i.e., when we see the first packet of the TWH
+ 	that allows to reliably determine the direction.
+       */
+       if (new_flow && (!(tcp_flags & TH_SYN) || (tcp_flags & TH_ACK)))
+ 	flow->check_swap();
+ 
+       if ((tcp_flags & (TH_RST | TH_FIN)) == 0) {
+ 	/*
+ 	  Ignore Zero-window on flow termination as this case
+ 	  is not necessary a zero windon indication
+ 	*/
+ 	flow->updateTcpWindow(ntohs(tcph->window), src2dst_direction);
+       }
+ 
+       flow->updateTcpSeqNum(when, ntohl(tcph->seq), ntohl(tcph->ack_seq),
+ 			    ntohs(tcph->window), tcp_flags,
+ 			    l4_len - (4 * tcph->doff), src2dst_direction);
+       break;
+ 
+     case IPPROTO_ICMP:
+     case IPPROTO_ICMPV6:
+       if (trusted_l4_packet_len > 2) {
+ 	u_int8_t icmp_type = l4[0];
+ 	u_int8_t icmp_code = l4[1];
+ 
+ 	flow->setICMP(src2dst_direction, icmp_type, icmp_code, l4);
+ 	flow->updateICMPFlood(when, src2dst_direction);
+ 	flow->setICMPPayloadSize(trusted_l4_packet_len);
+ 	trusted_payload_len = trusted_l4_packet_len, payload = l4;
+       }
+       break;
+ 
+     default:
+       /*
+ 	NOTE: for non TCP-flows, the swap heuristic is always checked on the
+ 	first packet
+       */
+       if (new_flow) flow->check_swap();
+       break;
+     }
+ 
+ #ifndef HAVE_NEDGE
+ #ifdef __OpenBSD__
+     struct timeval tv_ts;
+ 
+     tv_ts.tv_sec = h->ts.tv_sec;
+     tv_ts.tv_usec = h->ts.tv_usec;
+ 
+     flow->incStats(src2dst_direction, len_on_wire - encapsulation_overhead,
+                    payload, trusted_payload_len, l4_proto, is_fragment,
+                    tcp_flags, &tv_ts, fragment_extra_overhead);
+ #else
+     flow->incStats(src2dst_direction, len_on_wire - encapsulation_overhead,
+                    payload, trusted_payload_len, l4_proto, is_fragment,
+                    tcp_flags, &h->ts, fragment_extra_overhead);
+ #endif
+ #endif
+   }
+ 
+   /*
+     In case of a traffic mirror with no MAC gateway address configured
+     the traffic direction is set based on the local (-m) host
+   */
+   if (isTrafficMirrored() && (!isGwMacConfigured())) {
+     bool cli_local = src_ip.isLocalHost();
+     bool srv_local = dst_ip.isLocalHost();
+ 
+     if (cli_local && (!srv_local))
+       ingressPacket = false;
+     else if ((!cli_local) && srv_local)
+       ingressPacket = true;
+     else
+       ; /* Leave as is */
+ 
+ #if 0
+     char a[32], b[32];
+ 
+     ntop->getTrace()->traceEvent(TRACE_NORMAL, "%s (%s) -> %s (%s) [%s]",
+ 				 src_ip.print(a, sizeof(a)),
+ 				 src_ip.isLocalHost() ? "L" : "R",
+ 				 dst_ip.print(b, sizeof(b)),
+ 				 dst_ip.isLocalHost() ? "L" : "R",
+ 				 ingressPacket ? "IN" : "OUT");
+ #endif
+   }
+ 
+   /* Protocol Detection */
+ 
+   /* This is now incremented in Flow::hosts_periodic_stats_update
+    * by calling iface->incLocalStats */
+   // flow->updateInterfaceLocalStats(src2dst_direction, 1, len_on_wire);
+ 
+   if (!flow->isDetectionCompleted() || flow->needsExtraDissection()) {
+     if ((!is_fragment)
+ #ifdef IMPLEMENT_SMART_FRAGMENTS
+         || (fragment_offset == 0)
+ #endif
+ 	)
+       flow->processPacket(h, ip, trusted_ip_len, packet_time, payload,
+                           trusted_payload_len, src_port);
+     else {
+       // FIX - only handle unfragmented packets
+       // ntop->getTrace()->traceEvent(TRACE_WARNING, "IP fragments are not
+       // handled yet!");
+     }
+   }
+ 
+   if (flow->isDetectionCompleted() && (!isSampledTraffic())) {
+     switch (ndpi_get_lower_proto(flow->get_detected_protocol())) {
+     case NDPI_PROTOCOL_DHCP:
+       if (*srcHost) {
+ 	Mac *mac = (*srcHost)->getMac(), *payload_cli_mac;
+ 
+ 	if (mac && (trusted_payload_len > 240)) {
+ 	  struct dhcp_packet *dhcpp = (struct dhcp_packet *)payload;
+ 
+ 	  if (dhcpp->msgType == 0x01) {
+ 	    /* Request */
+ 	    ;  // mac->setDhcpHost();
+ 	    mac->incNumDHCPRequests();
+ 	  } else if (dhcpp->msgType == 0x02) { /* Reply */
+ 	    checkMacIPAssociation(false, dhcpp->chaddr, dhcpp->yiaddr, mac);
+ 	    checkDhcpIPRange(mac, dhcpp, vlan_id);
+ 	    setDHCPAddressesSeen();
+ 	    mac->incNumDHCPReplies();
+ 	  }
+ 
+-	  for (u_int32_t i = 240; i < trusted_payload_len;) {
++	  for (u_int32_t i = 240; (i+1) < trusted_payload_len;) {
+ 	    u_int8_t id = payload[i], len = payload[i + 1];
+ 
+ 	    if (len == 0) break;
+ 
+ #ifdef DHCP_DEBUG
+-	    ntop->getTrace()->traceEvent(TRACE_WARNING,
+-					 "[DHCP] [id=%u][len=%u]", id, len);
+-#endif
+-
+-	    if (id == 12 /* Host Name */) {
+-	      char name[64], buf[24], *client_mac, key[64];
+-	      int j;
+-
+-	      j = ndpi_min(len, sizeof(name) - 1);
+-	      strncpy((char *)name, (char *)&payload[i + 2], j);
+-	      name[j] = '\0';
+-
+-	      client_mac = Utils::formatMac(&payload[28], buf, sizeof(buf));
+-	      ntop->getTrace()->traceEvent(TRACE_INFO, "[DHCP] %s = '%s'",
+-					   client_mac, name);
+-
+-	      snprintf(key, sizeof(key), DHCP_CACHE, get_id(), client_mac);
+-	      ntop->getRedis()->set(key, name, 86400 /* 1d duration */);
+-
+-	      if ((payload_cli_mac = getMac(
+-					    &payload[28], false /* Do not create if missing */,
+-					    true /* Inline call */)))
+-		payload_cli_mac->inlineSetDHCPName(name);
+-
++	    ntop->getTrace()->traceEvent(TRACE_WARNING, "[DHCP] [id=%u][len=%u]", id, len);
++#endif
++
++	    if((i + 2 + len) < trusted_payload_len) {
++	      if (id == 12 /* Host Name */) {
++		char name[64], buf[24], *client_mac, key[64];
++		int j;
++
++		j = ndpi_min(len, sizeof(name) - 1);
++		strncpy((char *)name, (char *)&payload[i + 2], j);
++		name[j] = '\0';
++	      
++		client_mac = Utils::formatMac(&payload[28], buf, sizeof(buf));
++		ntop->getTrace()->traceEvent(TRACE_INFO, "[DHCP] %s = '%s'",
++					     client_mac, name);
++	      
++		snprintf(key, sizeof(key), DHCP_CACHE, get_id(), client_mac);
++		ntop->getRedis()->set(key, name, 86400 /* 1d duration */);
++	      
++		if ((payload_cli_mac = getMac(&payload[28], false /* Do not create if missing */,
++					      true /* Inline call */)))
++		  payload_cli_mac->inlineSetDHCPName(name);
++	      
+ #ifdef DHCP_DEBUG
+-	      ntop->getTrace()->traceEvent(TRACE_WARNING, "[DHCP] %s = '%s'",
+-					   client_mac, name);
+-#endif
+-	    } else if ((id == 55 /* Parameters List (Fingerprint) */) &&
+-		       flow->get_ndpi_flow()) {
+-	      char fingerprint[64], buf[32];
+-	      u_int idx, offset = 0;
+-
+-	      len = ndpi_min(len, sizeof(buf) / 2);
+-
+-	      for (idx = 0; idx < len; idx++) {
+-		snprintf((char *)&fingerprint[offset],
+-			 sizeof(fingerprint) - offset - 1, "%02X",
+-			 payload[i + 2 + idx] & 0xFF);
+-		offset += 2;
+-	      }
++		ntop->getTrace()->traceEvent(TRACE_WARNING, "[DHCP] %s = '%s'",
++					     client_mac, name);
++#endif	      
++	      } else if ((id == 55 /* Parameters List (Fingerprint) */) && flow->get_ndpi_flow()) {
++		char fingerprint[64], buf[32];
++		u_int idx, offset = 0;
++
++		len = ndpi_min(len, sizeof(buf) / 2);
++
++		for (idx = 0; idx < len; idx++) {
++		  snprintf((char *)&fingerprint[offset],
++			   sizeof(fingerprint) - offset - 1, "%02X",
++			   payload[i + 2 + idx] & 0xFF);
++		  offset += 2;
++		}
+ 
+ #ifdef DHCP_DEBUG
+-	      ntop->getTrace()->traceEvent(TRACE_WARNING, "%s = %s",
+-					   mac->print(buf, sizeof(buf)),
+-					   fingerprint);
+-#endif
+-	      mac->inlineSetFingerprint(
+-					(char *)flow->get_ndpi_flow()->protos.dhcp.fingerprint);
+-	    } else if (id == 0xFF)
+-	      break; /* End of options */
+-
++		ntop->getTrace()->traceEvent(TRACE_WARNING, "%s = %s",
++					     mac->print(buf, sizeof(buf)),
++					     fingerprint);
++#endif
++		mac->inlineSetFingerprint((char *)flow->get_ndpi_flow()->protos.dhcp.fingerprint);
++	      } else if (id == 0xFF)
++		break; /* End of options */
++	    } else
++	      break; /* Invalid lenght */
++	    
+ 	    i += len + 2;
+ 	  }
+ 	}
+       }
+ 
+       if (*dstHost) {
+         char host_name[64];
+         Mac *dst_mac = (*dstHost)->getMac();
++	
+         if (dst_mac && !(dst_mac->isBroadcast())) {
+           flow->setDHCPHostName(dst_mac->getDHCPNameNotLowerCase(host_name, sizeof(host_name)));
+         }
+       }
+ 
+       break;
+ 
+     case NDPI_PROTOCOL_DHCPV6:
+       if (*srcHost && *dstHost) {
+ 	Mac *src_mac = (*srcHost)->getMac();
+ 	Mac *dst_mac = (*dstHost)->getMac();
+ 
+ 	if (src_mac && dst_mac && (trusted_payload_len > 20) &&
+ 	    dst_mac->isMulticast())
+ 	  ;  // src_mac->setDhcpHost();
+       }
+       break;
+ 
+     case NDPI_PROTOCOL_NETBIOS:
+       flow->dissectNetBIOS(payload, trusted_payload_len);
+       break;
+ 
+     case NDPI_PROTOCOL_BITTORRENT:
+       if ((flow->getBitTorrentHash() == NULL) && (l4_proto == IPPROTO_UDP) &&
+ 	  (flow->get_packets() < 8))
+ 	flow->dissectBittorrent((char *)payload, trusted_payload_len);
+       break;
+ 
+     case NDPI_PROTOCOL_HTTP:
+       if (trusted_payload_len > 0)
+ 	flow->dissectHTTP(src2dst_direction, (char *)payload,
+ 			  trusted_payload_len);
+       break;
+ 
+     case NDPI_PROTOCOL_SSDP:
+       if (trusted_payload_len > 0)
+ 	flow->dissectSSDP(src2dst_direction, (char *)payload,
+ 			  trusted_payload_len);
+       break;
+ 
+     case NDPI_PROTOCOL_DNS:
+       /*
+ 	DNS-over-TCP flows may carry zero-payload TCP segments
+ 	e.g., during three-way-handshake, or when acknowledging.
+ 	Make sure only non-zero-payload segments are processed.
+       */
+       /* However still consider for a possible DNS flood */
+ #ifdef NTOPNG_PRO
+       flow->updateDNSFlood(when, src2dst_direction);
+ #endif
+ 
+       if ((trusted_payload_len > 0) && payload) {
+ 	flow->dissectDNS(src2dst_direction, (char *)payload,
+ 			 trusted_payload_len);
+ 	/*
+ 	  DNS-over-TCP has a 2-bytes field with DNS payload length
+ 	  at the beginning. See RFC1035 section 4.2.2. TCP usage.
+ 	*/
+       }
+ 
+       break;
+ 
+     case NDPI_PROTOCOL_SNMP:
+ #ifdef NTOPNG_PRO
+       flow->updateSNMPFlood(when, src2dst_direction);
+ #endif
+       break;
+ 
+     case NDPI_PROTOCOL_IEC60870:
+       if ((trusted_payload_len > 0) && payload) {
+ 	flow->processIEC60870Packet((htons(src_port) == 2404) ? true : false,
+ 				    payload, trusted_payload_len,
+ 				    (struct timeval *)&h->ts);
+       }
+       break;
+ 
+ #ifdef NTOPNG_PRO
+     case NDPI_PROTOCOL_MODBUS:
+       if ((trusted_payload_len > 0) && payload) {
+ 	flow->processModbusPacket((htons(dst_port) == 502) ? true : false,
+ 				  payload, trusted_payload_len,
+ 				  (struct timeval *)&h->ts);
+       }
+       break;
+ #endif
+ 
+     case NDPI_PROTOCOL_MDNS:
+ #ifdef MDNS_TEST
+       extern void _dissectMDNS(u_char * buf, u_int buf_len, char *out,
+ 			       u_int out_len);
+       char outbuf[1024];
+ 
+       _dissectMDNS(payload, trusted_payload_len, outbuf, sizeof(outbuf));
+       ntop->getTrace()->traceEvent(TRACE_NORMAL, "%s", outbuf);
+ #endif
+       flow->dissectMDNS(payload, trusted_payload_len);
+ 
+       if (discovery && iph)
+ 	discovery->queueMDNSResponse(iph->saddr, payload,
+ 				     trusted_payload_len);
+       break;
+ 
+     case NDPI_PROTOCOL_RTP:
+     case NDPI_PROTOCOL_SRTP:
+       if (flow->isZoomRTP()) {
+ 	/* ntop->getTrace()->traceEvent(TRACE_NORMAL, "XXX [%d]", payload[0]); */
+ 
+ 	if (payload[0] == 5 /* RTCP/RTP */) {
+ 	  u_int8_t encoding_type = payload[8];
+ 
+ 	  /* ntop->getTrace()->traceEvent(TRACE_NORMAL, "Zoom [%d]", encoding_type); */
+ 
+ 	  switch (encoding_type) {
+ 	  case 13: /* Screen Share */
+ 	  case 30: /* Screen Share */
+ 	    flow->setRTPStreamType(ndpi_multimedia_screen_sharing_flow);
+ 	    break;
+ 
+ 	  case 15: /* Audio */
+ 	    flow->setRTPStreamType(ndpi_multimedia_audio_flow);
+ 	    break;
+ 
+ 	  case 16: /* Video */
+ 	    flow->setRTPStreamType(ndpi_multimedia_video_flow);
+ 	    break;
+ 	  }
+ 	}
+       } else if (flow->getRTPStreamType() == ndpi_multimedia_unknown_flow) {
+ 	if (flow->get_ndpi_flow() != NULL) {
+ 	  flow->setRTPStreamType(flow->get_ndpi_flow()->flow_multimedia_type);
+ 	}
+       }
+       break;
+     }
+ 
+ #ifdef HAVE_NEDGE
+     if (is_bridge_interface()) {
+       struct tm now;
+       time_t t_now = time(NULL);
+       localtime_r(&t_now, &now);
+       pass_verdict = flow->checkPassVerdict(&now);
+ 
+       if (pass_verdict) {
+         TrafficShaper *shaper_ingress, *shaper_egress;
+         char buf[64];
+ 
+         flow->getFlowShapers(src2dst_direction, &shaper_ingress,
+                              &shaper_egress);
+         ntop->getTrace()->traceEvent(
+ 				     TRACE_DEBUG, "[%s] %u / %u ",
+ 				     flow->get_detected_protocol_name(buf, sizeof(buf)), shaper_ingress,
+ 				     shaper_egress);
+         pass_verdict = passShaperPacket(shaper_ingress, shaper_egress,
+                                         (struct pcap_pkthdr *)h);
+       } else {
+         flow->incFlowDroppedCounters();
+       }
+     }
+ #endif
+   }
+ 
+ #if 0
+   if(new_flow)
+     flow->updateCommunityIdFlowHash();
+ #endif
+ 
+   // ntop->getTrace()->traceEvent(TRACE_NORMAL, "direction: %s / len: %u",
+   // ingressPacket ? "IN" : "OUT", len_on_wire);
+ 
+   incStats(ingressPacket, when->tv_sec, iph ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+            flow->getStatsProtocol(), flow->get_protocol_category(), l4_proto,
+            len_on_wire, 1);
+ 
+   /* For large flows, a periodic_stats_update is performed straight after
+      processing a packet. Conditions checked to determine 'a large flow' are
+ 
+      (1) A minimum number of bytes transferred since the previous
+      periodic_stats_update (checked using get_current_*) (2) A minimum number of
+      milliseconds elapsed since the previous periodic_stats_update (checked
+      using get_current_update_time())
+ 
+      Conditions above are necessary as:
+ 
+      (1) ensures that large flows perform faster periodic_stats_update, without
+      having to wait for purgeIdle to visit the whole hash table (this may take
+      up to PURGE_FRACTION seconds). (2) ensures that periodic_stats_update is
+      not performed too frequently as it could be detrimental for performances
+      and lead to packet drops.
+   */
+   if (flow->get_current_bytes_cli2srv() + flow->get_current_bytes_srv2cli() >=
+       PERIODIC_STATS_UPDATE_MIN_REFRESH_BYTES &&
+       Utils::msTimevalDiff(when, flow->get_current_update_time()) >=
+       PERIODIC_STATS_UPDATE_MIN_REFRESH_MS) {
+     flow->periodic_stats_update(when);
+   }
+ 
+   return (pass_verdict);
+ }
+ 
+ /* **************************************************** */

@@ -1,0 +1,202 @@
+commit 74d00a8decebf940d95064ff60042dcb2cbcc2c0
+Author: James Carter <jwcart2@gmail.com>
+Date:   Wed Apr 28 16:07:02 2021 -0400
+
+    libsepol/cil: Detect degenerate inheritance and exit with an error
+    
+    A CIL policy with inheritance of the form
+    ...
+    (blockinherit ba)
+    (block ba
+      (block b1
+        (blockinherit bb)
+      )
+      (block bb
+        (block b2
+          (blockinherit bc)
+        )
+        (block bc
+          (block b3
+            (blockinherit bd)
+          )
+          (block bd
+            (block b4
+              (blockinherit be)
+            )
+            (block be
+            ...
+    will require creating 2^depth copies of the block at the bottom of
+    the inheritance chain. This pattern can quickly consume all the
+    memory of the system compiling this policy.
+    
+    The depth of the inheritance chain can be found be walking the
+    tree up through the parents and noting how many of the parent
+    blocks have been inherited. The number of times a block will be
+    copied is found by counting the list of nodes in the "bi_nodes"
+    list of the block. To minimize legitimate policies from being
+    falsely detected as being degenerate, both the depth and breadth
+    (number of copies) are checked and an error is given only if both
+    exceed the limits (depth >= 12 and breadth >= 4096).
+    
+    This problem was found by the secilc-fuzzer.
+    
+    Signed-off-by: James Carter <jwcart2@gmail.com>
+
+diff --git a/libsepol/cil/src/cil_internal.h b/libsepol/cil/src/cil_internal.h
+index 9bdcbdd0..74e0b34d 100644
+--- a/libsepol/cil/src/cil_internal.h
++++ b/libsepol/cil/src/cil_internal.h
+@@ -1,53 +1,55 @@
+ /*
+  * Copyright 2011 Tresys Technology, LLC. All rights reserved.
+  * 
+  * Redistribution and use in source and binary forms, with or without
+  * modification, are permitted provided that the following conditions are met:
+  * 
+  *    1. Redistributions of source code must retain the above copyright notice,
+  *       this list of conditions and the following disclaimer.
+  * 
+  *    2. Redistributions in binary form must reproduce the above copyright notice,
+  *       this list of conditions and the following disclaimer in the documentation
+  *       and/or other materials provided with the distribution.
+  * 
+  * THIS SOFTWARE IS PROVIDED BY TRESYS TECHNOLOGY, LLC ``AS IS'' AND ANY EXPRESS
+  * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+  * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+  * EVENT SHALL TRESYS TECHNOLOGY, LLC OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+  * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+  * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  * 
+  * The views and conclusions contained in the software and documentation are those
+  * of the authors and should not be interpreted as representing official policies,
+  * either expressed or implied, of Tresys Technology, LLC.
+  */
+ 
+ #ifndef CIL_INTERNAL_H_
+ #define CIL_INTERNAL_H_
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <arpa/inet.h>
+ 
+ #include <sepol/policydb/services.h>
+ #include <sepol/policydb/policydb.h>
+ #include <sepol/policydb/flask_types.h>
+ 
+ #include <cil/cil.h>
+ 
+ #include "cil_flavor.h"
+ #include "cil_tree.h"
+ #include "cil_symtab.h"
+ #include "cil_mem.h"
+ 
+ #define CIL_MAX_NAME_LENGTH 2048
+ 
++#define CIL_DEGENERATE_INHERITANCE_DEPTH 12
++#define CIL_DEGENERATE_INHERITANCE_BREADTH (0x1 << CIL_DEGENERATE_INHERITANCE_DEPTH)
+ 
+ enum cil_pass {
+ 	CIL_PASS_INIT = 0,
+diff --git a/libsepol/cil/src/cil_resolve_ast.c b/libsepol/cil/src/cil_resolve_ast.c
+index 5389df43..68909647 100644
+--- a/libsepol/cil/src/cil_resolve_ast.c
++++ b/libsepol/cil/src/cil_resolve_ast.c
+@@ -2410,39 +2410,93 @@ exit:
+ 	return rc;
+ }
+ 
++/*
++ * Detect degenerate inheritance of the form:
++ * ...
++ * (blockinherit ba)
++ * (block ba
++ *    (block b1
++ *      (blockinherit bb)
++ *    )
++ *    (block bb
++ *      (block b2
++ *        (blockinherit bc)
++ *      )
++ *      (block bc
++ *      ...
++ */
++static int cil_check_for_degenerate_inheritance(struct cil_tree_node *current)
++{
++	struct cil_block *block = current->data;
++	struct cil_tree_node *node;
++	struct cil_list_item *item;
++	unsigned depth;
++	unsigned breadth = 0;
++
++	cil_list_for_each(item, block->bi_nodes) {
++		breadth++;
++	}
++
++	if (breadth >= CIL_DEGENERATE_INHERITANCE_BREADTH) {
++		node = current->parent;
++		depth = 0;
++		while (node && node->flavor != CIL_ROOT) {
++			if (node->flavor == CIL_BLOCK) {
++				block = node->data;
++				if (block->bi_nodes != NULL) {
++					depth++;
++				}
++			}
++			node = node->parent;
++		}
++
++		if (depth >= CIL_DEGENERATE_INHERITANCE_DEPTH) {
++			cil_tree_log(current, CIL_ERR, "Degenerate inheritance detected (depth=%u, breadth=%u)", depth, breadth);
++			return SEPOL_ERR;
++		}
++	}
++
++	return SEPOL_OK;
++}
++
+ int cil_resolve_blockinherit_copy(struct cil_tree_node *current, void *extra_args)
+ {
+ 	struct cil_block *block = current->data;
+ 	struct cil_args_resolve *args = extra_args;
+ 	struct cil_db *db = NULL;
+ 	struct cil_list_item *item = NULL;
+ 	int rc = SEPOL_ERR;
+ 
+ 	// This block is not inherited
+ 	if (block->bi_nodes == NULL) {
+ 		rc = SEPOL_OK;
+ 		goto exit;
+ 	}
+ 
+ 	db = args->db;
+ 
++	rc = cil_check_for_degenerate_inheritance(current);
++	if (rc != SEPOL_OK) {
++		goto exit;
++	}
++
+ 	// Make sure this is the original block and not a merged block from a blockinherit
+ 	if (current != block->datum.nodes->head->data) {
+ 		rc = SEPOL_OK;
+ 		goto exit;
+ 	}
+ 
+ 	cil_list_for_each(item, block->bi_nodes) {
+ 		rc = cil_check_recursive_blockinherit(item->data);
+ 		if (rc != SEPOL_OK) {
+ 			goto exit;
+ 		}
+ 
+ 		rc = cil_copy_ast(db, current, item->data);
+ 		if (rc != SEPOL_OK) {
+ 			cil_log(CIL_ERR, "Failed to copy block contents into blockinherit\n");
+ 			goto exit;
+ 		}
+ 	}
+ 
+ 	return SEPOL_OK;

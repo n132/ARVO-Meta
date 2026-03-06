@@ -1,0 +1,3107 @@
+commit 0ff832d31470471803b175cfff4e40c1b08ee779
+Author: Varun Khaneja <ca.aawc@yahoo.com>
+Date:   Wed Nov 29 14:39:10 2017 -0800
+
+    5.6.1.4: Use in-memory archive instead of file IO
+
+diff --git a/arccmt.cpp b/arccmt.cpp
+index e0db392..33f2204 100644
+--- a/arccmt.cpp
++++ b/arccmt.cpp
+@@ -3,126 +3,126 @@ static bool IsAnsiEscComment(const wchar *Data,size_t Size);
+ bool Archive::GetComment(Array<wchar> *CmtData)
+ {
+   if (!MainComment)
+     return false;
+   SaveFilePos SavePos(*this);
+ 
+ #ifndef SFX_MODULE
+   uint CmtLength;
+   if (Format==RARFMT14)
+   {
+     Seek(SFXSize+SIZEOF_MAINHEAD14,SEEK_SET);
+     CmtLength=GetByte();
+     CmtLength+=(GetByte()<<8);
+   }
+   else
+ #endif
+   {
+     if (MainHead.CommentInHeader)
+     {
+       // Old style (RAR 2.9) archive comment embedded into the main 
+       // archive header.
+       Seek(SFXSize+SIZEOF_MARKHEAD3+SIZEOF_MAINHEAD3,SEEK_SET);
+       if (!ReadHeader())
+         return false;
+     }
+     else
+     {
+       // Current (RAR 3.0+) version of archive comment.
+       Seek(GetStartPos(),SEEK_SET);
+       return SearchSubBlock(SUBHEAD_TYPE_CMT)!=0 && ReadCommentData(CmtData);
+     }
+ #ifndef SFX_MODULE
+     // Old style (RAR 2.9) comment header embedded into the main 
+     // archive header.
+     if (BrokenHeader)
+     {
+       uiMsg(UIERROR_CMTBROKEN,FileName);
+       return false;
+     }
+     CmtLength=CommHead.HeadSize-SIZEOF_COMMHEAD;
+ #endif
+   }
+ #ifndef SFX_MODULE
+   if (Format==RARFMT14 && MainHead.PackComment || Format!=RARFMT14 && CommHead.Method!=0x30)
+   {
+     if (Format!=RARFMT14 && (CommHead.UnpVer < 15 || CommHead.UnpVer > VER_UNPACK || CommHead.Method > 0x35))
+       return false;
+     ComprDataIO DataIO;
+     DataIO.SetTestMode(true);
+     uint UnpCmtLength;
+     if (Format==RARFMT14)
+     {
+ #ifdef RAR_NOCRYPT
+       return false;
+ #else
+       UnpCmtLength=GetByte();
+       UnpCmtLength+=(GetByte()<<8);
+       CmtLength-=2;
+       DataIO.SetCmt13Encryption();
+       CommHead.UnpVer=15;
+ #endif
+     }
+     else
+       UnpCmtLength=CommHead.UnpSize;
+     DataIO.SetFiles(this,NULL);
+     DataIO.EnableShowProgress(false);
+     DataIO.SetPackedSizeToRead(CmtLength);
+     DataIO.UnpHash.Init(HASH_CRC32,1);
+     DataIO.SetNoFileHeader(true); // this->FileHead is not filled yet.
+ 
+     Unpack CmtUnpack(&DataIO);
+     CmtUnpack.Init(0x10000,false);
+     CmtUnpack.SetDestSize(UnpCmtLength);
+     CmtUnpack.DoUnpack(CommHead.UnpVer,false);
+ 
+     if (Format!=RARFMT14 && (DataIO.UnpHash.GetCRC32()&0xffff)!=CommHead.CommCRC)
+     {
+       uiMsg(UIERROR_CMTBROKEN,FileName);
+       return false;
+     }
+     else
+     {
+       byte *UnpData;
+       size_t UnpDataSize;
+       DataIO.GetUnpackedData(&UnpData,&UnpDataSize);
+ #ifdef _WIN_ALL
+       // If we ever decide to extend it to Android, we'll need to alloc
+       // 4x memory for OEM to UTF-8 output here.
+       OemToCharBuffA((char *)UnpData,(char *)UnpData,(DWORD)UnpDataSize);
+ #endif
+       CmtData->Alloc(UnpDataSize+1);
+       memset(CmtData->Addr(0),0,CmtData->Size()*sizeof(wchar));
+       CharToWide((char *)UnpData,CmtData->Addr(0),CmtData->Size());
+       CmtData->Alloc(wcslen(CmtData->Addr(0)));
+     }
+   }
+   else
+   {
+     if (CmtLength==0)
+       return false;
+     Array<byte> CmtRaw(CmtLength);
+     int ReadSize=Read(&CmtRaw[0],CmtLength);
+     if (ReadSize>=0 && (uint)ReadSize<CmtLength) // Comment is shorter than declared.
+     {
+       CmtLength=ReadSize;
+       CmtRaw.Alloc(CmtLength);
+     }
+ 
+     if (Format!=RARFMT14 && CommHead.CommCRC!=(~CRC32(0xffffffff,&CmtRaw[0],CmtLength)&0xffff))
+     {
+       uiMsg(UIERROR_CMTBROKEN,FileName);
+       return false;
+     }
+     CmtData->Alloc(CmtLength+1);
+     CmtRaw.Push(0);
+ #ifdef _WIN_ALL
+     // If we ever decide to extend it to Android, we'll need to alloc
+     // 4x memory for OEM to UTF-8 output here.
+     OemToCharA((char *)&CmtRaw[0],(char *)&CmtRaw[0]);
+ #endif
+-    CharToWide((char *)&CmtRaw[0],CmtData->Addr(0),CmtLength);
++    CharToWide((char *)&CmtRaw[0],CmtData->Addr(0),CmtData->Size());
+     CmtData->Alloc(wcslen(CmtData->Addr(0)));
+   }
+ #endif
+   return CmtData->Size() > 0;
+ }
+diff --git a/archive.cpp b/archive.cpp
+index 2abe60d..401fc34 100644
+--- a/archive.cpp
++++ b/archive.cpp
+@@ -3,51 +3,59 @@
+ #include "arccmt.cpp"
+ 
+ 
++#ifdef USE_ARCMEM
++#include "arcmem.cpp"
++#endif
++
+ Archive::Archive(RAROptions *InitCmd)
+ {
+   Cmd=NULL; // Just in case we'll have an exception in 'new' below.
+ 
+   DummyCmd=(InitCmd==NULL);
+   Cmd=DummyCmd ? (new RAROptions):InitCmd;
+ 
+   OpenShared=Cmd->OpenShared;
+   Format=RARFMT15;
+   Solid=false;
+   Volume=false;
+   MainComment=false;
+   Locked=false;
+   Signed=false;
+   FirstVolume=false;
+   NewNumbering=false;
+   SFXSize=0;
+   LatestTime.Reset();
+   Protected=false;
+   Encrypted=false;
+   FailedHeaderDecryption=false;
+   BrokenHeader=false;
+   LastReadBlock=0;
+ 
+   CurBlockPos=0;
+   NextBlockPos=0;
+ 
+   RecoverySize=-1;
+   RecoveryPercent=-1;
+ 
+   memset(&MainHead,0,sizeof(MainHead));
+   memset(&CryptHead,0,sizeof(CryptHead));
+   memset(&EndArcHead,0,sizeof(EndArcHead));
+ 
+   VolNumber=0;
+   VolWrite=0;
+   AddingFilesSize=0;
+   AddingHeadersSize=0;
+   *FirstVolumeName=0;
+ 
+   Splitting=false;
+   NewArchive=false;
+ 
+   SilentOpen=false;
+ 
++#ifdef USE_QOPEN
++  ProhibitQOpen=false;
++#endif
++
+ }
+ 
+ 
+@@ -280,53 +288,106 @@ void Archive::SeekToNext()
+ // Calculate the block size including encryption fields and padding if any.
+ uint Archive::FullHeaderSize(size_t Size)
+ {
+   if (Encrypted)
+   {
+     Size = ALIGN_VALUE(Size, CRYPT_BLOCK_SIZE); // Align to encryption block size.
+     if (Format == RARFMT50)
+       Size += SIZE_INITV;
+     else
+       Size += SIZE_SALT30;
+   }
+   return uint(Size);
+ }
+ 
+ 
+ 
+ 
+-#ifdef USE_QOPEN
+ bool Archive::Open(const wchar *Name,uint Mode)
+ {
++#ifdef USE_QOPEN
+   // Important if we reuse Archive object and it has virtual QOpen
+   // file position not matching real. For example, for 'l -v volname'.
+   QOpen.Unload();
++#endif
++
++#ifdef USE_ARCMEM
++  if (Cmd->ArcInMem)
++  {
++    wcsncpyz(FileName,Name,ASIZE(FileName));
++    ArcMem.Load(Cmd->ArcMemData,Cmd->ArcMemSize);
++    Cmd->SetArcInMem(NULL,0); // Return in memory data for first volume only, not for next volumes.
++    return true;
++  }
++#endif
+ 
+   return File::Open(Name,Mode);
+ }
+ 
+ 
++
++bool Archive::Close()
++{
++#ifdef USE_ARCMEM
++  if (ArcMem.Unload())
++    return true;
++#endif
++  return File::Close();
++}
++
++
++
+ int Archive::Read(void *Data,size_t Size)
+ {
+-  size_t Result;
+-  if (QOpen.Read(Data,Size,Result))
+-    return (int)Result;
++#ifdef USE_QOPEN
++  size_t QResult;
++  if (QOpen.Read(Data,Size,QResult))
++    return (int)QResult;
++#endif
++#ifdef USE_ARCMEM
++  size_t AResult;
++  if (ArcMem.Read(Data,Size,AResult))
++    return (int)AResult;
++#endif
+   return File::Read(Data,Size);
+ }
+ 
+ 
+ void Archive::Seek(int64 Offset,int Method)
+ {
+-  if (!QOpen.Seek(Offset,Method))
+-    File::Seek(Offset,Method);
++#ifdef USE_QOPEN
++  if (QOpen.Seek(Offset,Method))
++    return;
++#endif
++#ifdef USE_ARCMEM
++  if (ArcMem.Seek(Offset,Method))
++    return;
++#endif
++  File::Seek(Offset,Method);
+ }
+ 
+ 
+ int64 Archive::Tell()
+ {
++#ifdef USE_QOPEN
+   int64 QPos;
+   if (QOpen.Tell(&QPos))
+     return QPos;
++#endif
++#ifdef USE_ARCMEM
++  int64 APos;
++  if (ArcMem.Tell(&APos))
++    return APos;
++#endif
+   return File::Tell();
+ }
+-#endif
+ 
++
++
++bool Archive::IsOpened()
++{
++#ifdef USE_ARCMEM
++  if (ArcMem.IsLoaded())
++    return true;
++#endif
++  return File::IsOpened();
++};
+diff --git a/archive.hpp b/archive.hpp
+index 6e85b9f..473912f 100644
+--- a/archive.hpp
++++ b/archive.hpp
+@@ -23,129 +23,136 @@ enum ADDSUBDATA_FLAGS
+ class Archive:public File
+ {
+   private:
+     void UpdateLatestTime(FileHeader *CurBlock);
+     void ConvertNameCase(wchar *Name);
+     void ConvertFileHeader(FileHeader *hd);
+     void WriteBlock50(HEADER_TYPE HeaderType,BaseBlock *wb,bool OnlySetSize,bool NonFinalWrite);
+     size_t ReadHeader14();
+     size_t ReadHeader15();
+     size_t ReadHeader50();
+     void ProcessExtra50(RawRead *Raw,size_t ExtraSize,BaseBlock *bb);
+     void RequestArcPassword();
+     void UnexpEndArcMsg();
+     void BrokenHeaderMsg();
+     void UnkEncVerMsg(const wchar *Name);
+     void UnkEncVerMsg();
+     bool ReadCommentData(Array<wchar> *CmtData);
+ 
+ #if !defined(RAR_NOCRYPT)
+     CryptData HeadersCrypt;
+ #endif
+     ComprDataIO SubDataIO;
+     bool DummyCmd;
+     RAROptions *Cmd;
+ 
+     int64 RecoverySize;
+     int RecoveryPercent;
+ 
+     RarTime LatestTime;
+     int LastReadBlock;
+     HEADER_TYPE CurHeaderType;
+ 
+     bool SilentOpen;
+ #ifdef USE_QOPEN
+     QuickOpen QOpen;
++    bool ProhibitQOpen;
++#endif
++#ifdef USE_ARCMEM
++    ArcMemory ArcMem;
+ #endif
+   public:
+     Archive(RAROptions *InitCmd=NULL);
+     ~Archive();
+     static RARFORMAT IsSignature(const byte *D,size_t Size);
+     bool IsArchive(bool EnableBroken);
+     size_t SearchBlock(HEADER_TYPE HeaderType);
+     size_t SearchSubBlock(const wchar *Type);
+     size_t SearchRR();
+     void WriteBlock(HEADER_TYPE HeaderType,BaseBlock *wb=NULL,bool OnlySetSize=false,bool NonFinalWrite=false);
+     void SetBlockSize(HEADER_TYPE HeaderType,BaseBlock *wb=NULL) {WriteBlock(HeaderType,wb,true);}
+     size_t ReadHeader();
+     void CheckArc(bool EnableBroken);
+     void CheckOpen(const wchar *Name);
+     bool WCheckOpen(const wchar *Name);
+     bool GetComment(Array<wchar> *CmtData);
+     void ViewComment();
+     void SetLatestTime(RarTime *NewTime);
+     void SeekToNext();
+     bool CheckAccess();
+     bool IsArcDir();
+     void ConvertAttributes();
+     void VolSubtractHeaderSize(size_t SubSize);
+     uint FullHeaderSize(size_t Size);
+     int64 GetStartPos();
+     void AddSubData(byte *SrcData,uint64 DataSize,File *SrcFile,
+          const wchar *Name,uint Flags);
+     bool ReadSubData(Array<byte> *UnpData,File *DestFile);
+     HEADER_TYPE GetHeaderType() {return CurHeaderType;};
+     RAROptions* GetRAROptions() {return Cmd;}
+     void SetSilentOpen(bool Mode) {SilentOpen=Mode;}
+ #if 0
+     void GetRecoveryInfo(bool Required,int64 *Size,int *Percent);
+ #endif
+-#ifdef USE_QOPEN
+     bool Open(const wchar *Name,uint Mode=FMF_READ);
++    bool Close();
+     int Read(void *Data,size_t Size);
+     void Seek(int64 Offset,int Method);
+     int64 Tell();
++    bool IsOpened();
++#ifdef USE_QOPEN
+     void QOpenUnload() {QOpen.Unload();}
++    void SetProhibitQOpen(bool Mode) {ProhibitQOpen=Mode;}
+ #endif
+ 
+     BaseBlock ShortBlock;
+     MarkHeader MarkHead;
+     MainHeader MainHead;
+     CryptHeader CryptHead;
+     FileHeader FileHead;
+     EndArcHeader EndArcHead;
+     SubBlockHeader SubBlockHead;
+     FileHeader SubHead;
+     CommentHeader CommHead;
+     ProtectHeader ProtectHead;
+     AVHeader AVHead;
+     SignHeader SignHead;
+     UnixOwnersHeader UOHead;
+     MacFInfoHeader MACHead;
+     EAHeader EAHead;
+     StreamHeader StreamHead;
+ 
+     int64 CurBlockPos;
+     int64 NextBlockPos;
+ 
+     RARFORMAT Format;
+     bool Solid;
+     bool Volume;
+     bool MainComment;
+     bool Locked;
+     bool Signed;
+     bool FirstVolume;
+     bool NewNumbering;
+     bool Protected;
+     bool Encrypted;
+     size_t SFXSize;
+     bool BrokenHeader;
+     bool FailedHeaderDecryption;
+ 
+ #if !defined(RAR_NOCRYPT)
+     byte ArcSalt[SIZE_SALT50];
+ #endif
+ 
+     bool Splitting;
+ 
+     uint VolNumber;
+     int64 VolWrite;
+     uint64 AddingFilesSize;
+     uint64 AddingHeadersSize;
+ 
+     bool NewArchive;
+ 
+     wchar FirstVolumeName[NM];
+ };
+ 
+ 
+ #endif
+diff --git a/arcmem.cpp b/arcmem.cpp
+new file mode 100644
+index 0000000..a849785
+--- /dev/null
++++ b/arcmem.cpp
+@@ -0,0 +1,62 @@
++ArcMemory::ArcMemory()
++{
++  Loaded=false;
++  SeekPos=0;
++}
++
++
++void ArcMemory::Load(const byte *Data,size_t Size)
++{
++  ArcData.Alloc(Size);
++  memcpy(&ArcData[0],Data,Size);
++  Loaded=true;
++  SeekPos=0;
++}
++
++
++bool ArcMemory::Unload()
++{
++  if (!Loaded)
++    return false;
++  Loaded=false;
++  return true;
++}
++
++
++bool ArcMemory::Read(void *Data,size_t Size,size_t &Result)
++{
++  if (!Loaded)
++    return false;
++  Result=(size_t)Min(Size,ArcData.Size()-SeekPos);
++  memcpy(Data,&ArcData[(size_t)SeekPos],Result);
++  SeekPos+=Result;
++  return true;
++}
++
++
++bool ArcMemory::Seek(int64 Offset,int Method)
++{
++  if (!Loaded)
++    return false;
++  if (Method==SEEK_SET)
++    SeekPos=Min(Offset,ArcData.Size());
++  else
++    if (Method==SEEK_CUR || Method==SEEK_END)
++    {
++      if (Method==SEEK_END)
++        SeekPos=ArcData.Size();
++      SeekPos+=(uint64)Offset;
++      if (SeekPos>ArcData.Size())
++        SeekPos=Offset<0 ? 0 : ArcData.Size();
++    }
++  return true;
++}
++
++
++bool ArcMemory::Tell(int64 *Pos)
++{
++  if (!Loaded)
++    return false;
++  *Pos=SeekPos;
++  return true;
++}
+diff --git a/arcmem.hpp b/arcmem.hpp
+new file mode 100644
+index 0000000..6fbe7c3
+--- /dev/null
++++ b/arcmem.hpp
+@@ -0,0 +1,22 @@
++#ifndef _RAR_ARCMEM_
++#define _RAR_ARCMEM_
++
++// Memory interface for software fuzzers.
++
++class ArcMemory
++{
++  private:
++    bool Loaded;
++    Array<byte> ArcData;
++    uint64 SeekPos;
++  public:
++    ArcMemory();
++    void Load(const byte *Data,size_t Size);
++    bool Unload();
++    bool IsLoaded() {return Loaded;}
++    bool Read(void *Data,size_t Size,size_t &Result);
++    bool Seek(int64 Offset,int Method);
++    bool Tell(int64 *Pos);
++};
++
++#endif
+diff --git a/arcread.cpp b/arcread.cpp
+index a4900f9..6b3de71 100644
+--- a/arcread.cpp
++++ b/arcread.cpp
+@@ -573,326 +573,326 @@ size_t Archive::ReadHeader15()
+ size_t Archive::ReadHeader50()
+ {
+   RawRead Raw(this);
+ 
+   bool Decrypt=Encrypted && CurBlockPos>(int64)SFXSize+SIZEOF_MARKHEAD5;
+ 
+   if (Decrypt)
+   {
+ #if defined(RAR_NOCRYPT)
+     return 0;
+ #else
+ 
+     byte HeadersInitV[SIZE_INITV];
+     if (Read(HeadersInitV,SIZE_INITV)!=SIZE_INITV)
+     {
+       UnexpEndArcMsg();
+       return 0;
+     }
+ 
+     while (true) // Repeat the password prompt for wrong passwords.
+     {
+       RequestArcPassword();
+ 
+       byte PswCheck[SIZE_PSWCHECK];
+       HeadersCrypt.SetCryptKeys(false,CRYPT_RAR50,&Cmd->Password,CryptHead.Salt,HeadersInitV,CryptHead.Lg2Count,NULL,PswCheck);
+       // Verify password validity.
+       if (CryptHead.UsePswCheck && memcmp(PswCheck,CryptHead.PswCheck,SIZE_PSWCHECK)!=0)
+       {
+         // This message is used by Android GUI and Windows GUI and SFX to
+         // reset cached passwords. Update appropriate code if changed.
+         uiMsg(UIWAIT_BADPSW,FileName);
+ 
+         Cmd->Password.Clean();
+         continue;
+       }
+       break;
+     }
+ 
+     Raw.SetCrypt(&HeadersCrypt);
+ #endif
+   }
+ 
+   // Header size must not occupy more than 3 variable length integer bytes
+   // resulting in 2 MB maximum header size, so here we read 4 byte CRC32
+   // followed by 3 bytes or less of header size.
+   const size_t FirstReadSize=7; // Smallest possible block size.
+   if (Raw.Read(FirstReadSize)<FirstReadSize)
+   {
+     UnexpEndArcMsg();
+     return 0;
+   }
+ 
+   ShortBlock.Reset();
+   ShortBlock.HeadCRC=Raw.Get4();
+   uint SizeBytes=Raw.GetVSize(4);
+   uint64 BlockSize=Raw.GetV();
+ 
+   if (BlockSize==0 || SizeBytes==0)
+   {
+     BrokenHeaderMsg();
+     return 0;
+   }
+ 
+   int SizeToRead=int(BlockSize);
+   SizeToRead-=FirstReadSize-SizeBytes-4; // Adjust overread size bytes if any.
+   uint HeaderSize=4+SizeBytes+(uint)BlockSize;
+ 
+   if (SizeToRead<0 || HeaderSize<SIZEOF_SHORTBLOCKHEAD5)
+   {
+     BrokenHeaderMsg();
+     return 0;
+   }
+   
+   Raw.Read(SizeToRead);
+ 
+   if (Raw.Size()<HeaderSize)
+   {
+     UnexpEndArcMsg();
+     return 0;
+   }
+ 
+   uint HeaderCRC=Raw.GetCRC50();
+ 
+   ShortBlock.HeaderType=(HEADER_TYPE)Raw.GetV();
+   ShortBlock.Flags=(uint)Raw.GetV();
+   ShortBlock.SkipIfUnknown=(ShortBlock.Flags & HFL_SKIPIFUNKNOWN)!=0;
+   ShortBlock.HeadSize=HeaderSize;
+ 
+   CurHeaderType=ShortBlock.HeaderType;
+ 
+   bool BadCRC=(ShortBlock.HeadCRC!=HeaderCRC);
+   if (BadCRC)
+   {
+     BrokenHeaderMsg(); // Report, but attempt to process.
+ 
+     BrokenHeader=true;
+     ErrHandler.SetErrorCode(RARX_CRC);
+ 
+     if (Decrypt)
+     {
+       uiMsg(UIERROR_CHECKSUMENC,FileName,FileName);
+       FailedHeaderDecryption=true;
+       return 0;
+     }
+   }
+   
+   uint64 ExtraSize=0;
+   if ((ShortBlock.Flags & HFL_EXTRA)!=0)
+   {
+     ExtraSize=Raw.GetV();
+     if (ExtraSize>=ShortBlock.HeadSize)
+     {
+       BrokenHeaderMsg();
+       return 0;
+     }
+   }
+ 
+   uint64 DataSize=0;
+   if ((ShortBlock.Flags & HFL_DATA)!=0)
+     DataSize=Raw.GetV();
+ 
+   NextBlockPos=CurBlockPos+FullHeaderSize(ShortBlock.HeadSize);
+   // Set to 0 in case of overflow, so end of ReadHeader cares about it.
+   NextBlockPos=SafeAdd(NextBlockPos,DataSize,0);
+ 
+   switch(ShortBlock.HeaderType)
+   {
+     case HEAD_CRYPT:
+       {
+         *(BaseBlock *)&CryptHead=ShortBlock;
+         uint CryptVersion=(uint)Raw.GetV();
+         if (CryptVersion>CRYPT_VERSION)
+         {
+           UnkEncVerMsg(FileName);
+           return 0;
+         }
+         uint EncFlags=(uint)Raw.GetV();
+         CryptHead.UsePswCheck=(EncFlags & CHFL_CRYPT_PSWCHECK)!=0;
+         CryptHead.Lg2Count=Raw.Get1();
+         if (CryptHead.Lg2Count>CRYPT5_KDF_LG2_COUNT_MAX)
+         {
+           UnkEncVerMsg(FileName);
+           return 0;
+         }
+         Raw.GetB(CryptHead.Salt,SIZE_SALT50);
+         if (CryptHead.UsePswCheck)
+         {
+           Raw.GetB(CryptHead.PswCheck,SIZE_PSWCHECK);
+ 
+           byte csum[SIZE_PSWCHECK_CSUM];
+           Raw.GetB(csum,SIZE_PSWCHECK_CSUM);
+ 
+           sha256_context ctx;
+           sha256_init(&ctx);
+           sha256_process(&ctx, CryptHead.PswCheck, SIZE_PSWCHECK);
+ 
+           byte Digest[SHA256_DIGEST_SIZE];
+           sha256_done(&ctx, Digest);
+ 
+           CryptHead.UsePswCheck=memcmp(csum,Digest,SIZE_PSWCHECK_CSUM)==0;
+         }
+         Encrypted=true;
+       }
+       break;
+     case HEAD_MAIN:
+       {
+         MainHead.Reset();
+         *(BaseBlock *)&MainHead=ShortBlock;
+         uint ArcFlags=(uint)Raw.GetV();
+ 
+         Volume=(ArcFlags & MHFL_VOLUME)!=0;
+         Solid=(ArcFlags & MHFL_SOLID)!=0;
+         Locked=(ArcFlags & MHFL_LOCK)!=0;
+         Protected=(ArcFlags & MHFL_PROTECT)!=0;
+         Signed=false;
+         NewNumbering=true;
+ 
+         if ((ArcFlags & MHFL_VOLNUMBER)!=0)
+           VolNumber=(uint)Raw.GetV();
+         else
+           VolNumber=0;
+         FirstVolume=Volume && VolNumber==0;
+ 
+         if (ExtraSize!=0)
+           ProcessExtra50(&Raw,(size_t)ExtraSize,&MainHead);
+ 
+ #ifdef USE_QOPEN
+-        if (MainHead.Locator && MainHead.QOpenOffset>0 && Cmd->QOpenMode!=QOPEN_NONE)
++        if (!ProhibitQOpen && MainHead.Locator && MainHead.QOpenOffset>0 && Cmd->QOpenMode!=QOPEN_NONE)
+         {
+           // We seek to QO block in the end of archive when processing
+           // QOpen.Load, so we need to preserve current block positions
+           // to not break normal archive processing by calling function.
+           int64 SaveCurBlockPos=CurBlockPos,SaveNextBlockPos=NextBlockPos;
+           HEADER_TYPE SaveCurHeaderType=CurHeaderType;
+           
+           QOpen.Init(this,false);
+           QOpen.Load(MainHead.QOpenOffset);
+ 
+           CurBlockPos=SaveCurBlockPos;
+           NextBlockPos=SaveNextBlockPos;
+           CurHeaderType=SaveCurHeaderType;
+         }
+ #endif
+       }
+       break;
+     case HEAD_FILE:
+     case HEAD_SERVICE:
+       {
+         FileHeader *hd=ShortBlock.HeaderType==HEAD_FILE ? &FileHead:&SubHead;
+         hd->Reset();
+         *(BaseBlock *)hd=ShortBlock;
+ 
+         bool FileBlock=ShortBlock.HeaderType==HEAD_FILE;
+ 
+         hd->LargeFile=true;
+ 
+         hd->PackSize=DataSize;
+         hd->FileFlags=(uint)Raw.GetV();
+         hd->UnpSize=Raw.GetV();
+         
+         hd->UnknownUnpSize=(hd->FileFlags & FHFL_UNPUNKNOWN)!=0;
+         if (hd->UnknownUnpSize)
+           hd->UnpSize=INT64NDF;
+ 
+         hd->MaxSize=Max(hd->PackSize,hd->UnpSize);
+         hd->FileAttr=(uint)Raw.GetV();
+         if ((hd->FileFlags & FHFL_UTIME)!=0)
+           hd->mtime.SetUnix((time_t)Raw.Get4());
+ 
+         hd->FileHash.Type=HASH_NONE;
+         if ((hd->FileFlags & FHFL_CRC32)!=0)
+         {
+           hd->FileHash.Type=HASH_CRC32;
+           hd->FileHash.CRC32=Raw.Get4();
+         }
+ 
+         hd->RedirType=FSREDIR_NONE;
+ 
+         uint CompInfo=(uint)Raw.GetV();
+         hd->Method=(CompInfo>>7) & 7;
+ 
+         // "+ 50" to not mix with old RAR format algorithms. For example,
+         // we may need to use the compression algorithm 15 in the future,
+         // but it was already used in RAR 1.5 and Unpack needs to distinguish
+         // them.
+         hd->UnpVer=(CompInfo & 0x3f) + 50;
+ 
+         hd->HostOS=(byte)Raw.GetV();
+         size_t NameSize=(size_t)Raw.GetV();
+         hd->Inherited=(ShortBlock.Flags & HFL_INHERITED)!=0;
+ 
+         hd->HSType=HSYS_UNKNOWN;
+         if (hd->HostOS==HOST5_UNIX)
+           hd->HSType=HSYS_UNIX;
+         else
+           if (hd->HostOS==HOST5_WINDOWS)
+             hd->HSType=HSYS_WINDOWS;
+ 
+         hd->SplitBefore=(hd->Flags & HFL_SPLITBEFORE)!=0;
+         hd->SplitAfter=(hd->Flags & HFL_SPLITAFTER)!=0;
+         hd->SubBlock=(hd->Flags & HFL_CHILD)!=0;
+         hd->Solid=FileBlock && (CompInfo & FCI_SOLID)!=0;
+         hd->Dir=(hd->FileFlags & FHFL_DIRECTORY)!=0;
+         hd->WinSize=hd->Dir ? 0:size_t(0x20000)<<((CompInfo>>10)&0xf);
+ 
+         hd->CryptMethod=hd->Encrypted ? CRYPT_RAR50:CRYPT_NONE;
+ 
+         char FileName[NM*4];
+         size_t ReadNameSize=Min(NameSize,ASIZE(FileName)-1);
+         Raw.GetB((byte *)FileName,ReadNameSize);
+         FileName[ReadNameSize]=0;
+ 
+         UtfToWide(FileName,hd->FileName,ASIZE(hd->FileName));
+ 
+         // Should do it before converting names, because extra fields can
+         // affect name processing, like in case of NTFS streams.
+         if (ExtraSize!=0)
+           ProcessExtra50(&Raw,(size_t)ExtraSize,hd);
+ 
+         if (FileBlock)
+         {
+ #ifndef SFX_MODULE
+           ConvertNameCase(hd->FileName);
+ #endif
+           ConvertFileHeader(hd);
+         }
+ 
+         if (!FileBlock && hd->CmpName(SUBHEAD_TYPE_CMT))
+           MainComment=true;
+ 
+ #if 0
+         // For RAR5 format we read the user specified recovery percent here.
+         // It would be useful to do it for shell extension too, so we display
+         // the correct recovery record size in archive properties. But then
+         // we would need to include the entire recovery record processing
+         // code to shell extension, which is not done now.
+         if (!FileBlock && hd->CmpName(SUBHEAD_TYPE_RR) && hd->SubData.Size()>0)
+         {
+           RecoveryPercent=hd->SubData[0];
+           RSBlockHeader Header;
+           GetRRInfo(this,&Header);
+           RecoverySize=Header.RecSectionSize*Header.RecCount;
+         }
+ #endif
+           
+         if (BadCRC) // Add the file name to broken header message displayed above.
+           uiMsg(UIERROR_FHEADERBROKEN,Archive::FileName,hd->FileName);
+       }
+       break;
+     case HEAD_ENDARC:
+       {
+         *(BaseBlock *)&EndArcHead=ShortBlock;
+         uint ArcFlags=(uint)Raw.GetV();
+         EndArcHead.NextVolume=(ArcFlags & EHFL_NEXTVOLUME)!=0;
+         EndArcHead.StoreVolNumber=false;
+         EndArcHead.DataCRC=false;
+         EndArcHead.RevSpace=false;
+       }
+       break;
+   }
+ 
+   return Raw.Size();
+ }
+ 
+ 
+ #if !defined(RAR_NOCRYPT)
+@@ -943,242 +943,242 @@ void Archive::RequestArcPassword()
+ void Archive::ProcessExtra50(RawRead *Raw,size_t ExtraSize,BaseBlock *bb)
+ {
+   // Read extra data from the end of block skipping any fields before it.
+   size_t ExtraStart=Raw->Size()-ExtraSize;
+   if (ExtraStart<Raw->GetPos())
+     return;
+   Raw->SetPos(ExtraStart);
+   while (Raw->DataLeft()>=2)
+   {
+     int64 FieldSize=Raw->GetV(); // Needs to be signed for check below and can be negative.
+     if (FieldSize<=0 || Raw->DataLeft()==0 || FieldSize>(int64)Raw->DataLeft())
+       break;
+     size_t NextPos=size_t(Raw->GetPos()+FieldSize);
+     uint64 FieldType=Raw->GetV();
+ 
+     FieldSize=int64(NextPos-Raw->GetPos()); // Field size without size and type fields.
+ 
+     if (FieldSize<0) // FieldType is longer than expected extra field size.
+       break;
+ 
+     if (bb->HeaderType==HEAD_MAIN)
+     {
+       MainHeader *hd=(MainHeader *)bb;
+       if (FieldType==MHEXTRA_LOCATOR)
+       {
+         hd->Locator=true;
+         uint Flags=(uint)Raw->GetV();
+         if ((Flags & MHEXTRA_LOCATOR_QLIST)!=0)
+         {
+           uint64 Offset=Raw->GetV();
+           if (Offset!=0) // 0 means that reserved space was not enough to write the offset.
+             hd->QOpenOffset=Offset+CurBlockPos;
+         }
+         if ((Flags & MHEXTRA_LOCATOR_RR)!=0)
+         {
+           uint64 Offset=Raw->GetV();
+           if (Offset!=0) // 0 means that reserved space was not enough to write the offset.
+             hd->RROffset=Offset+CurBlockPos;
+         }
+       }
+     }
+ 
+     if (bb->HeaderType==HEAD_FILE || bb->HeaderType==HEAD_SERVICE)
+     {
+       FileHeader *hd=(FileHeader *)bb;
+       switch(FieldType)
+       {
+         case FHEXTRA_CRYPT:
+           {
+             FileHeader *hd=(FileHeader *)bb;
+             uint EncVersion=(uint)Raw->GetV();
+             if (EncVersion > CRYPT_VERSION)
+               UnkEncVerMsg(hd->FileName);
+             else
+             {
+               uint Flags=(uint)Raw->GetV();
+               hd->UsePswCheck=(Flags & FHEXTRA_CRYPT_PSWCHECK)!=0;
+               hd->UseHashKey=(Flags & FHEXTRA_CRYPT_HASHMAC)!=0;
+               hd->Lg2Count=Raw->Get1();
+               if (hd->Lg2Count>CRYPT5_KDF_LG2_COUNT_MAX)
+                 UnkEncVerMsg(hd->FileName);
+               Raw->GetB(hd->Salt,SIZE_SALT50);
+               Raw->GetB(hd->InitV,SIZE_INITV);
+               if (hd->UsePswCheck)
+               {
+                 Raw->GetB(hd->PswCheck,SIZE_PSWCHECK);
+ 
+                 // It is important to know if password check data is valid.
+                 // If it is damaged and header CRC32 fails to detect it,
+                 // archiver would refuse to decompress a possibly valid file.
+                 // Since we want to be sure distinguishing a wrong password
+                 // or corrupt file data, we use 64-bit password check data
+                 // and to control its validity we use 32 bits of password
+                 // check data SHA-256 additionally to 32-bit header CRC32.
+                 byte csum[SIZE_PSWCHECK_CSUM];
+                 Raw->GetB(csum,SIZE_PSWCHECK_CSUM);
+ 
+                 sha256_context ctx;
+                 sha256_init(&ctx);
+                 sha256_process(&ctx, hd->PswCheck, SIZE_PSWCHECK);
+ 
+                 byte Digest[SHA256_DIGEST_SIZE];
+                 sha256_done(&ctx, Digest);
+ 
+                 hd->UsePswCheck=memcmp(csum,Digest,SIZE_PSWCHECK_CSUM)==0;
+ 
+                 // RAR 5.21 and earlier set PswCheck field in service records to 0
+                 // even if UsePswCheck was present.
+                 if (bb->HeaderType==HEAD_SERVICE && memcmp(hd->PswCheck,"\0\0\0\0\0\0\0\0",SIZE_PSWCHECK)==0)
+                   hd->UsePswCheck=0;
+               }
+               hd->SaltSet=true;
+               hd->CryptMethod=CRYPT_RAR50;
+               hd->Encrypted=true;
+             }
+           }
+           break;
+         case FHEXTRA_HASH:
+           {
+             FileHeader *hd=(FileHeader *)bb;
+             uint Type=(uint)Raw->GetV();
+             if (Type==FHEXTRA_HASH_BLAKE2)
+             {
+               hd->FileHash.Type=HASH_BLAKE2;
+               Raw->GetB(hd->FileHash.Digest,BLAKE2_DIGEST_SIZE);
+             }
+           }
+           break;
+         case FHEXTRA_HTIME:
+           if (FieldSize>=5)
+           {
+             byte Flags=(byte)Raw->GetV();
+             bool UnixTime=(Flags & FHEXTRA_HTIME_UNIXTIME)!=0;
+             if ((Flags & FHEXTRA_HTIME_MTIME)!=0)
+               if (UnixTime)
+                 hd->mtime.SetUnix(Raw->Get4());
+               else
+                 hd->mtime.SetWin(Raw->Get8());
+             if ((Flags & FHEXTRA_HTIME_CTIME)!=0)
+               if (UnixTime)
+                 hd->ctime.SetUnix(Raw->Get4());
+               else
+                 hd->ctime.SetWin(Raw->Get8());
+             if ((Flags & FHEXTRA_HTIME_ATIME)!=0)
+               if (UnixTime)
+                 hd->atime.SetUnix((time_t)Raw->Get4());
+               else
+                 hd->atime.SetWin(Raw->Get8());
+             if (UnixTime && (Flags & FHEXTRA_HTIME_UNIX_NS)!=0) // Add nanoseconds.
+             {
+               uint ns;
+               if ((Flags & FHEXTRA_HTIME_MTIME)!=0 && (ns=(Raw->Get4() & 0x3fffffff))<1000000000)
+                 hd->mtime.Adjust(ns);
+               if ((Flags & FHEXTRA_HTIME_CTIME)!=0 && (ns=(Raw->Get4() & 0x3fffffff))<1000000000)
+                 hd->ctime.Adjust(ns);
+               if ((Flags & FHEXTRA_HTIME_ATIME)!=0 && (ns=(Raw->Get4() & 0x3fffffff))<1000000000)
+                 hd->atime.Adjust(ns);
+             }
+           }
+           break;
+         case FHEXTRA_VERSION:
+           if (FieldSize>=1)
+           {
+             Raw->GetV(); // Skip flags field.
+             uint Version=(uint)Raw->GetV();
+             if (Version!=0)
+             {
+               hd->Version=true;
+ 
+               wchar VerText[20];
+               swprintf(VerText,ASIZE(VerText),L";%u",Version);
+-              wcsncatz(FileHead.FileName,VerText,ASIZE(FileHead.FileName));
++              wcsncatz(hd->FileName,VerText,ASIZE(hd->FileName));
+             }
+           }
+           break;
+         case FHEXTRA_REDIR:
+           {
+             hd->RedirType=(FILE_SYSTEM_REDIRECT)Raw->GetV();
+             uint Flags=(uint)Raw->GetV();
+             hd->DirTarget=(Flags & FHEXTRA_REDIR_DIR)!=0;
+             size_t NameSize=(size_t)Raw->GetV();
+ 
+             char UtfName[NM*4];
+             *UtfName=0;
+             if (NameSize<ASIZE(UtfName)-1)
+             {
+               Raw->GetB(UtfName,NameSize);
+               UtfName[NameSize]=0;
+             }
+ #ifdef _WIN_ALL
+             UnixSlashToDos(UtfName,UtfName,ASIZE(UtfName));
+ #endif
+             UtfToWide(UtfName,hd->RedirName,ASIZE(hd->RedirName));
+           }
+           break;
+         case FHEXTRA_UOWNER:
+           {
+             uint Flags=(uint)Raw->GetV();
+             hd->UnixOwnerNumeric=(Flags & FHEXTRA_UOWNER_NUMUID)!=0;
+             hd->UnixGroupNumeric=(Flags & FHEXTRA_UOWNER_NUMGID)!=0;
+             *hd->UnixOwnerName=*hd->UnixGroupName=0;
+             if ((Flags & FHEXTRA_UOWNER_UNAME)!=0)
+             {
+               size_t Length=(size_t)Raw->GetV();
+               Length=Min(Length,ASIZE(hd->UnixOwnerName)-1);
+               Raw->GetB(hd->UnixOwnerName,Length);
+               hd->UnixOwnerName[Length]=0;
+             }
+             if ((Flags & FHEXTRA_UOWNER_GNAME)!=0)
+             {
+               size_t Length=(size_t)Raw->GetV();
+               Length=Min(Length,ASIZE(hd->UnixGroupName)-1);
+               Raw->GetB(hd->UnixGroupName,Length);
+               hd->UnixGroupName[Length]=0;
+             }
+ #ifdef _UNIX
+             if (hd->UnixOwnerNumeric)
+               hd->UnixOwnerID=(uid_t)Raw->GetV();
+             if (hd->UnixGroupNumeric)
+               hd->UnixGroupID=(gid_t)Raw->GetV();
+ #else
+             // Need these fields in Windows too for 'list' command,
+             // but uid_t and gid_t are not defined.
+             if (hd->UnixOwnerNumeric)
+               hd->UnixOwnerID=(uint)Raw->GetV();
+             if (hd->UnixGroupNumeric)
+               hd->UnixGroupID=(uint)Raw->GetV();
+ #endif
+             hd->UnixOwnerSet=true;
+           }
+           break;
+         case FHEXTRA_SUBDATA:
+           {
+             // RAR 5.21 and earlier set FHEXTRA_SUBDATA size to 1 less than
+             // required. It did not hurt extraction, because UnRAR 5.21
+             // and earlier ignored this field and set FieldSize as data left
+             // in entire extra area. But now we set the correct field size
+             // and set FieldSize based on the actual extra record size,
+             // so we need to adjust it for those older archives here.
+             // FHEXTRA_SUBDATA in those archives always belongs to HEAD_SERVICE
+             // and always is last in extra area. So since its size is by 1
+             // less than needed, we always have 1 byte left in extra area,
+             // which fact we use here to detect such archives.
+             if (bb->HeaderType==HEAD_SERVICE && Raw->Size()-NextPos==1)
+               FieldSize++;
+ 
+             // We cannot allocate too much memory here, because above
+             // we check FieldSize againt Raw size and we control that Raw size
+             // is sensible when reading headers.
+             hd->SubData.Alloc((size_t)FieldSize);
+             Raw->GetB(hd->SubData.Addr(0),(size_t)FieldSize);
+           }
+           break;
+       }
+     }
+ 
+     Raw->SetPos(NextPos);
+   }
+ }
+ 
+ 
+ #ifndef SFX_MODULE
+diff --git a/cmddata.cpp b/cmddata.cpp
+index 1b6da65..baa3eb6 100644
+--- a/cmddata.cpp
++++ b/cmddata.cpp
+@@ -89,63 +89,63 @@ void CommandData::ParseCommandLine(bool Preprocess,int argc, char *argv[])
+ #if !defined(SFX_MODULE)
+ void CommandData::ParseArg(wchar *Arg)
+ {
+   if (IsSwitch(*Arg) && !NoMoreSwitches)
+     if (Arg[1]=='-' && Arg[2]==0)
+       NoMoreSwitches=true;
+     else
+       ProcessSwitch(Arg+1);
+   else
+     if (*Command==0)
+     {
+-      wcsncpy(Command,Arg,ASIZE(Command));
++      wcsncpyz(Command,Arg,ASIZE(Command));
+ 
+ 
+       *Command=toupperw(*Command);
+       // 'I' and 'S' commands can contain case sensitive strings after
+       // the first character, so we must not modify their case.
+       // 'S' can contain SFX name, which case is important in Unix.
+       if (*Command!='I' && *Command!='S')
+         wcsupper(Command);
+     }
+     else
+       if (*ArcName==0)
+         wcsncpyz(ArcName,Arg,ASIZE(ArcName));
+       else
+       {
+         // Check if last character is the path separator.
+         size_t Length=wcslen(Arg);
+         wchar EndChar=Length==0 ? 0:Arg[Length-1];
+         bool EndSeparator=IsDriveDiv(EndChar) || IsPathDiv(EndChar);
+ 
+         wchar CmdChar=toupperw(*Command);
+         bool Add=wcschr(L"AFUM",CmdChar)!=NULL;
+         bool Extract=CmdChar=='X' || CmdChar=='E';
+         if (EndSeparator && !Add)
+           wcsncpyz(ExtrPath,Arg,ASIZE(ExtrPath));
+         else
+           if ((Add || CmdChar=='T') && (*Arg!='@' || ListMode==RCLM_REJECT_LISTS))
+             FileArgs.AddString(Arg);
+           else
+           {
+             FindData FileData;
+             bool Found=FindFile::FastFind(Arg,&FileData);
+             if ((!Found || ListMode==RCLM_ACCEPT_LISTS) && 
+                 ListMode!=RCLM_REJECT_LISTS && *Arg=='@' && !IsWildcard(Arg))
+             {
+               FileLists=true;
+ 
+               ReadTextFile(Arg+1,&FileArgs,false,true,FilelistCharset,true,true,true);
+ 
+             }
+             else
+               if (Found && FileData.IsDir && Extract && *ExtrPath==0)
+               {
+                 wcsncpyz(ExtrPath,Arg,ASIZE(ExtrPath));
+                 AddEndSlash(ExtrPath,ASIZE(ExtrPath));
+               }
+               else
+                 FileArgs.AddString(Arg);
+           }
+       }
+ }
+ #endif
+@@ -1192,31 +1192,31 @@ bool CommandData::SizeCheck(int64 Size)
+ int CommandData::IsProcessFile(FileHeader &FileHead,bool *ExactMatch,int MatchType,
+                                wchar *MatchedArg,uint MatchedArgSize)
+ {
+   if (MatchedArg!=NULL && MatchedArgSize>0)
+     *MatchedArg=0;
+-  if (wcslen(FileHead.FileName)>=NM)
+-    return 0;
++//  if (wcslen(FileHead.FileName)>=NM)
++//    return 0;
+   bool Dir=FileHead.Dir;
+   if (ExclCheck(FileHead.FileName,Dir,false,true))
+     return 0;
+ #ifndef SFX_MODULE
+   if (TimeCheck(FileHead.mtime))
+     return 0;
+   if ((FileHead.FileAttr & ExclFileAttr)!=0 || InclAttrSet && (FileHead.FileAttr & InclFileAttr)==0)
+     return 0;
+   if (!Dir && SizeCheck(FileHead.UnpSize))
+     return 0;
+ #endif
+   wchar *ArgName;
+   FileArgs.Rewind();
+   for (int StringCount=1;(ArgName=FileArgs.GetString())!=NULL;StringCount++)
+     if (CmpName(ArgName,FileHead.FileName,MatchType))
+     {
+       if (ExactMatch!=NULL)
+         *ExactMatch=wcsicompc(ArgName,FileHead.FileName)==0;
+       if (MatchedArg!=NULL)
+         wcsncpyz(MatchedArg,ArgName,MatchedArgSize);
+       return StringCount;
+     }
+   return 0;
+ }
+@@ -1225,67 +1225,67 @@ int CommandData::IsProcessFile(FileHeader &FileHead,bool *ExactMatch,int MatchTy
+ void CommandData::ProcessCommand()
+ {
+ #ifndef SFX_MODULE
+ 
+   const wchar *SingleCharCommands=L"FUADPXETK";
+   if (Command[0]!=0 && Command[1]!=0 && wcschr(SingleCharCommands,Command[0])!=NULL || *ArcName==0)
+     OutHelp(*Command==0 ? RARX_SUCCESS:RARX_USERERROR); // Return 'success' for 'rar' without parameters.
+ 
+   const wchar *ArcExt=GetExt(ArcName);
+ #ifdef _UNIX
+   if (ArcExt==NULL && (!FileExist(ArcName) || IsDir(GetFileAttr(ArcName))))
+     wcsncatz(ArcName,L".rar",ASIZE(ArcName));
+ #else
+   if (ArcExt==NULL)
+     wcsncatz(ArcName,L".rar",ASIZE(ArcName));
+ #endif
+   // Treat arcname.part1 as arcname.part1.rar.
+   if (ArcExt!=NULL && wcsnicomp(ArcExt,L".part",5)==0 && IsDigit(ArcExt[5]) &&
+       !FileExist(ArcName))
+   {
+     wchar Name[NM];
+     wcsncpyz(Name,ArcName,ASIZE(Name));
+     wcsncatz(Name,L".rar",ASIZE(Name));
+     if (FileExist(Name))
+       wcsncpyz(ArcName,Name,ASIZE(ArcName));
+   }
+ 
+-  if (wcschr(L"AFUMD",*Command)==NULL)
++  if (wcschr(L"AFUMD",*Command)==NULL && !ArcInMem)
+   {
+     if (GenerateArcName)
+       GenerateArchiveName(ArcName,ASIZE(ArcName),GenerateMask,false);
+ 
+     StringList ArcMasks;
+     ArcMasks.AddString(ArcName);
+     ScanTree Scan(&ArcMasks,Recurse,SaveSymLinks,SCAN_SKIPDIRS);
+     FindData FindData;
+     while (Scan.GetNext(&FindData)==SCAN_SUCCESS)
+       AddArcName(FindData.Name);
+   }
+   else
+     AddArcName(ArcName);
+ #endif
+ 
+   switch(Command[0])
+   {
+     case 'P':
+     case 'X':
+     case 'E':
+     case 'T':
+     case 'I':
+       {
+         CmdExtract Extract(this);
+         Extract.DoExtract();
+       }
+       break;
+ #ifndef SILENT
+     case 'V':
+     case 'L':
+       ListArchive(this);
+       break;
+     default:
+       OutHelp(RARX_USERERROR);
+ #endif
+   }
+   if (!BareOutput)
+     mprintf(L"\n");
+ }
+diff --git a/compress.hpp b/compress.hpp
+index 8e4f1ed..73f7ee4 100644
+--- a/compress.hpp
++++ b/compress.hpp
+@@ -4,37 +4,46 @@
+ // Combine pack and unpack constants to class to avoid polluting global
+ // namespace with numerous short names.
+ class PackDef
+ {
+   public:
++    // Maximum LZ match length we can encode even for short distances.
+     static const uint MAX_LZ_MATCH = 0x1001;
++
++    // We increment LZ match length for longer distances, because shortest
++    // matches are not allowed for them. Maximum length increment is 3
++    // for distances larger than 256KB (0x40000). Here we define the maximum
++    // incremented LZ match. Normally packer does not use it, but we must be
++    // ready to process it in corrupt archives.
++    static const uint MAX_INC_LZ_MATCH = MAX_LZ_MATCH + 3;
++
+     static const uint MAX3_LZ_MATCH = 0x101; // Maximum match length for RAR v3.
+     static const uint LOW_DIST_REP_COUNT = 16;
+ 
+     static const uint NC    = 306; /* alphabet = {0, 1, 2, ..., NC - 1} */
+     static const uint DC    = 64;
+     static const uint LDC   = 16;
+     static const uint RC    = 44;
+     static const uint HUFF_TABLE_SIZE = NC + DC + RC + LDC;
+     static const uint BC    = 20;
+ 
+     static const uint NC30  = 299; /* alphabet = {0, 1, 2, ..., NC - 1} */
+     static const uint DC30  = 60;
+     static const uint LDC30 = 17;
+     static const uint RC30  = 28;
+     static const uint BC30  = 20;
+     static const uint HUFF_TABLE_SIZE30 = NC30 + DC30 + RC30 + LDC30;
+ 
+     static const uint NC20  = 298; /* alphabet = {0, 1, 2, ..., NC - 1} */
+     static const uint DC20  = 48;
+     static const uint RC20  = 28;
+     static const uint BC20  = 19;
+     static const uint MC20  = 257;
+ 
+     // Largest alphabet size among all values listed above.
+     static const uint LARGEST_TABLE_SIZE = 306;
+ 
+     enum {
+       CODE_HUFFMAN, CODE_LZ, CODE_REPEATLZ, CODE_CACHELZ, CODE_STARTFILE,
+       CODE_ENDFILE, CODE_FILTER, CODE_FILTERDATA
+     };
+ };
+diff --git a/file.hpp b/file.hpp
+index f8cff4f..20734e2 100644
+--- a/file.hpp
++++ b/file.hpp
+@@ -50,88 +50,88 @@ enum FILE_MODE_FLAGS {
+ class File
+ {
+   private:
+     FileHandle hFile;
+     bool LastWrite;
+     FILE_HANDLETYPE HandleType;
+     bool SkipClose;
+     bool IgnoreReadErrors;
+     bool NewFile;
+     bool AllowDelete;
+     bool AllowExceptions;
+ #ifdef _WIN_ALL
+     bool NoSequentialRead;
+     uint CreateMode;
+ #endif
+   protected:
+     bool OpenShared; // Set by 'Archive' class.
+   public:
+     wchar FileName[NM];
+ 
+     FILE_ERRORTYPE ErrorType;
+   public:
+     File();
+     virtual ~File();
+     void operator = (File &SrcFile);
+     virtual bool Open(const wchar *Name,uint Mode=FMF_READ);
+     void TOpen(const wchar *Name);
+     bool WOpen(const wchar *Name);
+     bool Create(const wchar *Name,uint Mode=FMF_UPDATE|FMF_SHAREREAD);
+     void TCreate(const wchar *Name,uint Mode=FMF_UPDATE|FMF_SHAREREAD);
+     bool WCreate(const wchar *Name,uint Mode=FMF_UPDATE|FMF_SHAREREAD);
+-    bool Close();
++    virtual bool Close();
+     bool Delete();
+     bool Rename(const wchar *NewName);
+     bool Write(const void *Data,size_t Size);
+     virtual int Read(void *Data,size_t Size);
+     int DirectRead(void *Data,size_t Size);
+     virtual void Seek(int64 Offset,int Method);
+     bool RawSeek(int64 Offset,int Method);
+     virtual int64 Tell();
+     void Prealloc(int64 Size);
+     byte GetByte();
+     void PutByte(byte Byte);
+     bool Truncate();
+     void Flush();
+     void SetOpenFileTime(RarTime *ftm,RarTime *ftc=NULL,RarTime *fta=NULL);
+     void SetCloseFileTime(RarTime *ftm,RarTime *fta=NULL);
+     static void SetCloseFileTimeByName(const wchar *Name,RarTime *ftm,RarTime *fta);
+     void GetOpenFileTime(RarTime *ft);
+-    bool IsOpened() {return hFile!=FILE_BAD_HANDLE;};
++    virtual bool IsOpened() {return hFile!=FILE_BAD_HANDLE;};
+     int64 FileLength();
+     void SetHandleType(FILE_HANDLETYPE Type) {HandleType=Type;}
+     FILE_HANDLETYPE GetHandleType() {return HandleType;}
+     bool IsDevice();
+     static bool RemoveCreated();
+     FileHandle GetHandle() {return hFile;}
+     void SetHandle(FileHandle Handle) {Close();hFile=Handle;}
+     void SetIgnoreReadErrors(bool Mode) {IgnoreReadErrors=Mode;}
+     int64 Copy(File &Dest,int64 Length=INT64NDF);
+     void SetAllowDelete(bool Allow) {AllowDelete=Allow;}
+     void SetExceptions(bool Allow) {AllowExceptions=Allow;}
+ #ifdef _WIN_ALL
+     void RemoveSequentialFlag() {NoSequentialRead=true;}
+ #endif
+ #ifdef _UNIX
+     int GetFD()
+     {
+ #ifdef FILE_USE_OPEN
+       return hFile;
+ #else
+       return fileno(hFile);
+ #endif
+     }
+ #endif
+     static size_t CopyBufferSize()
+     {
+ #ifdef _WIN_ALL
+       // USB flash performance is poor with 64 KB buffer, 256+ KB resolved it.
+       // For copying from HDD to same HDD the best performance was with 256 KB
+       // buffer in XP and with 1 MB buffer in Win10.
+       return WinNT()==WNT_WXP ? 0x40000:0x100000;
+ #else
+       return 0x100000;
+ #endif
+     }
+ };
+ 
+ #endif
+diff --git a/makefile b/makefile
+index 4f46c2a..f70755f 100644
+--- a/makefile
++++ b/makefile
+@@ -3,7 +3,7 @@
+ 
+ # Linux using GCC
+ CXX=c++
+-CXXFLAGS=-O2
++CXXFLAGS=-O2 -Wno-logical-op-parentheses -Wno-switch -Wno-dangling-else
+ LIBFLAGS=-fPIC
+ DEFINES=-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -DRAR_SMP
+ STRIP=strip
+diff --git a/options.hpp b/options.hpp
+index b4fed13..781a59e 100644
+--- a/options.hpp
++++ b/options.hpp
+@@ -80,117 +80,131 @@ struct FilterMode
+ class RAROptions
+ {
+   public:
+     RAROptions();
+     ~RAROptions();
+     void Init();
+ 
+     uint ExclFileAttr;
+     uint InclFileAttr;
+     bool InclAttrSet;
+     size_t WinSize;
+     wchar TempPath[NM];
+-#ifdef USE_QOPEN
+     wchar SFXModule[NM];
++
++#ifdef USE_QOPEN
+     QOPEN_MODE QOpenMode;
+ #endif
++
++    bool ArcInMem;
++#ifdef USE_ARCMEM
++    void SetArcInMem(byte *Data,size_t Size)
++    {
++      ArcMemData=Data;
++      ArcMemSize=Size;
++      ArcInMem=Data!=NULL && Size>0;
++    }
++    byte *ArcMemData;
++    size_t ArcMemSize;
++#endif
++
+     bool ConfigDisabled; // Switch -cfg-.
+     wchar ExtrPath[NM];
+     wchar CommentFile[NM];
+     RAR_CHARSET CommentCharset;
+     RAR_CHARSET FilelistCharset;
+     RAR_CHARSET ErrlogCharset;
+     RAR_CHARSET RedirectCharset;
+ 
+     wchar ArcPath[NM];
+     SecPassword Password;
+     bool EncryptHeaders;
+     
+     bool ManualPassword; // Password entered manually during operation, might need to clean for next archive.
+ 
+     wchar LogName[NM];
+     MESSAGE_TYPE MsgStream;
+     bool Sound;
+     OVERWRITE_MODE Overwrite;
+     int Method;
+     HASH_TYPE HashType;
+     int Recovery;
+     int RecVolNumber;
+     bool DisablePercentage;
+     bool DisableCopyright;
+     bool DisableDone;
+     bool PrintVersion;
+     int Solid;
+     int SolidCount;
+     bool ClearArc;
+     bool AddArcOnly;
+     bool DisableComment;
+     bool FreshFiles;
+     bool UpdateFiles;
+     PATH_EXCL_MODE ExclPath;
+     RECURSE_MODE Recurse;
+     int64 VolSize;
+     Array<int64> NextVolSizes;
+     uint CurVolNum;
+     bool AllYes;
+     bool MoreInfo; // -im, show more information, used only in "WinRAR t" now.
+     bool DisableSortSolid;
+     int ArcTime;
+     int ConvertNames;
+     bool ProcessOwners;
+     bool SaveSymLinks;
+     bool SaveHardLinks;
+     bool AbsoluteLinks;
+     int Priority;
+     int SleepTime;
+     bool KeepBroken;
+     bool OpenShared;
+     bool DeleteFiles;
+ 
+ #ifdef _WIN_ALL
+     bool AllowIncompatNames; // Allow names with trailing dots and spaces.
+ #endif
+ 
+ 
+ #ifndef SFX_MODULE
+     bool GenerateArcName;
+     wchar GenerateMask[MAX_GENERATE_MASK];
+ #endif
+     bool SyncFiles;
+     bool ProcessEA;
+     bool SaveStreams;
+     bool SetCompressedAttr;
+     bool IgnoreGeneralAttr;
+     RarTime FileTimeBefore;
+     RarTime FileTimeAfter;
+     int64 FileSizeLess;
+     int64 FileSizeMore;
+     bool Lock;
+     bool Test;
+     bool VolumePause;
+     FilterMode FilterModes[MAX_FILTER_TYPES];
+     wchar EmailTo[NM];
+     uint VersionControl;
+     bool AppendArcNameToPath;
+     POWER_MODE Shutdown;
+     EXTTIME_MODE xmtime;
+     EXTTIME_MODE xctime;
+     EXTTIME_MODE xatime;
+     wchar CompressStdin[NM];
+ 
+     uint Threads; // We use it to init hash even if RAR_SMP is not defined.
+ 
+ 
+ 
+ 
+ 
+ #ifdef RARDLL
+     wchar DllDestName[NM];
+     int DllOpMode;
+     int DllError;
+     LPARAM UserData;
+     UNRARCALLBACK Callback;
+     CHANGEVOLPROC ChangeVolProc;
+     PROCESSDATAPROC ProcessDataProc;
+ #endif
+ };
+ #endif
+diff --git a/qopen.cpp b/qopen.cpp
+index 789e5c0..97851ca 100644
+--- a/qopen.cpp
++++ b/qopen.cpp
+@@ -61,41 +61,54 @@ void QuickOpen::Close()
+ 
+ void QuickOpen::Load(uint64 BlockPos)
+ {
+-  if (!Loaded) // If loading the first time, perform additional intialization.
++  if (!Loaded)
+   {
++    // If loading for the first time, perform additional intialization.
+     SeekPos=Arc->Tell();
+     UnsyncSeekPos=false;
+ 
+     SaveFilePos SavePos(*Arc);
+     Arc->Seek(BlockPos,SEEK_SET);
+-    if (Arc->ReadHeader()==0 || Arc->GetHeaderType()!=HEAD_SERVICE ||
++
++    // If BlockPos points to original main header, we'll have the infinite
++    // recursion, because ReadHeader() for main header will attempt to load
++    // QOpen and call QuickOpen::Load again. If BlockPos points to long chain
++    // of other main headers, we'll have multiple recursive calls of this
++    // function wasting resources. So we prohibit QOpen temporarily to
++    // prevent this. ReadHeader() calls QOpen.Init and sets MainHead Locator
++    // and QOpenOffset fields, so we cannot use them to prohibit QOpen.
++    Arc->SetProhibitQOpen(true);
++    size_t ReadSize=Arc->ReadHeader();
++    Arc->SetProhibitQOpen(false);
++
++    if (ReadSize==0 || Arc->GetHeaderType()!=HEAD_SERVICE ||
+         !Arc->SubHead.CmpName(SUBHEAD_TYPE_QOPEN))
+       return;
+     QLHeaderPos=Arc->CurBlockPos;
+     RawDataStart=Arc->Tell();
+     RawDataSize=Arc->SubHead.UnpSize;
+ 
+     Loaded=true; // Set only after all file processing calls like Tell, Seek, ReadHeader.
+   }
+ 
+   if (Arc->SubHead.Encrypted)
+   {
+     RAROptions *Cmd=Arc->GetRAROptions();
+ #ifndef RAR_NOCRYPT
+     if (Cmd->Password.IsSet())
+       Crypt.SetCryptKeys(false,CRYPT_RAR50,&Cmd->Password,Arc->SubHead.Salt,
+                          Arc->SubHead.InitV,Arc->SubHead.Lg2Count,
+                          Arc->SubHead.HashKey,Arc->SubHead.PswCheck);
+     else
+ #endif
+       return;
+   }
+ 
+   RawDataPos=0;
+   ReadBufSize=0;
+   ReadBufPos=0;
+   LastReadHeader.Reset();
+   LastReadHeaderPos=0;
+ 
+   ReadBuffer();
+ }
+diff --git a/rar.cpp b/rar.cpp
+index 326bf90..a410576 100644
+--- a/rar.cpp
++++ b/rar.cpp
+@@ -3,102 +3,109 @@
+ #if !defined(RARDLL)
+ int main(int argc, char *argv[])
+ {
+ 
+ #ifdef _UNIX
+   setlocale(LC_ALL,"");
+ #endif
+ 
+   InitConsole();
+   ErrHandler.SetSignalHandlers(true);
+ 
+ #ifdef SFX_MODULE
+   wchar ModuleName[NM];
+ #ifdef _WIN_ALL
+   GetModuleFileName(NULL,ModuleName,ASIZE(ModuleName));
+ #else
+   CharToWide(argv[0],ModuleName,ASIZE(ModuleName));
+ #endif
+ #endif
+ 
+ #ifdef _WIN_ALL
+   SetErrorMode(SEM_NOALIGNMENTFAULTEXCEPT|SEM_FAILCRITICALERRORS|SEM_NOOPENFILEERRORBOX);
+ 
+ 
+ #endif
+ 
+ #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+   // Must be initialized, normal initialization can be skipped in case of
+   // exception.
+   POWER_MODE ShutdownOnClose=POWERMODE_KEEP;
+ #endif
+ 
+   try 
+   {
+   
+     CommandData *Cmd=new CommandData;
+ #ifdef SFX_MODULE
+     wcscpy(Cmd->Command,L"X");
+     char *Switch=argc>1 ? argv[1]:NULL;
+     if (Switch!=NULL && Cmd->IsSwitch(Switch[0]))
+     {
+       int UpperCmd=etoupper(Switch[1]);
+       switch(UpperCmd)
+       {
+         case 'T':
+         case 'V':
+           Cmd->Command[0]=UpperCmd;
+           break;
+         case '?':
+           Cmd->OutHelp(RARX_SUCCESS);
+           break;
+       }
+     }
+     Cmd->AddArcName(ModuleName);
+     Cmd->ParseDone();
+     Cmd->AbsoluteLinks=true; // If users runs SFX, he trusts an archive source.
+ #else // !SFX_MODULE
+     Cmd->ParseCommandLine(true,argc,argv);
+     if (!Cmd->ConfigDisabled)
+     {
+       Cmd->ReadConfig();
+       Cmd->ParseEnvVar();
+     }
+     Cmd->ParseCommandLine(false,argc,argv);
+ #endif
+ 
+ #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+     ShutdownOnClose=Cmd->Shutdown;
+ #endif
+ 
+     uiInit(Cmd->Sound);
+     InitLogOptions(Cmd->LogName,Cmd->ErrlogCharset);
+     ErrHandler.SetSilent(Cmd->AllYes || Cmd->MsgStream==MSG_NULL);
+ 
+     Cmd->OutTitle();
++/*
++    byte Buf[10000];
++    File Src;
++    Src.TOpen(L"123.rar");
++    int Size=Src.Read(Buf,sizeof(Buf));
++    Cmd->SetArcInMem(Buf,Size);
++*/
+     Cmd->ProcessCommand();
+     delete Cmd;
+   }
+   catch (RAR_EXIT ErrCode)
+   {
+     ErrHandler.SetErrorCode(ErrCode);
+   }
+   catch (std::bad_alloc&)
+   {
+     ErrHandler.MemoryErrorMsg();
+     ErrHandler.SetErrorCode(RARX_MEMORY);
+   }
+   catch (...)
+   {
+     ErrHandler.SetErrorCode(RARX_FATAL);
+   }
+ 
+ #if defined(_WIN_ALL) && !defined(SFX_MODULE)
+   if (ShutdownOnClose!=POWERMODE_KEEP && ErrHandler.IsShutdownEnabled())
+     Shutdown(ShutdownOnClose);
+ #endif
+   ErrHandler.MainExit=true;
+   return ErrHandler.GetErrorCode();
+ }
+ #endif
+ 
+ 
+diff --git a/rar.hpp b/rar.hpp
+index 65e0496..99b3ee7 100644
+--- a/rar.hpp
++++ b/rar.hpp
+@@ -1,94 +1,97 @@
+ #ifndef _RAR_RARCOMMON_
+ #define _RAR_RARCOMMON_
+ 
+ #include "raros.hpp"
+ #include "rartypes.hpp"
+ #include "os.hpp"
+ 
+ #ifdef RARDLL
+ #include "dll.hpp"
+ #endif
+ 
+ #include "version.hpp"
+ #include "rardefs.hpp"
+ #include "rarlang.hpp"
+ #include "unicode.hpp"
+ #include "errhnd.hpp"
+ #include "secpassword.hpp"
+ #include "array.hpp"
+ #include "timefn.hpp"
+ #include "sha1.hpp"
+ #include "sha256.hpp"
+ #include "blake2s.hpp"
+ #include "hash.hpp"
+ #include "options.hpp"
+ #include "rijndael.hpp"
+ #include "crypt.hpp"
+ #include "headers5.hpp"
+ #include "headers.hpp"
+ #include "pathfn.hpp"
+ #include "strfn.hpp"
+ #include "strlist.hpp"
+ #ifdef _WIN_ALL
+ #include "isnt.hpp"
+ #endif
+ #include "file.hpp"
+ #include "crc.hpp"
+ #include "ui.hpp"
+ #include "filefn.hpp"
+ #include "filestr.hpp"
+ #include "find.hpp"
+ #include "scantree.hpp"
+ #include "savepos.hpp"
+ #include "getbits.hpp"
+ #include "rdwrfn.hpp"
+ #ifdef USE_QOPEN
+ #include "qopen.hpp"
+ #endif
++#ifdef USE_ARCMEM
++#include "arcmem.hpp"
++#endif
+ #include "archive.hpp"
+ #include "match.hpp"
+ #include "cmddata.hpp"
+ #include "filcreat.hpp"
+ #include "consio.hpp"
+ #include "system.hpp"
+ #include "log.hpp"
+ #include "rawint.hpp"
+ #include "rawread.hpp"
+ #include "encname.hpp"
+ #include "resource.hpp"
+ #include "compress.hpp"
+ 
+ #include "rarvm.hpp"
+ #include "model.hpp"
+ 
+ #include "threadpool.hpp"
+ 
+ #include "unpack.hpp"
+ 
+ 
+ 
+ #include "extinfo.hpp"
+ #include "extract.hpp"
+ 
+ 
+ 
+ #include "list.hpp"
+ 
+ 
+ #include "rs.hpp"
+ #include "rs16.hpp"
+ #include "recvol.hpp"
+ #include "volume.hpp"
+ #include "smallfn.hpp"
+ 
+ #include "global.hpp"
+ 
+ #if 0
+ #include "benchmark.hpp"
+ #endif
+ 
+ 
+ 
+ 
+ 
+ #endif
+diff --git a/rardefs.hpp b/rardefs.hpp
+index 90d4120..aa7c329 100644
+--- a/rardefs.hpp
++++ b/rardefs.hpp
+@@ -1,31 +1,32 @@
+ #ifndef _RAR_DEFS_
+ #define _RAR_DEFS_
+ 
+ #define  Min(x,y) (((x)<(y)) ? (x):(y))
+ #define  Max(x,y) (((x)>(y)) ? (x):(y))
+ 
+ // Universal replacement of abs function for non-int arguments.
+ #define  Abs(x) (((x)<0) ? -(x):(x))
+ 
+ #define  ASIZE(x) (sizeof(x)/sizeof(x[0]))
+ 
+ // MAXPASSWORD is expected to be multiple of CRYPTPROTECTMEMORY_BLOCK_SIZE (16)
+ // for CryptProtectMemory in SecPassword.
+ #define  MAXPASSWORD       128
+ 
+ #define  MAXSFXSIZE        0x200000
+ 
+ #define  MAXCMTSIZE        0x40000
+ 
+ #define  DefSFXName        L"default.sfx"
+ #define  DefSortListName   L"rarfiles.lst"
+ 
+ 
+ #ifndef SFX_MODULE
+ #define USE_QOPEN
+ #endif
++#define USE_ARCMEM
+ 
+ // Produce the value, which is equal or larger than 'v' and aligned to 'a'.
+ #define ALIGN_VALUE(v,a) (size_t(v) + ( (~size_t(v) + 1) & (a - 1) ) )
+ 
+ #endif
+diff --git a/recvol5.cpp b/recvol5.cpp
+index fddc25d..fd74c1b 100644
+--- a/recvol5.cpp
++++ b/recvol5.cpp
+@@ -136,287 +136,289 @@ void RecVolumes5::ProcessAreaRS(RecRSThreadData *td)
+ bool RecVolumes5::Restore(RAROptions *Cmd,const wchar *Name,bool Silent)
+ {
+   wchar ArcName[NM];
+   wcsncpyz(ArcName,Name,ASIZE(ArcName));
+ 
+   wchar *Num=GetVolNumPart(ArcName);
+   if (Num==ArcName)
+     return false; // Number part is missing in the name.
+   while (Num>ArcName && IsDigit(*(Num-1)))
+     Num--;
++  if (Num==ArcName)
++    return false; // Entire volume name is numeric, not possible for REV file.
+   wcsncpyz(Num,L"*.*",ASIZE(ArcName)-(Num-ArcName));
+   
+   wchar FirstVolName[NM];
+   *FirstVolName=0;
+ 
+   int64 RecFileSize=0;
+ 
+   FindFile VolFind;
+   VolFind.SetMask(ArcName);
+   FindData fd;
+   uint FoundRecVolumes=0;
+   while (VolFind.Next(&fd))
+   {
+     Wait();
+ 
+     Archive *Vol=new Archive(Cmd);
+     int ItemPos=-1;
+     if (Vol->WOpen(fd.Name))
+     {
+       if (CmpExt(fd.Name,L"rev"))
+       {
+         uint RecNum=ReadHeader(Vol,FoundRecVolumes==0);
+         if (RecNum!=0)
+         {
+           if (FoundRecVolumes==0)
+             RecFileSize=Vol->FileLength();
+ 
+           ItemPos=RecNum;
+           FoundRecVolumes++;
+         }
+       }
+       else
+         if (Vol->IsArchive(true) && (Vol->SFXSize>0 || CmpExt(fd.Name,L"rar")))
+         {
+           if (!Vol->Volume && !Vol->BrokenHeader)
+           {
+             uiMsg(UIERROR_NOTVOLUME,ArcName);
+             return false;
+           }
+           // We work with archive as with raw data file, so we do not want
+           // to spend time to QOpen I/O redirection.
+           Vol->QOpenUnload();
+       
+           Vol->Seek(0,SEEK_SET);
+ 
+           // RAR volume found. Get its number, store the handle in appropriate
+           // array slot, clean slots in between if we had to grow the array.
+           wchar *Num=GetVolNumPart(fd.Name);
+           uint VolNum=0;
+           for (uint K=1;Num>=fd.Name && IsDigit(*Num);K*=10,Num--)
+             VolNum+=(*Num-'0')*K;
+           if (VolNum==0 || VolNum>MaxVolumes)
+             continue;
+           size_t CurSize=RecItems.Size();
+           if (VolNum>CurSize)
+           {
+             RecItems.Alloc(VolNum);
+             for (size_t I=CurSize;I<VolNum;I++)
+               RecItems[I].f=NULL;
+           }
+           ItemPos=VolNum-1;
+ 
+           if (*FirstVolName==0)
+             VolNameToFirstName(fd.Name,FirstVolName,ASIZE(FirstVolName),true);
+         }
+     }
+     if (ItemPos==-1)
+       delete Vol; // Skip found file, it is not RAR or REV volume.
+     else
+       if ((uint)ItemPos<RecItems.Size()) // Check if found more REV than needed.
+       {
+         // Store found RAR or REV volume.
+         RecVolItem *Item=RecItems+ItemPos;
+         Item->f=Vol;
+         Item->New=false;
+         wcsncpyz(Item->Name,fd.Name,ASIZE(Item->Name));
+       }
+   }
+ 
+   if (!Silent || FoundRecVolumes!=0)
+     uiMsg(UIMSG_RECVOLFOUND,FoundRecVolumes);
+   if (FoundRecVolumes==0)
+     return false;
+ 
+   uiMsg(UIMSG_RECVOLCALCCHECKSUM);
+ 
+   MissingVolumes=0;
+   for (uint I=0;I<TotalCount;I++)
+   {
+     RecVolItem *Item=&RecItems[I];
+     if (Item->f!=NULL)
+     {
+       uiMsg(UIMSG_STRING,Item->Name);
+ 
+       uint RevCRC;
+       CalcFileSum(Item->f,&RevCRC,NULL,Cmd->Threads,INT64NDF,CALCFSUM_CURPOS);
+       Item->Valid=RevCRC==Item->CRC;
+       if (!Item->Valid)
+       {
+         uiMsg(UIMSG_CHECKSUM,Item->Name);
+ 
+         // Close only corrupt REV volumes here. We'll close and rename corrupt
+         // RAR volumes later, if we'll know that recovery is possible.
+         if (I>=DataCount)
+         {
+           Item->f->Close();
+           Item->f=NULL;
+           FoundRecVolumes--;
+         }
+       }
+     }
+     if (I<DataCount && (Item->f==NULL || !Item->Valid))
+       MissingVolumes++;
+   }
+ 
+   uiMsg(UIMSG_RECVOLMISSING,MissingVolumes);
+ 
+   if (MissingVolumes==0)
+   {
+     uiMsg(UIERROR_RECVOLALLEXIST);
+     return false;
+   }
+ 
+   if (MissingVolumes>FoundRecVolumes)
+   {
+     uiMsg(UIERROR_RECVOLFOUND,FoundRecVolumes); // Intentionally not displayed in console mode.
+     uiMsg(UIERROR_RECVOLCANNOTFIX);
+     return false;
+   }
+ 
+   uiMsg(UIMSG_RECONSTRUCTING);
+ 
+   // Create missing and rename bad volumes.
+   uint64 MaxVolSize=0;
+   for (uint I=0;I<DataCount;I++)
+   {
+     RecVolItem *Item=&RecItems[I];
+     if (Item->FileSize>MaxVolSize)
+       MaxVolSize=Item->FileSize;
+     if (Item->f!=NULL && !Item->Valid)
+     {
+       Item->f->Close();
+ 
+       wchar NewName[NM];
+       wcscpy(NewName,Item->Name);
+       wcscat(NewName,L".bad");
+ 
+       uiMsg(UIMSG_BADARCHIVE,Item->Name);
+       uiMsg(UIMSG_RENAMING,Item->Name,NewName);
+       RenameFile(Item->Name,NewName);
+       delete Item->f;
+       Item->f=NULL;
+     }
+ 
+     if ((Item->New=(Item->f==NULL))) // Additional parentheses to avoid GCC warning.
+     {
+       wcsncpyz(Item->Name,FirstVolName,ASIZE(Item->Name));
+       uiMsg(UIMSG_CREATING,Item->Name);
+       uiMsg(UIEVENT_NEWARCHIVE,Item->Name);
+       File *NewVol=new File;
+       bool UserReject;
+       if (!FileCreate(Cmd,NewVol,Item->Name,ASIZE(Item->Name),&UserReject))
+       {
+         if (!UserReject)
+           ErrHandler.CreateErrorMsg(Item->Name);
+         ErrHandler.Exit(UserReject ? RARX_USERBREAK:RARX_CREATE);
+       }
+       NewVol->Prealloc(Item->FileSize);
+       Item->f=NewVol;
+       Item->New=true;
+     }
+     NextVolumeName(FirstVolName,ASIZE(FirstVolName),false);
+   }
+ 
+ 
+   int64 ProcessedSize=0;
+   int LastPercent=-1;
+   mprintf(L"     ");
+ 
+   // Even though we already preliminary calculated missing volume number,
+   // let's do it again now, when we have the final and exact information.
+   MissingVolumes=0;
+ 
+   ValidFlags=new bool[TotalCount];
+   for (uint I=0;I<TotalCount;I++)
+   {
+     ValidFlags[I]=RecItems[I].f!=NULL && !RecItems[I].New;
+     if (I<DataCount && !ValidFlags[I])
+       MissingVolumes++;
+   }
+ 
+   // Size of per file buffer.
+   RecBufferSize=TotalBufferSize/MissingVolumes;
+   if ((RecBufferSize&1)==1) // Must be even for our RS16 codec.
+     RecBufferSize--;
+ #ifdef USE_SSE
+   RecBufferSize&=~(SSE_ALIGNMENT-1); // Align for SSE.
+ #endif
+ 
+   uint *Data=new uint[TotalCount];
+ 
+   RSCoder16 RS;
+   if (!RS.Init(DataCount,RecCount,ValidFlags))
+   {
+     delete[] ValidFlags;
+     delete[] Data;
+     return false; // Should not happen, we check parameter validity above.
+   }
+ 
+   RealReadBuffer=new byte[RecBufferSize+SSE_ALIGNMENT];
+   byte *ReadBuf=(byte *)ALIGN_VALUE(RealReadBuffer,SSE_ALIGNMENT);
+ 
+   while (true)
+   {
+     Wait();
+ 
+     int MaxRead=0;
+     for (uint I=0,J=DataCount;I<DataCount;I++)
+     {
+       uint VolNum=I;
+       if (!ValidFlags[I]) // If next RAR volume is missing or invalid.
+       {
+         while (!ValidFlags[J]) // Find next valid REV volume.
+           J++;
+         VolNum=J++; // Use next valid REV volume data instead of RAR.
+       }
+       RecVolItem *Item=RecItems+VolNum;
+ 
+       byte *B=&ReadBuf[0];
+       int ReadSize=0;
+       if (Item->f!=NULL && !Item->New)
+         ReadSize=Item->f->Read(B,RecBufferSize);
+       if (ReadSize!=RecBufferSize)
+         memset(B+ReadSize,0,RecBufferSize-ReadSize);
+       if (ReadSize>MaxRead)
+         MaxRead=ReadSize;
+ 
+       // We can have volumes of different size. Let's use data chunk
+       // for largest volume size.
+       uint DataToProcess=(uint)Min(RecBufferSize,MaxVolSize-ProcessedSize);
+       ProcessRS(Cmd,I,B,DataToProcess,false);
+     }
+     if (MaxRead==0)
+       break;
+ 
+     for (uint I=0,J=0;I<DataCount;I++)
+       if (!ValidFlags[I])
+       {
+         RecVolItem *Item=RecItems+I;
+         size_t WriteSize=(size_t)Min(MaxRead,Item->FileSize);
+         Item->f->Write(Buf+(J++)*RecBufferSize,WriteSize);
+         Item->FileSize-=WriteSize;
+       }
+ 
+     int CurPercent=ToPercent(ProcessedSize,RecFileSize);
+     if (!Cmd->DisablePercentage && CurPercent!=LastPercent)
+     {
+       uiProcessProgress("RV",ProcessedSize,RecFileSize);
+       LastPercent=CurPercent;
+     }
+     ProcessedSize+=MaxRead;
+   }
+ 
+   for (uint I=0;I<TotalCount;I++)
+     if (RecItems[I].f!=NULL)
+       RecItems[I].f->Close();
+ 
+   delete[] ValidFlags;
+   delete[] Data;
+ #if !defined(SILENT)
+   if (!Cmd->DisablePercentage)
+     mprintf(L"\b\b\b\b100%%");
+   if (!Silent && !Cmd->DisableDone)
+     mprintf(St(MDone));
+ #endif
+   return true;
+ }
+diff --git a/unicode.cpp b/unicode.cpp
+index 8ce752a..9f002ac 100644
+--- a/unicode.cpp
++++ b/unicode.cpp
+@@ -131,96 +131,97 @@ bool CharToWide(const char *Src,wchar *Dest,size_t DestSize)
+ #if defined(_UNIX) && defined(MBFUNCTIONS)
+ // Convert and restore mapped inconvertible Unicode characters. 
+ // We use it for extended ASCII names in Unix.
+ bool WideToCharMap(const wchar *Src,char *Dest,size_t DestSize,bool &Success)
+ {
+   // String with inconvertible characters mapped to private use Unicode area
+   // must have the mark code somewhere.
+   if (wcschr(Src,(wchar)MappedStringMark)==NULL)
+     return false;
+ 
+   Success=true;
+   uint SrcPos=0,DestPos=0;
+   while (Src[SrcPos]!=0 && DestPos<DestSize-MB_CUR_MAX)
+   {
+     if (uint(Src[SrcPos])==MappedStringMark)
+     {
+       SrcPos++;
+       continue;
+     }
+     // For security reasons do not restore low ASCII codes, so mapping cannot
+     // be used to hide control codes like path separators.
+     if (uint(Src[SrcPos])>=MapAreaStart+0x80 && uint(Src[SrcPos])<MapAreaStart+0x100)
+       Dest[DestPos++]=char(uint(Src[SrcPos++])-MapAreaStart);
+     else
+     {
+       mbstate_t ps;
+       memset(&ps,0,sizeof(ps));
+-      if (wcrtomb(Dest+DestPos,Src[SrcPos],&ps)==-1)
++      if (wcrtomb(Dest+DestPos,Src[SrcPos],&ps)==(size_t)-1)
+       {
+         Dest[DestPos]='_';
+         Success=false;
+       }
+       SrcPos++;
+       memset(&ps,0,sizeof(ps));
+       int Length=mbrlen(Dest+DestPos,MB_CUR_MAX,&ps);
+       DestPos+=Max(Length,1);
+     }
+   }
+   Dest[Min(DestPos,DestSize-1)]=0;
+   return true;
+ }
+ #endif
+ 
+ 
+ #if defined(_UNIX) && defined(MBFUNCTIONS)
+ // Convert and map inconvertible Unicode characters. 
+ // We use it for extended ASCII names in Unix.
+ void CharToWideMap(const char *Src,wchar *Dest,size_t DestSize,bool &Success)
+ {
+   // Map inconvertible characters to private use Unicode area 0xE000.
+   // Mark such string by placing special non-character code before
+   // first inconvertible character.
+   Success=false;
+   bool MarkAdded=false;
+   uint SrcPos=0,DestPos=0;
+   while (DestPos<DestSize)
+   {
+     if (Src[SrcPos]==0)
+     {
+       Success=true;
+       break;
+     }
+     mbstate_t ps;
+     memset(&ps,0,sizeof(ps));
+-    if (mbrtowc(Dest+DestPos,Src+SrcPos,MB_CUR_MAX,&ps)==-1)
++    size_t res=mbrtowc(Dest+DestPos,Src+SrcPos,MB_CUR_MAX,&ps);
++    if (res==(size_t)-1 || res==(size_t)-2)
+     {
+       // For security reasons we do not want to map low ASCII characters,
+       // so we do not have additional .. and path separator codes.
+       if (byte(Src[SrcPos])>=0x80)
+       {
+         if (!MarkAdded)
+         {
+           Dest[DestPos++]=MappedStringMark;
+           MarkAdded=true;
+           if (DestPos>=DestSize)
+             break;
+         }
+         Dest[DestPos++]=byte(Src[SrcPos++])+MapAreaStart;
+       }
+       else
+         break;
+     }
+     else
+     {
+       memset(&ps,0,sizeof(ps));
+       int Length=mbrlen(Src+SrcPos,MB_CUR_MAX,&ps);
+       SrcPos+=Max(Length,1);
+       DestPos++;
+     }
+   }
+   Dest[Min(DestPos,DestSize-1)]=0;
+ }
+ #endif
+ 
+ 
+ // SrcSize is in wide characters, not in bytes.
+diff --git a/unpack.hpp b/unpack.hpp
+index cd71106..93d5b87 100644
+--- a/unpack.hpp
++++ b/unpack.hpp
+@@ -202,202 +202,202 @@ class FragmentedWindow
+ class Unpack:PackDef
+ {
+   private:
+ 
+     void Unpack5(bool Solid);
+     void Unpack5MT(bool Solid);
+     bool UnpReadBuf();
+     void UnpWriteBuf();
+     byte* ApplyFilter(byte *Data,uint DataSize,UnpackFilter *Flt);
+     void UnpWriteArea(size_t StartPtr,size_t EndPtr);
+     void UnpWriteData(byte *Data,size_t Size);
+     _forceinline uint SlotToLength(BitInput &Inp,uint Slot);
+     void UnpInitData50(bool Solid);
+     bool ReadBlockHeader(BitInput &Inp,UnpackBlockHeader &Header);
+     bool ReadTables(BitInput &Inp,UnpackBlockHeader &Header,UnpackBlockTables &Tables);
+     void MakeDecodeTables(byte *LengthTable,DecodeTable *Dec,uint Size);
+     _forceinline uint DecodeNumber(BitInput &Inp,DecodeTable *Dec);
+     void CopyString();
+     inline void InsertOldDist(unsigned int Distance);
+     void UnpInitData(bool Solid);
+     _forceinline void CopyString(uint Length,uint Distance);
+     uint ReadFilterData(BitInput &Inp);
+     bool ReadFilter(BitInput &Inp,UnpackFilter &Filter);
+     bool AddFilter(UnpackFilter &Filter);
+     bool AddFilter();
+     void InitFilters();
+ 
+     ComprDataIO *UnpIO;
+     BitInput Inp;
+ 
+ #ifdef RAR_SMP
+     void InitMT();
+     bool UnpackLargeBlock(UnpackThreadData &D);
+     bool ProcessDecoded(UnpackThreadData &D);
+ 
+     ThreadPool *UnpThreadPool;
+     UnpackThreadData *UnpThreadData;
+     uint MaxUserThreads;
+     byte *ReadBufMT;
+ #endif
+ 
+     Array<byte> FilterSrcMemory;
+     Array<byte> FilterDstMemory;
+ 
+     // Filters code, one entry per filter.
+     Array<UnpackFilter> Filters;
+ 
+     uint OldDist[4],OldDistPtr;
+     uint LastLength;
+ 
+     // LastDist is necessary only for RAR2 and older with circular OldDist
+     // array. In RAR3 last distance is always stored in OldDist[0].
+     uint LastDist;
+ 
+     size_t UnpPtr,WrPtr;
+     
+     // Top border of read packed data.
+     int ReadTop; 
+ 
+     // Border to call UnpReadBuf. We use it instead of (ReadTop-C)
+     // for optimization reasons. Ensures that we have C bytes in buffer
+     // unless we are at the end of file.
+     int ReadBorder;
+ 
+     UnpackBlockHeader BlockHeader;
+     UnpackBlockTables BlockTables;
+ 
+     size_t WriteBorder;
+ 
+     byte *Window;
+ 
+     FragmentedWindow FragWindow;
+     bool Fragmented;
+ 
+ 
+     int64 DestUnpSize;
+ 
+     bool Suspended;
+     bool UnpAllBuf;
+     bool UnpSomeRead;
+     int64 WrittenFileSize;
+     bool FileExtracted;
+ 
+ 
+ /***************************** Unpack v 1.5 *********************************/
+     void Unpack15(bool Solid);
+     void ShortLZ();
+     void LongLZ();
+     void HuffDecode();
+     void GetFlagsBuf();
+     void UnpInitData15(int Solid);
+     void InitHuff();
+     void CorrHuff(ushort *CharSet,byte *NumToPlace);
+     void CopyString15(uint Distance,uint Length);
+     uint DecodeNum(uint Num,uint StartPos,uint *DecTab,uint *PosTab);
+ 
+     ushort ChSet[256],ChSetA[256],ChSetB[256],ChSetC[256];
+     byte NToPl[256],NToPlB[256],NToPlC[256];
+     uint FlagBuf,AvrPlc,AvrPlcB,AvrLn1,AvrLn2,AvrLn3;
+     int Buf60,NumHuf,StMode,LCount,FlagsCnt;
+     uint Nhfb,Nlzb,MaxDist3;
+ /***************************** Unpack v 1.5 *********************************/
+ 
+ /***************************** Unpack v 2.0 *********************************/
+     void Unpack20(bool Solid);
+ 
+     DecodeTable MD[4]; // Decode multimedia data, up to 4 channels.
+ 
+     unsigned char UnpOldTable20[MC20*4];
+     bool UnpAudioBlock;
+     uint UnpChannels,UnpCurChannel;
+     int UnpChannelDelta;
+     void CopyString20(uint Length,uint Distance);
+     bool ReadTables20();
+     void UnpWriteBuf20();
+     void UnpInitData20(int Solid);
+     void ReadLastTables();
+     byte DecodeAudio(int Delta);
+     struct AudioVariables AudV[4];
+ /***************************** Unpack v 2.0 *********************************/
+ 
+ /***************************** Unpack v 3.0 *********************************/
+     enum BLOCK_TYPES {BLOCK_LZ,BLOCK_PPM};
+ 
+     void UnpInitData30(bool Solid);
+     void Unpack29(bool Solid);
+     void InitFilters30(bool Solid);
+     bool ReadEndOfBlock();
+     bool ReadVMCode();
+     bool ReadVMCodePPM();
+-    bool AddVMCode(uint FirstByte,byte *Code,int CodeSize);
++    bool AddVMCode(uint FirstByte,byte *Code,uint CodeSize);
+     int SafePPMDecodeChar();
+     bool ReadTables30();
+     bool UnpReadBuf30();
+     void UnpWriteBuf30();
+     void ExecuteCode(VM_PreparedProgram *Prg);
+ 
+     int PrevLowDist,LowDistRepCount;
+ 
+     ModelPPM PPM;
+     int PPMEscChar;
+ 
+     byte UnpOldTable[HUFF_TABLE_SIZE30];
+     int UnpBlockType;
+ 
+     // If we already read decoding tables for Unpack v2,v3,v5.
+     // We should not use a single variable for all algorithm versions,
+     // because we can have a corrupt archive with one algorithm file
+     // followed by another algorithm file with "solid" flag and we do not
+     // want to reuse tables from one algorithm in another.
+     bool TablesRead2,TablesRead3,TablesRead5;
+ 
+     // Virtual machine to execute filters code.
+     RarVM VM;
+   
+     // Buffer to read VM filters code. We moved it here from AddVMCode
+     // function to reduce time spent in BitInput constructor.
+     BitInput VMCodeInp;
+ 
+     // Filters code, one entry per filter.
+     Array<UnpackFilter30 *> Filters30;
+ 
+     // Filters stack, several entrances of same filter are possible.
+     Array<UnpackFilter30 *> PrgStack;
+ 
+     // Lengths of preceding data blocks, one length of one last block
+     // for every filter. Used to reduce the size required to write
+     // the data block length if lengths are repeating.
+     Array<int> OldFilterLengths;
+ 
+     int LastFilter;
+ /***************************** Unpack v 3.0 *********************************/
+ 
+   public:
+     Unpack(ComprDataIO *DataIO);
+     ~Unpack();
+     void Init(size_t WinSize,bool Solid);
+     void DoUnpack(uint Method,bool Solid);
+     bool IsFileExtracted() {return(FileExtracted);}
+     void SetDestSize(int64 DestSize) {DestUnpSize=DestSize;FileExtracted=false;}
+     void SetSuspended(bool Suspended) {Unpack::Suspended=Suspended;}
+ 
+ #ifdef RAR_SMP
+     // More than 8 threads are unlikely to provide a noticeable gain
+     // for unpacking, but would use the additional memory.
+     void SetThreads(uint Threads) {MaxUserThreads=Min(Threads,8);}
+ 
+     void UnpackDecode(UnpackThreadData &D);
+ #endif
+ 
+     size_t MaxWinSize;
+     size_t MaxWinMask;
+ 
+     uint GetChar()
+     {
+       if (Inp.InAddr>BitInput::MAX_SIZE-30)
+         UnpReadBuf();
+       return(Inp.InBuf[Inp.InAddr++]);
+     }
+ };
+ 
+ #endif
+diff --git a/unpack30.cpp b/unpack30.cpp
+index 515fff1..6a8efa2 100644
+--- a/unpack30.cpp
++++ b/unpack30.cpp
+@@ -358,131 +358,131 @@ bool Unpack::ReadVMCodePPM()
+ }
+ 
+ 
+-bool Unpack::AddVMCode(uint FirstByte,byte *Code,int CodeSize)
++bool Unpack::AddVMCode(uint FirstByte,byte *Code,uint CodeSize)
+ {
+   VMCodeInp.InitBitInput();
+   memcpy(VMCodeInp.InBuf,Code,Min(BitInput::MAX_SIZE,CodeSize));
+   VM.Init();
+ 
+   uint FiltPos;
+   if ((FirstByte & 0x80)!=0)
+   {
+     FiltPos=RarVM::ReadData(VMCodeInp);
+     if (FiltPos==0)
+       InitFilters30(false);
+     else
+       FiltPos--;
+   }
+   else
+     FiltPos=LastFilter; // Use the same filter as last time.
+ 
+   if (FiltPos>Filters30.Size() || FiltPos>OldFilterLengths.Size())
+     return false;
+   LastFilter=FiltPos;
+   bool NewFilter=(FiltPos==Filters30.Size());
+ 
+   UnpackFilter30 *StackFilter=new UnpackFilter30; // New filter for PrgStack.
+ 
+   UnpackFilter30 *Filter;
+   if (NewFilter) // New filter code, never used before since VM reset.
+   {
+     if (FiltPos>MAX3_UNPACK_FILTERS)
+     {
+       // Too many different filters, corrupt archive.
+       delete StackFilter;
+       return false;
+     }
+ 
+     Filters30.Add(1);
+     Filters30[Filters30.Size()-1]=Filter=new UnpackFilter30;
+     StackFilter->ParentFilter=(uint)(Filters30.Size()-1);
+ 
+     // Reserve one item to store the data block length of our new filter 
+     // entry. We'll set it to real block length below, after reading it.
+     // But we need to initialize it now, because when processing corrupt
+     // data, we can access this item even before we set it to real value.
+     OldFilterLengths.Push(0);
+   }
+   else  // Filter was used in the past.
+   {
+     Filter=Filters30[FiltPos];
+     StackFilter->ParentFilter=FiltPos;
+   }
+ 
+   uint EmptyCount=0;
+   for (uint I=0;I<PrgStack.Size();I++)
+   {
+     PrgStack[I-EmptyCount]=PrgStack[I];
+     if (PrgStack[I]==NULL)
+       EmptyCount++;
+     if (EmptyCount>0)
+       PrgStack[I]=NULL;
+   }
+   if (EmptyCount==0)
+   {
+     if (PrgStack.Size()>MAX3_UNPACK_FILTERS)
+     {
+       delete StackFilter;
+       return false;
+     }
+     PrgStack.Add(1);
+     EmptyCount=1;
+   }
+   size_t StackPos=PrgStack.Size()-EmptyCount;
+   PrgStack[StackPos]=StackFilter;
+  
+   uint BlockStart=RarVM::ReadData(VMCodeInp);
+   if ((FirstByte & 0x40)!=0)
+     BlockStart+=258;
+   StackFilter->BlockStart=(uint)((BlockStart+UnpPtr)&MaxWinMask);
+   if ((FirstByte & 0x20)!=0)
+   {
+     StackFilter->BlockLength=RarVM::ReadData(VMCodeInp);
+ 
+     // Store the last data block length for current filter.
+     OldFilterLengths[FiltPos]=StackFilter->BlockLength;
+   }
+   else
+   {
+     // Set the data block size to same value as the previous block size
+     // for same filter. It is possible for corrupt data to access a new 
+     // and not filled yet item of OldFilterLengths array here. This is why
+     // we set new OldFilterLengths items to zero above.
+     StackFilter->BlockLength=FiltPos<OldFilterLengths.Size() ? OldFilterLengths[FiltPos]:0;
+   }
+ 
+   StackFilter->NextWindow=WrPtr!=UnpPtr && ((WrPtr-UnpPtr)&MaxWinMask)<=BlockStart;
+ 
+ //  DebugLog("\nNextWindow: UnpPtr=%08x WrPtr=%08x BlockStart=%08x",UnpPtr,WrPtr,BlockStart);
+ 
+   memset(StackFilter->Prg.InitR,0,sizeof(StackFilter->Prg.InitR));
+   StackFilter->Prg.InitR[4]=StackFilter->BlockLength;
+ 
+   if ((FirstByte & 0x10)!=0) // Set registers to optional parameters if any.
+   {
+     uint InitMask=VMCodeInp.fgetbits()>>9;
+     VMCodeInp.faddbits(7);
+     for (uint I=0;I<7;I++)
+       if (InitMask & (1<<I))
+         StackFilter->Prg.InitR[I]=RarVM::ReadData(VMCodeInp);
+   }
+ 
+   if (NewFilter)
+   {
+     uint VMCodeSize=RarVM::ReadData(VMCodeInp);
+-    if (VMCodeSize>=0x10000 || VMCodeSize==0)
++    if (VMCodeSize>=0x10000 || VMCodeSize==0 || VMCodeInp.InAddr+VMCodeSize>CodeSize)
+       return false;
+     Array<byte> VMCode(VMCodeSize);
+     for (uint I=0;I<VMCodeSize;I++)
+     {
+       if (VMCodeInp.Overflow(3))
+         return false;
+       VMCode[I]=VMCodeInp.fgetbits()>>8;
+       VMCodeInp.faddbits(8);
+     }
+     VM.Prepare(&VMCode[0],VMCodeSize,&Filter->Prg);
+   }
+   StackFilter->Prg.Type=Filter->Prg.Type;
+ 
+   return true;
+ }
+diff --git a/unpack50.cpp b/unpack50.cpp
+index d8a5959..dac1f6f 100644
+--- a/unpack50.cpp
++++ b/unpack50.cpp
+@@ -1,155 +1,155 @@
+ void Unpack::Unpack5(bool Solid)
+ {
+   FileExtracted=true;
+ 
+   if (!Suspended)
+   {
+     UnpInitData(Solid);
+     if (!UnpReadBuf())
+       return;
+ 
+     // Check TablesRead5 to be sure that we read tables at least once
+     // regardless of current block header TablePresent flag.
+     // So we can safefly use these tables below.
+     if (!ReadBlockHeader(Inp,BlockHeader) || 
+         !ReadTables(Inp,BlockHeader,BlockTables) || !TablesRead5)
+       return;
+   }
+ 
+   while (true)
+   {
+     UnpPtr&=MaxWinMask;
+ 
+     if (Inp.InAddr>=ReadBorder)
+     {
+       bool FileDone=false;
+ 
+       // We use 'while', because for empty block containing only Huffman table,
+       // we'll be on the block border once again just after reading the table.
+       while (Inp.InAddr>BlockHeader.BlockStart+BlockHeader.BlockSize-1 || 
+              Inp.InAddr==BlockHeader.BlockStart+BlockHeader.BlockSize-1 && 
+              Inp.InBit>=BlockHeader.BlockBitSize)
+       {
+         if (BlockHeader.LastBlockInFile)
+         {
+           FileDone=true;
+           break;
+         }
+         if (!ReadBlockHeader(Inp,BlockHeader) || !ReadTables(Inp,BlockHeader,BlockTables))
+           return;
+       }
+       if (FileDone || !UnpReadBuf())
+         break;
+     }
+ 
+-    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_LZ_MATCH+3 && WriteBorder!=UnpPtr)
++    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_INC_LZ_MATCH && WriteBorder!=UnpPtr)
+     {
+       UnpWriteBuf();
+       if (WrittenFileSize>DestUnpSize)
+         return;
+       if (Suspended)
+       {
+         FileExtracted=false;
+         return;
+       }
+     }
+ 
+     uint MainSlot=DecodeNumber(Inp,&BlockTables.LD);
+     if (MainSlot<256)
+     {
+       if (Fragmented)
+         FragWindow[UnpPtr++]=(byte)MainSlot;
+       else
+         Window[UnpPtr++]=(byte)MainSlot;
+       continue;
+     }
+     if (MainSlot>=262)
+     {
+       uint Length=SlotToLength(Inp,MainSlot-262);
+ 
+       uint DBits,Distance=1,DistSlot=DecodeNumber(Inp,&BlockTables.DD);
+       if (DistSlot<4)
+       {
+         DBits=0;
+         Distance+=DistSlot;
+       }
+       else
+       {
+         DBits=DistSlot/2 - 1;
+         Distance+=(2 | (DistSlot & 1)) << DBits;
+       }
+ 
+       if (DBits>0)
+       {
+         if (DBits>=4)
+         {
+           if (DBits>4)
+           {
+             Distance+=((Inp.getbits32()>>(36-DBits))<<4);
+             Inp.addbits(DBits-4);
+           }
+           uint LowDist=DecodeNumber(Inp,&BlockTables.LDD);
+           Distance+=LowDist;
+         }
+         else
+         {
+           Distance+=Inp.getbits32()>>(32-DBits);
+           Inp.addbits(DBits);
+         }
+       }
+ 
+       if (Distance>0x100)
+       {
+         Length++;
+         if (Distance>0x2000)
+         {
+           Length++;
+           if (Distance>0x40000)
+             Length++;
+         }
+       }
+ 
+       InsertOldDist(Distance);
+       LastLength=Length;
+       if (Fragmented)
+         FragWindow.CopyString(Length,Distance,UnpPtr,MaxWinMask);
+       else
+         CopyString(Length,Distance);
+       continue;
+     }
+     if (MainSlot==256)
+     {
+       UnpackFilter Filter;
+       if (!ReadFilter(Inp,Filter) || !AddFilter(Filter))
+         break;
+       continue;
+     }
+     if (MainSlot==257)
+     {
+       if (LastLength!=0)
+         if (Fragmented)
+           FragWindow.CopyString(LastLength,OldDist[0],UnpPtr,MaxWinMask);
+         else
+           CopyString(LastLength,OldDist[0]);
+       continue;
+     }
+     if (MainSlot<262)
+     {
+       uint DistNum=MainSlot-258;
+       uint Distance=OldDist[DistNum];
+       for (uint I=DistNum;I>0;I--)
+         OldDist[I]=OldDist[I-1];
+       OldDist[0]=Distance;
+ 
+       uint LengthSlot=DecodeNumber(Inp,&BlockTables.RD);
+       uint Length=SlotToLength(Inp,LengthSlot);
+       LastLength=Length;
+       if (Fragmented)
+         FragWindow.CopyString(Length,Distance,UnpPtr,MaxWinMask);
+       else
+         CopyString(Length,Distance);
+       continue;
+     }
+   }
+   UnpWriteBuf();
+ }
+diff --git a/unpack50mt.cpp b/unpack50mt.cpp
+index c4acaf1..59e111b 100644
+--- a/unpack50mt.cpp
++++ b/unpack50mt.cpp
+@@ -447,209 +447,209 @@ void Unpack::UnpackDecode(UnpackThreadData &D)
+ // Process decoded Huffman block data.
+ bool Unpack::ProcessDecoded(UnpackThreadData &D)
+ {
+   UnpackDecodedItem *Item=D.Decoded,*Border=D.Decoded+D.DecodedSize;
+   while (Item<Border)
+   {
+     UnpPtr&=MaxWinMask;
+-    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_LZ_MATCH+3 && WriteBorder!=UnpPtr)
++    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_INC_LZ_MATCH && WriteBorder!=UnpPtr)
+     {
+       UnpWriteBuf();
+       if (WrittenFileSize>DestUnpSize)
+         return false;
+     }
+ 
+     if (Item->Type==UNPDT_LITERAL)
+     {
+ #if defined(LITTLE_ENDIAN) && defined(ALLOW_MISALIGNED)
+       if (Item->Length==3 && UnpPtr<MaxWinSize-4)
+       {
+         *(uint32 *)(Window+UnpPtr)=*(uint32 *)Item->Literal;
+         UnpPtr+=4;
+       }
+       else
+ #endif
+         for (uint I=0;I<=Item->Length;I++)
+           Window[UnpPtr++ & MaxWinMask]=Item->Literal[I];
+     }
+     else
+       if (Item->Type==UNPDT_MATCH)
+       {
+         InsertOldDist(Item->Distance);
+         LastLength=Item->Length;
+         CopyString(Item->Length,Item->Distance);
+       }
+       else
+         if (Item->Type==UNPDT_REP)
+         {
+           uint Distance=OldDist[Item->Distance];
+           for (uint I=Item->Distance;I>0;I--)
+             OldDist[I]=OldDist[I-1];
+           OldDist[0]=Distance;
+           LastLength=Item->Length;
+           CopyString(Item->Length,Distance);
+         }
+         else
+           if (Item->Type==UNPDT_FULLREP)
+           {
+             if (LastLength!=0)
+               CopyString(LastLength,OldDist[0]);
+           }
+           else
+             if (Item->Type==UNPDT_FILTER)
+             {
+               UnpackFilter Filter;
+               
+               Filter.Type=(byte)Item->Length;
+               Filter.BlockStart=Item->Distance;
+ 
+               Item++;
+ 
+               Filter.Channels=(byte)Item->Length;
+               Filter.BlockLength=Item->Distance;
+ 
+               AddFilter(Filter);
+             }
+     Item++;
+   }
+   return true;
+ }
+ 
+ 
+ // For large blocks we decode and process in same function in single threaded
+ // mode, so we do not need to store intermediate data in memory.
+ bool Unpack::UnpackLargeBlock(UnpackThreadData &D)
+ {
+   if (!D.TableRead)
+   {
+     D.TableRead=true;
+     if (!ReadTables(D.Inp,D.BlockHeader,D.BlockTables))
+     {
+       D.DamagedData=true;
+       return false;
+     }
+   }
+ 
+   if (D.Inp.InAddr>D.BlockHeader.HeaderSize+D.BlockHeader.BlockSize)
+   {
+     D.DamagedData=true;
+     return false;
+   }
+   
+   int BlockBorder=D.BlockHeader.BlockStart+D.BlockHeader.BlockSize-1;
+ 
+   // Reserve enough space even for filter entry.
+   int DataBorder=D.DataSize-16;
+   int ReadBorder=Min(BlockBorder,DataBorder);
+ 
+   while (true)
+   {
+     UnpPtr&=MaxWinMask;
+     if (D.Inp.InAddr>=ReadBorder)
+     {
+       if (D.Inp.InAddr>BlockBorder || D.Inp.InAddr==BlockBorder && 
+           D.Inp.InBit>=D.BlockHeader.BlockBitSize)
+         break;
+ 
+       // If we do not have any more data in file to read, we must process
+       // what we have until last byte. Otherwise we can return and append
+       // more data to unprocessed few bytes.
+       if ((D.Inp.InAddr>=DataBorder) && !D.NoDataLeft || D.Inp.InAddr>=D.DataSize)
+       {
+         D.Incomplete=true;
+         break;
+       }
+     }
+-    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_LZ_MATCH+3 && WriteBorder!=UnpPtr)
++    if (((WriteBorder-UnpPtr) & MaxWinMask)<MAX_INC_LZ_MATCH && WriteBorder!=UnpPtr)
+     {
+       UnpWriteBuf();
+       if (WrittenFileSize>DestUnpSize)
+         return false;
+     }
+ 
+     uint MainSlot=DecodeNumber(D.Inp,&D.BlockTables.LD);
+     if (MainSlot<256)
+     {
+       Window[UnpPtr++]=(byte)MainSlot;
+       continue;
+     }
+     if (MainSlot>=262)
+     {
+       uint Length=SlotToLength(D.Inp,MainSlot-262);
+ 
+       uint DBits,Distance=1,DistSlot=DecodeNumber(D.Inp,&D.BlockTables.DD);
+       if (DistSlot<4)
+       {
+         DBits=0;
+         Distance+=DistSlot;
+       }
+       else
+       {
+         DBits=DistSlot/2 - 1;
+         Distance+=(2 | (DistSlot & 1)) << DBits;
+       }
+ 
+       if (DBits>0)
+       {
+         if (DBits>=4)
+         {
+           if (DBits>4)
+           {
+             Distance+=((D.Inp.getbits32()>>(36-DBits))<<4);
+             D.Inp.addbits(DBits-4);
+           }
+           uint LowDist=DecodeNumber(D.Inp,&D.BlockTables.LDD);
+           Distance+=LowDist;
+         }
+         else
+         {
+           Distance+=D.Inp.getbits32()>>(32-DBits);
+           D.Inp.addbits(DBits);
+         }
+       }
+ 
+       if (Distance>0x100)
+       {
+         Length++;
+         if (Distance>0x2000)
+         {
+           Length++;
+           if (Distance>0x40000)
+             Length++;
+         }
+       }
+ 
+       InsertOldDist(Distance);
+       LastLength=Length;
+       CopyString(Length,Distance);
+       continue;
+     }
+     if (MainSlot==256)
+     {
+       UnpackFilter Filter;
+       if (!ReadFilter(D.Inp,Filter) || !AddFilter(Filter))
+         break;
+       continue;
+     }
+     if (MainSlot==257)
+     {
+       if (LastLength!=0)
+         CopyString(LastLength,OldDist[0]);
+       continue;
+     }
+     if (MainSlot<262)
+     {
+       uint DistNum=MainSlot-258;
+       uint Distance=OldDist[DistNum];
+       for (uint I=DistNum;I>0;I--)
+         OldDist[I]=OldDist[I-1];
+       OldDist[0]=Distance;
+ 
+       uint LengthSlot=DecodeNumber(D.Inp,&D.BlockTables.RD);
+       uint Length=SlotToLength(D.Inp,LengthSlot);
+       LastLength=Length;
+       CopyString(Length,Distance);
+       continue;
+     }
+   }
+   return true;
+ }
+diff --git a/unpackinline.cpp b/unpackinline.cpp
+index c12c77d..04c3d1f 100644
+--- a/unpackinline.cpp
++++ b/unpackinline.cpp
+@@ -13,67 +13,67 @@ _forceinline void Unpack::InsertOldDist(uint Distance)
+ _forceinline void Unpack::CopyString(uint Length,uint Distance)
+ {
+   size_t SrcPtr=UnpPtr-Distance;
+-  if (SrcPtr<MaxWinSize-MAX_LZ_MATCH && UnpPtr<MaxWinSize-MAX_LZ_MATCH)
++  if (SrcPtr<MaxWinSize-MAX_INC_LZ_MATCH && UnpPtr<MaxWinSize-MAX_INC_LZ_MATCH)
+   {
+     // If we are not close to end of window, we do not need to waste time
+     // to "& MaxWinMask" pointer protection.
+ 
+     byte *Src=Window+SrcPtr;
+     byte *Dest=Window+UnpPtr;
+     UnpPtr+=Length;
+ 
+ #ifdef FAST_MEMCPY
+     if (Distance<Length) // Overlapping strings
+ #endif
+       while (Length>=8)
+       {
+         Dest[0]=Src[0];
+         Dest[1]=Src[1];
+         Dest[2]=Src[2];
+         Dest[3]=Src[3];
+         Dest[4]=Src[4];
+         Dest[5]=Src[5];
+         Dest[6]=Src[6];
+         Dest[7]=Src[7];
+ 
+         Src+=8;
+         Dest+=8;
+         Length-=8;
+       }
+ #ifdef FAST_MEMCPY
+     else
+       while (Length>=8)
+       {
+         // In theory we still could overlap here.
+         // Supposing Distance == MaxWinSize - 1 we have memcpy(Src, Src + 1, 8).
+-        // But for real RAR archives Distance <= MaxWinSize - MAX_LZ_MATCH
++        // But for real RAR archives Distance <= MaxWinSize - MAX_INC_LZ_MATCH
+         // always, so overlap here is impossible.
+ 
+         // This memcpy expanded inline by MSVC. We could also use uint64
+         // assignment, which seems to provide about the same speed.
+         memcpy(Dest,Src,8); 
+ 
+         Src+=8;
+         Dest+=8;
+         Length-=8;
+       }
+ #endif
+ 
+     // Unroll the loop for 0 - 7 bytes left. Note that we use nested "if"s.
+     if (Length>0) { Dest[0]=Src[0];
+     if (Length>1) { Dest[1]=Src[1];
+     if (Length>2) { Dest[2]=Src[2];
+     if (Length>3) { Dest[3]=Src[3];
+     if (Length>4) { Dest[4]=Src[4];
+     if (Length>5) { Dest[5]=Src[5];
+     if (Length>6) { Dest[6]=Src[6]; } } } } } } } // Close all nested "if"s.
+   }
+   else
+     while (Length-- > 0) // Slow copying with all possible precautions.
+     {
+       Window[UnpPtr]=Window[SrcPtr++ & MaxWinMask];
+       // We need to have masked UnpPtr after quit from loop, so it must not
+       // be replaced with 'Window[UnpPtr++ & MaxWinMask]'
+       UnpPtr=(UnpPtr+1) & MaxWinMask;
+     }
+ }

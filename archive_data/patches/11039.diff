@@ -1,0 +1,461 @@
+commit a6161b1746c91b0bdb676044bd170c50d163bcc0
+Author: Leon Scroggins III <scroggo@google.com>
+Date:   Thu Oct 18 14:45:26 2018 -0400
+
+    Properly fill in memory in sampled RLE BMPs
+    
+    Bug: oss-fuzz:11039
+    
+    Previously, RLE BMPs were not initialized when they were incomplete,
+    with the thinking that they were fully initialized at the start of
+    decoding. While this is true during full decodes (onGetPixels), it is
+    not true of scanline decodes where we may start with a failing skip.
+    
+    Remove incorrect comment about creating a sampler in SkBmpRLECodec.
+    Instead create the sampler when appropriate. Rather than make it
+    implement its own version of SkSampler::fill, which would look like the
+    other implementations, add a new virtual method to determine the width
+    and leave the common implementation to the caller.
+    
+    Simplify SkCodec::fillIncompleteImage, which always does basically the
+    same thing.
+    
+    Change-Id: I885ebb7a0fe5add2a4f59bce57d07d98e4dc1bdb
+    Reviewed-on: https://skia-review.googlesource.com/c/163484
+    Reviewed-by: Mike Klein <mtklein@google.com>
+    Commit-Queue: Leon Scroggins <scroggo@google.com>
+
+diff --git a/src/codec/SkBmpRLECodec.cpp b/src/codec/SkBmpRLECodec.cpp
+index 8fc0ea8045..669062942c 100644
+--- a/src/codec/SkBmpRLECodec.cpp
++++ b/src/codec/SkBmpRLECodec.cpp
+@@ -272,60 +272,59 @@ SkCodec::Result SkBmpRLECodec::onPrepareToDecode(const SkImageInfo& dstInfo,
+ /*
+  * Performs the bitmap decoding for RLE input format
+  * RLE decoding is performed all at once, rather than a one row at a time
+  */
+ int SkBmpRLECodec::decodeRows(const SkImageInfo& info, void* dst, size_t dstRowBytes,
+         const Options& opts) {
+-    const int width = this->dimensions().width();
+     int height = info.height();
+ 
+     // Account for sampling.
+-    SkImageInfo dstInfo = info.makeWH(get_scaled_dimension(width, fSampleX), height);
++    SkImageInfo dstInfo = info.makeWH(this->fillWidth(), height);
+ 
+     // Set the background as transparent.  Then, if the RLE code skips pixels,
+     // the skipped pixels will be transparent.
+     if (dst) {
+         SkSampler::Fill(dstInfo, dst, dstRowBytes, opts.fZeroInitialized);
+     }
+ 
+     // Adjust the height and the dst if the previous call to decodeRows() left us
+     // with lines that need to be skipped.
+     if (height > fLinesToSkip) {
+         height -= fLinesToSkip;
+         if (dst) {
+             dst = SkTAddOffset<void>(dst, fLinesToSkip * dstRowBytes);
+         }
+         fLinesToSkip = 0;
+ 
+         dstInfo = dstInfo.makeWH(dstInfo.width(), height);
+     } else {
+         fLinesToSkip -= height;
+         return height;
+     }
+ 
+     void* decodeDst = dst;
+     size_t decodeRowBytes = dstRowBytes;
+     SkImageInfo decodeInfo = dstInfo;
+     if (decodeDst) {
+         if (this->colorXform()) {
+             decodeInfo = decodeInfo.makeColorType(kXformSrcColorType);
+             if (kRGBA_F16_SkColorType == dstInfo.colorType()) {
+                 int count = height * dstInfo.width();
+                 this->resetXformBuffer(count);
+                 sk_bzero(this->xformBuffer(), count * sizeof(uint32_t));
+                 decodeDst = this->xformBuffer();
+                 decodeRowBytes = dstInfo.width() * sizeof(uint32_t);
+             }
+         }
+     }
+ 
+     int decodedHeight = this->decodeRLE(decodeInfo, decodeDst, decodeRowBytes);
+     if (this->colorXform() && decodeDst) {
+         for (int y = 0; y < decodedHeight; y++) {
+             this->applyColorXform(dst, decodeDst, dstInfo.width());
+             decodeDst = SkTAddOffset<void>(decodeDst, decodeRowBytes);
+             dst = SkTAddOffset<void>(dst, dstRowBytes);
+         }
+     }
+ 
+     return decodedHeight;
+ }
+@@ -538,6 +537,10 @@ public:
+         SkASSERT(fCodec);
+     }
+ 
++    int fillWidth() const override {
++        return fCodec->fillWidth();
++    }
++
+ private:
+     int onSetSampleX(int sampleX) override {
+         return fCodec->setSampleX(sampleX);
+@@ -547,20 +550,19 @@ private:
+     SkBmpRLECodec* fCodec;
+ };
+ 
+-SkSampler* SkBmpRLECodec::getSampler(bool /*createIfNecessary*/) {
+-    // We will always create an SkBmpRLESampler if one is requested.
+-    // This allows clients to always use the SkBmpRLESampler's
+-    // version of fill(), which does nothing since RLE decodes have
+-    // already filled pixel memory.  This seems fine, since creating
+-    // an SkBmpRLESampler is pretty inexpensive.
+-    if (!fSampler) {
++SkSampler* SkBmpRLECodec::getSampler(bool createIfNecessary) {
++    if (!fSampler && createIfNecessary) {
+         fSampler.reset(new SkBmpRLESampler(this));
+     }
+ 
+     return fSampler.get();
+ }
+ 
+-int SkBmpRLECodec::setSampleX(int sampleX){
++int SkBmpRLECodec::setSampleX(int sampleX) {
+     fSampleX = sampleX;
+-    return get_scaled_dimension(this->dimensions().width(), sampleX);
++    return this->fillWidth();
++}
++
++int SkBmpRLECodec::fillWidth() const {
++    return get_scaled_dimension(this->dimensions().width(), fSampleX);
+ }
+diff --git a/src/codec/SkBmpRLECodec.h b/src/codec/SkBmpRLECodec.h
+index dc6f26d86e..4ed12d09cb 100644
+--- a/src/codec/SkBmpRLECodec.h
++++ b/src/codec/SkBmpRLECodec.h
+@@ -41,6 +41,8 @@ public:
+ 
+     int setSampleX(int);
+ 
++    int fillWidth() const;
++
+ protected:
+ 
+     Result onGetPixels(const SkImageInfo& dstInfo, void* dst,
+diff --git a/src/codec/SkCodec.cpp b/src/codec/SkCodec.cpp
+index f9c34dd245..dfd1e0a5e8 100644
+--- a/src/codec/SkCodec.cpp
++++ b/src/codec/SkCodec.cpp
+@@ -559,41 +559,22 @@ int SkCodec::onOutputScanline(int inputScanline) const {
+     }
+ }
+ 
+-static void fill_proc(const SkImageInfo& info, void* dst, size_t rowBytes,
+-                      SkCodec::ZeroInitialized zeroInit, SkSampler* sampler) {
+-    if (sampler) {
+-        sampler->fill(info, dst, rowBytes, zeroInit);
+-    } else {
+-        SkSampler::Fill(info, dst, rowBytes, zeroInit);
+-    }
+-}
+-
+ void SkCodec::fillIncompleteImage(const SkImageInfo& info, void* dst, size_t rowBytes,
+         ZeroInitialized zeroInit, int linesRequested, int linesDecoded) {
++    if (kYes_ZeroInitialized == zeroInit) {
++        return;
++    }
+ 
+-    void* fillDst;
+     const int linesRemaining = linesRequested - linesDecoded;
+     SkSampler* sampler = this->getSampler(false);
+ 
+-    int fillWidth = info.width();
+-    if (fOptions.fSubset) {
+-        fillWidth = fOptions.fSubset->width();
+-    }
+-
+-    switch (this->getScanlineOrder()) {
+-        case kTopDown_SkScanlineOrder: {
+-            const SkImageInfo fillInfo = info.makeWH(fillWidth, linesRemaining);
+-            fillDst = SkTAddOffset<void>(dst, linesDecoded * rowBytes);
+-            fill_proc(fillInfo, fillDst, rowBytes, zeroInit, sampler);
+-            break;
+-        }
+-        case kBottomUp_SkScanlineOrder: {
+-            fillDst = dst;
+-            const SkImageInfo fillInfo = info.makeWH(fillWidth, linesRemaining);
+-            fill_proc(fillInfo, fillDst, rowBytes, zeroInit, sampler);
+-            break;
+-        }
+-    }
++    const int fillWidth = sampler          ? sampler->fillWidth()      :
++                          fOptions.fSubset ? fOptions.fSubset->width() :
++                                             info.width()              ;
++    void* fillDst = this->getScanlineOrder() == kBottomUp_SkScanlineOrder ? dst :
++                        SkTAddOffset<void>(dst, linesDecoded * rowBytes);
++    const auto fillInfo = info.makeWH(fillWidth, linesRemaining);
++    SkSampler::Fill(fillInfo, fillDst, rowBytes, kNo_ZeroInitialized);
+ }
+ 
+ static inline bool select_xform_format(SkColorType colorType, bool forColorTable,
+diff --git a/src/codec/SkGifCodec.cpp b/src/codec/SkGifCodec.cpp
+index 2e03b79a47..24d1720273 100644
+--- a/src/codec/SkGifCodec.cpp
++++ b/src/codec/SkGifCodec.cpp
+@@ -322,65 +322,63 @@ SkCodec::Result SkGifCodec::onIncrementalDecode(int* rowsDecoded) {
+ SkCodec::Result SkGifCodec::decodeFrame(bool firstAttempt, const Options& opts, int* rowsDecoded) {
+     const SkImageInfo& dstInfo = this->dstInfo();
+     const int scaledHeight = get_scaled_dimension(dstInfo.height(), fSwizzler->sampleY());
+ 
+     const int frameIndex = opts.fFrameIndex;
+     SkASSERT(frameIndex < fReader->imagesCount());
+     const SkGIFFrameContext* frameContext = fReader->frameContext(frameIndex);
+     if (firstAttempt) {
+         // rowsDecoded reports how many rows have been initialized, so a layer above
+         // can fill the rest. In some cases, we fill the background before decoding
+         // (or it is already filled for us), so we report rowsDecoded to be the full
+         // height.
+         bool filledBackground = false;
+         if (frameContext->getRequiredFrame() == kNoFrame) {
+             // We may need to clear to transparent for one of the following reasons:
+             // - The frameRect does not cover the full bounds. haveDecodedRow will
+             //   only draw inside the frameRect, so we need to clear the rest.
+             // - The frame is interlaced. There is no obvious way to fill
+             //   afterwards for an incomplete image. (FIXME: Does the first pass
+             //   cover all rows? If so, we do not have to fill here.)
+             // - There is no color table for this frame. In that case will not
+             //   draw anything, so we need to fill.
+             if (frameContext->frameRect() != this->bounds()
+                     || frameContext->interlaced() || !fCurrColorTableIsReal) {
+-                // fill ignores the width (replaces it with the actual, scaled width).
+-                // But we need to scale in Y.
+-                auto fillInfo = dstInfo.makeWH(0, scaledHeight);
+-                fSwizzler->fill(fillInfo, fDst, fDstRowBytes, opts.fZeroInitialized);
++                auto fillInfo = dstInfo.makeWH(fSwizzler->fillWidth(), scaledHeight);
++                SkSampler::Fill(fillInfo, fDst, fDstRowBytes, opts.fZeroInitialized);
+                 filledBackground = true;
+             }
+         } else {
+             // Not independent.
+             // SkCodec ensured that the prior frame has been decoded.
+             filledBackground = true;
+         }
+ 
+         fFilledBackground = filledBackground;
+         if (filledBackground) {
+             // Report the full (scaled) height, since the client will never need to fill.
+             fRowsDecoded = scaledHeight;
+         } else {
+             // This will be updated by haveDecodedRow.
+             fRowsDecoded = 0;
+         }
+     }
+ 
+     if (!fCurrColorTableIsReal) {
+         // Nothing to draw this frame.
+         return kSuccess;
+     }
+ 
+     bool frameDecoded = false;
+     const bool fatalError = !fReader->decode(frameIndex, &frameDecoded);
+     if (fatalError || !frameDecoded || fRowsDecoded != scaledHeight) {
+         if (rowsDecoded) {
+             *rowsDecoded = fRowsDecoded;
+         }
+         if (fatalError) {
+             return kErrorInInput;
+         }
+         return kIncompleteInput;
+     }
+ 
+     return kSuccess;
+ }
+diff --git a/src/codec/SkMaskSwizzler.h b/src/codec/SkMaskSwizzler.h
+index b8289f35c3..eff43ee025 100644
+--- a/src/codec/SkMaskSwizzler.h
++++ b/src/codec/SkMaskSwizzler.h
+@@ -22,31 +22,26 @@ class SkMaskSwizzler : public SkSampler {
+ public:
+ 
+     /*
+      * @param masks Unowned pointer to helper class
+      */
+     static SkMaskSwizzler* CreateMaskSwizzler(const SkImageInfo& dstInfo,
+                                               bool srcIsOpaque,
+                                               SkMasks* masks,
+                                               uint32_t bitsPerPixel,
+                                               const SkCodec::Options& options);
+ 
+     /*
+      * Swizzle a row
+      */
+     void swizzle(void* dst, const uint8_t* SK_RESTRICT src);
+ 
+-    /**
+-     * Implement fill using a custom width.
+-     */
+-    void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-              SkCodec::ZeroInitialized zeroInit) override {
+-        const SkImageInfo fillInfo = info.makeWH(fDstWidth, info.height());
+-        SkSampler::Fill(fillInfo, dst, rowBytes, zeroInit);
++    int fillWidth() const override {
++        return fDstWidth;
+     }
+ 
+     /**
+      *  Returns the byte offset at which we write to destination memory, taking
+      *  scaling, subsetting, and partial frames into account.
+      *  A similar function exists on SkSwizzler.
+      */
+     int swizzleWidth() const { return fDstWidth; }
+diff --git a/src/codec/SkSampler.h b/src/codec/SkSampler.h
+index 815153b3de..05043b981c 100644
+--- a/src/codec/SkSampler.h
++++ b/src/codec/SkSampler.h
+@@ -15,67 +15,63 @@ class SkSampler : public SkNoncopyable {
+ public:
+     /**
+      *  Update the sampler to sample every sampleX'th pixel. Returns the
+      *  width after sampling.
+      */
+     int setSampleX(int sampleX) {
+         return this->onSetSampleX(sampleX);
+     }
+ 
+     /**
+      *  Update the sampler to sample every sampleY'th row.
+      */
+     void setSampleY(int sampleY) {
+         fSampleY = sampleY;
+     }
+ 
+     /**
+      *  Retrieve the value set for sampleY.
+      */
+     int sampleY() const {
+         return fSampleY;
+     }
+ 
+     /**
+      *  Based on fSampleY, return whether this row belongs in the output.
+      *
+      *  @param row Row of the image, starting with the first row in the subset.
+      */
+     bool rowNeeded(int row) const {
+         return (row - get_start_coord(fSampleY)) % fSampleY == 0;
+     }
+ 
+     /**
+      * Fill the remainder of the destination with 0.
+      *
+      * 0 has a different meaning depending on the SkColorType. For color types
+      * with transparency, this means transparent. For k565 and kGray, 0 is
+      * black.
+      *
+      * @param info
+      * Contains the color type of the rows to fill.
+      * Contains the pixel width of the destination rows to fill
+      * Contains the number of rows that we need to fill.
+      *
+      * @param dst
+      * The destination row to fill.
+      *
+      * @param rowBytes
+      * Stride in bytes of the destination.
+      *
+      * @param zeroInit
+      * Indicates whether memory is already zero initialized.
+      */
+     static void Fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+                      SkCodec::ZeroInitialized zeroInit);
+ 
+-    /**
+-     * Allow subclasses to implement unique versions of fill().
+-     */
+-    virtual void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-                      SkCodec::ZeroInitialized zeroInit) {} // FIXME: Can this be abstract?
++    virtual int fillWidth() const = 0;
+ 
+     SkSampler()
+         : fSampleY(1)
+     {}
+ 
+     virtual ~SkSampler() {}
+diff --git a/src/codec/SkSwizzler.h b/src/codec/SkSwizzler.h
+index df2cf9f26b..b172e458cc 100644
+--- a/src/codec/SkSwizzler.h
++++ b/src/codec/SkSwizzler.h
+@@ -17,69 +17,64 @@ class SkSwizzler : public SkSampler {
+ public:
+     /**
+      *  Create a new SkSwizzler.
+      *  @param encodedInfo Description of the format of the encoded data.
+      *  @param ctable Unowned pointer to an array of up to 256 colors for an
+      *                index source.
+      *  @param dstInfo Describes the destination.
+      *  @param options Indicates if dst is zero-initialized. The
+      *                         implementation may choose to skip writing zeroes
+      *                         if set to kYes_ZeroInitialized.
+      *                 Contains partial scanline information.
+      *  @param frame   Is non-NULL if the source pixels are part of an image
+      *                 frame that is a subset of the full image.
+      *  @param skipFormatConversion Indicates that we should skip format conversion.
+      *                              The swizzler only needs to sample and/or subset.
+      *
+      *  Note that a deeper discussion of partial scanline subsets and image frame
+      *  subsets is below.  Currently, we do not support both simultaneously.  If
+      *  options->fSubset is non-NULL, frame must be NULL.
+      *
+      *  @return A new SkSwizzler or nullptr on failure.
+      */
+     static SkSwizzler* CreateSwizzler(const SkEncodedInfo& encodedInfo, const SkPMColor* ctable,
+                                       const SkImageInfo& dstInfo, const SkCodec::Options&,
+                                       const SkIRect* frame = nullptr,
+                                       bool skipFormatConversion = false);
+ 
+     /**
+      *  Swizzle a line. Generally this will be called height times, once
+      *  for each row of source.
+      *  By allowing the caller to pass in the dst pointer, we give the caller
+      *  flexibility to use the swizzler even when the encoded data does not
+      *  store the rows in order.  This also improves usability for scaled and
+      *  subset decodes.
+      *  @param dst Where we write the output.
+      *  @param src The next row of the source data.
+      */
+     void swizzle(void* dst, const uint8_t* SK_RESTRICT src);
+ 
+-    /**
+-     * Implement fill using a custom width.
+-     */
+-    void fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+-            SkCodec::ZeroInitialized zeroInit) override {
+-        const SkImageInfo fillInfo = info.makeWH(fAllocatedWidth, info.height());
+-        SkSampler::Fill(fillInfo, dst, rowBytes, zeroInit);
++    int fillWidth() const override {
++        return fAllocatedWidth;
+     }
+ 
+     /**
+      *  If fSampleX > 1, the swizzler is sampling every fSampleX'th pixel and
+      *  discarding the rest.
+      *
+      *  This getter is currently used by SkBmpStandardCodec for Bmp-in-Ico decodes.
+      *  Ideally, the subclasses of SkCodec would have no knowledge of sampling, but
+      *  this allows us to apply a transparency mask to pixels after swizzling.
+      */
+     int sampleX() const { return fSampleX; }
+ 
+     /**
+      *  Returns the actual number of pixels written to destination memory, taking
+      *  scaling, subsetting, and partial frames into account.
+      */
+     int swizzleWidth() const { return fSwizzleWidth; }
+ 
+     /**
+      *  Returns the byte offset at which we write to destination memory, taking
+      *  scaling, subsetting, and partial frames into account.
+      */
+     size_t swizzleOffsetBytes() const { return fDstOffsetBytes; }

@@ -1,0 +1,723 @@
+commit f6389c5a793648f1b12cc791b8957cf6d1752222
+Author: Alan Modra <amodra@gmail.com>
+Date:   Mon Feb 27 14:53:22 2023 +1030
+
+    Add some sanity checking in ECOFF lookup_line
+    
+    More anti-fuzzer bounds checking for the ECOFF support.  A lot of this
+    is in ancient code using "long" for counts and sizes, which is why the
+    patch uses "(long) ((unsigned long) x + 1) > 0" in a few places.  The
+    unsigned long cast is so that "x + 1" doesn't trigger ubsan warnings
+    about signed integer overflow.  It would be a good idea to replace
+    most of the longs used in binutils with size_t, but that's more than I
+    care to do for COFF/ECOFF.
+    
+            * ecofflink.c (mk_fdrtab): Sanity check string offsets.
+            (lookup_line): Likewise, and symbol indices.
+
+diff --git a/bfd/ecofflink.c b/bfd/ecofflink.c
+index e902bd51d53..422ce57f430 100644
+--- a/bfd/ecofflink.c
++++ b/bfd/ecofflink.c
+@@ -1723,104 +1723,109 @@ static bool
+ mk_fdrtab (bfd *abfd,
+ 	   struct ecoff_debug_info * const debug_info,
+ 	   const struct ecoff_debug_swap * const debug_swap,
+ 	   struct ecoff_find_line *line_info)
+ {
+   struct ecoff_fdrtab_entry *tab;
+   FDR *fdr_ptr;
+   FDR *fdr_start;
+   FDR *fdr_end;
+   bool stabs;
+   size_t len;
+   size_t amt;
+ 
+   fdr_start = debug_info->fdr;
+   fdr_end = fdr_start + debug_info->symbolic_header.ifdMax;
+ 
+   /* First, let's see how long the table needs to be.  */
+   for (len = 0, fdr_ptr = fdr_start; fdr_ptr < fdr_end; fdr_ptr++)
+     {
+       /* Sanity check fdr procedure descriptor pointer.  */
+       long ipdMax = debug_info->symbolic_header.ipdMax;
+       if (fdr_ptr->ipdFirst >= ipdMax
+ 	  || fdr_ptr->cpd > ipdMax - fdr_ptr->ipdFirst)
+ 	fdr_ptr->cpd = 0;
+       /* Skip FDRs that have no PDRs.  */
+       if (fdr_ptr->cpd == 0)
+ 	continue;
+       ++len;
+     }
+ 
+   /* Now, create and fill in the table.  */
+   if (_bfd_mul_overflow (len, sizeof (struct ecoff_fdrtab_entry), &amt))
+     {
+       bfd_set_error (bfd_error_file_too_big);
+       return false;
+     }
+   line_info->fdrtab = (struct ecoff_fdrtab_entry*) bfd_zalloc (abfd, amt);
+   if (line_info->fdrtab == NULL)
+     return false;
+ 
+   tab = line_info->fdrtab;
+   for (fdr_ptr = fdr_start; fdr_ptr < fdr_end; fdr_ptr++)
+     {
+       if (fdr_ptr->cpd == 0)
+ 	continue;
+ 
+       /* Check whether this file has stabs debugging information.  In
+ 	 a file with stabs debugging information, the second local
+ 	 symbol is named @stabs.  */
+       stabs = false;
+       if (fdr_ptr->csym >= 2)
+ 	{
+ 	  char *sym_ptr;
+ 	  SYMR sym;
+ 
+ 	  if ((long) ((unsigned long) fdr_ptr->isymBase + 1) <= 0
+ 	      || fdr_ptr->isymBase + 1 >= debug_info->symbolic_header.isymMax)
+ 	    continue;
+ 
+ 	  sym_ptr = ((char *) debug_info->external_sym
+ 		     + (fdr_ptr->isymBase + 1) * debug_swap->external_sym_size);
+ 	  (*debug_swap->swap_sym_in) (abfd, sym_ptr, &sym);
+-	  if (strcmp (debug_info->ss + fdr_ptr->issBase + sym.iss,
+-		      STABS_SYMBOL) == 0)
++	  if (fdr_ptr->issBase >= 0
++	      && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++	      && sym.iss >= 0
++	      && sym.iss < (debug_info->symbolic_header.issMax
++			    - fdr_ptr->issBase)
++	      && strcmp (debug_info->ss + fdr_ptr->issBase + sym.iss,
++			 STABS_SYMBOL) == 0)
+ 	    stabs = true;
+ 	}
+ 
+       if (!stabs)
+ 	{
+ 	  /* eraxxon: There are at least two problems with this computation:
+ 	     1) PDRs do *not* contain offsets but full vma's; and typically the
+ 	     address of the first PDR is the address of the FDR, which will
+ 	     make (most) of the results of the original computation 0!
+ 	     2) Once in a wacky while, the Compaq compiler generated PDR
+ 	     addresses do not equal the FDR vma, but they (the PDR address)
+ 	     are still vma's and not offsets.  Cf. comments in
+ 	     'lookup_line'.  */
+ 	  /* The address of the first PDR is the offset of that
+ 	     procedure relative to the beginning of file FDR.  */
+ 	  tab->base_addr = fdr_ptr->adr;
+ 	}
+       else
+ 	{
+ 	  /* XXX I don't know about stabs, so this is a guess
+ 	     (davidm@cs.arizona.edu).  */
+ 	  tab->base_addr = fdr_ptr->adr;
+ 	}
+       tab->fdr = fdr_ptr;
+       ++tab;
+     }
+   len = tab - line_info->fdrtab;
+   line_info->fdrtab_len = len;
+ 
+   /* Finally, the table is sorted in increasing memory-address order.
+      The table is mostly sorted already, but there are cases (e.g.,
+      static functions in include files), where this does not hold.
+      Use "odump -PFv" to verify...  */
+   qsort (line_info->fdrtab, len,
+ 	 sizeof (struct ecoff_fdrtab_entry), cmp_fdrtab_entry);
+ 
+   return true;
+ }
+ 
+ /* Return index of first FDR that covers to OFFSET.  */
+@@ -1877,494 +1882,547 @@ static bool
+ lookup_line (bfd *abfd,
+ 	     struct ecoff_debug_info * const debug_info,
+ 	     const struct ecoff_debug_swap * const debug_swap,
+ 	     struct ecoff_find_line *line_info)
+ {
+   struct ecoff_fdrtab_entry *tab;
+   bfd_vma offset;
+   bool stabs;
+   FDR *fdr_ptr;
+   int i;
+ 
+   /* eraxxon: note that 'offset' is the full vma, not a section offset.  */
+   offset = line_info->cache.start;
+ 
+   /* Build FDR table (sorted by object file's base-address) if we
+      don't have it already.  */
+   if (line_info->fdrtab == NULL
+       && !mk_fdrtab (abfd, debug_info, debug_swap, line_info))
+     return false;
+ 
+   tab = line_info->fdrtab;
+ 
+   /* Find first FDR for address OFFSET.  */
+   i = fdrtab_lookup (line_info, offset);
+   if (i < 0)
+     return false;		/* no FDR, no fun...  */
+ 
+   /* eraxxon: 'fdrtab_lookup' doesn't give what we want, at least for Compaq's
+      C++ compiler 6.2.  Consider three FDRs with starting addresses of x, y,
+      and z, respectively, such that x < y < z.  Assume further that
+      y < 'offset' < z.  It is possible at times that the PDR for 'offset' is
+      associated with FDR x and *not* with FDR y.  Erg!!
+ 
+      From a binary dump of my C++ test case 'moo' using Compaq's coffobjanl
+      (output format has been edited for our purposes):
+ 
+      FDR [2]: (main.C): First instruction: 0x12000207c <x>
+        PDR [5] for File [2]: LoopTest__Xv		  <0x1200020a0> (a)
+        PDR [7] for File [2]: foo__Xv			  <0x120002168>
+      FDR [1]: (-1):	First instruction: 0x1200020e8 <y>
+        PDR [3] for File [1]:				  <0x120001ad0> (b)
+      FDR [6]: (-1):	First instruction: 0x1200026f0 <z>
+ 
+      (a) In the case of PDR5, the vma is such that the first few instructions
+      of the procedure can be found.  But since the size of this procedure is
+      160b, the vma will soon cross into the 'address space' of FDR1 and no
+      debugging info will be found.  How repugnant!
+ 
+      (b) It is also possible for a PDR to have a *lower* vma than its associated
+      FDR; see FDR1 and PDR3.  Gross!
+ 
+      Since the FDRs that are causing so much havok (in this case) 1) do not
+      describe actual files (fdr.rss == -1), and 2) contain only compiler
+      generated routines, I thought a simple fix would be to exclude them from
+      the FDR table in 'mk_fdrtab'.  But, besides not knowing for certain
+      whether this would be correct, it creates an additional problem.  If we
+      happen to ask for source file info on a compiler generated (procedure)
+      symbol -- which is still in the symbol table -- the result can be
+      information from a real procedure!  This is because compiler generated
+      procedures with vma's higher than the last FDR in the fdr table will be
+      associated with a PDR from this FDR, specifically the PDR with the
+      highest vma.  This wasn't a problem before, because each procedure had a
+      PDR.  (Yes, this problem could be eliminated if we kept the size of the
+      last PDR around, but things are already getting ugly).
+ 
+      Probably, a better solution would be to have a sorted PDR table.  Each
+      PDR would have a pointer to its FDR so file information could still be
+      obtained.  A FDR table could still be constructed if necessary -- since
+      it only contains pointers, not much extra memory would be used -- but
+      the PDR table would be searched to locate debugging info.
+ 
+      There is still at least one remaining issue.  Sometimes a FDR can have a
+      bogus name, but contain PDRs that should belong to another FDR with a
+      real name.  E.g:
+ 
+      FDR [3]: 0000000120001b50 (/home/.../Array.H~alt~deccxx_5E5A62AD)
+        PDR [a] for File [3]: 0000000120001b50
+        PDR [b] for File [3]: 0000000120001cf0
+        PDR [c] for File [3]: 0000000120001dc8
+        PDR [d] for File [3]: 0000000120001e40
+        PDR [e] for File [3]: 0000000120001eb8
+        PDR [f] for File [3]: 0000000120001f4c
+      FDR [4]: 0000000120001b50 (/home/.../Array.H)
+ 
+      Here, FDR4 has the correct name, but should (seemingly) contain PDRa-f.
+      The symbol table for PDR4 does contain symbols for PDRa-f, but so does
+      the symbol table for FDR3.  However the former is different; perhaps this
+      can be detected easily. (I'm not sure at this point.)  This problem only
+      seems to be associated with files with templates.  I am assuming the idea
+      is that there is a 'fake' FDR (with PDRs) for each differently typed set
+      of templates that must be generated.  Currently, FDR4 is completely
+      excluded from the FDR table in 'mk_fdrtab' because it contains no PDRs.
+ 
+      Since I don't have time to prepare a real fix for this right now, be
+      prepared for 'A Horrible Hack' to force the inspection of all non-stabs
+      FDRs.  It's coming...  */
+   fdr_ptr = tab[i].fdr;
+ 
+   /* Check whether this file has stabs debugging information.  In a
+      file with stabs debugging information, the second local symbol is
+      named @stabs.  */
+   stabs = false;
+   if (fdr_ptr->csym >= 2)
+     {
+       char *sym_ptr;
+       SYMR sym;
+ 
+-      sym_ptr = ((char *) debug_info->external_sym
+-		 + (fdr_ptr->isymBase + 1) * debug_swap->external_sym_size);
+-      (*debug_swap->swap_sym_in) (abfd, sym_ptr, &sym);
+-      if (strcmp (debug_info->ss + fdr_ptr->issBase + sym.iss,
+-		  STABS_SYMBOL) == 0)
+-	stabs = true;
++      if ((long) ((unsigned long) fdr_ptr->isymBase + 1) > 0
++	  && fdr_ptr->isymBase + 1 < debug_info->symbolic_header.isymMax)
++	{
++	  sym_ptr = ((char *) debug_info->external_sym
++		     + (fdr_ptr->isymBase + 1) * debug_swap->external_sym_size);
++	  (*debug_swap->swap_sym_in) (abfd, sym_ptr, &sym);
++	  if (fdr_ptr->issBase >= 0
++	      && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++	      && sym.iss >= 0
++	      && sym.iss < (debug_info->symbolic_header.issMax
++			    - fdr_ptr->issBase)
++	      && strcmp (debug_info->ss + fdr_ptr->issBase + sym.iss,
++			 STABS_SYMBOL) == 0)
++	    stabs = true;
++	}
+     }
+ 
++  line_info->cache.filename = NULL;
++  line_info->cache.functionname = NULL;
++  line_info->cache.line_num = 0;
++
+   if (!stabs)
+     {
+       bfd_size_type external_pdr_size;
+       char *pdr_ptr;
+       char *best_pdr = NULL;
+       FDR *best_fdr;
+       bfd_signed_vma best_dist = -1;
+       PDR pdr;
+       unsigned char *line_ptr;
+       unsigned char *line_end;
+       int lineno;
+       /* This file uses ECOFF debugging information.  Each FDR has a
+ 	 list of procedure descriptors (PDR).  The address in the FDR
+ 	 is the absolute address of the first procedure.  The address
+ 	 in the first PDR gives the offset of that procedure relative
+ 	 to the object file's base-address.  The addresses in
+ 	 subsequent PDRs specify each procedure's address relative to
+ 	 the object file's base-address.  To make things more juicy,
+ 	 whenever the PROF bit in the PDR is set, the real entry point
+ 	 of the procedure may be 16 bytes below what would normally be
+ 	 the procedure's entry point.  Instead, DEC came up with a
+ 	 wicked scheme to create profiled libraries "on the fly":
+ 	 instead of shipping a regular and a profiled version of each
+ 	 library, they insert 16 bytes of unused space in front of
+ 	 each procedure and set the "prof" bit in the PDR to indicate
+ 	 that there is a gap there (this is done automagically by "as"
+ 	 when option "-pg" is specified).  Thus, normally, you link
+ 	 against such a library and, except for lots of 16 byte gaps
+ 	 between functions, things will behave as usual.  However,
+ 	 when invoking "ld" with option "-pg", it will fill those gaps
+ 	 with code that calls mcount().  It then moves the function's
+ 	 entry point down by 16 bytes, and out pops a binary that has
+ 	 all functions profiled.
+ 
+ 	 NOTE: Neither FDRs nor PDRs are strictly sorted in memory
+ 	       order.  For example, when including header-files that
+ 	       define functions, the FDRs follow behind the including
+ 	       file, even though their code may have been generated at
+ 	       a lower address.  File coff-alpha.c from libbfd
+ 	       illustrates this (use "odump -PFv" to look at a file's
+ 	       FDR/PDR).  Similarly, PDRs are sometimes out of order
+ 	       as well.  An example of this is OSF/1 v3.0 libc's
+ 	       malloc.c.  I'm not sure why this happens, but it could
+ 	       be due to optimizations that reorder a function's
+ 	       position within an object-file.
+ 
+ 	 Strategy:
+ 
+ 	 On the first call to this function, we build a table of FDRs
+ 	 that is sorted by the base-address of the object-file the FDR
+ 	 is referring to.  Notice that each object-file may contain
+ 	 code from multiple source files (e.g., due to code defined in
+ 	 include files).  Thus, for any given base-address, there may
+ 	 be multiple FDRs (but this case is, fortunately, uncommon).
+ 	 lookup(addr) guarantees to return the first FDR that applies
+ 	 to address ADDR.  Thus, after invoking lookup(), we have a
+ 	 list of FDRs that may contain the PDR for ADDR.  Next, we
+ 	 walk through the PDRs of these FDRs and locate the one that
+ 	 is closest to ADDR (i.e., for which the difference between
+ 	 ADDR and the PDR's entry point is positive and minimal).
+ 	 Once, the right FDR and PDR are located, we simply walk
+ 	 through the line-number table to lookup the line-number that
+ 	 best matches ADDR.  Obviously, things could be sped up by
+ 	 keeping a sorted list of PDRs instead of a sorted list of
+ 	 FDRs.  However, this would increase space requirements
+ 	 considerably, which is undesirable.  */
+       external_pdr_size = debug_swap->external_pdr_size;
+ 
+       /* eraxxon: The Horrible Hack: Because of the problems above, set 'i'
+ 	 to 0 so we look through all FDRs.
+ 
+ 	 Because FDR's without any symbols are assumed to be non-stabs,
+ 	 searching through all FDRs may cause the following code to try to
+ 	 read stabs FDRs as ECOFF ones.  However, I don't think this will
+ 	 harm anything.  */
+       i = 0;
+ 
+       /* Search FDR list starting at tab[i] for the PDR that best matches
+ 	 OFFSET.  Normally, the FDR list is only one entry long.  */
+       best_fdr = NULL;
+       do
+ 	{
+ 	  /* eraxxon: 'dist' and 'min_dist' can be negative now
+ 	     because we iterate over every FDR rather than just ones
+ 	     with a base address less than or equal to 'offset'.  */
+ 	  bfd_signed_vma dist = -1, min_dist = -1;
+ 	  char *pdr_hold;
+ 	  char *pdr_end;
+ 
+ 	  fdr_ptr = tab[i].fdr;
+ 
+ 	  pdr_ptr = ((char *) debug_info->external_pdr
+ 		     + fdr_ptr->ipdFirst * external_pdr_size);
+ 	  pdr_end = pdr_ptr + fdr_ptr->cpd * external_pdr_size;
+ 	  (*debug_swap->swap_pdr_in) (abfd, pdr_ptr, &pdr);
+ 	  /* Find PDR that is closest to OFFSET.  If pdr.prof is set,
+ 	     the procedure entry-point *may* be 0x10 below pdr.adr.  We
+ 	     simply pretend that pdr.prof *implies* a lower entry-point.
+ 	     This is safe because it just means that may identify 4 NOPs
+ 	     in front of the function as belonging to the function.  */
+ 	  for (pdr_hold = NULL;
+ 	       pdr_ptr < pdr_end;
+ 	       (pdr_ptr += external_pdr_size,
+ 		(*debug_swap->swap_pdr_in) (abfd, pdr_ptr, &pdr)))
+ 	    {
+ 	      if (offset >= (pdr.adr - 0x10 * pdr.prof))
+ 		{
+ 		  dist = offset - (pdr.adr - 0x10 * pdr.prof);
+ 
+ 		  /* eraxxon: 'dist' can be negative now.  Note that
+ 		     'min_dist' can be negative if 'pdr_hold' below is NULL.  */
+ 		  if (!pdr_hold || (dist >= 0 && dist < min_dist))
+ 		    {
+ 		      min_dist = dist;
+ 		      pdr_hold = pdr_ptr;
+ 		    }
+ 		}
+ 	    }
+ 
+ 	  if (!best_pdr || (min_dist >= 0 && min_dist < best_dist))
+ 	    {
+ 	      best_dist = (bfd_vma) min_dist;
+ 	      best_fdr = fdr_ptr;
+ 	      best_pdr = pdr_hold;
+ 	    }
+ 	  /* Continue looping until base_addr of next entry is different.  */
+ 	}
+       /* eraxxon: We want to iterate over all FDRs.
+ 	 See previous comment about 'fdrtab_lookup'.  */
+       while (++i < line_info->fdrtab_len);
+ 
+       if (!best_fdr || !best_pdr)
+ 	return false;			/* Shouldn't happen...  */
+ 
+       /* Phew, finally we got something that we can hold onto.  */
+       fdr_ptr = best_fdr;
+       pdr_ptr = best_pdr;
+       (*debug_swap->swap_pdr_in) (abfd, pdr_ptr, &pdr);
+       /* Now we can look for the actual line number.  The line numbers
+ 	 are stored in a very funky format, which I won't try to
+ 	 describe.  The search is bounded by the end of the FDRs line
+ 	 number entries.  */
+       line_end = debug_info->line + fdr_ptr->cbLineOffset + fdr_ptr->cbLine;
+ 
+       /* Make offset relative to procedure entry.  */
+       offset -= pdr.adr - 0x10 * pdr.prof;
+       lineno = pdr.lnLow;
+       line_ptr = debug_info->line + fdr_ptr->cbLineOffset + pdr.cbLineOffset;
+       while (line_ptr < line_end)
+ 	{
+ 	  int delta;
+ 	  unsigned int count;
+ 
+ 	  delta = *line_ptr >> 4;
+ 	  if (delta >= 0x8)
+ 	    delta -= 0x10;
+ 	  count = (*line_ptr & 0xf) + 1;
+ 	  ++line_ptr;
+ 	  if (delta == -8)
+ 	    {
+ 	      delta = (((line_ptr[0]) & 0xff) << 8) + ((line_ptr[1]) & 0xff);
+ 	      if (delta >= 0x8000)
+ 		delta -= 0x10000;
+ 	      line_ptr += 2;
+ 	    }
+ 	  lineno += delta;
+ 	  if (offset < count * 4)
+ 	    {
+ 	      line_info->cache.stop += count * 4 - offset;
+ 	      break;
+ 	    }
+ 	  offset -= count * 4;
+ 	}
+ 
+       /* If fdr_ptr->rss is -1, then this file does not have full
+ 	 symbols, at least according to gdb/mipsread.c.  */
+       if (fdr_ptr->rss == -1)
+ 	{
+-	  line_info->cache.filename = NULL;
+-	  if (pdr.isym == -1)
+-	    line_info->cache.functionname = NULL;
+-	  else
+-	    {
+-	      EXTR proc_ext;
++	  EXTR proc_ext;
+ 
++	  if (pdr.isym >= 0
++	      && pdr.isym < debug_info->symbolic_header.iextMax)
++	    {
+ 	      (*debug_swap->swap_ext_in)
+-		(abfd,
+-		 ((char *) debug_info->external_ext
+-		  + pdr.isym * debug_swap->external_ext_size),
++		(abfd, ((char *) debug_info->external_ext
++			+ pdr.isym * debug_swap->external_ext_size),
+ 		 &proc_ext);
+-	      line_info->cache.functionname = (debug_info->ssext
+-					       + proc_ext.asym.iss);
++	      if (proc_ext.asym.iss >= 0
++		  && proc_ext.asym.iss < debug_info->symbolic_header.issExtMax)
++		line_info->cache.functionname = (debug_info->ssext
++						 + proc_ext.asym.iss);
+ 	    }
+ 	}
+-      else
++      else if (fdr_ptr->issBase >= 0
++	       && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++	       && fdr_ptr->rss >= 0
++	       && fdr_ptr->rss < (debug_info->symbolic_header.issMax
++				  - fdr_ptr->issBase))
+ 	{
+ 	  SYMR proc_sym;
+ 
+ 	  line_info->cache.filename = (debug_info->ss
+ 				       + fdr_ptr->issBase
+ 				       + fdr_ptr->rss);
+-	  (*debug_swap->swap_sym_in)
+-	    (abfd,
+-	     ((char *) debug_info->external_sym
+-	      + ((fdr_ptr->isymBase + pdr.isym)
+-		 * debug_swap->external_sym_size)),
+-	     &proc_sym);
+-	  line_info->cache.functionname = (debug_info->ss
+-					   + fdr_ptr->issBase
+-					   + proc_sym.iss);
++	  if (fdr_ptr->isymBase >= 0
++	      && fdr_ptr->isymBase < debug_info->symbolic_header.isymMax
++	      && pdr.isym >= 0
++	      && pdr.isym < (debug_info->symbolic_header.isymMax
++			     - fdr_ptr->isymBase))
++	    {
++	      (*debug_swap->swap_sym_in)
++		(abfd, ((char *) debug_info->external_sym
++			+ ((fdr_ptr->isymBase + pdr.isym)
++			   * debug_swap->external_sym_size)),
++		 &proc_sym);
++	      if (proc_sym.iss >= 0
++		  && proc_sym.iss < (debug_info->symbolic_header.issMax
++				     - fdr_ptr->issBase))
++		line_info->cache.functionname = (debug_info->ss
++						 + fdr_ptr->issBase
++						 + proc_sym.iss);
++	    }
+ 	}
+       if (lineno == ilineNil)
+ 	lineno = 0;
+       line_info->cache.line_num = lineno;
+     }
+   else
+     {
+       bfd_size_type external_sym_size;
+       const char *directory_name;
+       const char *main_file_name;
+       const char *current_file_name;
+       const char *function_name;
+       const char *line_file_name;
+       bfd_vma low_func_vma;
+       bfd_vma low_line_vma;
+       bool past_line;
+       bool past_fn;
+       char *sym_ptr, *sym_ptr_end;
+       size_t len, funclen;
+       char *buffer = NULL;
+ 
+       /* This file uses stabs debugging information.  When gcc is not
+ 	 optimizing, it will put the line number information before
+ 	 the function name stabs entry.  When gcc is optimizing, it
+ 	 will put the stabs entry for all the function first, followed
+ 	 by the line number information.  (This appears to happen
+ 	 because of the two output files used by the -mgpopt switch,
+ 	 which is implied by -O).  This means that we must keep
+ 	 looking through the symbols until we find both a line number
+ 	 and a function name which are beyond the address we want.  */
+ 
+-      line_info->cache.filename = NULL;
+-      line_info->cache.functionname = NULL;
+-      line_info->cache.line_num = 0;
+-
+       directory_name = NULL;
+       main_file_name = NULL;
+       current_file_name = NULL;
+       function_name = NULL;
+       line_file_name = NULL;
+       low_func_vma = 0;
+       low_line_vma = 0;
+       past_line = false;
+       past_fn = false;
+ 
+       external_sym_size = debug_swap->external_sym_size;
+ 
+-      sym_ptr = ((char *) debug_info->external_sym
+-		 + (fdr_ptr->isymBase + 2) * external_sym_size);
+-      sym_ptr_end = sym_ptr + (fdr_ptr->csym - 2) * external_sym_size;
++      if (fdr_ptr->isymBase >= 0
++	  && fdr_ptr->isymBase < debug_info->symbolic_header.isymMax
++	  && fdr_ptr->csym >= 2
++	  && fdr_ptr->csym < (debug_info->symbolic_header.isymMax
++			      - fdr_ptr->isymBase))
++	{
++	  sym_ptr = ((char *) debug_info->external_sym
++		     + (fdr_ptr->isymBase + 2) * external_sym_size);
++	  sym_ptr_end = sym_ptr + (fdr_ptr->csym - 2) * external_sym_size;
++	}
++      else
++	{
++	  sym_ptr = NULL;
++	  sym_ptr_end = sym_ptr;
++	}
+       for (;
+ 	   sym_ptr < sym_ptr_end && (! past_line || ! past_fn);
+ 	   sym_ptr += external_sym_size)
+ 	{
+ 	  SYMR sym;
+ 
+ 	  (*debug_swap->swap_sym_in) (abfd, sym_ptr, &sym);
+ 
+ 	  if (ECOFF_IS_STAB (&sym))
+ 	    {
+ 	      switch (ECOFF_UNMARK_STAB (sym.index))
+ 		{
+ 		case N_SO:
+-		  main_file_name = current_file_name =
+-		    debug_info->ss + fdr_ptr->issBase + sym.iss;
++		  if (fdr_ptr->issBase >= 0
++		      && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++		      && sym.iss >= 0
++		      && sym.iss < (debug_info->symbolic_header.issMax
++				    - fdr_ptr->issBase))
++		    main_file_name = current_file_name
++		      = debug_info->ss + fdr_ptr->issBase + sym.iss;
+ 
+ 		  /* Check the next symbol to see if it is also an
+ 		     N_SO symbol.  */
+ 		  if (sym_ptr + external_sym_size < sym_ptr_end)
+ 		    {
+ 		      SYMR nextsym;
+ 
+ 		      (*debug_swap->swap_sym_in) (abfd,
+ 						  sym_ptr + external_sym_size,
+ 						  &nextsym);
+ 		      if (ECOFF_IS_STAB (&nextsym)
+ 			  && ECOFF_UNMARK_STAB (nextsym.index) == N_SO)
+ 			{
+ 			  directory_name = current_file_name;
+-			  main_file_name = current_file_name =
+-			    debug_info->ss + fdr_ptr->issBase + nextsym.iss;
++			  if (fdr_ptr->issBase >= 0
++			      && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++			      && nextsym.iss >= 0
++			      && nextsym.iss < (debug_info->symbolic_header.issMax
++						- fdr_ptr->issBase))
++			  main_file_name = current_file_name
++			    = debug_info->ss + fdr_ptr->issBase + nextsym.iss;
+ 			  sym_ptr += external_sym_size;
+ 			}
+ 		    }
+ 		  break;
+ 
+ 		case N_SOL:
+-		  current_file_name =
+-		    debug_info->ss + fdr_ptr->issBase + sym.iss;
++		  if (fdr_ptr->issBase >= 0
++		      && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++		      && sym.iss >= 0
++		      && sym.iss < (debug_info->symbolic_header.issMax
++				    - fdr_ptr->issBase))
++		    current_file_name
++		      = debug_info->ss + fdr_ptr->issBase + sym.iss;
+ 		  break;
+ 
+ 		case N_FUN:
+ 		  if (sym.value > offset)
+ 		    past_fn = true;
+ 		  else if (sym.value >= low_func_vma)
+ 		    {
+ 		      low_func_vma = sym.value;
+-		      function_name =
+-			debug_info->ss + fdr_ptr->issBase + sym.iss;
++		      if (fdr_ptr->issBase >= 0
++			  && fdr_ptr->issBase < debug_info->symbolic_header.issMax
++			  && sym.iss >= 0
++			  && sym.iss < (debug_info->symbolic_header.issMax
++					- fdr_ptr->issBase))
++			function_name
++			  = debug_info->ss + fdr_ptr->issBase + sym.iss;
+ 		    }
+ 		  break;
+ 		}
+ 	    }
+ 	  else if (sym.st == stLabel && sym.index != indexNil)
+ 	    {
+ 	      if (sym.value > offset)
+ 		past_line = true;
+ 	      else if (sym.value >= low_line_vma)
+ 		{
+ 		  low_line_vma = sym.value;
+ 		  line_file_name = current_file_name;
+ 		  line_info->cache.line_num = sym.index;
+ 		}
+ 	    }
+ 	}
+ 
+       if (line_info->cache.line_num != 0)
+ 	main_file_name = line_file_name;
+ 
+       /* We need to remove the stuff after the colon in the function
+ 	 name.  We also need to put the directory name and the file
+ 	 name together.  */
+       if (function_name == NULL)
+ 	len = funclen = 0;
+       else
+ 	len = funclen = strlen (function_name) + 1;
+ 
+       if (main_file_name != NULL
+ 	  && directory_name != NULL
+ 	  && main_file_name[0] != '/')
+ 	len += strlen (directory_name) + strlen (main_file_name) + 1;
+ 
+       if (len != 0)
+ 	{
+ 	  free (line_info->find_buffer);
+ 	  buffer = (char *) bfd_malloc ((bfd_size_type) len);
+ 	  line_info->find_buffer = buffer;
+ 	  if (buffer == NULL)
+ 	    return false;
+ 	}
+ 
+       if (function_name != NULL)
+ 	{
+ 	  char *colon;
+ 
+ 	  strcpy (buffer, function_name);
+ 	  colon = strchr (buffer, ':');
+ 	  if (colon != NULL)
+ 	    *colon = '\0';
+ 	  line_info->cache.functionname = buffer;
+ 	}
+ 
+       if (main_file_name != NULL)
+ 	{
+ 	  if (directory_name == NULL || main_file_name[0] == '/')
+ 	    line_info->cache.filename = main_file_name;
+ 	  else
+ 	    {
+ 	      sprintf (buffer + funclen, "%s%s", directory_name,
+ 		       main_file_name);
+ 	      line_info->cache.filename = buffer + funclen;
+ 	    }
+ 	}
+     }
+ 
+   return true;
+ }
+ 
+ /* Do the work of find_nearest_line.  */

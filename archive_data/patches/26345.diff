@@ -1,0 +1,229 @@
+commit 61164218298f9dbee5bac6648b5b4f5e97759bba
+Author: DavidKorczynski <david@adalogics.com>
+Date:   Fri Nov 13 20:14:44 2020 +0000
+
+    parser: fix inconsistent memory allocation in parser creation (#2760)
+    
+    * parser: fix inconsistent memory allocation in parser creation (oss-fuzz
+    26345)
+    
+    This commit fixes https://github.com/fluent/fluent-bit/issues/2686 by
+    avoiding any free of memory provided by the caller in flb_parser_create.
+    
+    Signed-off-by: davkor <david@adalogics.com>
+
+diff --git a/src/flb_parser.c b/src/flb_parser.c
+index cd1a87039..d43dbef40 100644
+--- a/src/flb_parser.c
++++ b/src/flb_parser.c
+@@ -105,175 +105,207 @@ int flb_parser_logfmt_do(struct flb_parser *parser,
+                          void **out_buf, size_t *out_size,
+                          struct flb_time *out_time);
+ 
++/*
++ * This function is used to free all aspects of a parser
++ * which is provided by the caller of flb_create_parser.
++ * Specifically, this function frees all but parser.types and
++ * parser.decoders from a parser.
++ *
++ * This function is only to be used in parser creation routines.
++ */
++static void flb_interim_parser_destroy(struct flb_parser *parser)
++{
++    int i = 0;
++    if (parser->type == FLB_PARSER_REGEX) {
++        flb_regex_destroy(parser->regex);
++        flb_free(parser->p_regex);
++    }
++
++    flb_free(parser->name);
++    if (parser->time_fmt) {
++        flb_free(parser->time_fmt);
++        flb_free(parser->time_fmt_full);
++    }
++    if (parser->time_fmt_year) {
++        flb_free(parser->time_fmt_year);
++    }
++    if (parser->time_key) {
++        flb_free(parser->time_key);
++    }
++
++    mk_list_del(&parser->_head);
++    flb_free(parser);
++}
++
+ struct flb_parser *flb_parser_create(const char *name, const char *format,
+                                      const char *p_regex,
+                                      const char *time_fmt, const char *time_key,
+                                      const char *time_offset,
+                                      int time_keep,
+                                      struct flb_parser_types *types,
+                                      int types_len,
+                                      struct mk_list *decoders,
+                                      struct flb_config *config)
+ {
+     int ret;
+     int len;
+     int diff = 0;
+     int size;
+     int is_epoch = FLB_FALSE;
+     char *tmp;
+     char *timeptr;
+     struct mk_list *head;
+     struct flb_parser *p;
+     struct flb_regex *regex;
+ 
+     /* Iterate current parsers and make sure the new one don't exists */
+     mk_list_foreach(head, &config->parsers) {
+         p = mk_list_entry(head, struct flb_parser, _head);
+         if (strcmp(p->name, name) == 0) {
+             flb_error("[parser] parser named '%s' already exists, skip.",
+                       name);
+             return NULL;
+         }
+     }
+ 
+     /* Allocate context */
+     p = flb_calloc(1, sizeof(struct flb_parser));
+     if (!p) {
+         flb_errno();
+         return NULL;
+     }
+     p->decoders = decoders;
+     mk_list_add(&p->_head, &config->parsers);
+ 
+     /* Format lookup */
+     if (strcasecmp(format, "regex") == 0) {
+         p->type = FLB_PARSER_REGEX;
+     }
+     else if (strcasecmp(format, "json") == 0) {
+         p->type = FLB_PARSER_JSON;
+     }
+     else if (strcmp(format, "ltsv") == 0) {
+         p->type = FLB_PARSER_LTSV;
+     }
+     else if (strcmp(format, "logfmt") == 0) {
+         p->type = FLB_PARSER_LOGFMT;
+     }
+     else {
+         flb_error("[parser:%s] Invalid format %s", name, format);
+         flb_free(p);
+         return NULL;
+     }
+ 
+     if (p->type == FLB_PARSER_REGEX) {
+         if (!p_regex) {
+             flb_error("[parser:%s] Invalid regex pattern", name);
+             flb_free(p);
+             return NULL;
+         }
+ 
+         regex = flb_regex_create(p_regex);
+         if (!regex) {
+             flb_error("[parser:%s] Invalid regex pattern %s", name, p_regex);
+             flb_free(p);
+             return NULL;
+         }
+         p->regex = regex;
+         p->p_regex = flb_strdup(p_regex);
+     }
+ 
+     p->name = flb_strdup(name);
+ 
+     if (time_fmt) {
+         p->time_fmt_full = flb_strdup(time_fmt);
+         p->time_fmt = flb_strdup(time_fmt);
+ 
+         /* Check if the format is considering the year */
+         if (strstr(p->time_fmt, "%Y") || strstr(p->time_fmt, "%y")) {
+             p->time_with_year = FLB_TRUE;
+         }
+         else if (strstr(p->time_fmt, "%s")) {
+             is_epoch = FLB_TRUE;
+             p->time_with_year = FLB_TRUE;
+         }
+         else {
+             size = strlen(p->time_fmt);
+             p->time_with_year = FLB_FALSE;
+             p->time_fmt_year = flb_malloc(size + 4);
+             if (!p->time_fmt_year) {
+                 flb_errno();
+-                flb_parser_destroy(p);
++                flb_interim_parser_destroy(p);
+                 return NULL;
+             }
+ 
+             /* Append the year at the beginning */
+             tmp = p->time_fmt_year;
+             *tmp++ = '%';
+             *tmp++ = 'Y';
+             *tmp++ = ' ';
+ 
+             memcpy(tmp, p->time_fmt, size);
+             tmp += size;
+             *tmp++ = '\0';
+         }
+ 
+         /* Check if the format contains a timezone (%z) */
+         if (strstr(p->time_fmt, "%z") || strstr(p->time_fmt, "%Z") ||
+             strstr(p->time_fmt, "%SZ") || strstr(p->time_fmt, "%S.%LZ")) {
+ #if defined(FLB_HAVE_GMTOFF) || !defined(FLB_HAVE_SYSTEM_STRPTIME)
+             p->time_with_tz = FLB_TRUE;
+ #else
+             flb_error("[parser] timezone offset not supported");
+             flb_error("[parser] you cannot use %%z/%%Z on this platform");
+-            flb_parser_destroy(p);
++            flb_interim_parser_destroy(p);
+             return NULL;
+ #endif
+         }
+ 
+         /*
+          * Check if the format expect fractional seconds
+          *
+          * Since strptime(3) does not support fractional seconds, this
+          * requires a workaround/hack in our parser. This is a known
+          * issue and addressed in different ways in other languages.
+          *
+          * The following links are a good reference:
+          *
+          * - http://stackoverflow.com/questions/7114690/how-to-parse-syslog-timestamp
+          * - http://code.activestate.com/lists/python-list/521885/
+          */
+         if (is_epoch == FLB_TRUE || p->time_with_year == FLB_TRUE) {
+             timeptr = p->time_fmt;
+         }
+         else {
+             timeptr = p->time_fmt_year;
+         }
+ 
+         tmp = strstr(timeptr, "%L");
+         if (tmp) {
+             tmp[0] = '\0';
+             tmp[1] = '\0';
+             p->time_frac_secs = (tmp + 2);
+         }
+ 
+         /* Optional fixed timezone offset */
+         if (time_offset) {
+             diff = 0;
+             len = strlen(time_offset);
+             ret = flb_parser_tzone_offset(time_offset, len, &diff);
+             if (ret == -1) {
+-                flb_parser_destroy(p);
++                flb_interim_parser_destroy(p);
+                 return NULL;
+             }
+             p->time_offset = diff;
+         }
+     }
+ 
+     if (time_key) {
+         p->time_key = flb_strdup(time_key);
+     }
+ 
+     p->time_keep = time_keep;
+     p->types = types;
+     p->types_len = types_len;
+     return p;
+ }

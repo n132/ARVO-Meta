@@ -1,0 +1,718 @@
+commit b8900bfc21cb3df44a3d17df4acb2a533dfd36a3
+Author: Hal Murray <hmurray@megapathdsl.net>
+Date:   Thu Dec 22 17:44:05 2022 -0800
+
+    Fix for gliitches found by Google's oss-fuzz
+
+diff --git a/include/nts.h b/include/nts.h
+index d01c48d15..41b03ed81 100644
+--- a/include/nts.h
++++ b/include/nts.h
+@@ -51,20 +51,24 @@ bool nts_ke_process_receive(struct BufCtl_t *buf, int *aead);
+ bool nts_ke_setup_send(struct BufCtl_t *buf, int aead,
+        uint8_t *c2s, uint8_t *s2c, int keylen);
+ 
+ /***********************************************************/
+ 
+ /* buffer packing/unpacking routines.
+  * NB: The length field in NTP extensions includes the header
+  * while the length field in NTS-KE data streams does not.
+  *
+  * These routines do not handle padding.  NTS-KE has no padding.
+  * NTP extensions are padded to word (4 byte) boundaries.
+  *
+  * Note that data on the wire is big endian.
+  * buffer is wire format, not host format.
+  */
+ 
+ 
++/* 2 byte type, 2 byte length */
++#define NTS_KE_HDR_LNG 4
++#define NTS_KE_U16_LNG 2
++
+ /* xxx_append_record_foo makes whole record with one foo */
+ /* append_foo appends foo to existing partial record */
+ void ke_append_record_null(BufCtl* buf, uint16_t type);
+diff --git a/ntpd/nts.c b/ntpd/nts.c
+index 107d08ca7..c42dbbb7e 100644
+--- a/ntpd/nts.c
++++ b/ntpd/nts.c
+@@ -284,22 +284,18 @@ int nts_ssl_write(SSL *ssl, uint8_t *buff, int buff_length) {
+ void nts_log_ssl_error(void) {
+ 	char buff[256];
+ 	int err = ERR_get_error();
+ 	SSL_load_error_strings();        /* Needed on NetBSD */
+ 	while (0 != err) {
+ 		ERR_error_string_n(err, buff, sizeof(buff));
+ 		msyslog(LOG_INFO, "NTS: %s", buff);
+ 		err = ERR_get_error();
+ 	}
+ }
+ 
+ /*****************************************************/
+ 
+ /* NB: KE length is body length, Extension length includes header. */
+ 
+-/* 2 byte type, 2 byte length */
+-#define NTS_KE_HDR_LNG 4
+-#define NTS_KE_U16_LNG 2
+-
+ /* Troubles with signed/unsigned compares when using sizeof() */
+ 
+ void ke_append_record_null(BufCtl* buf, uint16_t type) {
+diff --git a/ntpd/nts_client.c b/ntpd/nts_client.c
+index c76d48598..0f174caa2 100644
+--- a/ntpd/nts_client.c
++++ b/ntpd/nts_client.c
+@@ -607,138 +607,141 @@ bool nts_client_process_response(SSL *ssl, struct peer* peer) {
+ bool nts_client_process_response_core(uint8_t *buff, int transferred, struct peer* peer) {
+ 	int idx;
+ 	struct BufCtl_t buf;
+ 
+ 	peer->nts_state.aead = NO_AEAD;
+ 	peer->nts_state.keylen = 0;
+ 	peer->nts_state.writeIdx = 0;
+ 	peer->nts_state.readIdx = 0;
+ 	peer->nts_state.count = 0;
+ 
+ 	buf.next = buff;
+ 	buf.left = transferred;
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type, data, port;
+ 		bool critical = false;
+ 		int length, keylength;
+ 		char errbuf[100];
+ #define MAX_SERVER 100
+ 		char server[MAX_SERVER];
+ 
+ 		type = ke_next_record(&buf, &length);
+ 		if (NTS_CRITICAL & type) {
+ 			critical = true;
+ 			type &= ~NTS_CRITICAL;
+ 		}
+ 		if (0) // Handy for debugging but very verbose
+ 			msyslog(LOG_ERR, "NTSc: Record: T=%d, L=%d, C=%d", type, length, critical);
+ 		switch (type) {
+ 		    case nts_error:
+ 			data = next_uint16(&buf);
+ 			if (sizeof(data) != length)
+ 				msyslog(LOG_ERR, "NTSc: wrong length on error: %d", length);
+ 			msyslog(LOG_ERR, "NTSc: error: %d", data);
+ 			return false;
+ 		    case nts_next_protocol_negotiation:
+ 			data = next_uint16(&buf);
+ 			if ((sizeof(data) != length) || (data != nts_protocol_NTP)) {
+ 				msyslog(LOG_ERR, "NTSc: NPN-Wrong length or bad data: %d, %d",
+ 					length, data);
+ 				return false;
+ 			}
+ 			break;
+ 		    case nts_algorithm_negotiation:
+ 			data = next_uint16(&buf);
+ 			if (sizeof(data) != length) {
+ 				msyslog(LOG_ERR, "NTSc: AN-Wrong length: %d", length);
+ 				return false;
+ 			}
+ 			keylength = nts_get_key_length(data);
+ 			if (0 == keylength) {
+ 				msyslog(LOG_ERR, "NTSc: AN-Unsupported AEAN type: %d", data);
+ 				return false;
+ 			}
+ 			peer->nts_state.aead = data;
+ 			break;
+ 		    case nts_new_cookie:
+ 			if (NTS_MAX_COOKIELEN < length) {
+ 				msyslog(LOG_ERR, "NTSc: NC cookie too big: %d", length);
+ 				return false;
+ 			}
+ 			if (0 == peer->nts_state.cookielen)
+ 				peer->nts_state.cookielen = length;
+ 			if (length != peer->nts_state.cookielen) {
+ 				msyslog(LOG_ERR, "NTSc: Cookie length mismatch %d, %d.",
+ 					length, peer->nts_state.cookielen);
+ 				return false;
+ 			}
+ 			idx = peer->nts_state.writeIdx;
+ 			if (NTS_MAX_COOKIES <= peer->nts_state.count) {
+ 				msyslog(LOG_ERR, "NTSc: Extra cookie ignored.");
+ 				break;
+ 			}
+ 			next_bytes(&buf, (uint8_t*)&peer->nts_state.cookies[idx], length);
+ 			peer->nts_state.writeIdx++;
+ 			peer->nts_state.writeIdx = peer->nts_state.writeIdx % NTS_MAX_COOKIES;
+ 			peer->nts_state.count++;
+ 			break;
+ 		    case nts_server_negotiation:
+ 			if (MAX_SERVER < (length+1)) {
+ 				msyslog(LOG_ERR, "NTSc: server string too long %d.", length);
+ 				return false;
+ 			}
+ 			next_bytes(&buf, (uint8_t *)server, length);
+ 			server[length] = '\0';
+ 			/* save port in case port specified before server */
+ 			port = SRCPORT(&sockaddr);
+ 			if (!nts_server_lookup(server, &sockaddr, AF(&peer->srcadr)))
+ 				return false;
+ 			SET_PORT(&sockaddr, port);
+ 			socktoa_r(&sockaddr, errbuf, sizeof(errbuf));
+ 			msyslog(LOG_ERR, "NTSc: Using server %s=>%s", server, errbuf);
+ 			break;
+ 		    case nts_port_negotiation:
+ 			if (sizeof(port) != length) {
+ 				msyslog(LOG_ERR, "NTSc: PN-Wrong length: %d, %d",
+ 					length, critical);
+ 				return false;
+ 			}
+ 			port = next_uint16(&buf);
+ 			SET_PORT(&sockaddr, port);
+ 			msyslog(LOG_ERR, "NTSc: Using port %d", port);
+ 			break;
+ 		    case nts_end_of_message:
+ 			if ((0 != length) || !critical) {
+ 				msyslog(LOG_ERR, "NTSc: EOM-Wrong length or not Critical: %d, %d",
+ 					length, critical);
+ 				return false;
+ 			}
+ 			if (0 != buf.left) {
+ 				msyslog(LOG_ERR, "NTSc: EOM not at end: %d", buf.left);
+ 				return false;
+ 			}
+ 			break;
+ 		    default:
+ 			msyslog(LOG_ERR, "NTSc: received strange type: T=%d, C=%d, L=%d",
+ 				type, critical, length);
+ 			if (critical) {
+ 				return false;
+ 			}
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			break;
+ 		} /* case */
+ 	}   /* while */
+ 
++	if (buf.left > 0)
++		return false;
++
+ 	if (NO_AEAD == peer->nts_state.aead) {
+ 		msyslog(LOG_ERR, "NTSc: No AEAD algorithim.");
+ 		return false;
+ 	}
+ 	if (0 == peer->nts_state.count) {
+ 		msyslog(LOG_ERR, "NTSc: No cookies.");
+ 		return false;
+ 	}
+ 
+ 	msyslog(LOG_ERR, "NTSc: Got %d cookies, length %d, aead=%d.",
+ 		peer->nts_state.count, peer->nts_state.cookielen, peer->nts_state.aead);
+ 	return true;
+ }
+diff --git a/ntpd/nts_extens.c b/ntpd/nts_extens.c
+index b893c7a68..553b61b25 100644
+--- a/ntpd/nts_extens.c
++++ b/ntpd/nts_extens.c
+@@ -128,141 +128,144 @@ int extens_client_send(struct peer *peer, struct pkt *xpkt) {
+ bool extens_server_recv(struct ntspacket_t *ntspacket, uint8_t *pkt, int lng) {
+ 	struct BufCtl_t buf;
+ 	uint16_t aead;
+ 	int noncelen, cmaclen;
+ 	bool sawcookie, sawAEEF;
+ 	int cookielen;			/* cookie and placeholder(s) */
+ 
+ 	nts_server_recv_bad++;		/* assume bad, undo if OK */
+ 
+ 	buf.next = pkt+LEN_PKT_NOMAC;
+ 	buf.left = lng-LEN_PKT_NOMAC;
+ 
+ 	sawcookie = sawAEEF = false;
+ 	cookielen = 0;
+ 	ntspacket->uidlen = 0;
+ 	ntspacket->needed = 0;
+ 
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type;
+ 		bool critical = false;
+ 		int length, adlength;
+ 		size_t outlen;
+ 		uint8_t *nonce, *cmac;
+ 		bool ok;
+ 
+ 		type = ex_next_record(&buf, &length); /* length excludes header */
+ 		if (length&3 || length > buf.left || length < 0) {
+ 			return false;
+ 		}
+ 		if (NTS_CRITICAL & type) {
+ 			critical = true;
+ 			type &= ~NTS_CRITICAL;
+ 		}
+ 		switch (type) {
+ 		    case Unique_Identifier:
+ 			if (length > NTS_UID_MAX_LENGTH) {
+ 				return false;
+ 			}
+ 			ntspacket->uidlen = length;
+ 			next_bytes(&buf, ntspacket->UID, length);
+ 			break;
+ 		    case NTS_Cookie:
+ 			/* cookies and placeholders must be the same length
+ 			 * in order to avoid amplification attacks.
+ 			 */
+ 			if (sawcookie) {
+ 				return false; /* second cookie */
+ 			}
+ 			if (0 == cookielen) {
+ 				cookielen = length;
+ 			}
+ 			else if (length != cookielen) {
+ 				return false;
+ 			}
+ 			ok = nts_unpack_cookie(buf.next, length, &aead, ntspacket->c2s,
+ 					       ntspacket->s2c, &ntspacket->keylen);
+ 			if (!ok) {
+ 				return false;
+ 			}
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			sawcookie = true;
+ 			ntspacket->needed++;
+ 			ntspacket->aead = aead;
+ 			break;
+ 		    case NTS_Cookie_Placeholder:
+ 			if (0 == cookielen) {
+ 				cookielen = length;
+ 			}
+ 			else if (length != cookielen) {
+ 				return false;
+ 			}
+ 			ntspacket->needed++;
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			break;
+ 		    case NTS_AEEF:
+ 			if (!sawcookie) {
+ 				return false; /* no cookie yet, no c2s */
+ 			}
+ 			if (length != NTP_EX_HDR_LNG+NONCE_LENGTH+CMAC_LENGTH) {
+ 				return false;
+ 			}
+ 			/* Additional data is up to this exten. */
+ 			/* backup over header */
+ 			adlength = buf.next-NTP_EX_HDR_LNG-pkt;
+ 			noncelen = next_uint16(&buf);
+ 			cmaclen = next_uint16(&buf);
+ 			if (noncelen & 3) {
+ 				return false; /* would require padding */
+ 			}
+ 			if (CMAC_LENGTH != cmaclen) {
+ 				return false;
+ 			}
+ 			nonce = buf.next;
+ 			cmac = nonce+NONCE_LENGTH;
+ 			outlen = 6;
+ 			ok = AES_SIV_Decrypt(wire_ctx,
+ 					     NULL, &outlen,
+ 					     ntspacket->c2s, ntspacket->keylen,
+ 					     nonce, noncelen,
+ 					     cmac, CMAC_LENGTH,
+ 					     pkt, adlength);
+ 			if (!ok) {
+ 				return false;
+ 			}
+ 			if (0 != outlen) {
+ 				return false;
+ 			}
+ 			/* we already used 2 length slots way above*/
+ 			length -= (NTP_EX_U16_LNG+NTP_EX_U16_LNG);
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			if (0 != buf.left) {
+ 				return false; /* Reject extens after AEEF block */
+ 			}
+ 			sawAEEF = true;
+ 			break;
+ 		    default:
+ 			/* Non NTS extensions on requests at server.
+ 			 * Call out when we get some that we want.
+ 			 * Until then, it's probably a bug. */
+ 			if (critical) {
+ 				return false;
+ 			}
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			return false;
+ 		}
+ 	}
+ 
+ 	if (!sawAEEF) {
+ 		return false;
+ 	}
++	if (buf.left > 0)
++		return false;
++
+ 	//  printf("ESRx: %d, %d, %d\n",
+ 	//      lng-LEN_PKT_NOMAC, ntspacket->needed, ntspacket->keylen);
+ 	ntspacket->valid = true;
+ 	nts_server_recv_good++;
+ 	nts_server_recv_bad--;
+ 	return true;
+ }
+@@ -354,96 +357,98 @@ int extens_server_send(struct ntspacket_t *ntspacket, struct pkt *xpkt) {
+ bool extens_client_recv(struct peer *peer, uint8_t *pkt, int lng) {
+ 	struct BufCtl_t buf;
+ 	int idx;
+ 	bool sawAEEF = false;
+ 
+ 	nts_client_recv_bad++;		/* assume bad, undo if OK */
+ 
+ 	buf.next = pkt+LEN_PKT_NOMAC;
+ 	buf.left = lng-LEN_PKT_NOMAC;
+ 
+-	while (buf.left > 0) {
++	while (buf.left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type;
+ 		bool critical = false;
+ 		int length, adlength, noncelen;
+ 		uint8_t *nonce, *ciphertext, *plaintext;
+ 		size_t outlen;
+ 		bool ok;
+ 
+ 		type = ex_next_record(&buf, &length); /* length excludes header */
+ 		if (length&3 || length > buf.left || length < 0)
+ 			return false;
+ 		if (NTS_CRITICAL & type) {
+ 			critical = true;
+ 			type &= ~NTS_CRITICAL;
+ 		}
+ 		//     printf("ECR: %d, %d, %d\n", type, length, buf.left);
+ 		switch (type) {
+ 		    case Unique_Identifier:
+ 			if (NTS_UID_LENGTH != length)
+ 				return false;
+ 			if (0 != memcmp(buf.next, peer->nts_state.UID, NTS_UID_LENGTH))
+ 				return false;
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			break;
+ 		    case NTS_Cookie:
+ 			if (!sawAEEF)
+ 				return false;			/* reject unencrypted cookies */
+ 			if (NTS_MAX_COOKIES <= peer->nts_state.count)
+ 				return false;			/* reject extra cookies */
+ 			if (length != peer->nts_state.cookielen)
+ 				return false;			/* reject length change */
+ 			idx = peer->nts_state.writeIdx++;
+ 			memcpy((uint8_t*)&peer->nts_state.cookies[idx], buf.next, length);
+ 			peer->nts_state.writeIdx = peer->nts_state.writeIdx % NTS_MAX_COOKIES;
+ 			peer->nts_state.count++;
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			break;
+ 		    case NTS_AEEF:
+ 			adlength = buf.next-NTP_EX_HDR_LNG-pkt;  /* backup over header */
+ 			noncelen = next_uint16(&buf);
+ 			outlen = next_uint16(&buf);
+ 			if (noncelen&3 || outlen&3)
+ 				return false;                 /* else round up */
+ 			nonce = buf.next;
+ 			ciphertext = nonce+noncelen;
+ 			plaintext = ciphertext+CMAC_LENGTH;
+ 			outlen = buf.left-NONCE_LENGTH-CMAC_LENGTH;
+ 			//      printf("ECRa: %lu, %d\n", (long unsigned)outlen, noncelen);
+ 			ok = AES_SIV_Decrypt(wire_ctx,
+ 					     plaintext, &outlen,
+ 					     peer->nts_state.s2c, peer->nts_state.keylen,
+ 					     nonce, noncelen,
+ 					     ciphertext, outlen+CMAC_LENGTH,
+ 					     pkt, adlength);
+ 			//      printf("ECRb: %d, %lu\n", ok, (long unsigned)outlen);
+ 			if (!ok)
+ 				return false;
+ 			/* setup to process encrypted headers */
+ 			buf.next += NONCE_LENGTH+CMAC_LENGTH;
+ 			buf.left -= NONCE_LENGTH+CMAC_LENGTH;
+ 			sawAEEF = true;
+ 			break;
+ 		    default:
+ 			/* Non NTS extensions on reply from server.
+ 			 * Call out when we get some that we want.
+ 			 * For now, it's probably a bug. */
+ 			if (critical)
+ 				return false;
+ 			buf.next += length;
+ 			buf.left -= length;
+ 			return false;
+ 		}
+ 	}
+ 
+ 	//  printf("ECRx: %d, %d  %d, %d\n", sawAEEF, peer->nts_state.count,
+ 	//      peer->nts_state.writeIdx, peer->nts_state.readIdx);
+ 	if (!sawAEEF) {
+ 		return false;
+ 	}
++	if (buf.left > 0)
++		return false;
+ 	nts_client_recv_good++;
+ 	nts_client_recv_bad--;
+ 	return true;
+ }
+ /* end */
+diff --git a/ntpd/nts_server.c b/ntpd/nts_server.c
+index d6081db5a..c1d1f073e 100644
+--- a/ntpd/nts_server.c
++++ b/ntpd/nts_server.c
+@@ -491,69 +491,72 @@ bool create_listener6(int port) {
+ }
+ 
+ bool nts_ke_process_receive(struct BufCtl_t *buf, int *aead) {
+-	while (buf->left > 0) {
++	while (buf->left >= NTS_KE_HDR_LNG) {
+ 		uint16_t type, data;
+ 		int length;
+ 		bool critical = false;
+ 
+ 		type = ke_next_record(buf, &length);
+ 		if (NTS_CRITICAL & type) {
+ 			critical = true;
+ 			type &= ~NTS_CRITICAL;
+ 		}
+ 		if (0) // Handy for debugging but very verbose
+ 			msyslog(LOG_INFO, "NTSs: Record: T=%d, L=%d, C=%d", type, length, critical);
+ 		switch (type) {
+ 		    case nts_error:
+ 			data = next_uint16(buf);
+ 			if (sizeof(data) != length)
+ 				msyslog(LOG_ERR, "NTSs: wrong length on error: %d", length);
+ 			msyslog(LOG_ERR, "NTSs: error: %d", data);
+ 			return false;
+ 		    case nts_next_protocol_negotiation:
+ 			data = next_uint16(buf);
+ 			if ((sizeof(data) != length) || (data != nts_protocol_NTP)) {
+ 				msyslog(LOG_ERR, "NTSs: NPN-Wrong length or bad data: %d, %d",
+ 					length, data);
+ 				return false;
+ 			}
+ 			break;
+ 		    case nts_algorithm_negotiation:
+ 			for (int i=0; i<length; i+=sizeof(uint16_t)) {
+ 				data = next_uint16(buf);
+ 				if (0 == nts_get_key_length(data)) {
+ 					if (0)  /* for debugging */
+ 						msyslog(LOG_ERR, "NTSs: AN-Unsupported AEAN type: %d", data);
+ 					continue;     /* ignore types we don't support */
+ 				}
+ 				if (*aead != NO_AEAD)
+ 					continue;     /* already got one */
+ 				*aead = data;   /* take this one */
+ 			}
+ 			break;
+ 		    case nts_end_of_message:
+ 			if ((0 != length) || !critical) {
+ 				msyslog(LOG_ERR, "NTSs: EOM-Wrong length or not Critical: %d, %d",
+ 					length, critical);
+ 				return false;
+ 			}
+ 			if (0 != buf->left) {
+ 				msyslog(LOG_ERR, "NTSs: EOM not at end: %d", buf->left);
+ 				return false;
+ 			}
+ 			break;
+ 		    default:
+ 			msyslog(LOG_ERR, "NTSs: received strange type: T=%d, C=%d, L=%d",
+ 				type, critical, length);
+ 			if (critical) {
+ 				return false;
+ 			}
+ 			buf->next += length;
+ 			buf->left -= length;
+ 			break;
+ 		} /* case */
+ 	}   /* while */
+ 
++	if (buf->left > 0)
++		return false;
++
+ 	return true;
+ 
+ }
+diff --git a/tests/ntpd/nts_client.c b/tests/ntpd/nts_client.c
+index d870b5535..da899e573 100644
+--- a/tests/ntpd/nts_client.c
++++ b/tests/ntpd/nts_client.c
+@@ -103,168 +103,172 @@ TEST(nts_client, nts_client_send_request_core) {
+ TEST(nts_client, nts_client_process_response_core) {
+ 	/* General init */
+ 	bool success;
+ 	struct peer peer;
+ 	peer.nts_state.aead = 42; /* Dummy init values */
+ 	peer.nts_state.cookielen = 0;
+ 	peer.nts_state.writeIdx = 0;
+ 	peer.nts_state.count = 0;
+ 	/* Coverity barfed on uninitialized peer.srcadr, 2022-Mar-16
+ 	 * ** CID 349664:  Uninitialized variables  (UNINIT)
+ 	 * So initialize it with something. */
+ 	peer.srcadr.sa4.sin_family = AF_INET;
+ 	peer.srcadr.sa4.sin_port = htons(9999);
+ 	peer.srcadr.sa4.sin_addr.s_addr= htonl(0x04030201);
+ 	/* ===== Test: all correct ===== */
+ 	/* data */
+ 	uint8_t buf0[] = {
+-		0x80, nts_next_protocol_negotiation, 0, 2, 0, nts_protocol_NTP,
+-		0x80, nts_algorithm_negotiation, 0, 2, 0, AEAD_AES_SIV_CMAC_256,
+-		0x80, nts_new_cookie, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8,
++		0x80, nts_next_protocol_negotiation, 0, 2,
++			0, nts_protocol_NTP,
++		0x80, nts_algorithm_negotiation, 0, 2,
++			0, AEAD_AES_SIV_CMAC_256,
++		0x80, nts_new_cookie, 0, 8,
++			1, 2, 3, 4, 5, 6, 7, 8,
+ 		/* server_negotiation skipped due to getaddrinfo() containment breach */
+-		0x80, nts_port_negotiation, 0, 2, 0, 3,
++		0x80, nts_port_negotiation, 0, 2,
++			0, 123,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf0, sizeof(buf0), &peer);
+ 	/* check */
+ 	TEST_ASSERT_EQUAL(true, success);
+ 	TEST_ASSERT_EQUAL_INT16(AEAD_AES_SIV_CMAC_256, peer.nts_state.aead);
+ 	TEST_ASSERT_EQUAL_INT32(8, peer.nts_state.cookielen);
+ 	TEST_ASSERT_EQUAL_INT8(1, peer.nts_state.cookies[0][0]);
+ 	TEST_ASSERT_EQUAL_INT8(2, peer.nts_state.cookies[0][1]);
+ 	TEST_ASSERT_EQUAL_INT8(3, peer.nts_state.cookies[0][2]);
+ 	TEST_ASSERT_EQUAL_INT8(4, peer.nts_state.cookies[0][3]);
+ 	TEST_ASSERT_EQUAL_INT8(5, peer.nts_state.cookies[0][4]);
+ 	TEST_ASSERT_EQUAL_INT8(6, peer.nts_state.cookies[0][5]);
+ 	TEST_ASSERT_EQUAL_INT8(7, peer.nts_state.cookies[0][6]);
+ 	TEST_ASSERT_EQUAL_INT8(8, peer.nts_state.cookies[0][7]);
+ 	TEST_ASSERT_EQUAL_INT32(1, peer.nts_state.writeIdx);
+ 	TEST_ASSERT_EQUAL_INT32(1, peer.nts_state.count);
+ 	/* ===== Test: nts_error ===== */
+ 	/* data */
+ 	uint8_t buf1[] = {
+ 		0x80, nts_error, 0, 2, 0x11, 0x22,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf1, sizeof(buf1), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_next_protocol, wrong data length ===== */
+ 	/* data */
+ 	uint8_t buf2[] = {
+ 		0x80, nts_error, 0, 4, 0x11, 0x22, 0x33, 0x44,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf2, sizeof(buf2), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_next_protocol, wrong data ===== */
+ 	/* data */
+ 	uint8_t buf3[] = {
+ 		0x80, nts_error, 0, 2, 0x11, 0x22,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf3, sizeof(buf3), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_algorithm_negotiation, wrong length ===== */
+ 	/* data */
+ 	uint8_t buf4[] = {
+ 		0x80, nts_algorithm_negotiation, 0, 4, 0x11, 0x22, 0x33, 0x44,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf4, sizeof(buf4), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test:nts_algorithm_negotiation, bad AEAN type ===== */
+ 	/* data */
+ 	uint8_t buf5[] = {
+ 		0x80, nts_algorithm_negotiation, 0, 4, 0x11, 0x22,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf5, sizeof(buf5), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_new_cookie, over max cookie length ===== */
+ 	/* data */
+ 	uint8_t buf6[] = {
+ 		0x80, nts_new_cookie, 0, 4, 0x11, 0x22, /* NTS_MAX_COOKIELEN == 192 */
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf6, sizeof(buf6), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_new_cookie, cookie doesn't equal peer cookie size ===== */
+ 	/* data */
+ 	peer.nts_state.cookielen = 8;
+ 	uint8_t buf7[] = {
+ 		0x80, nts_new_cookie, 0, 4, 0, 9,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf7, sizeof(buf7), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_new_cookie, have max cookies ===== */
+ 	/* data */
+ 	uint8_t buf8[] = {
+ 		0x80, nts_new_cookie, 0, 4, 0, 8, 10, 20, 30, 40, 50, 60, 70, 80,
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	peer.nts_state.writeIdx = 0;
+ 	peer.nts_state.count = NTS_MAX_COOKIES;
+ 	/* run */
+ 	success = nts_client_process_response_core(buf8, sizeof(buf8), &peer);
+ 	/* check */
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	TEST_ASSERT_EQUAL(0, peer.nts_state.writeIdx);
+ 	TEST_ASSERT_NOT_EQUAL(10, peer.nts_state.cookies[0][0]);
+ 	/* ===== Test: nts_end_of_message, wrong length ===== */
+ 	/* data */
+ 	uint8_t buf9[] = {
+ 		0x80, nts_end_of_message, 0, 4
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf9, sizeof(buf9), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: nts_end_of_message, data remaining ===== */
+ 	/* data */
+ 	uint8_t buf10[] = {
+ 		0x80, nts_end_of_message, 0, 0,
+ 		42
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf10, sizeof(buf10), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: weird type, critical ===== */
+ 	/* data */
+ 	uint8_t buf11[] = {
+ 		0x80, 0xFF, 0, 0,
+ 		0x80, nts_end_of_message, 0, 0,
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf11, sizeof(buf11), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: no cookies ===== */
+ 	/* data */
+ 	peer.nts_state.count = 0;
+ 	uint8_t buf12[] = {
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf12, sizeof(buf12), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ 	/* ===== Test: no aead ===== */
+ 	/* data */
+ 	peer.nts_state.count = 8; /* So this doesn't trigger an error */
+ 	peer.nts_state.aead = NO_AEAD;
+ 	uint8_t buf13[] = {
+ 		0x80, nts_end_of_message, 0, 0
+ 	};
+ 	/* run */
+ 	success = nts_client_process_response_core(buf13, sizeof(buf13), &peer);
+ 	TEST_ASSERT_EQUAL(false, success);
+ }
+ 
+ /* Hacks to keep linker happy */
+ 
+ #ifdef HAVE_SECCOMP_H

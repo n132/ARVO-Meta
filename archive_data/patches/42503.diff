@@ -1,0 +1,161 @@
+commit 98c4a42b515a93efda58ceac39d8b531df7f349b
+Merge: 9a65fd0adf 2745cd9997
+Author: Dmitry Stogov <dmitry@zend.com>
+Date:   Fri Dec 17 12:50:48 2021 +0300
+
+    Merge branch 'PHP-8.1'
+    
+    * PHP-8.1:
+      Fix array clobbering by user error handler
+
+diff --git a/ext/opcache/jit/zend_jit_helpers.c b/ext/opcache/jit/zend_jit_helpers.c
+index fbac12f524..3dcc15f2ee 100644
+--- a/ext/opcache/jit/zend_jit_helpers.c
++++ b/ext/opcache/jit/zend_jit_helpers.c
+@@ -696,71 +696,122 @@ static zval* ZEND_FASTCALL zend_jit_fetch_dim_rw_helper(zend_array *ht, zval *di
+ static zval* ZEND_FASTCALL zend_jit_fetch_dim_w_helper(zend_array *ht, zval *dim)
+ {
+ 	zend_ulong hval;
+ 	zend_string *offset_key;
+ 	zval *retval;
+ 	zend_execute_data *execute_data;
+ 	const zend_op *opline;
+ 
+ 	if (Z_TYPE_P(dim) == IS_REFERENCE) {
+ 		dim = Z_REFVAL_P(dim);
+ 	}
+ 
+ 	switch (Z_TYPE_P(dim)) {
+ 		case IS_LONG:
+ 			hval = Z_LVAL_P(dim);
+ 			goto num_index;
+ 		case IS_STRING:
+ 			offset_key = Z_STR_P(dim);
+ 			goto str_index;
+ 		case IS_UNDEF:
+ 			execute_data = EG(current_execute_data);
+ 			opline = EX(opline);
+ 			if (!zend_jit_undefined_op_helper_write(ht, opline->op2.var)) {
+ 				if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
+ 					if (EG(exception)) {
+ 						ZVAL_UNDEF(EX_VAR(opline->result.var));
+ 					} else {
+ 						ZVAL_NULL(EX_VAR(opline->result.var));
+ 					}
+ 				}
+ 				return NULL;
+ 			}
+ 			ZEND_FALLTHROUGH;
+ 		case IS_NULL:
+ 			offset_key = ZSTR_EMPTY_ALLOC();
+ 			goto str_index;
+ 		case IS_DOUBLE:
+-			hval = zend_dval_to_lval_safe(Z_DVAL_P(dim));
++			hval = zend_dval_to_lval(Z_DVAL_P(dim));
++			if (!zend_is_long_compatible(Z_DVAL_P(dim), hval)) {
++				/* The array may be destroyed while throwing the notice.
++				 * Temporarily increase the refcount to detect this situation. */
++				if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE)) {
++					GC_ADDREF(ht);
++				}
++				execute_data = EG(current_execute_data);
++				opline = EX(opline);
++				zend_incompatible_double_to_long_error(Z_DVAL_P(dim));
++				if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE) && !GC_DELREF(ht)) {
++					zend_array_destroy(ht);
++					if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++						if (EG(exception)) {
++							ZVAL_UNDEF(EX_VAR(opline->result.var));
++						} else {
++							ZVAL_NULL(EX_VAR(opline->result.var));
++						}
++					}
++					return NULL;
++				}
++				if (EG(exception)) {
++					if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++						ZVAL_UNDEF(EX_VAR(opline->result.var));
++					}
++					return NULL;
++				}
++			}
+ 			goto num_index;
+ 		case IS_RESOURCE:
++			/* The array may be destroyed while throwing the notice.
++			 * Temporarily increase the refcount to detect this situation. */
++			if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE)) {
++				GC_ADDREF(ht);
++			}
++			execute_data = EG(current_execute_data);
++			opline = EX(opline);
+ 			zend_use_resource_as_offset(dim);
++			if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE) && !GC_DELREF(ht)) {
++				zend_array_destroy(ht);
++				if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++					if (EG(exception)) {
++						ZVAL_UNDEF(EX_VAR(opline->result.var));
++					} else {
++						ZVAL_NULL(EX_VAR(opline->result.var));
++					}
++				}
++				return NULL;
++			}
++			if (EG(exception)) {
++				if (opline->result_type & (IS_VAR | IS_TMP_VAR)) {
++					ZVAL_UNDEF(EX_VAR(opline->result.var));
++				}
++				return NULL;
++			}
+ 			hval = Z_RES_HANDLE_P(dim);
+ 			goto num_index;
+ 		case IS_FALSE:
+ 			hval = 0;
+ 			goto num_index;
+ 		case IS_TRUE:
+ 			hval = 1;
+ 			goto num_index;
+ 		default:
+ 			zend_jit_illegal_offset();
+ 			undef_result_after_exception();
+ 			if ((EG(opline_before_exception)+1)->opcode == ZEND_OP_DATA
+ 			 && ((EG(opline_before_exception)+1)->op1_type & (IS_VAR|IS_TMP_VAR))) {
+ 				zend_execute_data *execute_data = EG(current_execute_data);
+ 
+ 				zval_ptr_dtor_nogc(EX_VAR((EG(opline_before_exception)+1)->op1.var));
+ 			}
+ 			return NULL;
+ 	}
+ 
+ str_index:
+ 	if (ZEND_HANDLE_NUMERIC(offset_key, hval)) {
+ 		goto num_index;
+ 	}
+ 	return zend_hash_lookup(ht, offset_key);
+ 
+ num_index:
+ 	ZEND_HASH_INDEX_LOOKUP(ht, hval, retval);
+ 	return retval;
+ }
+diff --git a/ext/opcache/tests/jit/fetch_dim_w_003.phpt b/ext/opcache/tests/jit/fetch_dim_w_003.phpt
+new file mode 100644
+index 0000000000..33fc2ccbb8
+--- /dev/null
++++ b/ext/opcache/tests/jit/fetch_dim_w_003.phpt
+@@ -0,0 +1,17 @@
++--TEST--
++JIT FETCH_DIM_W: 003
++--INI--
++opcache.enable=1
++opcache.enable_cli=1
++opcache.file_update_protection=0
++opcache.jit_buffer_size=1M
++--FILE--
++<?php
++set_error_handler(function() {
++    $GLOBALS['a']='';
++});
++$a[3E44]='';
++?>
++DONE
++--EXPECT--
++DONE

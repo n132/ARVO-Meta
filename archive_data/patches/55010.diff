@@ -1,0 +1,1470 @@
+commit 3803b028dda9d7f3bf06836b5ad4522ff1ae0cb3
+Author: Anna Henningsen <anna@addaleax.net>
+Date:   Thu Mar 2 15:31:08 2023 +0100
+
+    src: share common code paths for SEA and embedder script
+    
+    Since SEA is very similar in principle to embedding functionality,
+    it makes sense to share code paths where possible. This commit does
+    so and addresses a `TODO` while doing so.
+    
+    It also adds a utility to directly run CJS code to the embedder
+    startup callback, which comes in handy for this purpose.
+    
+    Finally, this commit is breaking because it aligns the behavior
+    of `require()`ing internal modules; previously, embedders could
+    use the `require` function that they received to do so.
+    (If this is not considered breaking because accessing internals
+    is not covered by the API, then this would need ABI compatibility
+    patches for becoming fully non-breaking.)
+    
+    PR-URL: https://github.com/nodejs/node/pull/46825
+    Reviewed-By: Darshan Sen <raisinten@gmail.com>
+    Reviewed-By: Joyee Cheung <joyeec9h3@gmail.com>
+    Reviewed-By: James M Snell <jasnell@gmail.com>
+    Reviewed-By: Minwoo Jung <nodecorelab@gmail.com>
+
+diff --git a/lib/internal/main/embedding.js b/lib/internal/main/embedding.js
+new file mode 100644
+index 0000000000..aa3f06cca1
+--- /dev/null
++++ b/lib/internal/main/embedding.js
+@@ -0,0 +1,18 @@
++'use strict';
++const {
++  prepareMainThreadExecution,
++  markBootstrapComplete,
++} = require('internal/process/pre_execution');
++const { isSea } = internalBinding('sea');
++const { emitExperimentalWarning } = require('internal/util');
++const { embedderRequire, embedderRunCjs } = require('internal/util/embedding');
++const { getEmbedderEntryFunction } = internalBinding('mksnapshot');
++
++prepareMainThreadExecution(false, true);
++markBootstrapComplete();
++
++if (isSea()) {
++  emitExperimentalWarning('Single executable application');
++}
++
++return getEmbedderEntryFunction()(embedderRequire, embedderRunCjs);
+diff --git a/lib/internal/main/environment.js b/lib/internal/main/environment.js
+deleted file mode 100644
+index 0be982bfb6..0000000000
+--- a/lib/internal/main/environment.js
++++ /dev/null
+@@ -1,13 +0,0 @@
+-'use strict';
+-
+-// This runs necessary preparations to prepare a complete Node.js context
+-// that depends on run time states.
+-// It is currently only intended for preparing contexts for embedders.
+-
+-const {
+-  prepareMainThreadExecution,
+-  markBootstrapComplete
+-} = require('internal/process/pre_execution');
+-
+-prepareMainThreadExecution();
+-markBootstrapComplete();
+diff --git a/lib/internal/main/mksnapshot.js b/lib/internal/main/mksnapshot.js
+index 928b3fd13f..08d483dcff 100644
+--- a/lib/internal/main/mksnapshot.js
++++ b/lib/internal/main/mksnapshot.js
+@@ -118,57 +118,66 @@ function requireForUserSnapshot(id) {
+ function main() {
+   const {
+     prepareMainThreadExecution
+   } = require('internal/process/pre_execution');
++  const path = require('path');
+ 
+   let serializeMainFunction = getEmbedderEntryFunction();
+   const serializeMainArgs = [requireForUserSnapshot];
+ 
+   if (serializeMainFunction) { // embedded case
+     prepareMainThreadExecution(false, false);
++    // TODO(addaleax): Make this `embedderRunCjs` once require('module')
++    // is supported in snapshots.
++    const filename = process.execPath;
++    const dirname = path.dirname(filename);
++    function minimalRunCjs(source) {
++      const fn = compileSerializeMain(filename, source);
++      return fn(requireForUserSnapshot, filename, dirname);
++    }
++    serializeMainArgs.push(minimalRunCjs);
+   } else {
+     prepareMainThreadExecution(true, false);
+     const file = process.argv[1];
+-    const path = require('path');
+     const filename = path.resolve(file);
+     const dirname = path.dirname(filename);
+     const source = readFileSync(file, 'utf-8');
+     serializeMainFunction = compileSerializeMain(filename, source);
+     serializeMainArgs.push(filename, dirname);
+   }
+ 
+   const {
+     initializeCallbacks,
+     namespace: {
+       addSerializeCallback,
+       addDeserializeCallback,
+     },
+   } = require('internal/v8/startup_snapshot');
+   initializeCallbacks();
+ 
+   let stackTraceLimitDesc;
+   addDeserializeCallback(() => {
+     if (stackTraceLimitDesc !== undefined) {
+       ObjectDefineProperty(Error, 'stackTraceLimit', stackTraceLimitDesc);
+     }
+   });
+ 
+   if (getOptionValue('--inspect-brk')) {
+     internalBinding('inspector').callAndPauseOnStart(
+       serializeMainFunction, undefined, ...serializeMainArgs);
+   } else {
+     serializeMainFunction(...serializeMainArgs);
+   }
+ 
+   addSerializeCallback(() => {
+     stackTraceLimitDesc = ObjectGetOwnPropertyDescriptor(Error, 'stackTraceLimit');
+ 
+     if (stackTraceLimitDesc !== undefined) {
+       // We want to use null-prototype objects to not rely on globally mutable
+       // %Object.prototype%.
+       ObjectSetPrototypeOf(stackTraceLimitDesc, null);
+       process._rawDebug('Deleting Error.stackTraceLimit from the snapshot. ' +
+                         'It will be re-installed after deserialization');
+       delete Error.stackTraceLimit;
+     }
+   });
+ }
+diff --git a/lib/internal/main/single_executable_application.js b/lib/internal/main/single_executable_application.js
+deleted file mode 100644
+index d9604cff72..0000000000
+--- a/lib/internal/main/single_executable_application.js
++++ /dev/null
+@@ -1,55 +0,0 @@
+-'use strict';
+-const {
+-  prepareMainThreadExecution,
+-  markBootstrapComplete,
+-} = require('internal/process/pre_execution');
+-const { getSingleExecutableCode } = internalBinding('sea');
+-const { emitExperimentalWarning } = require('internal/util');
+-const { Module, wrapSafe } = require('internal/modules/cjs/loader');
+-const { codes: { ERR_UNKNOWN_BUILTIN_MODULE } } = require('internal/errors');
+-
+-prepareMainThreadExecution(false, true);
+-markBootstrapComplete();
+-
+-emitExperimentalWarning('Single executable application');
+-
+-// This is roughly the same as:
+-//
+-// const mod = new Module(filename);
+-// mod._compile(contents, filename);
+-//
+-// but the code has been duplicated because currently there is no way to set the
+-// value of require.main to module.
+-//
+-// TODO(RaisinTen): Find a way to deduplicate this.
+-
+-const filename = process.execPath;
+-const contents = getSingleExecutableCode();
+-const compiledWrapper = wrapSafe(filename, contents);
+-
+-const customModule = new Module(filename, null);
+-customModule.filename = filename;
+-customModule.paths = Module._nodeModulePaths(customModule.path);
+-
+-const customExports = customModule.exports;
+-
+-function customRequire(path) {
+-  if (!Module.isBuiltin(path)) {
+-    throw new ERR_UNKNOWN_BUILTIN_MODULE(path);
+-  }
+-
+-  return require(path);
+-}
+-
+-customRequire.main = customModule;
+-
+-const customFilename = customModule.filename;
+-
+-const customDirname = customModule.path;
+-
+-compiledWrapper(
+-  customExports,
+-  customRequire,
+-  customModule,
+-  customFilename,
+-  customDirname);
+diff --git a/lib/internal/util/embedding.js b/lib/internal/util/embedding.js
+new file mode 100644
+index 0000000000..139d4c7a25
+--- /dev/null
++++ b/lib/internal/util/embedding.js
+@@ -0,0 +1,47 @@
++'use strict';
++const { codes: { ERR_UNKNOWN_BUILTIN_MODULE } } = require('internal/errors');
++const { Module, wrapSafe } = require('internal/modules/cjs/loader');
++
++// This is roughly the same as:
++//
++// const mod = new Module(filename);
++// mod._compile(contents, filename);
++//
++// but the code has been duplicated because currently there is no way to set the
++// value of require.main to module.
++//
++// TODO(RaisinTen): Find a way to deduplicate this.
++
++function embedderRunCjs(contents) {
++  const filename = process.execPath;
++  const compiledWrapper = wrapSafe(filename, contents);
++
++  const customModule = new Module(filename, null);
++  customModule.filename = filename;
++  customModule.paths = Module._nodeModulePaths(customModule.path);
++
++  const customExports = customModule.exports;
++
++  embedderRequire.main = customModule;
++
++  const customFilename = customModule.filename;
++
++  const customDirname = customModule.path;
++
++  return compiledWrapper(
++    customExports,
++    embedderRequire,
++    customModule,
++    customFilename,
++    customDirname);
++}
++
++function embedderRequire(path) {
++  if (!Module.isBuiltin(path)) {
++    throw new ERR_UNKNOWN_BUILTIN_MODULE(path);
++  }
++
++  return require(path);
++}
++
++module.exports = { embedderRequire, embedderRunCjs };
+diff --git a/src/api/environment.cc b/src/api/environment.cc
+index 8aa1385f54..2f4d7a5c7f 100644
+--- a/src/api/environment.cc
++++ b/src/api/environment.cc
+@@ -528,17 +528,15 @@ MaybeLocal<Value> LoadEnvironment(
+   return StartExecution(env, cb);
+ }
+ 
+-MaybeLocal<Value> LoadEnvironment(
+-    Environment* env,
+-    const char* main_script_source_utf8) {
+-  CHECK_NOT_NULL(main_script_source_utf8);
++MaybeLocal<Value> LoadEnvironment(Environment* env,
++                                  std::string_view main_script_source_utf8) {
++  CHECK_NOT_NULL(main_script_source_utf8.data());
+   return LoadEnvironment(
+       env, [&](const StartExecutionCallbackInfo& info) -> MaybeLocal<Value> {
+-        std::string name = "embedder_main_" + std::to_string(env->thread_id());
+-        env->builtin_loader()->Add(name.c_str(), main_script_source_utf8);
+-        Realm* realm = env->principal_realm();
+-
+-        return realm->ExecuteBootstrapper(name.c_str());
++        Local<Value> main_script =
++            ToV8Value(env->context(), main_script_source_utf8).ToLocalChecked();
++        return info.run_cjs->Call(
++            env->context(), Null(env->isolate()), 1, &main_script);
+       });
+ }
+ 
+diff --git a/src/env-inl.h b/src/env-inl.h
+index 1d7a502b35..68dfb3a4d5 100644
+--- a/src/env-inl.h
++++ b/src/env-inl.h
+@@ -406,14 +406,12 @@ inline builtins::BuiltinLoader* Environment::builtin_loader() {
+   return &builtin_loader_;
+ }
+ 
+-inline const StartExecutionCallback&
+-Environment::embedder_mksnapshot_entry_point() const {
+-  return embedder_mksnapshot_entry_point_;
++inline const StartExecutionCallback& Environment::embedder_entry_point() const {
++  return embedder_entry_point_;
+ }
+ 
+-inline void Environment::set_embedder_mksnapshot_entry_point(
+-    StartExecutionCallback&& fn) {
+-  embedder_mksnapshot_entry_point_ = std::move(fn);
++inline void Environment::set_embedder_entry_point(StartExecutionCallback&& fn) {
++  embedder_entry_point_ = std::move(fn);
+ }
+ 
+ inline double Environment::new_async_id() {
+diff --git a/src/env.h b/src/env.h
+index 95ffa357ab..c0e28d6c2e 100644
+--- a/src/env.h
++++ b/src/env.h
+@@ -539,610 +539,610 @@ v8::Maybe<ExitCode> EmitProcessExitInternal(Environment* env);
+ /**
+  * Environment is a per-isolate data structure that represents an execution
+  * environment. Each environment has a principal realm. An environment can
+  * create multiple subsidiary synthetic realms.
+  */
+ class Environment : public MemoryRetainer {
+  public:
+   Environment(const Environment&) = delete;
+   Environment& operator=(const Environment&) = delete;
+   Environment(Environment&&) = delete;
+   Environment& operator=(Environment&&) = delete;
+ 
+   SET_MEMORY_INFO_NAME(Environment)
+ 
+   inline size_t SelfSize() const override;
+   bool IsRootNode() const override { return true; }
+   void MemoryInfo(MemoryTracker* tracker) const override;
+ 
+   EnvSerializeInfo Serialize(v8::SnapshotCreator* creator);
+   void DeserializeProperties(const EnvSerializeInfo* info);
+ 
+   void PrintInfoForSnapshotIfDebug();
+   void EnqueueDeserializeRequest(DeserializeRequestCallback cb,
+                                  v8::Local<v8::Object> holder,
+                                  int index,
+                                  InternalFieldInfoBase* info);
+   void RunDeserializeRequests();
+   // Should be called before InitializeInspector()
+   void InitializeDiagnostics();
+ 
+   std::string GetCwd();
+ 
+ #if HAVE_INSPECTOR
+   // If the environment is created for a worker, pass parent_handle and
+   // the ownership if transferred into the Environment.
+   void InitializeInspector(
+       std::unique_ptr<inspector::ParentInspectorHandle> parent_handle);
+ #endif
+ 
+   inline size_t async_callback_scope_depth() const;
+   inline void PushAsyncCallbackScope();
+   inline void PopAsyncCallbackScope();
+ 
+   static inline Environment* GetCurrent(v8::Isolate* isolate);
+   static inline Environment* GetCurrent(v8::Local<v8::Context> context);
+   static inline Environment* GetCurrent(
+       const v8::FunctionCallbackInfo<v8::Value>& info);
+ 
+   template <typename T>
+   static inline Environment* GetCurrent(
+       const v8::PropertyCallbackInfo<T>& info);
+ 
+   // Create an Environment without initializing a main Context. Use
+   // InitializeMainContext() to initialize a main context for it.
+   Environment(IsolateData* isolate_data,
+               v8::Isolate* isolate,
+               const std::vector<std::string>& args,
+               const std::vector<std::string>& exec_args,
+               const EnvSerializeInfo* env_info,
+               EnvironmentFlags::Flags flags,
+               ThreadId thread_id);
+   void InitializeMainContext(v8::Local<v8::Context> context,
+                              const EnvSerializeInfo* env_info);
+   ~Environment() override;
+ 
+   void InitializeLibuv();
+   inline const std::vector<std::string>& exec_argv();
+   inline const std::vector<std::string>& argv();
+   const std::string& exec_path() const;
+ 
+   typedef void (*HandleCleanupCb)(Environment* env,
+                                   uv_handle_t* handle,
+                                   void* arg);
+   struct HandleCleanup {
+     uv_handle_t* handle_;
+     HandleCleanupCb cb_;
+     void* arg_;
+   };
+ 
+   void RegisterHandleCleanups();
+   void CleanupHandles();
+   void Exit(ExitCode code);
+   void ExitEnv(StopFlags::Flags flags);
+ 
+   // Register clean-up cb to be called on environment destruction.
+   inline void RegisterHandleCleanup(uv_handle_t* handle,
+                                     HandleCleanupCb cb,
+                                     void* arg);
+ 
+   template <typename T, typename OnCloseCallback>
+   inline void CloseHandle(T* handle, OnCloseCallback callback);
+ 
+   void ResetPromiseHooks(v8::Local<v8::Function> init,
+                          v8::Local<v8::Function> before,
+                          v8::Local<v8::Function> after,
+                          v8::Local<v8::Function> resolve);
+   void AssignToContext(v8::Local<v8::Context> context,
+                        Realm* realm,
+                        const ContextInfo& info);
+   void TrackContext(v8::Local<v8::Context> context);
+   void UntrackContext(v8::Local<v8::Context> context);
+ 
+   void StartProfilerIdleNotifier();
+ 
+   inline v8::Isolate* isolate() const;
+   inline uv_loop_t* event_loop() const;
+   void TryLoadAddon(const char* filename,
+                     int flags,
+                     const std::function<bool(binding::DLib*)>& was_loaded);
+ 
+   static inline Environment* from_timer_handle(uv_timer_t* handle);
+   inline uv_timer_t* timer_handle();
+ 
+   static inline Environment* from_immediate_check_handle(uv_check_t* handle);
+   inline uv_check_t* immediate_check_handle();
+   inline uv_idle_t* immediate_idle_handle();
+ 
+   inline void IncreaseWaitingRequestCounter();
+   inline void DecreaseWaitingRequestCounter();
+ 
+   inline AsyncHooks* async_hooks();
+   inline ImmediateInfo* immediate_info();
+   inline AliasedInt32Array& timeout_info();
+   inline TickInfo* tick_info();
+   inline uint64_t timer_base() const;
+   inline permission::Permission* permission();
+   inline std::shared_ptr<KVStore> env_vars();
+   inline void set_env_vars(std::shared_ptr<KVStore> env_vars);
+ 
+   inline IsolateData* isolate_data() const;
+ 
+   inline bool printed_error() const;
+   inline void set_printed_error(bool value);
+ 
+   void PrintSyncTrace() const;
+   inline void set_trace_sync_io(bool value);
+ 
+   inline void set_force_context_aware(bool value);
+   inline bool force_context_aware() const;
+ 
+   // This contains fields that are a pseudo-boolean that keeps track of whether
+   // the process is exiting, an integer representing the process exit code, and
+   // a pseudo-boolean to indicate whether the exit code is undefined.
+   inline AliasedInt32Array& exit_info();
+   inline void set_exiting(bool value);
+   inline ExitCode exit_code(const ExitCode default_code) const;
+ 
+   // This stores whether the --abort-on-uncaught-exception flag was passed
+   // to Node.
+   inline bool abort_on_uncaught_exception() const;
+   inline void set_abort_on_uncaught_exception(bool value);
+   // This is a pseudo-boolean that keeps track of whether an uncaught exception
+   // should abort the process or not if --abort-on-uncaught-exception was
+   // passed to Node. If the flag was not passed, it is ignored.
+   inline AliasedUint32Array& should_abort_on_uncaught_toggle();
+ 
+   inline AliasedInt32Array& stream_base_state();
+ 
+   // The necessary API for async_hooks.
+   inline double new_async_id();
+   inline double execution_async_id();
+   inline double trigger_async_id();
+   inline double get_default_trigger_async_id();
+ 
+   // List of id's that have been destroyed and need the destroy() cb called.
+   inline std::vector<double>* destroy_async_id_list();
+ 
+   builtins::BuiltinLoader* builtin_loader();
+ 
+   std::unordered_multimap<int, loader::ModuleWrap*> hash_to_module_map;
+   std::unordered_map<uint32_t, loader::ModuleWrap*> id_to_module_map;
+   std::unordered_map<uint32_t, contextify::ContextifyScript*>
+       id_to_script_map;
+   std::unordered_map<uint32_t, contextify::CompiledFnEntry*> id_to_function_map;
+ 
+   inline uint32_t get_next_module_id();
+   inline uint32_t get_next_script_id();
+   inline uint32_t get_next_function_id();
+ 
+   EnabledDebugList* enabled_debug_list() { return &enabled_debug_list_; }
+ 
+   inline performance::PerformanceState* performance_state();
+ 
+   void CollectUVExceptionInfo(v8::Local<v8::Value> context,
+                               int errorno,
+                               const char* syscall = nullptr,
+                               const char* message = nullptr,
+                               const char* path = nullptr,
+                               const char* dest = nullptr);
+ 
+   // If this flag is set, calls into JS (if they would be observable
+   // from userland) must be avoided.  This flag does not indicate whether
+   // calling into JS is allowed from a VM perspective at this point.
+   inline bool can_call_into_js() const;
+   inline void set_can_call_into_js(bool can_call_into_js);
+ 
+   // Increase or decrease a counter that manages whether this Environment
+   // keeps the event loop alive on its own or not. The counter starts out at 0,
+   // meaning it does not, and any positive value will make it keep the event
+   // loop alive.
+   // This is used by Workers to manage their own .ref()/.unref() implementation,
+   // as Workers aren't directly associated with their own libuv handles.
+   void add_refs(int64_t diff);
+ 
+   // Convenient getter of the principal realm's has_run_bootstrapping_code().
+   inline bool has_run_bootstrapping_code() const;
+ 
+   inline bool has_serialized_options() const;
+   inline void set_has_serialized_options(bool has_serialized_options);
+ 
+   inline bool is_main_thread() const;
+   inline bool no_native_addons() const;
+   inline bool should_not_register_esm_loader() const;
+   inline bool should_create_inspector() const;
+   inline bool owns_process_state() const;
+   inline bool owns_inspector() const;
+   inline bool tracks_unmanaged_fds() const;
+   inline bool hide_console_windows() const;
+   inline bool no_global_search_paths() const;
+   inline bool no_browser_globals() const;
+   inline uint64_t thread_id() const;
+   inline worker::Worker* worker_context() const;
+   Environment* worker_parent_env() const;
+   inline void add_sub_worker_context(worker::Worker* context);
+   inline void remove_sub_worker_context(worker::Worker* context);
+   void stop_sub_worker_contexts();
+   template <typename Fn>
+   inline void ForEachWorker(Fn&& iterator);
+   // Determine if the environment is stopping. This getter is thread-safe.
+   inline bool is_stopping() const;
+   inline void set_stopping(bool value);
+   inline std::list<node_module>* extra_linked_bindings();
+   inline node_module* extra_linked_bindings_head();
+   inline node_module* extra_linked_bindings_tail();
+   inline const Mutex& extra_linked_bindings_mutex() const;
+ 
+   inline bool filehandle_close_warning() const;
+   inline void set_filehandle_close_warning(bool on);
+ 
+   inline void set_source_maps_enabled(bool on);
+   inline bool source_maps_enabled() const;
+ 
+   inline void ThrowError(const char* errmsg);
+   inline void ThrowTypeError(const char* errmsg);
+   inline void ThrowRangeError(const char* errmsg);
+   inline void ThrowErrnoException(int errorno,
+                                   const char* syscall = nullptr,
+                                   const char* message = nullptr,
+                                   const char* path = nullptr);
+   inline void ThrowUVException(int errorno,
+                                const char* syscall = nullptr,
+                                const char* message = nullptr,
+                                const char* path = nullptr,
+                                const char* dest = nullptr);
+ 
+   void AtExit(void (*cb)(void* arg), void* arg);
+   void RunAtExitCallbacks();
+ 
+   void RunWeakRefCleanup();
+ 
+   v8::MaybeLocal<v8::Value> RunSnapshotSerializeCallback() const;
+   v8::MaybeLocal<v8::Value> RunSnapshotDeserializeCallback() const;
+   v8::MaybeLocal<v8::Value> RunSnapshotDeserializeMain() const;
+ 
+   // Primitive values are shared across realms.
+   // The getters simply proxy to the per-isolate primitive.
+ #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
+ #define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
+ #define VS(PropertyName, StringValue) V(v8::String, PropertyName)
+ #define V(TypeName, PropertyName)                                             \
+   inline v8::Local<TypeName> PropertyName() const;
+   PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(VP)
+   PER_ISOLATE_SYMBOL_PROPERTIES(VY)
+   PER_ISOLATE_STRING_PROPERTIES(VS)
+ #undef V
+ #undef VS
+ #undef VY
+ #undef VP
+ 
+ #define V(PropertyName, TypeName)                                             \
+   inline v8::Local<TypeName> PropertyName() const;                            \
+   inline void set_ ## PropertyName(v8::Local<TypeName> value);
+   PER_ISOLATE_TEMPLATE_PROPERTIES(V)
+   // Per-realm strong persistent values of the principal realm.
+   // Get/set the value with an explicit realm instead when possible.
+   // Deprecate soon.
+   PER_REALM_STRONG_PERSISTENT_VALUES(V)
+ #undef V
+ 
+   // Return the context of the principal realm.
+   // Get the context with an explicit realm instead when possible.
+   // Deprecate soon.
+   inline v8::Local<v8::Context> context() const;
+   inline Realm* principal_realm() const;
+ 
+ #if HAVE_INSPECTOR
+   inline inspector::Agent* inspector_agent() const {
+     return inspector_agent_.get();
+   }
+ 
+   inline bool is_in_inspector_console_call() const;
+   inline void set_is_in_inspector_console_call(bool value);
+ #endif
+ 
+   typedef ListHead<HandleWrap, &HandleWrap::handle_wrap_queue_> HandleWrapQueue;
+   typedef ListHead<ReqWrapBase, &ReqWrapBase::req_wrap_queue_> ReqWrapQueue;
+ 
+   inline HandleWrapQueue* handle_wrap_queue() { return &handle_wrap_queue_; }
+   inline ReqWrapQueue* req_wrap_queue() { return &req_wrap_queue_; }
+ 
+   inline uint64_t time_origin() {
+     return time_origin_;
+   }
+   inline double time_origin_timestamp() {
+     return time_origin_timestamp_;
+   }
+ 
+   inline bool EmitProcessEnvWarning() {
+     bool current_value = emit_env_nonstring_warning_;
+     emit_env_nonstring_warning_ = false;
+     return current_value;
+   }
+ 
+   inline bool EmitErrNameWarning() {
+     bool current_value = emit_err_name_warning_;
+     emit_err_name_warning_ = false;
+     return current_value;
+   }
+ 
+   // cb will be called as cb(env) on the next event loop iteration.
+   // Unlike the JS setImmediate() function, nested SetImmediate() calls will
+   // be run without returning control to the event loop, similar to nextTick().
+   template <typename Fn>
+   inline void SetImmediate(
+       Fn&& cb, CallbackFlags::Flags flags = CallbackFlags::kRefed);
+   template <typename Fn>
+   // This behaves like SetImmediate() but can be called from any thread.
+   inline void SetImmediateThreadsafe(
+       Fn&& cb, CallbackFlags::Flags flags = CallbackFlags::kRefed);
+   // This behaves like V8's Isolate::RequestInterrupt(), but also accounts for
+   // the event loop (i.e. combines the V8 function with SetImmediate()).
+   // The passed callback may not throw exceptions.
+   // This function can be called from any thread.
+   template <typename Fn>
+   inline void RequestInterrupt(Fn&& cb);
+   // This needs to be available for the JS-land setImmediate().
+   void ToggleImmediateRef(bool ref);
+ 
+   inline void PushShouldNotAbortOnUncaughtScope();
+   inline void PopShouldNotAbortOnUncaughtScope();
+   inline bool inside_should_not_abort_on_uncaught_scope() const;
+ 
+   static inline Environment* ForAsyncHooks(AsyncHooks* hooks);
+ 
+   v8::Local<v8::Value> GetNow();
+   uint64_t GetNowUint64();
+ 
+   void ScheduleTimer(int64_t duration);
+   void ToggleTimerRef(bool ref);
+ 
+   inline void AddCleanupHook(CleanupQueue::Callback cb, void* arg);
+   inline void RemoveCleanupHook(CleanupQueue::Callback cb, void* arg);
+   void RunCleanup();
+ 
+   static size_t NearHeapLimitCallback(void* data,
+                                       size_t current_heap_limit,
+                                       size_t initial_heap_limit);
+   static void BuildEmbedderGraph(v8::Isolate* isolate,
+                                  v8::EmbedderGraph* graph,
+                                  void* data);
+ 
+   inline std::shared_ptr<EnvironmentOptions> options();
+   inline std::shared_ptr<ExclusiveAccess<HostPort>> inspector_host_port();
+ 
+   inline int32_t stack_trace_limit() const { return 10; }
+ 
+ #if HAVE_INSPECTOR
+   void set_coverage_connection(
+       std::unique_ptr<profiler::V8CoverageConnection> connection);
+   profiler::V8CoverageConnection* coverage_connection();
+ 
+   inline void set_coverage_directory(const char* directory);
+   inline const std::string& coverage_directory() const;
+ 
+   void set_cpu_profiler_connection(
+       std::unique_ptr<profiler::V8CpuProfilerConnection> connection);
+   profiler::V8CpuProfilerConnection* cpu_profiler_connection();
+ 
+   inline void set_cpu_prof_name(const std::string& name);
+   inline const std::string& cpu_prof_name() const;
+ 
+   inline void set_cpu_prof_interval(uint64_t interval);
+   inline uint64_t cpu_prof_interval() const;
+ 
+   inline void set_cpu_prof_dir(const std::string& dir);
+   inline const std::string& cpu_prof_dir() const;
+ 
+   void set_heap_profiler_connection(
+       std::unique_ptr<profiler::V8HeapProfilerConnection> connection);
+   profiler::V8HeapProfilerConnection* heap_profiler_connection();
+ 
+   inline void set_heap_prof_name(const std::string& name);
+   inline const std::string& heap_prof_name() const;
+ 
+   inline void set_heap_prof_dir(const std::string& dir);
+   inline const std::string& heap_prof_dir() const;
+ 
+   inline void set_heap_prof_interval(uint64_t interval);
+   inline uint64_t heap_prof_interval() const;
+ 
+ #endif  // HAVE_INSPECTOR
+ 
+-  inline const StartExecutionCallback& embedder_mksnapshot_entry_point() const;
+-  inline void set_embedder_mksnapshot_entry_point(StartExecutionCallback&& fn);
++  inline const StartExecutionCallback& embedder_entry_point() const;
++  inline void set_embedder_entry_point(StartExecutionCallback&& fn);
+ 
+   inline void set_process_exit_handler(
+       std::function<void(Environment*, ExitCode)>&& handler);
+ 
+   void RunAndClearNativeImmediates(bool only_refed = false);
+   void RunAndClearInterrupts();
+ 
+   uv_buf_t allocate_managed_buffer(const size_t suggested_size);
+   std::unique_ptr<v8::BackingStore> release_managed_buffer(const uv_buf_t& buf);
+ 
+   void AddUnmanagedFd(int fd);
+   void RemoveUnmanagedFd(int fd);
+ 
+   template <typename T>
+   void ForEachRealm(T&& iterator) const;
+ 
+   inline void set_heap_snapshot_near_heap_limit(uint32_t limit);
+   inline bool is_in_heapsnapshot_heap_limit_callback() const;
+ 
+   inline void AddHeapSnapshotNearHeapLimitCallback();
+ 
+   inline void RemoveHeapSnapshotNearHeapLimitCallback(size_t heap_limit);
+ 
+   // Field identifiers for exit_info_
+   enum ExitInfoField {
+     kExiting = 0,
+     kExitCode,
+     kHasExitCode,
+     kExitInfoFieldCount
+   };
+ 
+  private:
+   inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),
+                          const char* errmsg);
+ 
+   std::list<binding::DLib> loaded_addons_;
+   v8::Isolate* const isolate_;
+   IsolateData* const isolate_data_;
+   uv_timer_t timer_handle_;
+   uv_check_t immediate_check_handle_;
+   uv_idle_t immediate_idle_handle_;
+   uv_prepare_t idle_prepare_handle_;
+   uv_check_t idle_check_handle_;
+   uv_async_t task_queues_async_;
+   int64_t task_queues_async_refs_ = 0;
+ 
+   AsyncHooks async_hooks_;
+   ImmediateInfo immediate_info_;
+   AliasedInt32Array timeout_info_;
+   TickInfo tick_info_;
+   permission::Permission permission_;
+   const uint64_t timer_base_;
+   std::shared_ptr<KVStore> env_vars_;
+   bool printed_error_ = false;
+   bool trace_sync_io_ = false;
+   bool emit_env_nonstring_warning_ = true;
+   bool emit_err_name_warning_ = true;
+   bool emit_filehandle_warning_ = true;
+   bool source_maps_enabled_ = false;
+ 
+   size_t async_callback_scope_depth_ = 0;
+   std::vector<double> destroy_async_id_list_;
+ 
+ #if HAVE_INSPECTOR
+   std::unique_ptr<profiler::V8CoverageConnection> coverage_connection_;
+   std::unique_ptr<profiler::V8CpuProfilerConnection> cpu_profiler_connection_;
+   std::string coverage_directory_;
+   std::string cpu_prof_dir_;
+   std::string cpu_prof_name_;
+   uint64_t cpu_prof_interval_;
+   std::unique_ptr<profiler::V8HeapProfilerConnection> heap_profiler_connection_;
+   std::string heap_prof_dir_;
+   std::string heap_prof_name_;
+   uint64_t heap_prof_interval_;
+ #endif  // HAVE_INSPECTOR
+ 
+   std::shared_ptr<EnvironmentOptions> options_;
+   // options_ contains debug options parsed from CLI arguments,
+   // while inspector_host_port_ stores the actual inspector host
+   // and port being used. For example the port is -1 by default
+   // and can be specified as 0 (meaning any port allocated when the
+   // server starts listening), but when the inspector server starts
+   // the inspector_host_port_->port() will be the actual port being
+   // used.
+   std::shared_ptr<ExclusiveAccess<HostPort>> inspector_host_port_;
+   std::vector<std::string> exec_argv_;
+   std::vector<std::string> argv_;
+   std::string exec_path_;
+ 
+   bool is_in_heapsnapshot_heap_limit_callback_ = false;
+   uint32_t heap_limit_snapshot_taken_ = 0;
+   uint32_t heap_snapshot_near_heap_limit_ = 0;
+   bool heapsnapshot_near_heap_limit_callback_added_ = false;
+ 
+   uint32_t module_id_counter_ = 0;
+   uint32_t script_id_counter_ = 0;
+   uint32_t function_id_counter_ = 0;
+ 
+   AliasedInt32Array exit_info_;
+ 
+   AliasedUint32Array should_abort_on_uncaught_toggle_;
+   int should_not_abort_scope_counter_ = 0;
+ 
+   std::unique_ptr<TrackingTraceStateObserver> trace_state_observer_;
+ 
+   AliasedInt32Array stream_base_state_;
+ 
+   // https://w3c.github.io/hr-time/#dfn-time-origin
+   uint64_t time_origin_;
+   // https://w3c.github.io/hr-time/#dfn-get-time-origin-timestamp
+   double time_origin_timestamp_;
+   std::unique_ptr<performance::PerformanceState> performance_state_;
+ 
+   bool has_serialized_options_ = false;
+ 
+   std::atomic_bool can_call_into_js_ { true };
+   uint64_t flags_;
+   uint64_t thread_id_;
+   std::unordered_set<worker::Worker*> sub_worker_contexts_;
+ 
+ #if HAVE_INSPECTOR
+   std::unique_ptr<inspector::Agent> inspector_agent_;
+   bool is_in_inspector_console_call_ = false;
+ #endif
+ 
+   std::list<DeserializeRequest> deserialize_requests_;
+ 
+   // handle_wrap_queue_ and req_wrap_queue_ needs to be at a fixed offset from
+   // the start of the class because it is used by
+   // src/node_postmortem_metadata.cc to calculate offsets and generate debug
+   // symbols for Environment, which assumes that the position of members in
+   // memory are predictable. For more information please refer to
+   // `doc/contributing/node-postmortem-support.md`
+   friend int GenDebugSymbols();
+   HandleWrapQueue handle_wrap_queue_;
+   ReqWrapQueue req_wrap_queue_;
+   std::list<HandleCleanup> handle_cleanup_queue_;
+   int handle_cleanup_waiting_ = 0;
+   int request_waiting_ = 0;
+ 
+   EnabledDebugList enabled_debug_list_;
+ 
+   std::vector<v8::Global<v8::Context>> contexts_;
+   std::list<node_module> extra_linked_bindings_;
+   Mutex extra_linked_bindings_mutex_;
+ 
+   static void RunTimers(uv_timer_t* handle);
+ 
+   struct ExitCallback {
+     void (*cb_)(void* arg);
+     void* arg_;
+   };
+ 
+   std::list<ExitCallback> at_exit_functions_;
+ 
+   typedef CallbackQueue<void, Environment*> NativeImmediateQueue;
+   NativeImmediateQueue native_immediates_;
+   Mutex native_immediates_threadsafe_mutex_;
+   NativeImmediateQueue native_immediates_threadsafe_;
+   NativeImmediateQueue native_immediates_interrupts_;
+   // Also guarded by native_immediates_threadsafe_mutex_. This can be used when
+   // trying to post tasks from other threads to an Environment, as the libuv
+   // handle for the immediate queues (task_queues_async_) may not be initialized
+   // yet or already have been destroyed.
+   bool task_queues_async_initialized_ = false;
+ 
+   std::atomic<Environment**> interrupt_data_ {nullptr};
+   void RequestInterruptFromV8();
+   static void CheckImmediate(uv_check_t* handle);
+ 
+   CleanupQueue cleanup_queue_;
+   bool started_cleanup_ = false;
+ 
+   std::atomic_bool is_stopping_ { false };
+ 
+   std::unordered_set<int> unmanaged_fds_;
+ 
+   std::function<void(Environment*, ExitCode)> process_exit_handler_{
+       DefaultProcessExitHandlerInternal};
+ 
+   std::unique_ptr<Realm> principal_realm_ = nullptr;
+ 
+   builtins::BuiltinLoader builtin_loader_;
+-  StartExecutionCallback embedder_mksnapshot_entry_point_;
++  StartExecutionCallback embedder_entry_point_;
+ 
+   // Used by allocate_managed_buffer() and release_managed_buffer() to keep
+   // track of the BackingStore for a given pointer.
+   std::unordered_map<char*, std::unique_ptr<v8::BackingStore>>
+       released_allocated_buffers_;
+ };
+ 
+ }  // namespace node
+ 
+ #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+ 
+ #endif  // SRC_ENV_H_
+diff --git a/src/node.cc b/src/node.cc
+index 3f1b28a8a1..2aba7333d9 100644
+--- a/src/node.cc
++++ b/src/node.cc
+@@ -271,102 +271,85 @@ MaybeLocal<Value> StartExecution(Environment* env, const char* main_script_id) {
+ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
+   InternalCallbackScope callback_scope(
+       env,
+       Object::New(env->isolate()),
+       { 1, 0 },
+       InternalCallbackScope::kSkipAsyncHooks);
+ 
+   if (cb != nullptr) {
+     EscapableHandleScope scope(env->isolate());
++    // TODO(addaleax): pass the callback to the main script more directly,
++    // e.g. by making StartExecution(env, builtin) parametrizable
++    env->set_embedder_entry_point(std::move(cb));
++    auto reset_entry_point =
++        OnScopeLeave([&]() { env->set_embedder_entry_point({}); });
+ 
+-    if (env->isolate_data()->options()->build_snapshot) {
+-      // TODO(addaleax): pass the callback to the main script more directly,
+-      // e.g. by making StartExecution(env, builtin) parametrizable
+-      env->set_embedder_mksnapshot_entry_point(std::move(cb));
+-      auto reset_entry_point =
+-          OnScopeLeave([&]() { env->set_embedder_mksnapshot_entry_point({}); });
++    const char* entry = env->isolate_data()->options()->build_snapshot
++                            ? "internal/main/mksnapshot"
++                            : "internal/main/embedding";
+ 
+-      return StartExecution(env, "internal/main/mksnapshot");
+-    }
+-
+-    if (StartExecution(env, "internal/main/environment").IsEmpty()) return {};
+-    return scope.EscapeMaybe(cb({
+-        env->process_object(),
+-        env->builtin_module_require(),
+-    }));
++    return scope.EscapeMaybe(StartExecution(env, entry));
+   }
+ 
+   // TODO(joyeecheung): move these conditions into JS land and let the
+   // deserialize main function take precedence. For workers, we need to
+   // move the pre-execution part into a different file that can be
+   // reused when dealing with user-defined main functions.
+   if (!env->snapshot_deserialize_main().IsEmpty()) {
+     return env->RunSnapshotDeserializeMain();
+   }
+ 
+   if (env->worker_context() != nullptr) {
+     return StartExecution(env, "internal/main/worker_thread");
+   }
+ 
+   std::string first_argv;
+   if (env->argv().size() > 1) {
+     first_argv = env->argv()[1];
+   }
+ 
+-#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
+-  if (sea::IsSingleExecutable()) {
+-    // TODO(addaleax): Find a way to reuse:
+-    //
+-    // LoadEnvironment(Environment*, const char*)
+-    //
+-    // instead and not add yet another main entry point here because this
+-    // already duplicates existing code.
+-    return StartExecution(env, "internal/main/single_executable_application");
+-  }
+-#endif
+-
+   if (first_argv == "inspect") {
+     return StartExecution(env, "internal/main/inspect");
+   }
+ 
+   if (env->isolate_data()->options()->build_snapshot) {
+     return StartExecution(env, "internal/main/mksnapshot");
+   }
+ 
+   if (per_process::cli_options->print_help) {
+     return StartExecution(env, "internal/main/print_help");
+   }
+ 
+ 
+   if (env->options()->prof_process) {
+     return StartExecution(env, "internal/main/prof_process");
+   }
+ 
+   // -e/--eval without -i/--interactive
+   if (env->options()->has_eval_string && !env->options()->force_repl) {
+     return StartExecution(env, "internal/main/eval_string");
+   }
+ 
+   if (env->options()->syntax_check_only) {
+     return StartExecution(env, "internal/main/check_syntax");
+   }
+ 
+   if (env->options()->test_runner) {
+     return StartExecution(env, "internal/main/test_runner");
+   }
+ 
+   if (env->options()->watch_mode) {
+     return StartExecution(env, "internal/main/watch_mode");
+   }
+ 
+   if (!first_argv.empty() && first_argv != "-") {
+     return StartExecution(env, "internal/main/run_main_module");
+   }
+ 
+   if (env->options()->force_repl || uv_guess_handle(STDIN_FILENO) == UV_TTY) {
+     return StartExecution(env, "internal/main/repl");
+   }
+ 
+   return StartExecution(env, "internal/main/eval_stdin");
+ }
+ 
+ #ifdef __POSIX__
+diff --git a/src/node.h b/src/node.h
+index 635e5349f4..c3a81076d5 100644
+--- a/src/node.h
++++ b/src/node.h
+@@ -682,6 +682,7 @@ NODE_EXTERN std::unique_ptr<InspectorParentHandle> GetInspectorParentHandle(
+ struct StartExecutionCallbackInfo {
+   v8::Local<v8::Object> process_object;
+   v8::Local<v8::Function> native_require;
++  v8::Local<v8::Function> run_cjs;
+ };
+ 
+ using StartExecutionCallback =
+@@ -691,8 +692,7 @@ NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+     Environment* env,
+     StartExecutionCallback cb);
+ NODE_EXTERN v8::MaybeLocal<v8::Value> LoadEnvironment(
+-    Environment* env,
+-    const char* main_script_source_utf8);
++    Environment* env, std::string_view main_script_source_utf8);
+ NODE_EXTERN void FreeEnvironment(Environment* env);
+ 
+ // Set a callback that is called when process.exit() is called from JS,
+diff --git a/src/node_builtins.cc b/src/node_builtins.cc
+index e9bf8a5a0e..0439fff511 100644
+--- a/src/node_builtins.cc
++++ b/src/node_builtins.cc
+@@ -185,31 +185,28 @@ static std::string OnDiskFileName(const char* id) {
+ MaybeLocal<String> BuiltinLoader::LoadBuiltinSource(Isolate* isolate,
+                                                     const char* id) const {
+   auto source = source_.read();
+-#ifdef NODE_BUILTIN_MODULES_PATH
+-  if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-#endif  // NODE_BUILTIN_MODULES_PATH
+-    const auto source_it = source->find(id);
+-    if (UNLIKELY(source_it == source->end())) {
+-      fprintf(stderr, "Cannot find native builtin: \"%s\".\n", id);
+-      ABORT();
+-    }
+-    return source_it->second.ToStringChecked(isolate);
+-#ifdef NODE_BUILTIN_MODULES_PATH
++#ifndef NODE_BUILTIN_MODULES_PATH
++  const auto source_it = source->find(id);
++  if (UNLIKELY(source_it == source->end())) {
++    fprintf(stderr, "Cannot find native builtin: \"%s\".\n", id);
++    ABORT();
+   }
++  return source_it->second.ToStringChecked(isolate);
++#else   // !NODE_BUILTIN_MODULES_PATH
+   std::string filename = OnDiskFileName(id);
+ 
+   std::string contents;
+   int r = ReadFileSync(&contents, filename.c_str());
+   if (r != 0) {
+     const std::string buf = SPrintF("Cannot read local builtin. %s: %s \"%s\"",
+                                     uv_err_name(r),
+                                     uv_strerror(r),
+                                     filename);
+     Local<String> message = OneByteString(isolate, buf.c_str());
+     isolate->ThrowException(v8::Exception::Error(message));
+     return MaybeLocal<String>();
+   }
+   return String::NewFromUtf8(
+       isolate, contents.c_str(), v8::NewStringType::kNormal, contents.length());
+ #endif  // NODE_BUILTIN_MODULES_PATH
+ }
+@@ -359,65 +356,59 @@ MaybeLocal<Function> BuiltinLoader::LookupAndCompileInternal(
+ // Returns Local<Function> of the compiled module if return_code_cache
+ // is false (we are only compiling the function).
+ // Otherwise return a Local<Object> containing the cache.
+ MaybeLocal<Function> BuiltinLoader::LookupAndCompile(Local<Context> context,
+                                                      const char* id,
+                                                      Realm* optional_realm) {
+   Result result;
+   std::vector<Local<String>> parameters;
+   Isolate* isolate = context->GetIsolate();
+   // Detects parameters of the scripts based on module ids.
+   // internal/bootstrap/loaders: process, getLinkedBinding,
+   //                             getInternalBinding, primordials
+   if (strcmp(id, "internal/bootstrap/loaders") == 0) {
+     parameters = {
+         FIXED_ONE_BYTE_STRING(isolate, "process"),
+         FIXED_ONE_BYTE_STRING(isolate, "getLinkedBinding"),
+         FIXED_ONE_BYTE_STRING(isolate, "getInternalBinding"),
+         FIXED_ONE_BYTE_STRING(isolate, "primordials"),
+     };
+   } else if (strncmp(id,
+                      "internal/per_context/",
+                      strlen("internal/per_context/")) == 0) {
+     // internal/per_context/*: global, exports, primordials
+     parameters = {
+         FIXED_ONE_BYTE_STRING(isolate, "exports"),
+         FIXED_ONE_BYTE_STRING(isolate, "primordials"),
+     };
+   } else if (strncmp(id, "internal/main/", strlen("internal/main/")) == 0 ||
+              strncmp(id,
+                      "internal/bootstrap/",
+                      strlen("internal/bootstrap/")) == 0) {
+     // internal/main/*, internal/bootstrap/*: process, require,
+     //                                        internalBinding, primordials
+     parameters = {
+         FIXED_ONE_BYTE_STRING(isolate, "process"),
+         FIXED_ONE_BYTE_STRING(isolate, "require"),
+         FIXED_ONE_BYTE_STRING(isolate, "internalBinding"),
+         FIXED_ONE_BYTE_STRING(isolate, "primordials"),
+     };
+-  } else if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-    // Synthetic embedder main scripts from LoadEnvironment(): process, require
+-    parameters = {
+-        FIXED_ONE_BYTE_STRING(isolate, "process"),
+-        FIXED_ONE_BYTE_STRING(isolate, "require"),
+-    };
+   } else {
+     // others: exports, require, module, process, internalBinding, primordials
+     parameters = {
+         FIXED_ONE_BYTE_STRING(isolate, "exports"),
+         FIXED_ONE_BYTE_STRING(isolate, "require"),
+         FIXED_ONE_BYTE_STRING(isolate, "module"),
+         FIXED_ONE_BYTE_STRING(isolate, "process"),
+         FIXED_ONE_BYTE_STRING(isolate, "internalBinding"),
+         FIXED_ONE_BYTE_STRING(isolate, "primordials"),
+     };
+   }
+ 
+   MaybeLocal<Function> maybe =
+       LookupAndCompileInternal(context, id, &parameters, &result);
+   if (optional_realm != nullptr) {
+     DCHECK_EQ(this, optional_realm->env()->builtin_loader());
+     RecordResult(id, result, optional_realm);
+   }
+   return maybe;
+ }
+@@ -425,52 +416,46 @@ MaybeLocal<Function> BuiltinLoader::LookupAndCompile(Local<Context> context,
+ MaybeLocal<Value> BuiltinLoader::CompileAndCall(Local<Context> context,
+                                                 const char* id,
+                                                 Realm* realm) {
+   Isolate* isolate = context->GetIsolate();
+   // Arguments must match the parameters specified in
+   // BuiltinLoader::LookupAndCompile().
+   std::vector<Local<Value>> arguments;
+   // Detects parameters of the scripts based on module ids.
+   // internal/bootstrap/loaders: process, getLinkedBinding,
+   //                             getInternalBinding, primordials
+   if (strcmp(id, "internal/bootstrap/loaders") == 0) {
+     Local<Value> get_linked_binding;
+     Local<Value> get_internal_binding;
+     if (!NewFunctionTemplate(isolate, binding::GetLinkedBinding)
+              ->GetFunction(context)
+              .ToLocal(&get_linked_binding) ||
+         !NewFunctionTemplate(isolate, binding::GetInternalBinding)
+              ->GetFunction(context)
+              .ToLocal(&get_internal_binding)) {
+       return MaybeLocal<Value>();
+     }
+     arguments = {realm->process_object(),
+                  get_linked_binding,
+                  get_internal_binding,
+                  realm->primordials()};
+   } else if (strncmp(id, "internal/main/", strlen("internal/main/")) == 0 ||
+              strncmp(id,
+                      "internal/bootstrap/",
+                      strlen("internal/bootstrap/")) == 0) {
+     // internal/main/*, internal/bootstrap/*: process, require,
+     //                                        internalBinding, primordials
+     arguments = {realm->process_object(),
+                  realm->builtin_module_require(),
+                  realm->internal_binding_loader(),
+                  realm->primordials()};
+-  } else if (strncmp(id, "embedder_main_", strlen("embedder_main_")) == 0) {
+-    // Synthetic embedder main scripts from LoadEnvironment(): process, require
+-    arguments = {
+-        realm->process_object(),
+-        realm->builtin_module_require(),
+-    };
+   } else {
+     // This should be invoked with the other CompileAndCall() methods, as
+     // we are unable to generate the arguments.
+     // Currently there are two cases:
+     // internal/per_context/*: the arguments are generated in
+     //                         InitializePrimordials()
+     // all the other cases: the arguments are generated in the JS-land loader.
+     UNREACHABLE();
+   }
+   return CompileAndCall(context, id, arguments.size(), arguments.data(), realm);
+ }
+diff --git a/src/node_main_instance.cc b/src/node_main_instance.cc
+index 5a4d127ffe..f0dc6ca275 100644
+--- a/src/node_main_instance.cc
++++ b/src/node_main_instance.cc
+@@ -1,22 +1,23 @@
+ #include "node_main_instance.h"
+ #include <memory>
+ #if HAVE_OPENSSL
+ #include "crypto/crypto_util.h"
+ #endif  // HAVE_OPENSSL
+ #include "debug_utils-inl.h"
+ #include "node_builtins.h"
+ #include "node_external_reference.h"
+ #include "node_internals.h"
+ #include "node_options-inl.h"
+ #include "node_realm.h"
++#include "node_sea.h"
+ #include "node_snapshot_builder.h"
+ #include "node_snapshotable.h"
+ #include "node_v8_platform-inl.h"
+ #include "util-inl.h"
+ #if defined(LEAK_SANITIZER)
+ #include <sanitizer/lsan_interface.h>
+ #endif
+ 
+ #if HAVE_INSPECTOR
+ #include "inspector/worker_inspector.h"  // ParentInspectorHandle
+ #endif
+@@ -86,13 +87,22 @@ ExitCode NodeMainInstance::Run() {
+ 
+ void NodeMainInstance::Run(ExitCode* exit_code, Environment* env) {
+   if (*exit_code == ExitCode::kNoFailure) {
+-    LoadEnvironment(env, StartExecutionCallback{});
++    bool is_sea = false;
++#ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
++    if (sea::IsSingleExecutable()) {
++      is_sea = true;
++      LoadEnvironment(env, sea::FindSingleExecutableCode());
++    }
++#endif
++    if (!is_sea) {
++      LoadEnvironment(env, StartExecutionCallback{});
++    }
+ 
+     *exit_code =
+         SpinEventLoopInternal(env).FromMaybe(ExitCode::kGenericUserError);
+   }
+ 
+ #if defined(LEAK_SANITIZER)
+   __lsan_do_leak_check();
+ #endif
+ }
+diff --git a/src/node_sea.cc b/src/node_sea.cc
+index 18b661ce4f..b65620d1ff 100644
+--- a/src/node_sea.cc
++++ b/src/node_sea.cc
+@@ -1,25 +1,22 @@
+ #include "node_sea.h"
+ 
+ #include "env-inl.h"
+ #include "node_external_reference.h"
+ #include "node_internals.h"
+ #include "node_union_bytes.h"
+-#include "simdutf.h"
+-#include "v8.h"
+ 
+ // The POSTJECT_SENTINEL_FUSE macro is a string of random characters selected by
+ // the Node.js project that is present only once in the entire binary. It is
+ // used by the postject_has_resource() function to efficiently detect if a
+ // resource has been injected. See
+ // https://github.com/nodejs/postject/blob/35343439cac8c488f2596d7c4c1dddfec1fddcae/postject-api.h#L42-L45.
+ #define POSTJECT_SENTINEL_FUSE "NODE_JS_FUSE_fce680ab2cc467b6e072b8b5df1996b2"
+ #include "postject-api.h"
+ #undef POSTJECT_SENTINEL_FUSE
+ 
+ #include <memory>
+ #include <string_view>
+ #include <tuple>
+-#include <vector>
+ 
+ #if !defined(DISABLE_SINGLE_EXECUTABLE_APPLICATION)
+ 
+@@ -29,64 +26,36 @@ using v8::Local;
+ using v8::Object;
+ using v8::Value;
+ 
+-namespace {
++namespace node {
++namespace sea {
+ 
+-const std::string_view FindSingleExecutableCode() {
++std::string_view FindSingleExecutableCode() {
++  CHECK(IsSingleExecutable());
+   static const std::string_view sea_code = []() -> std::string_view {
+     size_t size;
+ #ifdef __APPLE__
+     postject_options options;
+     postject_options_init(&options);
+     options.macho_segment_name = "NODE_JS";
+     const char* code = static_cast<const char*>(
+         postject_find_resource("NODE_JS_CODE", &size, &options));
+ #else
+     const char* code = static_cast<const char*>(
+         postject_find_resource("NODE_JS_CODE", &size, nullptr));
+ #endif
+     return {code, size};
+   }();
+   return sea_code;
+ }
+ 
+-void GetSingleExecutableCode(const FunctionCallbackInfo<Value>& args) {
+-  node::Environment* env = node::Environment::GetCurrent(args);
+-
+-  static const std::string_view sea_code = FindSingleExecutableCode();
+-
+-  if (sea_code.empty()) {
+-    return;
+-  }
+-
+-  // TODO(joyeecheung): Use one-byte strings for ASCII-only source to save
+-  // memory/binary size - using UTF16 by default results in twice of the size
+-  // than necessary.
+-  static const node::UnionBytes sea_code_union_bytes =
+-      []() -> node::UnionBytes {
+-    size_t expected_u16_length =
+-        simdutf::utf16_length_from_utf8(sea_code.data(), sea_code.size());
+-    auto out = std::make_shared<std::vector<uint16_t>>(expected_u16_length);
+-    size_t u16_length = simdutf::convert_utf8_to_utf16(
+-        sea_code.data(),
+-        sea_code.size(),
+-        reinterpret_cast<char16_t*>(out->data()));
+-    out->resize(u16_length);
+-    return node::UnionBytes{out};
+-  }();
+-
+-  args.GetReturnValue().Set(
+-      sea_code_union_bytes.ToStringChecked(env->isolate()));
+-}
+-
+-}  // namespace
+-
+-namespace node {
+-namespace sea {
+-
+ bool IsSingleExecutable() {
+   return postject_has_resource();
+ }
+ 
++void IsSingleExecutable(const FunctionCallbackInfo<Value>& args) {
++  args.GetReturnValue().Set(IsSingleExecutable());
++}
++
+ std::tuple<int, char**> FixupArgsForSEA(int argc, char** argv) {
+   // Repeats argv[0] at position 1 on argv as a replacement for the missing
+   // entry point file path.
+@@ -112,14 +81,13 @@ std::tuple<int, char**> FixupArgsForSEA(int argc, char** argv) {
+ void Initialize(Local<Object> target,
+                 Local<Value> unused,
+                 Local<Context> context,
+                 void* priv) {
+-  SetMethod(
+-      context, target, "getSingleExecutableCode", GetSingleExecutableCode);
++  SetMethod(context, target, "isSea", IsSingleExecutable);
+ }
+ 
+ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+-  registry->Register(GetSingleExecutableCode);
++  registry->Register(IsSingleExecutable);
+ }
+ 
+ }  // namespace sea
+ }  // namespace node
+diff --git a/src/node_sea.h b/src/node_sea.h
+index 97bf0115e0..aa0f202047 100644
+--- a/src/node_sea.h
++++ b/src/node_sea.h
+@@ -1,16 +1,18 @@
+ #ifndef SRC_NODE_SEA_H_
+ #define SRC_NODE_SEA_H_
+ 
+ #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+ 
+ #if !defined(DISABLE_SINGLE_EXECUTABLE_APPLICATION)
+ 
++#include <string_view>
+ #include <tuple>
+ 
+ namespace node {
+ namespace sea {
+ 
+ bool IsSingleExecutable();
++std::string_view FindSingleExecutableCode();
+ std::tuple<int, char**> FixupArgsForSEA(int argc, char** argv);
+ 
+ }  // namespace sea
+diff --git a/src/node_snapshotable.cc b/src/node_snapshotable.cc
+index e6323a128f..ee32786737 100644
+--- a/src/node_snapshotable.cc
++++ b/src/node_snapshotable.cc
+@@ -1444,19 +1444,25 @@ void SerializeSnapshotableObjects(Realm* realm,
+ 
+ namespace mksnapshot {
+ 
++// NB: This is also used by the regular embedding codepath.
+ void GetEmbedderEntryFunction(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
+   Isolate* isolate = env->isolate();
+-  if (!env->embedder_mksnapshot_entry_point()) return;
++  if (!env->embedder_entry_point()) return;
+   MaybeLocal<Function> jsfn =
+       Function::New(isolate->GetCurrentContext(),
+                     [](const FunctionCallbackInfo<Value>& args) {
+                       Environment* env = Environment::GetCurrent(args);
+                       Local<Value> require_fn = args[0];
++                      Local<Value> runcjs_fn = args[1];
+                       CHECK(require_fn->IsFunction());
+-                      CHECK(env->embedder_mksnapshot_entry_point());
+-                      env->embedder_mksnapshot_entry_point()(
+-                          {env->process_object(), require_fn.As<Function>()});
++                      CHECK(runcjs_fn->IsFunction());
++                      MaybeLocal<Value> retval = env->embedder_entry_point()(
++                          {env->process_object(),
++                           require_fn.As<Function>(),
++                           runcjs_fn.As<Function>()});
++                      if (!retval.IsEmpty())
++                        args.GetReturnValue().Set(retval.ToLocalChecked());
+                     });
+   if (!jsfn.IsEmpty()) args.GetReturnValue().Set(jsfn.ToLocalChecked());
+ }
+diff --git a/test/embedding/test-embedding.js b/test/embedding/test-embedding.js
+index 498c05fdeb..9dfaad6c2a 100644
+--- a/test/embedding/test-embedding.js
++++ b/test/embedding/test-embedding.js
+@@ -40,6 +40,11 @@ assert.strictEqual(
+   child_process.spawnSync(binary, ['throw new Error()']).status,
+   1);
+ 
++// Cannot require internals anymore:
++assert.strictEqual(
++  child_process.spawnSync(binary, ['require("lib/internal/test/binding")']).status,
++  1);
++
+ assert.strictEqual(
+   child_process.spawnSync(binary, ['process.exitCode = 8']).status,
+   8);

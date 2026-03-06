@@ -1,0 +1,1026 @@
+commit 5078eedc5b18f0d208af6e30f60b33419132d1b6
+Author: jx124 <64946984+jx124@users.noreply.github.com>
+Date:   Tue May 2 03:15:47 2023 +0800
+
+    gh-104016: Fixed off by 1 error in f string tokenizer (#104047)
+    
+    Co-authored-by: sunmy2019 <59365878+sunmy2019@users.noreply.github.com>
+    Co-authored-by: Ken Jin <kenjin@python.org>
+    Co-authored-by: Pablo Galindo <pablogsal@gmail.com>
+
+diff --git a/Lib/test/test_fstring.py b/Lib/test/test_fstring.py
+index 5e94c99ae6..5c5176dc54 100644
+--- a/Lib/test/test_fstring.py
++++ b/Lib/test/test_fstring.py
+@@ -564,8 +564,24 @@ def test_mismatched_parens(self):
+     def test_fstring_nested_too_deeply(self):
+         self.assertAllRaise(SyntaxError,
+                             "f-string: expressions nested too deeply",
+                             ['f"{1+2:{1+2:{1+1:{1}}}}"'])
++        
++        def create_nested_fstring(n):
++            if n == 0:
++                return "1+1"
++            prev = create_nested_fstring(n-1)
++            return f'f"{{{prev}}}"'
+ 
++        self.assertAllRaise(SyntaxError,
++                            "too many nested f-strings",
++                            [create_nested_fstring(160)])
++    
++    def test_syntax_error_in_nested_fstring(self):
++        # See gh-104016 for more information on this crash
++        self.assertAllRaise(SyntaxError,
++                            "invalid syntax",
++                            ['f"{1 1:' + ('{f"1:' * 199)])
++    
+     def test_double_braces(self):
+         self.assertEqual(f'{{', '{')
+         self.assertEqual(f'a{{', 'a{')
+diff --git a/Parser/tokenizer.c b/Parser/tokenizer.c
+index 8fb9be7bfd..d2f9fee110 100644
+--- a/Parser/tokenizer.c
++++ b/Parser/tokenizer.c
+@@ -41,19 +41,19 @@
+ #define INSIDE_FSTRING(tok) (tok->tok_mode_stack_index > 0)
+ #define INSIDE_FSTRING_EXPR(tok) (tok->curly_bracket_expr_start_depth >= 0)
+ #ifdef Py_DEBUG
+ static inline tokenizer_mode* TOK_GET_MODE(struct tok_state* tok) {
+     assert(tok->tok_mode_stack_index >= 0);
+-    assert(tok->tok_mode_stack_index < MAXLEVEL);
++    assert(tok->tok_mode_stack_index < MAXFSTRINGLEVEL);
+     return &(tok->tok_mode_stack[tok->tok_mode_stack_index]);
+ }
+ static inline tokenizer_mode* TOK_NEXT_MODE(struct tok_state* tok) {
+     assert(tok->tok_mode_stack_index >= 0);
+-    assert(tok->tok_mode_stack_index < MAXLEVEL);
++    assert(tok->tok_mode_stack_index + 1 < MAXFSTRINGLEVEL); 
+     return &(tok->tok_mode_stack[++tok->tok_mode_stack_index]);
+ }
+ #else
+ #define TOK_GET_MODE(tok) (&(tok->tok_mode_stack[tok->tok_mode_stack_index]))
+ #define TOK_NEXT_MODE(tok) (&(tok->tok_mode_stack[++tok->tok_mode_stack_index]))
+ #endif
+ 
+ /* Forward */
+@@ -1634,862 +1634,865 @@ static int
+ tok_get_normal_mode(struct tok_state *tok, tokenizer_mode* current_tok, struct token *token)
+ {
+     int c;
+     int blankline, nonascii;
+ 
+     const char *p_start = NULL;
+     const char *p_end = NULL;
+   nextline:
+     tok->start = NULL;
+     tok->starting_col_offset = -1;
+     blankline = 0;
+ 
+     /* Get indentation level */
+     if (tok->atbol) {
+         int col = 0;
+         int altcol = 0;
+         tok->atbol = 0;
+         int cont_line_col = 0;
+         for (;;) {
+             c = tok_nextc(tok);
+             if (c == ' ') {
+                 col++, altcol++;
+             }
+             else if (c == '\t') {
+                 col = (col / tok->tabsize + 1) * tok->tabsize;
+                 altcol = (altcol / ALTTABSIZE + 1) * ALTTABSIZE;
+             }
+             else if (c == '\014')  {/* Control-L (formfeed) */
+                 col = altcol = 0; /* For Emacs users */
+             }
+             else if (c == '\\') {
+                 // Indentation cannot be split over multiple physical lines
+                 // using backslashes. This means that if we found a backslash
+                 // preceded by whitespace, **the first one we find** determines
+                 // the level of indentation of whatever comes next.
+                 cont_line_col = cont_line_col ? cont_line_col : col;
+                 if ((c = tok_continuation_line(tok)) == -1) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+             else {
+                 break;
+             }
+         }
+         tok_backup(tok, c);
+         if (c == '#' || c == '\n') {
+             /* Lines with only whitespace and/or comments
+                shouldn't affect the indentation and are
+                not passed to the parser as NEWLINE tokens,
+                except *totally* empty lines in interactive
+                mode, which signal the end of a command group. */
+             if (col == 0 && c == '\n' && tok->prompt != NULL) {
+                 blankline = 0; /* Let it through */
+             }
+             else if (tok->prompt != NULL && tok->lineno == 1) {
+                 /* In interactive mode, if the first line contains
+                    only spaces and/or a comment, let it through. */
+                 blankline = 0;
+                 col = altcol = 0;
+             }
+             else {
+                 blankline = 1; /* Ignore completely */
+             }
+             /* We can't jump back right here since we still
+                may need to skip to the end of a comment */
+         }
+         if (!blankline && tok->level == 0) {
+             col = cont_line_col ? cont_line_col : col;
+             altcol = cont_line_col ? cont_line_col : altcol;
+             if (col == tok->indstack[tok->indent]) {
+                 /* No change */
+                 if (altcol != tok->altindstack[tok->indent]) {
+                     return MAKE_TOKEN(indenterror(tok));
+                 }
+             }
+             else if (col > tok->indstack[tok->indent]) {
+                 /* Indent -- always one */
+                 if (tok->indent+1 >= MAXINDENT) {
+                     tok->done = E_TOODEEP;
+                     tok->cur = tok->inp;
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+                 if (altcol <= tok->altindstack[tok->indent]) {
+                     return MAKE_TOKEN(indenterror(tok));
+                 }
+                 tok->pendin++;
+                 tok->indstack[++tok->indent] = col;
+                 tok->altindstack[tok->indent] = altcol;
+             }
+             else /* col < tok->indstack[tok->indent] */ {
+                 /* Dedent -- any number, must be consistent */
+                 while (tok->indent > 0 &&
+                     col < tok->indstack[tok->indent]) {
+                     tok->pendin--;
+                     tok->indent--;
+                 }
+                 if (col != tok->indstack[tok->indent]) {
+                     tok->done = E_DEDENT;
+                     tok->cur = tok->inp;
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+                 if (altcol != tok->altindstack[tok->indent]) {
+                     return MAKE_TOKEN(indenterror(tok));
+                 }
+             }
+         }
+     }
+ 
+     tok->start = tok->cur;
+     tok->starting_col_offset = tok->col_offset;
+ 
+     /* Return pending indents/dedents */
+     if (tok->pendin != 0) {
+         if (tok->pendin < 0) {
+             tok->pendin++;
+             return MAKE_TOKEN(DEDENT);
+         }
+         else {
+             tok->pendin--;
+             return MAKE_TOKEN(INDENT);
+         }
+     }
+ 
+     /* Peek ahead at the next character */
+     c = tok_nextc(tok);
+     tok_backup(tok, c);
+     /* Check if we are closing an async function */
+     if (tok->async_def
+         && !blankline
+         /* Due to some implementation artifacts of type comments,
+          * a TYPE_COMMENT at the start of a function won't set an
+          * indentation level and it will produce a NEWLINE after it.
+          * To avoid spuriously ending an async function due to this,
+          * wait until we have some non-newline char in front of us. */
+         && c != '\n'
+         && tok->level == 0
+         /* There was a NEWLINE after ASYNC DEF,
+            so we're past the signature. */
+         && tok->async_def_nl
+         /* Current indentation level is less than where
+            the async function was defined */
+         && tok->async_def_indent >= tok->indent)
+     {
+         tok->async_def = 0;
+         tok->async_def_indent = 0;
+         tok->async_def_nl = 0;
+     }
+ 
+  again:
+     tok->start = NULL;
+     /* Skip spaces */
+     do {
+         c = tok_nextc(tok);
+     } while (c == ' ' || c == '\t' || c == '\014');
+ 
+     /* Set start of current token */
+     tok->start = tok->cur == NULL ? NULL : tok->cur - 1;
+     tok->starting_col_offset = tok->col_offset - 1;
+ 
+     /* Skip comment, unless it's a type comment */
+     if (c == '#') {
+ 
+         if (INSIDE_FSTRING(tok)) {
+             return MAKE_TOKEN(syntaxerror(tok, "f-string expression part cannot include '#'"));
+         }
+ 
+         const char *prefix, *p, *type_start;
+         int current_starting_col_offset;
+ 
+         while (c != EOF && c != '\n') {
+             c = tok_nextc(tok);
+         }
+ 
+         if (tok->type_comments) {
+             p = tok->start;
+             current_starting_col_offset = tok->starting_col_offset;
+             prefix = type_comment_prefix;
+             while (*prefix && p < tok->cur) {
+                 if (*prefix == ' ') {
+                     while (*p == ' ' || *p == '\t') {
+                         p++;
+                         current_starting_col_offset++;
+                     }
+                 } else if (*prefix == *p) {
+                     p++;
+                     current_starting_col_offset++;
+                 } else {
+                     break;
+                 }
+ 
+                 prefix++;
+             }
+ 
+             /* This is a type comment if we matched all of type_comment_prefix. */
+             if (!*prefix) {
+                 int is_type_ignore = 1;
+                 // +6 in order to skip the word 'ignore'
+                 const char *ignore_end = p + 6;
+                 const int ignore_end_col_offset = current_starting_col_offset + 6;
+                 tok_backup(tok, c);  /* don't eat the newline or EOF */
+ 
+                 type_start = p;
+ 
+                 /* A TYPE_IGNORE is "type: ignore" followed by the end of the token
+                  * or anything ASCII and non-alphanumeric. */
+                 is_type_ignore = (
+                     tok->cur >= ignore_end && memcmp(p, "ignore", 6) == 0
+                     && !(tok->cur > ignore_end
+                          && ((unsigned char)ignore_end[0] >= 128 || Py_ISALNUM(ignore_end[0]))));
+ 
+                 if (is_type_ignore) {
+                     p_start = ignore_end;
+                     p_end = tok->cur;
+ 
+                     /* If this type ignore is the only thing on the line, consume the newline also. */
+                     if (blankline) {
+                         tok_nextc(tok);
+                         tok->atbol = 1;
+                     }
+                     return MAKE_TYPE_COMMENT_TOKEN(TYPE_IGNORE, ignore_end_col_offset, tok->col_offset);
+                 } else {
+                     p_start = type_start;
+                     p_end = tok->cur;
+                     return MAKE_TYPE_COMMENT_TOKEN(TYPE_COMMENT, current_starting_col_offset, tok->col_offset);
+                 }
+             }
+         }
+     }
+ 
+     if (tok->done == E_INTERACT_STOP) {
+         return MAKE_TOKEN(ENDMARKER);
+     }
+ 
+     /* Check for EOF and errors now */
+     if (c == EOF) {
+         if (tok->level) {
+             return MAKE_TOKEN(ERRORTOKEN);
+         }
+         return MAKE_TOKEN(tok->done == E_EOF ? ENDMARKER : ERRORTOKEN);
+     }
+ 
+     /* Identifier (most frequent token!) */
+     nonascii = 0;
+     if (is_potential_identifier_start(c)) {
+         /* Process the various legal combinations of b"", r"", u"", and f"". */
+         int saw_b = 0, saw_r = 0, saw_u = 0, saw_f = 0;
+         while (1) {
+             if (!(saw_b || saw_u || saw_f) && (c == 'b' || c == 'B'))
+                 saw_b = 1;
+             /* Since this is a backwards compatibility support literal we don't
+                want to support it in arbitrary order like byte literals. */
+             else if (!(saw_b || saw_u || saw_r || saw_f)
+                      && (c == 'u'|| c == 'U')) {
+                 saw_u = 1;
+             }
+             /* ur"" and ru"" are not supported */
+             else if (!(saw_r || saw_u) && (c == 'r' || c == 'R')) {
+                 saw_r = 1;
+             }
+             else if (!(saw_f || saw_b || saw_u) && (c == 'f' || c == 'F')) {
+                 saw_f = 1;
+             }
+             else {
+                 break;
+             }
+             c = tok_nextc(tok);
+             if (c == '"' || c == '\'') {
+                 if (saw_f) {
+                     goto f_string_quote;
+                 }
+                 goto letter_quote;
+             }
+         }
+         while (is_potential_identifier_char(c)) {
+             if (c >= 128) {
+                 nonascii = 1;
+             }
+             c = tok_nextc(tok);
+         }
+         tok_backup(tok, c);
+         if (nonascii && !verify_identifier(tok)) {
+             return MAKE_TOKEN(ERRORTOKEN);
+         }
+ 
+         p_start = tok->start;
+         p_end = tok->cur;
+ 
+         /* async/await parsing block. */
+         if (tok->cur - tok->start == 5 && tok->start[0] == 'a') {
+             /* May be an 'async' or 'await' token.  For Python 3.7 or
+                later we recognize them unconditionally.  For Python
+                3.5 or 3.6 we recognize 'async' in front of 'def', and
+                either one inside of 'async def'.  (Technically we
+                shouldn't recognize these at all for 3.4 or earlier,
+                but there's no *valid* Python 3.4 code that would be
+                rejected, and async functions will be rejected in a
+                later phase.) */
+             if (!tok->async_hacks || tok->async_def) {
+                 /* Always recognize the keywords. */
+                 if (memcmp(tok->start, "async", 5) == 0) {
+                     return MAKE_TOKEN(ASYNC);
+                 }
+                 if (memcmp(tok->start, "await", 5) == 0) {
+                     return MAKE_TOKEN(AWAIT);
+                 }
+             }
+             else if (memcmp(tok->start, "async", 5) == 0) {
+                 /* The current token is 'async'.
+                    Look ahead one token to see if that is 'def'. */
+ 
+                 struct tok_state ahead_tok;
+                 struct token ahead_token;
+                 int ahead_tok_kind;
+ 
+                 memcpy(&ahead_tok, tok, sizeof(ahead_tok));
+                 ahead_tok_kind = tok_get_normal_mode(&ahead_tok,
+                                                      current_tok,
+                                                      &ahead_token);
+ 
+                 if (ahead_tok_kind == NAME
+                     && ahead_tok.cur - ahead_tok.start == 3
+                     && memcmp(ahead_tok.start, "def", 3) == 0)
+                 {
+                     /* The next token is going to be 'def', so instead of
+                        returning a plain NAME token, return ASYNC. */
+                     tok->async_def_indent = tok->indent;
+                     tok->async_def = 1;
+                     return MAKE_TOKEN(ASYNC);
+                 }
+             }
+         }
+ 
+         return MAKE_TOKEN(NAME);
+     }
+ 
+     /* Newline */
+     if (c == '\n') {
+         tok->atbol = 1;
+         if (blankline || tok->level > 0) {
+             goto nextline;
+         }
+         p_start = tok->start;
+         p_end = tok->cur - 1; /* Leave '\n' out of the string */
+         tok->cont_line = 0;
+         if (tok->async_def) {
+             /* We're somewhere inside an 'async def' function, and
+                we've encountered a NEWLINE after its signature. */
+             tok->async_def_nl = 1;
+         }
+         return MAKE_TOKEN(NEWLINE);
+     }
+ 
+     /* Period or number starting with period? */
+     if (c == '.') {
+         c = tok_nextc(tok);
+         if (isdigit(c)) {
+             goto fraction;
+         } else if (c == '.') {
+             c = tok_nextc(tok);
+             if (c == '.') {
+                 p_start = tok->start;
+                 p_end = tok->cur;
+                 return MAKE_TOKEN(ELLIPSIS);
+             }
+             else {
+                 tok_backup(tok, c);
+             }
+             tok_backup(tok, '.');
+         }
+         else {
+             tok_backup(tok, c);
+         }
+         p_start = tok->start;
+         p_end = tok->cur;
+         return MAKE_TOKEN(DOT);
+     }
+ 
+     /* Number */
+     if (isdigit(c)) {
+         if (c == '0') {
+             /* Hex, octal or binary -- maybe. */
+             c = tok_nextc(tok);
+             if (c == 'x' || c == 'X') {
+                 /* Hex */
+                 c = tok_nextc(tok);
+                 do {
+                     if (c == '_') {
+                         c = tok_nextc(tok);
+                     }
+                     if (!isxdigit(c)) {
+                         tok_backup(tok, c);
+                         return MAKE_TOKEN(syntaxerror(tok, "invalid hexadecimal literal"));
+                     }
+                     do {
+                         c = tok_nextc(tok);
+                     } while (isxdigit(c));
+                 } while (c == '_');
+                 if (!verify_end_of_number(tok, c, "hexadecimal")) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+             else if (c == 'o' || c == 'O') {
+                 /* Octal */
+                 c = tok_nextc(tok);
+                 do {
+                     if (c == '_') {
+                         c = tok_nextc(tok);
+                     }
+                     if (c < '0' || c >= '8') {
+                         if (isdigit(c)) {
+                             return MAKE_TOKEN(syntaxerror(tok,
+                                     "invalid digit '%c' in octal literal", c));
+                         }
+                         else {
+                             tok_backup(tok, c);
+                             return MAKE_TOKEN(syntaxerror(tok, "invalid octal literal"));
+                         }
+                     }
+                     do {
+                         c = tok_nextc(tok);
+                     } while ('0' <= c && c < '8');
+                 } while (c == '_');
+                 if (isdigit(c)) {
+                     return MAKE_TOKEN(syntaxerror(tok,
+                             "invalid digit '%c' in octal literal", c));
+                 }
+                 if (!verify_end_of_number(tok, c, "octal")) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+             else if (c == 'b' || c == 'B') {
+                 /* Binary */
+                 c = tok_nextc(tok);
+                 do {
+                     if (c == '_') {
+                         c = tok_nextc(tok);
+                     }
+                     if (c != '0' && c != '1') {
+                         if (isdigit(c)) {
+                             return MAKE_TOKEN(syntaxerror(tok, "invalid digit '%c' in binary literal", c));
+                         }
+                         else {
+                             tok_backup(tok, c);
+                             return MAKE_TOKEN(syntaxerror(tok, "invalid binary literal"));
+                         }
+                     }
+                     do {
+                         c = tok_nextc(tok);
+                     } while (c == '0' || c == '1');
+                 } while (c == '_');
+                 if (isdigit(c)) {
+                     return MAKE_TOKEN(syntaxerror(tok, "invalid digit '%c' in binary literal", c));
+                 }
+                 if (!verify_end_of_number(tok, c, "binary")) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+             else {
+                 int nonzero = 0;
+                 /* maybe old-style octal; c is first char of it */
+                 /* in any case, allow '0' as a literal */
+                 while (1) {
+                     if (c == '_') {
+                         c = tok_nextc(tok);
+                         if (!isdigit(c)) {
+                             tok_backup(tok, c);
+                             return MAKE_TOKEN(syntaxerror(tok, "invalid decimal literal"));
+                         }
+                     }
+                     if (c != '0') {
+                         break;
+                     }
+                     c = tok_nextc(tok);
+                 }
+                 char* zeros_end = tok->cur;
+                 if (isdigit(c)) {
+                     nonzero = 1;
+                     c = tok_decimal_tail(tok);
+                     if (c == 0) {
+                         return MAKE_TOKEN(ERRORTOKEN);
+                     }
+                 }
+                 if (c == '.') {
+                     c = tok_nextc(tok);
+                     goto fraction;
+                 }
+                 else if (c == 'e' || c == 'E') {
+                     goto exponent;
+                 }
+                 else if (c == 'j' || c == 'J') {
+                     goto imaginary;
+                 }
+                 else if (nonzero) {
+                     /* Old-style octal: now disallowed. */
+                     tok_backup(tok, c);
+                     return MAKE_TOKEN(syntaxerror_known_range(
+                             tok, (int)(tok->start + 1 - tok->line_start),
+                             (int)(zeros_end - tok->line_start),
+                             "leading zeros in decimal integer "
+                             "literals are not permitted; "
+                             "use an 0o prefix for octal integers"));
+                 }
+                 if (!verify_end_of_number(tok, c, "decimal")) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+         }
+         else {
+             /* Decimal */
+             c = tok_decimal_tail(tok);
+             if (c == 0) {
+                 return MAKE_TOKEN(ERRORTOKEN);
+             }
+             {
+                 /* Accept floating point numbers. */
+                 if (c == '.') {
+                     c = tok_nextc(tok);
+         fraction:
+                     /* Fraction */
+                     if (isdigit(c)) {
+                         c = tok_decimal_tail(tok);
+                         if (c == 0) {
+                             return MAKE_TOKEN(ERRORTOKEN);
+                         }
+                     }
+                 }
+                 if (c == 'e' || c == 'E') {
+                     int e;
+                   exponent:
+                     e = c;
+                     /* Exponent part */
+                     c = tok_nextc(tok);
+                     if (c == '+' || c == '-') {
+                         c = tok_nextc(tok);
+                         if (!isdigit(c)) {
+                             tok_backup(tok, c);
+                             return MAKE_TOKEN(syntaxerror(tok, "invalid decimal literal"));
+                         }
+                     } else if (!isdigit(c)) {
+                         tok_backup(tok, c);
+                         if (!verify_end_of_number(tok, e, "decimal")) {
+                             return MAKE_TOKEN(ERRORTOKEN);
+                         }
+                         tok_backup(tok, e);
+                         p_start = tok->start;
+                         p_end = tok->cur;
+                         return MAKE_TOKEN(NUMBER);
+                     }
+                     c = tok_decimal_tail(tok);
+                     if (c == 0) {
+                         return MAKE_TOKEN(ERRORTOKEN);
+                     }
+                 }
+                 if (c == 'j' || c == 'J') {
+                     /* Imaginary part */
+         imaginary:
+                     c = tok_nextc(tok);
+                     if (!verify_end_of_number(tok, c, "imaginary")) {
+                         return MAKE_TOKEN(ERRORTOKEN);
+                     }
+                 }
+                 else if (!verify_end_of_number(tok, c, "decimal")) {
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+         }
+         tok_backup(tok, c);
+         p_start = tok->start;
+         p_end = tok->cur;
+         return MAKE_TOKEN(NUMBER);
+     }
+ 
+   f_string_quote:
+     if (((tolower(*tok->start) == 'f' || tolower(*tok->start) == 'r') && (c == '\'' || c == '"'))) {
+         int quote = c;
+         int quote_size = 1;             /* 1 or 3 */
+ 
+         /* Nodes of type STRING, especially multi line strings
+            must be handled differently in order to get both
+            the starting line number and the column offset right.
+            (cf. issue 16806) */
+         tok->first_lineno = tok->lineno;
+         tok->multi_line_start = tok->line_start;
+ 
+         /* Find the quote size and start of string */
+         int after_quote = tok_nextc(tok);
+         if (after_quote == quote) {
+             int after_after_quote = tok_nextc(tok);
+             if (after_after_quote == quote) {
+                 quote_size = 3;
+             }
+             else {
+                 // TODO: Check this
+                 tok_backup(tok, after_after_quote);
+                 tok_backup(tok, after_quote);
+             }
+         }
+         if (after_quote != quote) {
+             tok_backup(tok, after_quote);
+         }
+ 
+ 
+         p_start = tok->start;
+         p_end = tok->cur;
++        if (tok->tok_mode_stack_index + 1 >= MAXFSTRINGLEVEL) {
++            return MAKE_TOKEN(syntaxerror(tok, "too many nested f-strings"));
++        }
+         tokenizer_mode *the_current_tok = TOK_NEXT_MODE(tok);
+         the_current_tok->kind = TOK_FSTRING_MODE;
+         the_current_tok->f_string_quote = quote;
+         the_current_tok->f_string_quote_size = quote_size;
+         the_current_tok->f_string_start = tok->start;
+         the_current_tok->f_string_multi_line_start = tok->line_start;
+         the_current_tok->f_string_start_offset = -1;
+         the_current_tok->f_string_multi_line_start_offset = -1;
+         the_current_tok->last_expr_buffer = NULL;
+         the_current_tok->last_expr_size = 0;
+         the_current_tok->last_expr_end = -1;
+         the_current_tok->f_string_debug = 0;
+ 
+         switch (*tok->start) {
+             case 'F':
+             case 'f':
+                 the_current_tok->f_string_raw = tolower(*(tok->start + 1)) == 'r';
+                 break;
+             case 'R':
+             case 'r':
+                 the_current_tok->f_string_raw = 1;
+                 break;
+             default:
+                 Py_UNREACHABLE();
+         }
+ 
+         the_current_tok->curly_bracket_depth = 0;
+         the_current_tok->curly_bracket_expr_start_depth = -1;
+         return MAKE_TOKEN(FSTRING_START);
+     }
+ 
+   letter_quote:
+     /* String */
+     if (c == '\'' || c == '"') {
+         int quote = c;
+         int quote_size = 1;             /* 1 or 3 */
+         int end_quote_size = 0;
+ 
+         /* Nodes of type STRING, especially multi line strings
+            must be handled differently in order to get both
+            the starting line number and the column offset right.
+            (cf. issue 16806) */
+         tok->first_lineno = tok->lineno;
+         tok->multi_line_start = tok->line_start;
+ 
+         /* Find the quote size and start of string */
+         c = tok_nextc(tok);
+         if (c == quote) {
+             c = tok_nextc(tok);
+             if (c == quote) {
+                 quote_size = 3;
+             }
+             else {
+                 end_quote_size = 1;     /* empty string found */
+             }
+         }
+         if (c != quote) {
+             tok_backup(tok, c);
+         }
+ 
+         /* Get rest of string */
+         while (end_quote_size != quote_size) {
+             c = tok_nextc(tok);
+             if (tok->done == E_DECODE)
+                 break;
+             if (c == EOF || (quote_size == 1 && c == '\n')) {
+                 assert(tok->multi_line_start != NULL);
+                 // shift the tok_state's location into
+                 // the start of string, and report the error
+                 // from the initial quote character
+                 tok->cur = (char *)tok->start;
+                 tok->cur++;
+                 tok->line_start = tok->multi_line_start;
+                 int start = tok->lineno;
+                 tok->lineno = tok->first_lineno;
+ 
+                 if (INSIDE_FSTRING(tok)) {
+                     /* When we are in an f-string, before raising the
+                      * unterminated string literal error, check whether
+                      * does the initial quote matches with f-strings quotes
+                      * and if it is, then this must be a missing '}' token
+                      * so raise the proper error */
+                     tokenizer_mode *the_current_tok = TOK_GET_MODE(tok);
+                     if (the_current_tok->f_string_quote == quote &&
+                         the_current_tok->f_string_quote_size == quote_size) {
+                         return MAKE_TOKEN(syntaxerror(tok, "f-string: expecting '}'", start));
+                     }
+                 }
+ 
+                 if (quote_size == 3) {
+                     syntaxerror(tok, "unterminated triple-quoted string literal"
+                                      " (detected at line %d)", start);
+                     if (c != '\n') {
+                         tok->done = E_EOFS;
+                     }
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+                 else {
+                     syntaxerror(tok, "unterminated string literal (detected at"
+                                      " line %d)", start);
+                     if (c != '\n') {
+                         tok->done = E_EOLS;
+                     }
+                     return MAKE_TOKEN(ERRORTOKEN);
+                 }
+             }
+             if (c == quote) {
+                 end_quote_size += 1;
+             }
+             else {
+                 end_quote_size = 0;
+                 if (c == '\\') {
+                     tok_nextc(tok);  /* skip escaped char */
+                 }
+             }
+         }
+ 
+         p_start = tok->start;
+         p_end = tok->cur;
+         return MAKE_TOKEN(STRING);
+     }
+ 
+     /* Line continuation */
+     if (c == '\\') {
+         if ((c = tok_continuation_line(tok)) == -1) {
+             return MAKE_TOKEN(ERRORTOKEN);
+         }
+         tok->cont_line = 1;
+         goto again; /* Read next line */
+     }
+ 
+     /* Punctuation character */
+     int is_punctuation = (c == ':' || c == '}' || c == '!' || c == '{');
+     if (is_punctuation && INSIDE_FSTRING(tok) && INSIDE_FSTRING_EXPR(current_tok)) {
+         /* This code block gets executed before the curly_bracket_depth is incremented
+          * by the `{` case, so for ensuring that we are on the 0th level, we need
+          * to adjust it manually */
+         int cursor = current_tok->curly_bracket_depth - (c != '{');
+         if (cursor == 0 && !update_fstring_expr(tok, c)) {
+             return MAKE_TOKEN(ENDMARKER);
+         }
+         if (cursor == 0 && c != '{' && set_fstring_expr(tok, token, c)) {
+             return MAKE_TOKEN(ERRORTOKEN);
+         }
+ 
+         if (c == ':' && cursor == current_tok->curly_bracket_expr_start_depth) {
+             current_tok->kind = TOK_FSTRING_MODE;
+             p_start = tok->start;
+             p_end = tok->cur;
+             return MAKE_TOKEN(_PyToken_OneChar(c));
+         }
+     }
+ 
+     /* Check for two-character token */
+     {
+         int c2 = tok_nextc(tok);
+         int current_token = _PyToken_TwoChars(c, c2);
+         if (current_token != OP) {
+             int c3 = tok_nextc(tok);
+             int current_token3 = _PyToken_ThreeChars(c, c2, c3);
+             if (current_token3 != OP) {
+                 current_token = current_token3;
+             }
+             else {
+                 tok_backup(tok, c3);
+             }
+             p_start = tok->start;
+             p_end = tok->cur;
+             return MAKE_TOKEN(current_token);
+         }
+         tok_backup(tok, c2);
+     }
+ 
+     /* Keep track of parentheses nesting level */
+     switch (c) {
+     case '(':
+     case '[':
+     case '{':
+         if (tok->level >= MAXLEVEL) {
+             return MAKE_TOKEN(syntaxerror(tok, "too many nested parentheses"));
+         }
+         tok->parenstack[tok->level] = c;
+         tok->parenlinenostack[tok->level] = tok->lineno;
+         tok->parencolstack[tok->level] = (int)(tok->start - tok->line_start);
+         tok->level++;
+         if (INSIDE_FSTRING(tok)) {
+             current_tok->curly_bracket_depth++;
+         }
+         break;
+     case ')':
+     case ']':
+     case '}':
+         if (!tok->level) {
+             if (INSIDE_FSTRING(tok) && !current_tok->curly_bracket_depth && c == '}') {
+                 return MAKE_TOKEN(syntaxerror(tok, "f-string: single '}' is not allowed"));
+             }
+             return MAKE_TOKEN(syntaxerror(tok, "unmatched '%c'", c));
+         }
+         tok->level--;
+         int opening = tok->parenstack[tok->level];
+         if (!((opening == '(' && c == ')') ||
+               (opening == '[' && c == ']') ||
+               (opening == '{' && c == '}')))
+         {
+             /* If the opening bracket belongs to an f-string's expression
+                part (e.g. f"{)}") and the closing bracket is an arbitrary
+                nested expression, then instead of matching a different
+                syntactical construct with it; we'll throw an unmatched
+                parentheses error. */
+             if (INSIDE_FSTRING(tok) && opening == '{') {
+                 assert(current_tok->curly_bracket_depth >= 0);
+                 int previous_bracket = current_tok->curly_bracket_depth - 1;
+                 if (previous_bracket == current_tok->curly_bracket_expr_start_depth) {
+                     return MAKE_TOKEN(syntaxerror(tok, "f-string: unmatched '%c'", c));
+                 }
+             }
+             if (tok->parenlinenostack[tok->level] != tok->lineno) {
+                 return MAKE_TOKEN(syntaxerror(tok,
+                         "closing parenthesis '%c' does not match "
+                         "opening parenthesis '%c' on line %d",
+                         c, opening, tok->parenlinenostack[tok->level]));
+             }
+             else {
+                 return MAKE_TOKEN(syntaxerror(tok,
+                         "closing parenthesis '%c' does not match "
+                         "opening parenthesis '%c'",
+                         c, opening));
+             }
+         }
+ 
+         if (INSIDE_FSTRING(tok)) {
+             current_tok->curly_bracket_depth--;
+             if (c == '}' && current_tok->curly_bracket_depth == current_tok->curly_bracket_expr_start_depth) {
+                 current_tok->curly_bracket_expr_start_depth--;
+                 current_tok->kind = TOK_FSTRING_MODE;
+                 current_tok->f_string_debug = 0;
+             }
+         }
+         break;
+     default:
+         break;
+     }
+ 
+     if (!Py_UNICODE_ISPRINTABLE(c)) {
+         char hex[9];
+         (void)PyOS_snprintf(hex, sizeof(hex), "%04X", c);
+         return MAKE_TOKEN(syntaxerror(tok, "invalid non-printable character U+%s", hex));
+     }
+ 
+     if( c == '=' && INSIDE_FSTRING_EXPR(current_tok)) {
+         current_tok->f_string_debug = 1;
+     }
+ 
+     /* Punctuation character */
+     p_start = tok->start;
+     p_end = tok->cur;
+     return MAKE_TOKEN(_PyToken_OneChar(c));
+ }
+diff --git a/Parser/tokenizer.h b/Parser/tokenizer.h
+index 8b4213c4ce..5e2171885a 100644
+--- a/Parser/tokenizer.h
++++ b/Parser/tokenizer.h
+@@ -1,17 +1,18 @@
+ #ifndef Py_TOKENIZER_H
+ #define Py_TOKENIZER_H
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+ #include "object.h"
+ 
+ /* Tokenizer interface */
+ 
+ #include "pycore_token.h" /* For token types */
+ 
+-#define MAXINDENT 100   /* Max indentation level */
+-#define MAXLEVEL 200    /* Max parentheses level */
++#define MAXINDENT 100       /* Max indentation level */
++#define MAXLEVEL 200        /* Max parentheses level */
++#define MAXFSTRINGLEVEL 150 /* Max f-string nesting level */
+ 
+ enum decoding_state {
+     STATE_INIT,
+@@ -65,68 +66,68 @@ typedef struct _tokenizer_mode {
+ /* Tokenizer state */
+ struct tok_state {
+     /* Input state; buf <= cur <= inp <= end */
+     /* NB an entire line is held in the buffer */
+     char *buf;          /* Input buffer, or NULL; malloc'ed if fp != NULL */
+     char *cur;          /* Next character in buffer */
+     char *inp;          /* End of data in buffer */
+     int fp_interactive; /* If the file descriptor is interactive */
+     char *interactive_src_start; /* The start of the source parsed so far in interactive mode */
+     char *interactive_src_end; /* The end of the source parsed so far in interactive mode */
+     const char *end;    /* End of input buffer if buf != NULL */
+     const char *start;  /* Start of current token if not NULL */
+     int done;           /* E_OK normally, E_EOF at EOF, otherwise error code */
+     /* NB If done != E_OK, cur must be == inp!!! */
+     FILE *fp;           /* Rest of input; NULL if tokenizing a string */
+     int tabsize;        /* Tab spacing */
+     int indent;         /* Current indentation index */
+     int indstack[MAXINDENT];            /* Stack of indents */
+     int atbol;          /* Nonzero if at begin of new line */
+     int pendin;         /* Pending indents (if > 0) or dedents (if < 0) */
+     const char *prompt, *nextprompt;          /* For interactive prompting */
+     int lineno;         /* Current line number */
+     int first_lineno;   /* First line of a single line or multi line string
+                            expression (cf. issue 16806) */
+     int starting_col_offset; /* The column offset at the beginning of a token */
+     int col_offset;     /* Current col offset */
+     int level;          /* () [] {} Parentheses nesting level */
+             /* Used to allow free continuations inside them */
+     char parenstack[MAXLEVEL];
+     int parenlinenostack[MAXLEVEL];
+     int parencolstack[MAXLEVEL];
+     PyObject *filename;
+     /* Stuff for checking on different tab sizes */
+     int altindstack[MAXINDENT];         /* Stack of alternate indents */
+     /* Stuff for PEP 0263 */
+     enum decoding_state decoding_state;
+     int decoding_erred;         /* whether erred in decoding  */
+     char *encoding;         /* Source encoding. */
+     int cont_line;          /* whether we are in a continuation line. */
+     const char* line_start;     /* pointer to start of current line */
+     const char* multi_line_start; /* pointer to start of first line of
+                                      a single line or multi line string
+                                      expression (cf. issue 16806) */
+     PyObject *decoding_readline; /* open(...).readline */
+     PyObject *decoding_buffer;
+     const char* enc;        /* Encoding for the current str. */
+     char* str;          /* Source string being tokenized (if tokenizing from a string)*/
+     char* input;       /* Tokenizer's newline translated copy of the string. */
+ 
+     int type_comments;      /* Whether to look for type comments */
+ 
+     /* async/await related fields (still needed depending on feature_version) */
+     int async_hacks;     /* =1 if async/await aren't always keywords */
+     int async_def;        /* =1 if tokens are inside an 'async def' body. */
+     int async_def_indent; /* Indentation level of the outermost 'async def'. */
+     int async_def_nl;     /* =1 if the outermost 'async def' had at least one
+                              NEWLINE token after it. */
+     /* How to proceed when asked for a new token in interactive mode */
+     enum interactive_underflow_t interactive_underflow;
+     int report_warnings;
+     // TODO: Factor this into its own thing
+-    tokenizer_mode tok_mode_stack[MAXLEVEL];
++    tokenizer_mode tok_mode_stack[MAXFSTRINGLEVEL];
+     int tok_mode_stack_index;
+     int tok_report_warnings;
+ #ifdef Py_DEBUG
+     int debug;
+ #endif
+ };

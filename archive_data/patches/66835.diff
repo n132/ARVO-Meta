@@ -1,0 +1,218 @@
+commit 08ecfb5da586e7d28e92edab0881020f831e3e34
+Author: Reini Urban <reini.urban@gmail.com>
+Date:   Tue Feb 20 15:13:31 2024 +0100
+
+    indxf: fix UAF
+    
+    Fixes oss-fuzz 66835
+
+diff --git a/src/in_dxf.c b/src/in_dxf.c
+index e53ab823..20e039d9 100644
+--- a/src/in_dxf.c
++++ b/src/in_dxf.c
+@@ -12069,203 +12069,204 @@ static int
+ dxf_tables_read (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+ {
+   char table[80];
+   Dxf_Pair *pair;
+ 
+   pair = dxf_read_pair (dat);
+   table[0] = '\0'; // init
+   while (pair)     // read next 0 TABLE
+     {
+       if (pair->code == 0 && pair->value.s) // TABLE or ENDTAB
+         {
+           if (strEQc (pair->value.s, "TABLE"))
+             table[0] = '\0'; // new table coming up
+           else if (strEQc (pair->value.s, "BLOCK_RECORD"))
+             {
+               strncpy (table, pair->value.s, 79);
+               table[79] = '\0';
+             }
+           else if (strEQc (pair->value.s, "ENDTAB"))
+             {
+               table[0] = '\0'; // close table
+             }
+           else if (strEQc (pair->value.s, "ENDSEC"))
+             {
+               dxf_free_pair (pair);
+               return 0;
+             }
+           else
+             {
+               LOG_ERROR ("Unknown 0 %s (%s)", pair->value.s, "tables");
+               dxf_free_pair (pair);
+               return 1;
+             }
+         }
+       else if (pair->code == 2 && pair->value.s && strlen (pair->value.s) < 80
+                && is_table_name (pair->value.s)) // new table NAME
+         {
+           long i = 0;
+           BITCODE_BL ctrl_id;
+           strncpy (table, pair->value.s, 79);
+           table[79] = '\0';
+           pair = new_table_control (table, dat, dwg); // until 0 table
+           ctrl_id = dwg->num_objects - 1;             // dwg->object might move
+           while (pair && pair->code == 0 && pair->value.s
+                  && strEQ (pair->value.s, table))
+             {
+               Dwg_Object *obj;
+-              Dwg_Object *ctrl = &dwg->object[ctrl_id];
++              Dwg_Object *ctrl;
+               char *dxfname = strdup (pair->value.s);
+               BITCODE_BL idx = dwg->num_objects;
+               BITCODE_H ref;
+               dxf_free_pair (pair);
+               // until 0 table or 0 ENDTAB
+               pair = new_object (table, dxfname, dat, dwg, ctrl_id,
+                                  (BITCODE_BL *)&i);
+               obj = &dwg->object[idx];
++              ctrl = &dwg->object[ctrl_id];
+               if (!pair)
+                 {
+                   free (dxfname);
+                   if (idx != dwg->num_objects)
+                     obj->dxfname = NULL;
+                   return DWG_ERR_INVALIDDWG;
+                 }
+               // A minimal DXF will have no handle values
+               if (!obj->handle.value)
+                 {
+                   BITCODE_RLL next_handle = dwg_next_handle (dwg);
+                   dwg_add_handle (&obj->handle, 0, next_handle, NULL);
+                   // ref = dwg_add_handleref (dwg, 3, next_handle, ctrl);
+                   LOG_TRACE ("%s.handle = (0.%d." FORMAT_RLLx ")\n", obj->name,
+                              obj->handle.size, obj->handle.value);
+                 }
+               {
+                 Dwg_Object_BLOCK_CONTROL *_ctrl
+                     = ctrl->tio.object->tio.BLOCK_CONTROL;
+                 ref = dwg_add_handleref (dwg, 2, obj->handle.value, NULL);
+                 PUSH_HV (_ctrl, num_entries, entries, ref);
+               }
+               // undo BLOCK_CONTROL.entries and LTYPE_CONTROL.entries
+               if (strEQc (table, "BLOCK_RECORD"))
+                 {
+                   Dwg_Object_BLOCK_CONTROL *_ctrl
+                       = ctrl->tio.object->tio.BLOCK_CONTROL;
+                   if (_ctrl->model_space
+                       && obj->handle.value == _ctrl->model_space->absolute_ref)
+                     i--;
+                   else if (_ctrl->paper_space
+                            && obj->handle.value
+                                   == _ctrl->paper_space->absolute_ref)
+                     i--;
+                 }
+               else if (strEQc (table, "LTYPE"))
+                 {
+                   Dwg_Object_LTYPE *_obj = obj->tio.object->tio.LTYPE;
+                   Dwg_Object_LTYPE_CONTROL *_ctrl
+                       = ctrl->tio.object->tio.LTYPE_CONTROL;
+                   int j = _ctrl->num_entries;
+                   if (_ctrl->bylayer
+                       && obj->handle.value == _ctrl->bylayer->absolute_ref)
+                     i--;
+                   else if (_ctrl->byblock
+                            && obj->handle.value
+                                   == _ctrl->byblock->absolute_ref)
+                     i--;
+                   else
+                     {
+                       if (dwg->header.from_version > R_2004 && _obj->name
+                           && _obj->has_strings_area)
+                         {
+                           _obj->strings_area = (BITCODE_TF)xcalloc (512, 1);
+                           if (!_obj->strings_area)
+                             {
+                               free (dxfname);
+                               goto outofmem;
+                             }
+                         }
+                       if (dwg->header.from_version <= R_2004)
+                         {
+                           _obj->strings_area = (BITCODE_TF)xcalloc (256, 1);
+                           if (!_obj->strings_area)
+                             {
+                               free (dxfname);
+                               goto outofmem;
+                             }
+                         }
+                     }
+                 }
+             }
+           // next table
+           // fixup entries vs num_entries (no NULL entries)
+           {
+             Dwg_Object *ctrl = &dwg->object[ctrl_id];
+             Dwg_Object_BLOCK_CONTROL *_ctrl
+                 = ctrl->tio.object->tio.BLOCK_CONTROL;
+             int at_end = 1;
+             unsigned num_entries = 0;
+             if (!dwg_obj_is_control (ctrl))
+               {
+                 LOG_ERROR ("Missing CONTROL object");
+                 dxf_free_pair (pair);
+                 return 1;
+               }
+             // A minimal DXF will have no handle values, assign them then
+             if (!ctrl->handle.value)
+               {
+                 BITCODE_RLL next_handle = dwg_next_handle (dwg);
+                 dwg_add_handle (&ctrl->handle, 0, next_handle, NULL);
+                 // adds header_vars->CONTROL ref
+                 (void)dwg_ctrl_table (dwg, table);
+                 // ref = dwg_add_handleref (dwg, 3, next_handle, ctrl);
+                 LOG_TRACE ("%s.handle = (0.%d." FORMAT_RLLx ")\n", ctrl->name,
+                            ctrl->handle.size, ctrl->handle.value);
+               }
+             num_entries = _ctrl->num_entries;
+             if (_ctrl && ctrl->fixedtype == DWG_TYPE_BLOCK_CONTROL)
+               {
+                 for (int j = num_entries - 1; j >= 0; j--)
+                   {
+                     BITCODE_H ref = _ctrl->entries ? _ctrl->entries[j] : NULL;
+                     if (!ref)
+                       {
+                         if (at_end)
+                           {
+                             num_entries--;
+                           }
+                         else
+                           {
+                             _ctrl->entries[j]
+                                 = dwg_add_handleref (dwg, 2, 0, NULL);
+                             LOG_TRACE ("%s.entries[%d] = (2.0.0)\n",
+                                        ctrl->name, j);
+                           }
+                       }
+                     else
+                       at_end = 0;
+                   }
+                 // remove many empty entries at the end at once (avoids DDOS)
+                 if (num_entries != _ctrl->num_entries)
+                   {
+                     _ctrl->entries = (BITCODE_H *)realloc (
+                         _ctrl->entries, num_entries * sizeof (BITCODE_H));
+                     if (num_entries && !_ctrl->entries)
+                       goto outofmem;
+                     _ctrl->num_entries = num_entries;
+                     LOG_TRACE ("%s.num_entries => %d\n", ctrl->name,
+                                _ctrl->num_entries);
+                   }
+                 // leave room for one active entry
+                 if (_ctrl->num_entries == 1 && !_ctrl->entries[0])
+                   {
+                     _ctrl->entries[0] = dwg_add_handleref (dwg, 2, 0, NULL);
+                     LOG_TRACE ("%s.entries[0] = (2.0.0)\n", ctrl->name);
+                   }
+               }
+           }
+         }
+       DXF_RETURN_ENDSEC (0) // next TABLE or ENDSEC
+       dxf_free_pair (pair);
+       pair = dxf_read_pair (dat);
+       DXF_CHECK_EOF;
+     } // while (pair)
+   dxf_free_pair (pair);
+   return 0;

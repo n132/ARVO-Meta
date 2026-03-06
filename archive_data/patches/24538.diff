@@ -1,0 +1,411 @@
+commit f07b44cec577a117ad0028c35896804dc8efd548
+Author: Nickolay Olshevsky <o.nickolay@gmail.com>
+Date:   Sat Aug 1 14:54:54 2020 +0300
+
+    Correctly handle case with too long gpg s2k card serial number.
+
+diff --git a/src/librepgp/stream-dump.cpp b/src/librepgp/stream-dump.cpp
+index 18178bcf..33c65082 100644
+--- a/src/librepgp/stream-dump.cpp
++++ b/src/librepgp/stream-dump.cpp
+@@ -434,21 +434,22 @@ static void
+ dst_print_s2k(pgp_dest_t *dst, pgp_s2k_t *s2k)
+ {
+     dst_printf(dst, "s2k specifier: %d\n", (int) s2k->specifier);
+     if ((s2k->specifier == PGP_S2KS_EXPERIMENTAL) && s2k->gpg_ext_num) {
+         dst_printf(dst, "GPG extension num: %d\n", (int) s2k->gpg_ext_num);
+         if (s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) {
+-            dst_print_hex(
+-              dst, "card serial number", s2k->gpg_serial, s2k->gpg_serial_len, true);
++            static_assert(sizeof(s2k->gpg_serial) == 16, "invalid s2k->gpg_serial size");
++            size_t slen = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++            dst_print_hex(dst, "card serial number", s2k->gpg_serial, slen, true);
+         }
+         return;
+     }
+     dst_print_halg(dst, "s2k hash algorithm", s2k->hash_alg);
+     if ((s2k->specifier == PGP_S2KS_SALTED) ||
+         (s2k->specifier == PGP_S2KS_ITERATED_AND_SALTED)) {
+         dst_print_hex(dst, "s2k salt", s2k->salt, PGP_SALT_SIZE, false);
+     }
+     if (s2k->specifier == PGP_S2KS_ITERATED_AND_SALTED) {
+         size_t real_iter = pgp_s2k_decode_iterations(s2k->iterations);
+         dst_printf(dst, "s2k iterations: %zu (encoded as %u)\n", real_iter, s2k->iterations);
+     }
+ }
+@@ -1409,36 +1410,37 @@ static bool
+ obj_add_s2k_json(json_object *obj, pgp_s2k_t *s2k)
+ {
+     json_object *s2k_obj = json_object_new_object();
+     if (!obj_add_field_json(obj, "s2k", s2k_obj)) {
+         return false;
+     }
+     if (!obj_add_field_json(s2k_obj, "specifier", json_object_new_int(s2k->specifier))) {
+         return false;
+     }
+     if ((s2k->specifier == PGP_S2KS_EXPERIMENTAL) && s2k->gpg_ext_num) {
+         if (!obj_add_field_json(
+               s2k_obj, "gpg extension", json_object_new_int(s2k->gpg_ext_num))) {
+             return false;
+         }
+-        if ((s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) &&
+-            !obj_add_hex_json(
+-              s2k_obj, "card serial number", s2k->gpg_serial, s2k->gpg_serial_len)) {
+-            return false;
++        if (s2k->gpg_ext_num == PGP_S2K_GPG_SMARTCARD) {
++            size_t slen = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++            if (!obj_add_hex_json(s2k_obj, "card serial number", s2k->gpg_serial, slen)) {
++                return false;
++            }
+         }
+     }
+     if (!obj_add_intstr_json(s2k_obj, "hash algorithm", s2k->hash_alg, hash_alg_map)) {
+         return false;
+     }
+     if (((s2k->specifier == PGP_S2KS_SALTED) ||
+          (s2k->specifier == PGP_S2KS_ITERATED_AND_SALTED)) &&
+         !obj_add_hex_json(s2k_obj, "salt", s2k->salt, PGP_SALT_SIZE)) {
+         return false;
+     }
+     if (s2k->specifier == PGP_S2KS_ITERATED_AND_SALTED) {
+         size_t real_iter = pgp_s2k_decode_iterations(s2k->iterations);
+         if (!obj_add_field_json(s2k_obj, "iterations", json_object_new_int(real_iter))) {
+             return false;
+         }
+     }
+     return true;
+ }
+diff --git a/src/librepgp/stream-packet.cpp b/src/librepgp/stream-packet.cpp
+index 02141038..2879f571 100644
+--- a/src/librepgp/stream-packet.cpp
++++ b/src/librepgp/stream-packet.cpp
+@@ -576,58 +576,62 @@ static bool
+ get_packet_body_s2k(pgp_packet_body_t *body, pgp_s2k_t *s2k)
+ {
+     uint8_t spec = 0, halg = 0;
+     if (!get_packet_body_byte(body, &spec) || !get_packet_body_byte(body, &halg)) {
+         return false;
+     }
+     s2k->specifier = (pgp_s2k_specifier_t) spec;
+     s2k->hash_alg = (pgp_hash_alg_t) halg;
+ 
+     switch (s2k->specifier) {
+     case PGP_S2KS_SIMPLE:
+         return true;
+     case PGP_S2KS_SALTED:
+         return get_packet_body_buf(body, s2k->salt, PGP_SALT_SIZE);
+     case PGP_S2KS_ITERATED_AND_SALTED: {
+         uint8_t iter;
+         if (!get_packet_body_buf(body, s2k->salt, PGP_SALT_SIZE) ||
+             !get_packet_body_byte(body, &iter)) {
+             return false;
+         }
+         s2k->iterations = iter;
+         return true;
+     }
+     case PGP_S2KS_EXPERIMENTAL: {
+         uint8_t gnu[3] = {0};
+         if (!get_packet_body_buf(body, gnu, 3) || memcmp(gnu, "GNU", 3)) {
+             RNP_LOG("Unknown experimental s2k. Skipping.");
+             body->pos = body->len;
+             s2k->gpg_ext_num = PGP_S2K_GPG_NONE;
+             return true;
+         }
+         uint8_t ext_num = 0;
+         if (!get_packet_body_byte(body, &ext_num)) {
+             return false;
+         }
+         if ((ext_num != PGP_S2K_GPG_NO_SECRET) && (ext_num != PGP_S2K_GPG_SMARTCARD)) {
+             RNP_LOG("Unsupported gpg extension num: %" PRIu8, ext_num);
+         }
+         s2k->gpg_ext_num = (pgp_s2k_gpg_extension_t) ext_num;
+         if (s2k->gpg_ext_num == PGP_S2K_GPG_NO_SECRET) {
+             return true;
+         }
+         if (!get_packet_body_byte(body, &s2k->gpg_serial_len)) {
+             RNP_LOG("Failed to get GPG serial len");
+             return false;
+         }
+-        size_t len = s2k->gpg_serial_len > 16 ? 16 : s2k->gpg_serial_len;
++        size_t len = s2k->gpg_serial_len;
++        if (s2k->gpg_serial_len > 16) {
++            RNP_LOG("Warning: gpg_serial_len is %d", (int) len);
++            len = 16;
++        }
+         if (!get_packet_body_buf(body, s2k->gpg_serial, len)) {
+             RNP_LOG("Failed to get GPG serial");
+             return false;
+         }
+         return true;
+     }
+     default:
+         RNP_LOG("unknown s2k specifier: %d", (int) s2k->specifier);
+         return false;
+     }
+ }
+diff --git a/src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp b/src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp
+new file mode 100644
+index 00000000..93e7b090
+Binary files /dev/null and b/src/tests/data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp differ
+diff --git a/src/tests/ffi.cpp b/src/tests/ffi.cpp
+index a3d88423..baecdb46 100644
+--- a/src/tests/ffi.cpp
++++ b/src/tests/ffi.cpp
+@@ -5307,6 +5307,39 @@ TEST_F(rnp_tests, test_ffi_key_dump)
+     rnp_ffi_destroy(ffi);
+ }
+ 
++TEST_F(rnp_tests, test_ffi_key_dump_edge_cases)
++{
++    rnp_ffi_t ffi = NULL;
++    assert_rnp_success(rnp_ffi_create(&ffi, "GPG", "GPG"));
++
++    /* secret key, stored on gpg card, with too large card serial len */
++    rnp_input_t input = NULL;
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    rnp_output_t output = NULL;
++    assert_rnp_success(rnp_output_to_memory(&output, 0));
++    assert_rnp_success(rnp_dump_packets_to_output(input, output, 0));
++    rnp_input_destroy(input);
++    uint8_t *buf = NULL;
++    size_t   len = 0;
++    assert_rnp_success(rnp_output_memory_get_buf(output, &buf, &len, false));
++    buf[len - 1] = '\0';
++    assert_non_null(strstr(
++      (char *) buf, "card serial number: 0x000102030405060708090a0b0c0d0e0f (16 bytes)"));
++    rnp_output_destroy(output);
++
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    char *json = NULL;
++    assert_rnp_success(rnp_dump_packets_to_json(input, 0, &json));
++    rnp_input_destroy(input);
++    assert_non_null(
++      strstr(json, "\"card serial number\":\"000102030405060708090a0b0c0d0e0f\""));
++    rnp_buffer_destroy(json);
++
++    rnp_ffi_destroy(ffi);
++}
++
+ TEST_F(rnp_tests, test_ffi_key_userid_dump_has_no_special_chars)
+ {
+     rnp_ffi_t    ffi = NULL;
+@@ -9330,187 +9363,204 @@ TEST_F(rnp_tests, test_ffi_key_import_edge_cases)
+ TEST_F(rnp_tests, test_ffi_key_import_gpg_s2k)
+ {
+     rnp_ffi_t ffi = NULL;
+     assert_rnp_success(rnp_ffi_create(&ffi, "GPG", "GPG"));
+ 
+     /* secret subkeys, exported via gpg --export-secret-subkeys (no primary secret key data) */
+     rnp_input_t input = NULL;
+     assert_rnp_success(
+       rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-1-subs.pgp"));
+     assert_rnp_success(rnp_import_keys(
+       ffi, input, RNP_LOAD_SAVE_PUBLIC_KEYS | RNP_LOAD_SAVE_SECRET_KEYS, NULL));
+     rnp_input_destroy(input);
+     rnp_key_handle_t key = NULL;
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
+     bool secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     bool locked = false;
+     assert_rnp_success(rnp_key_is_locked(key, &locked));
+     assert_true(locked);
+     assert_rnp_failure(rnp_key_unlock(key, "password"));
+     size_t count = 0;
+     assert_rnp_success(rnp_key_get_subkey_count(key, &count));
+     assert_int_equal(count, 2);
+     /* signing secret subkey */
+     rnp_key_handle_t sub = NULL;
+     assert_rnp_success(rnp_key_get_subkey_at(key, 0, &sub));
+     char *keyid = NULL;
+     assert_rnp_success(rnp_key_get_keyid(sub, &keyid));
+     assert_string_equal(keyid, "22F3A217C0E439CB");
+     rnp_buffer_destroy(keyid);
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(sub, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     assert_rnp_success(rnp_key_unlock(sub, "password"));
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_false(locked);
+     rnp_key_handle_destroy(sub);
+     /* encrypting secret subkey */
+     assert_rnp_success(rnp_key_get_subkey_at(key, 1, &sub));
+     assert_rnp_success(rnp_key_get_keyid(sub, &keyid));
+     assert_string_equal(keyid, "DD23CEB7FEBEFF17");
+     rnp_buffer_destroy(keyid);
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(sub, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     assert_rnp_success(rnp_key_unlock(sub, "password"));
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_false(locked);
+     rnp_key_handle_destroy(sub);
+     rnp_key_handle_destroy(key);
+ 
+     /* save keyrings and reload */
+     rnp_output_t output = NULL;
+     assert_rnp_success(rnp_output_to_path(&output, "pubring.gpg"));
+     assert_rnp_success(rnp_save_keys(ffi, "GPG", output, RNP_LOAD_SAVE_PUBLIC_KEYS));
+     assert_rnp_success(rnp_output_destroy(output));
+     assert_rnp_success(rnp_output_to_path(&output, "secring.gpg"));
+     assert_rnp_success(rnp_save_keys(ffi, "GPG", output, RNP_LOAD_SAVE_SECRET_KEYS));
+     assert_rnp_success(rnp_output_destroy(output));
+     assert_rnp_success(rnp_ffi_destroy(ffi));
+     /* re-init ffi and load keys */
+     assert_rnp_success(rnp_ffi_create(&ffi, "GPG", "GPG"));
+     assert_rnp_success(rnp_input_from_path(&input, "pubring.gpg"));
+     assert_rnp_success(rnp_load_keys(ffi, "GPG", input, RNP_LOAD_SAVE_PUBLIC_KEYS));
+     rnp_input_destroy(input);
+     assert_rnp_success(rnp_input_from_path(&input, "secring.gpg"));
+     assert_rnp_success(rnp_load_keys(ffi, "GPG", input, RNP_LOAD_SAVE_SECRET_KEYS));
+     rnp_input_destroy(input);
+     assert_int_equal(unlink("pubring.gpg"), 0);
+     assert_int_equal(unlink("secring.gpg"), 0);
+ 
+     key = NULL;
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(key, &locked));
+     assert_true(locked);
+     count = 0;
+     assert_rnp_success(rnp_key_get_subkey_count(key, &count));
+     assert_int_equal(count, 2);
+     /* signing secret subkey */
+     sub = NULL;
+     assert_rnp_success(rnp_key_get_subkey_at(key, 0, &sub));
+     keyid = NULL;
+     assert_rnp_success(rnp_key_get_keyid(sub, &keyid));
+     assert_string_equal(keyid, "22F3A217C0E439CB");
+     rnp_buffer_destroy(keyid);
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(sub, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     rnp_key_handle_destroy(sub);
+     /* encrypting secret subkey */
+     assert_rnp_success(rnp_key_get_subkey_at(key, 1, &sub));
+     assert_rnp_success(rnp_key_get_keyid(sub, &keyid));
+     assert_string_equal(keyid, "DD23CEB7FEBEFF17");
+     rnp_buffer_destroy(keyid);
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(sub, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     rnp_key_handle_destroy(sub);
+     rnp_key_handle_destroy(key);
+ 
+     /* secret subkeys, and key stored on the smartcard by gpg */
+     assert_rnp_success(
+       rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card.pgp"));
+     assert_rnp_success(rnp_import_keys(
+       ffi, input, RNP_LOAD_SAVE_PUBLIC_KEYS | RNP_LOAD_SAVE_SECRET_KEYS, NULL));
+     rnp_input_destroy(input);
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(key, &locked));
+     assert_true(locked);
+     assert_rnp_failure(rnp_key_unlock(key, "password"));
+     count = 0;
+     assert_rnp_success(rnp_key_get_subkey_count(key, &count));
+     assert_int_equal(count, 2);
+     /* signing secret subkey */
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "22F3A217C0E439CB", &sub));
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     rnp_key_handle_destroy(sub);
+     /* encrypting secret subkey */
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "DD23CEB7FEBEFF17", &sub));
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     locked = false;
+     assert_rnp_success(rnp_key_is_locked(sub, &locked));
+     assert_true(locked);
+     rnp_key_handle_destroy(sub);
+     rnp_key_handle_destroy(key);
+ 
+     /* save keyrings and reload */
+     output = NULL;
+     assert_rnp_success(rnp_output_to_path(&output, "pubring.gpg"));
+     assert_rnp_success(rnp_save_keys(ffi, "GPG", output, RNP_LOAD_SAVE_PUBLIC_KEYS));
+     assert_rnp_success(rnp_output_destroy(output));
+     assert_rnp_success(rnp_output_to_path(&output, "secring.gpg"));
+     assert_rnp_success(rnp_save_keys(ffi, "GPG", output, RNP_LOAD_SAVE_SECRET_KEYS));
+     assert_rnp_success(rnp_output_destroy(output));
+     assert_rnp_success(rnp_ffi_destroy(ffi));
+     /* re-init ffi and load keys */
+     assert_rnp_success(rnp_ffi_create(&ffi, "GPG", "GPG"));
+     assert_rnp_success(rnp_input_from_path(&input, "pubring.gpg"));
+     assert_rnp_success(rnp_load_keys(ffi, "GPG", input, RNP_LOAD_SAVE_PUBLIC_KEYS));
+     rnp_input_destroy(input);
+     assert_rnp_success(rnp_input_from_path(&input, "secring.gpg"));
+     assert_rnp_success(rnp_load_keys(ffi, "GPG", input, RNP_LOAD_SAVE_SECRET_KEYS));
+     rnp_input_destroy(input);
+     assert_int_equal(unlink("pubring.gpg"), 0);
+     assert_int_equal(unlink("secring.gpg"), 0);
+ 
+     key = NULL;
+     assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
+     secret = false;
+     assert_rnp_success(rnp_key_have_secret(key, &secret));
+     assert_true(secret);
+     count = 0;
+     assert_rnp_success(rnp_key_get_subkey_count(key, &count));
+     assert_int_equal(count, 2);
+     rnp_key_handle_destroy(key);
+ 
++    /* load key with too large gpg_serial_len */
++    assert_rnp_success(rnp_unload_keys(ffi, RNP_KEY_UNLOAD_PUBLIC | RNP_KEY_UNLOAD_SECRET));
++    assert_rnp_success(
++      rnp_input_from_path(&input, "data/test_key_edge_cases/alice-s2k-101-2-card-len.pgp"));
++    assert_rnp_success(rnp_import_keys(
++      ffi, input, RNP_LOAD_SAVE_PUBLIC_KEYS | RNP_LOAD_SAVE_SECRET_KEYS, NULL));
++    rnp_input_destroy(input);
++    assert_rnp_success(rnp_locate_key(ffi, "keyid", "0451409669FFDE3C", &key));
++    secret = false;
++    assert_rnp_success(rnp_key_have_secret(key, &secret));
++    assert_true(secret);
++    locked = false;
++    assert_rnp_success(rnp_key_is_locked(key, &locked));
++    assert_true(locked);
++    assert_rnp_failure(rnp_key_unlock(key, "password"));
++    rnp_key_handle_destroy(key);
++
+     rnp_ffi_destroy(ffi);
+ }
+ 
+diff --git a/src/tests/rnp_tests.h b/src/tests/rnp_tests.h
+index 37614af3..9e3e7b91 100644
+--- a/src/tests/rnp_tests.h
++++ b/src/tests/rnp_tests.h
+@@ -235,6 +235,8 @@ void test_ffi_key_export_customized_enarmor(void **state);
+ 
+ void test_ffi_key_dump(void **state);
+ 
++void test_ffi_key_dump_edge_cases(void **state);
++
+ void test_ffi_key_userid_dump_has_no_special_chars(void **state);
+ 
+ void test_ffi_pkt_dump(void **state);

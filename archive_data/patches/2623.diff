@@ -1,0 +1,198 @@
+commit 56204921b666cfb237f0579a603a946756a1559b
+Author: Frederik Deweerdt <fdeweerdt@fastly.com>
+Date:   Fri Oct 13 14:57:28 2017 +0900
+
+    in streaming body mode, send error when receiving data after end_of_stream
+
+diff --git a/lib/core/proxy.c b/lib/core/proxy.c
+index 2dbee04cf..1d937ea71 100644
+--- a/lib/core/proxy.c
++++ b/lib/core/proxy.c
+@@ -587,7 +587,10 @@ static void proxy_write_req_chunk_done(void *priv, size_t written, int done)
+ static int frontend_write_req_chunk(void *priv, h2o_iovec_t payload, int is_end_stream)
+ {
+     struct rp_generator_t *self = priv;
+ 
++    if (is_end_stream) {
++        self->src_req->_write_req_chunk.cb = NULL;
++    }
+     return h2o_http1client_write_req_chunk(self->client->sock, payload, is_end_stream);
+ }
+ 
+diff --git a/lib/http2/connection.c b/lib/http2/connection.c
+index 8cda768cb..066dfd995 100644
+--- a/lib/http2/connection.c
++++ b/lib/http2/connection.c
+@@ -595,51 +595,51 @@ static int write_req_chunk(void *req_, h2o_iovec_t payload, int is_end_stream)
+ static int handle_data_frame(h2o_http2_conn_t *conn, h2o_http2_frame_t *frame, const char **err_desc)
+ {
+     h2o_http2_data_payload_t payload;
+     h2o_http2_stream_t *stream;
+     int ret;
+ 
+     if ((ret = h2o_http2_decode_data_payload(&payload, frame, err_desc)) != 0)
+         return ret;
+ 
+     if (conn->state >= H2O_HTTP2_CONN_STATE_HALF_CLOSED)
+         return 0;
+ 
+     update_input_window(conn, 0, &conn->_input_window, payload.length);
+ 
+     stream = h2o_http2_conn_get_stream(conn, frame->stream_id);
+ 
+     /* save the input in the request body buffer, or send error (and close the stream) */
+     if (stream == NULL) {
+         if (frame->stream_id <= conn->pull_stream_ids.max_open) {
+             stream_send_error(conn, frame->stream_id, H2O_HTTP2_ERROR_STREAM_CLOSED);
+             stream = NULL;
+         } else {
+             *err_desc = "invalid DATA frame";
+             return H2O_HTTP2_ERROR_PROTOCOL;
+         }
+-    } else if (stream->state != H2O_HTTP2_STREAM_STATE_RECV_BODY) {
++    } else if (stream->state != H2O_HTTP2_STREAM_STATE_RECV_BODY || !stream->req._write_req_chunk.cb) {
+         stream_send_error(conn, frame->stream_id, H2O_HTTP2_ERROR_STREAM_CLOSED);
+         h2o_http2_stream_reset(conn, stream);
+         stream = NULL;
+     } else if (h2o_http2_stream_req_body_size(stream) + payload.length > conn->super.ctx->globalconf->max_request_entity_size) {
+         stream_send_error(conn, frame->stream_id, H2O_HTTP2_ERROR_REFUSED_STREAM);
+         h2o_http2_stream_reset(conn, stream);
+         stream = NULL;
+     } else {
+         int ret;
+ 
+         if (!stream->request_blocked_by_server) {
+             h2o_http2_stream_set_request_blocked_by_server(conn, stream, 1);
+             update_idle_timeout(conn);
+         }
+ 
+         ret = stream->req._write_req_chunk.cb(stream->req._write_req_chunk.priv, h2o_iovec_init(payload.data, payload.length),
+                                               frame->flags & H2O_HTTP2_FRAME_FLAG_END_STREAM);
+         if (ret < 0) {
+             stream_send_error(conn, frame->stream_id, H2O_HTTP2_ERROR_STREAM_CLOSED);
+             h2o_http2_stream_reset(conn, stream);
+             stream = NULL;
+             goto UpdateWindow;
+         }
+         return 0;
+     }
+diff --git a/t/50too-much-data.t b/t/50too-much-data.t
+new file mode 100644
+index 000000000..64cbc8ebe
+--- /dev/null
++++ b/t/50too-much-data.t
+@@ -0,0 +1,66 @@
++use strict;
++use warnings;
++use Net::EmptyPort qw(check_port empty_port);
++use Test::More;
++use t::Util;
++
++my $upstream_port = empty_port();
++
++my $upstream = spawn_server(
++    argv     => [ qw(plackup -s Starlet --keepalive-timeout 100 --access-log /dev/null --listen), $upstream_port, ASSETS_DIR . "/upstream.psgi" ],
++    is_ready =>  sub {
++        check_port($upstream_port);
++    },
++);
++
++
++my $server = spawn_h2o(<< "EOT");
++http2-idle-timeout: 2
++hosts:
++  default:
++    paths:
++      "/":
++        proxy.reverse.url: http://127.0.0.1:$upstream_port
++EOT
++
++sub test {
++    my ($iter, $data_size, $sleep, $second_end_stream) = @_;
++    my $output = run_with_h2get_simple($server, <<"EOR");
++    req = {
++        ":method" => "POST",
++        ":authority" => host,
++        ":scheme" => "https",
++        ":path" => "/echo-headers",
++    }
++    h2g.send_headers(req, 1, END_HEADERS)
++    (1..$iter).each { |c| h2g.send_data(1, 0, "a" * $data_size) }
++    h2g.send_data(1, END_STREAM, "")
++    $sleep
++    (1..$iter).each { |c| h2g.send_data(1, 0, "a" * $data_size) }
++    h2g.send_data(1, END_STREAM, "") if $second_end_stream
++
++    while true
++        f = h2g.read(1000)
++        if f == nil
++            puts "timeout"
++            exit 1
++        end
++        puts "#{f.type}, stream_id:#{f.stream_id}, len:#{f.len}, flags:#{f.flags}"
++    end
++EOR
++
++    like $output, qr{RST_STREAM}, "h2get script got at RST_STREAM";
++}
++
++foreach my $iter ((1, 10, 100)) {
++    foreach my $sleep (("", "sleep 1")) {
++        foreach my $data_size ((1, 10000)) {
++            foreach my $second_end_stream (("true", "false")) {
++                diag("nr DATA packets: $iter, DATA size: $data_size, sleep directive: '$sleep', second END_HEADERS: $second_end_stream");
++                test($iter, $data_size, $sleep, $second_end_stream);
++            }
++        }
++    }
++}
++done_testing();
++
+diff --git a/t/Util.pm b/t/Util.pm
+index d01ca7cc5..c989dacf0 100644
+--- a/t/Util.pm
++++ b/t/Util.pm
+@@ -12,7 +12,7 @@ use Test::More;
+ use Time::HiRes qw(sleep);
+ 
+ use base qw(Exporter);
+-our @EXPORT = qw(ASSETS_DIR DOC_ROOT bindir server_features exec_unittest exec_mruby_unittest spawn_server spawn_h2o empty_ports create_data_file md5_file prog_exists run_prog openssl_can_negotiate curl_supports_http2 run_with_curl run_with_h2get);
++our @EXPORT = qw(ASSETS_DIR DOC_ROOT bindir server_features exec_unittest exec_mruby_unittest spawn_server spawn_h2o empty_ports create_data_file md5_file prog_exists run_prog openssl_can_negotiate curl_supports_http2 run_with_curl run_with_h2get run_with_h2get_simple);
+ 
+ use constant ASSETS_DIR => 't/assets';
+ use constant DOC_ROOT   => ASSETS_DIR . "/doc_root";
+@@ -285,11 +285,34 @@ sub run_with_curl {
+ sub run_with_h2get {
+     my ($server, $script) = @_;
+     plan skip_all => "h2get not found"
+         unless prog_exists(bindir()."/h2get_bin/h2get");
+     my ($scriptfh, $scriptfn) = tempfile(UNLINK => 1);
+     print $scriptfh $script;
+     close($scriptfh);
+     return run_prog(bindir()."/h2get_bin/h2get $scriptfn https://127.0.0.1:$server->{tls_port}");
+ }
+ 
++sub run_with_h2get_simple {
++    my ($server, $script) = @_;
++    my $settings = <<'EOS';
++    h2g = H2.new
++    host = ARGV[0]
++    h2g.connect(host)
++    h2g.send_prefix()
++    h2g.send_settings()
++    i = 0
++    while i < 2 do
++        f = h2g.read(-1)
++        if f.type == "SETTINGS" and (f.flags == ACK) then
++            i += 1
++        elsif f.type == "SETTINGS" then
++            h2g.send_settings_ack()
++            i += 1
++        end
++    end
++EOS
++    run_with_h2get($server, $settings."\n".$script);
++}
++
++
+ 1;

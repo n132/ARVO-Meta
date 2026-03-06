@@ -1,0 +1,312 @@
+commit 08488f66b6028761d8eb60a3bddb9aa080a2af4a
+Author: Willy Tarreau <w@1wt.eu>
+Date:   Fri Jun 26 17:24:54 2020 +0200
+
+    BUG/MINOR: cfgparse: correctly deal with empty lines
+    
+    Issue 23653 in oss-fuzz reports a heap overflow bug which is in fact a
+    bug introduced by commit 9e1758efb ("BUG/MEDIUM: cfgparse: use
+    parse_line() to expand/unquote/unescape config lines") to address
+    oss-fuzz issue 22689, which was only partially fixed by commit 70f58997f
+    ("BUG/MINOR: cfgparse: Support configurations without newline at EOF").
+    
+    Actually on an empty line, end == line so we cannot dereference end-1
+    to check for a trailing LF without first being sure that end is greater
+    than line.
+    
+    No backport is needed, this is 2.2 only.
+
+diff --git a/src/cfgparse.c b/src/cfgparse.c
+index 92f17691c..63efc9114 100644
+--- a/src/cfgparse.c
++++ b/src/cfgparse.c
+@@ -1833,288 +1833,288 @@ cfg_parse_track_sc_num(unsigned int *track_sc_num,
+ /*
+  * This function reads and parses the configuration file given in the argument.
+  * Returns the error code, 0 if OK, or any combination of :
+  *  - ERR_ABORT: must abort ASAP
+  *  - ERR_FATAL: we can continue parsing but not start the service
+  *  - ERR_WARN: a warning has been emitted
+  *  - ERR_ALERT: an alert has been emitted
+  * Only the two first ones can stop processing, the two others are just
+  * indicators.
+  */
+ int readcfgfile(const char *file)
+ {
+ 	char *thisline;
+ 	int linesize = LINESIZE;
+ 	FILE *f;
+ 	int linenum = 0;
+ 	int err_code = 0;
+ 	struct cfg_section *cs = NULL, *pcs = NULL;
+ 	struct cfg_section *ics;
+ 	int readbytes = 0;
+ 	char *outline = NULL;
+ 	size_t outlen = 0;
+ 	size_t outlinesize = 0;
+ 	int fatal = 0;
+ 	int missing_lf = -1;
+ 
+ 	if ((thisline = malloc(sizeof(*thisline) * linesize)) == NULL) {
+ 		ha_alert("parsing [%s] : out of memory.\n", file);
+ 		return -1;
+ 	}
+ 
+ 	if ((f=fopen(file,"r")) == NULL) {
+ 		free(thisline);
+ 		return -1;
+ 	}
+ 
+ next_line:
+ 	while (fgets(thisline + readbytes, linesize - readbytes, f) != NULL) {
+ 		int arg, kwm = KWM_STD;
+ 		char *end;
+ 		char *args[MAX_LINE_ARGS + 1];
+ 		char *line = thisline;
+ 
+ 		if (missing_lf != -1) {
+ 			ha_warning("parsing [%s:%d]: Stray NUL character at position %d. "
+ 			           "This will become a hard error in HAProxy 2.3.\n",
+ 			           file, linenum, (missing_lf + 1));
+ 			err_code |= ERR_WARN;
+ 			missing_lf = -1;
+ 		}
+ 
+ 		linenum++;
+ 
+ 		if (fatal >= 50) {
+ 			ha_alert("parsing [%s:%d]: too many fatal errors (%d), stopping now.\n", file, linenum, fatal);
+ 			break;
+ 		}
+ 
+ 		end = line + strlen(line);
+ 
+ 		if (end-line == linesize-1 && *(end-1) != '\n') {
+ 			/* Check if we reached the limit and the last char is not \n.
+ 			 * Watch out for the last line without the terminating '\n'!
+ 			 */
+ 			char *newline;
+ 			int newlinesize = linesize * 2;
+ 
+ 			newline = realloc(thisline, sizeof(*thisline) * newlinesize);
+ 			if (newline == NULL) {
+ 				ha_alert("parsing [%s:%d]: line too long, cannot allocate memory.\n",
+ 					 file, linenum);
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				linenum--;
+ 				continue;
+ 			}
+ 
+ 			readbytes = linesize - 1;
+ 			linesize = newlinesize;
+ 			thisline = newline;
+ 			linenum--;
+ 			continue;
+ 		}
+ 
+ 		readbytes = 0;
+ 
+-		if (*(end-1) == '\n') {
++		if (end > line && *(end-1) == '\n') {
+ 			/* kill trailing LF */
+ 			*(end - 1) = 0;
+ 		}
+ 		else {
+ 			/* mark this line as truncated */
+ 			missing_lf = end - line;
+ 		}
+ 
+ 		/* skip leading spaces */
+ 		while (isspace((unsigned char)*line))
+ 			line++;
+ 
+ 		if (*line == '[') {/* This is the beginning if a scope */
+ 			err_code |= cfg_parse_scope(file, linenum, line);
+ 			goto next_line;
+ 		}
+ 
+ 		while (1) {
+ 			uint32_t err;
+ 			char *errptr;
+ 
+ 			arg = MAX_LINE_ARGS + 1;
+ 			outlen = outlinesize;
+ 			err = parse_line(line, outline, &outlen, args, &arg,
+ 					 PARSE_OPT_ENV | PARSE_OPT_DQUOTE | PARSE_OPT_SQUOTE |
+ 					 PARSE_OPT_BKSLASH | PARSE_OPT_SHARP, &errptr);
+ 
+ 			if (err & PARSE_ERR_QUOTE) {
+ 				size_t newpos = sanitize_for_printing(line, errptr - line, 80);
+ 
+ 				ha_alert("parsing [%s:%d]: unmatched quote at position %d:\n"
+ 					 "  %s\n  %*s\n", file, linenum, (int)(errptr-thisline+1), line, (int)(newpos+1), "^");
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				goto next_line;
+ 			}
+ 
+ 			if (err & PARSE_ERR_BRACE) {
+ 				size_t newpos = sanitize_for_printing(line, errptr - line, 80);
+ 
+ 				ha_alert("parsing [%s:%d]: unmatched brace in environment variable name at position %d:\n"
+ 					 "  %s\n  %*s\n", file, linenum, (int)(errptr-thisline+1), line, (int)(newpos+1), "^");
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				goto next_line;
+ 			}
+ 
+ 			if (err & PARSE_ERR_VARNAME) {
+ 				size_t newpos = sanitize_for_printing(line, errptr - line, 80);
+ 
+ 				ha_alert("parsing [%s:%d]: forbidden first char in environment variable name at position %d:\n"
+ 					 "  %s\n  %*s\n", file, linenum, (int)(errptr-thisline+1), line, (int)(newpos+1), "^");
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				goto next_line;
+ 			}
+ 
+ 			if (err & PARSE_ERR_HEX) {
+ 				size_t newpos = sanitize_for_printing(line, errptr - line, 80);
+ 
+ 				ha_alert("parsing [%s:%d]: truncated or invalid hexadecimal sequence at position %d:\n"
+ 					 "  %s\n  %*s\n", file, linenum, (int)(errptr-thisline+1), line, (int)(newpos+1), "^");
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				goto next_line;
+ 			}
+ 
+ 			if (err & (PARSE_ERR_TOOLARGE|PARSE_ERR_OVERLAP)) {
+ 				outlinesize = (outlen + 1023) & -1024;
+ 				outline = realloc(outline, outlinesize);
+ 				if (outline == NULL) {
+ 					ha_alert("parsing [%s:%d]: line too long, cannot allocate memory.\n",
+ 						 file, linenum);
+ 					err_code |= ERR_ALERT | ERR_FATAL;
+ 					fatal++;
+ 					goto next_line;
+ 				}
+ 				/* try again */
+ 				continue;
+ 			}
+ 
+ 			if (err & PARSE_ERR_TOOMANY) {
+ 				/* only check this *after* being sure the output is allocated */
+ 				ha_alert("parsing [%s:%d]: too many words, truncating after word %d, position %ld: <%s>.\n",
+ 					 file, linenum, MAX_LINE_ARGS, (long)(args[MAX_LINE_ARGS-1] - outline + 1), args[MAX_LINE_ARGS-1]);
+ 				err_code |= ERR_ALERT | ERR_FATAL;
+ 				fatal++;
+ 				goto next_line;
+ 			}
+ 
+ 			/* everything's OK */
+ 			break;
+ 		}
+ 
+ 		/* empty line */
+ 		if (!**args)
+ 			continue;
+ 
+ 		/* check for keyword modifiers "no" and "default" */
+ 		if (!strcmp(args[0], "no")) {
+ 			char *tmp;
+ 
+ 			kwm = KWM_NO;
+ 			tmp = args[0];
+ 			for (arg=0; *args[arg+1]; arg++)
+ 				args[arg] = args[arg+1];		// shift args after inversion
+ 			*tmp = '\0'; 					// fix the next arg to \0
+ 			args[arg] = tmp;
+ 		}
+ 		else if (!strcmp(args[0], "default")) {
+ 			kwm = KWM_DEF;
+ 			for (arg=0; *args[arg+1]; arg++)
+ 				args[arg] = args[arg+1];		// shift args after inversion
+ 		}
+ 
+ 		if (kwm != KWM_STD && strcmp(args[0], "option") != 0 &&
+ 		    strcmp(args[0], "log") != 0 && strcmp(args[0], "busy-polling") != 0 &&
+ 		    strcmp(args[0], "set-dumpable") != 0 && strcmp(args[0], "strict-limits") != 0 &&
+ 		    strcmp(args[0], "insecure-fork-wanted") != 0) {
+ 			ha_alert("parsing [%s:%d]: negation/default currently "
+ 				 "supported only for options, log, busy-polling, "
+ 				 "set-dumpable, strict-limits, and insecure-fork-wanted.\n", file, linenum);
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+ 			fatal++;
+ 		}
+ 
+ 		/* detect section start */
+ 		list_for_each_entry(ics, &sections, list) {
+ 			if (strcmp(args[0], ics->section_name) == 0) {
+ 				cursection = ics->section_name;
+ 				pcs = cs;
+ 				cs = ics;
+ 				break;
+ 			}
+ 		}
+ 
+ 		if (pcs && pcs->post_section_parser) {
+ 			int status;
+ 
+ 			status = pcs->post_section_parser();
+ 			err_code |= status;
+ 			if (status & ERR_FATAL)
+ 				fatal++;
+ 
+ 			if (err_code & ERR_ABORT)
+ 				goto err;
+ 		}
+ 		pcs = NULL;
+ 
+ 		if (!cs) {
+ 			ha_alert("parsing [%s:%d]: unknown keyword '%s' out of section.\n", file, linenum, args[0]);
+ 			err_code |= ERR_ALERT | ERR_FATAL;
+ 			fatal++;
+ 		} else {
+ 			int status;
+ 
+ 			status = cs->section_parser(file, linenum, args, kwm);
+ 			err_code |= status;
+ 			if (status & ERR_FATAL)
+ 				fatal++;
+ 
+ 			if (err_code & ERR_ABORT)
+ 				goto err;
+ 		}
+ 	}
+ 
+ 	if (missing_lf != -1) {
+ 		ha_warning("parsing [%s:%d]: Missing LF on last line, file might have been truncated at position %d. "
+ 		           "This will become a hard error in HAProxy 2.3.\n",
+ 		           file, linenum, (missing_lf + 1));
+ 		err_code |= ERR_WARN;
+ 	}
+ 
+ 	if (cs && cs->post_section_parser)
+ 		err_code |= cs->post_section_parser();
+ 
+ err:
+ 	free(cfg_scope);
+ 	cfg_scope = NULL;
+ 	cursection = NULL;
+ 	free(thisline);
+ 	free(outline);
+ 	fclose(f);
+ 	return err_code;
+ }
+ 
+ /* This function propagates processes from frontend <from> to backend <to> so
+  * that it is always guaranteed that a backend pointed to by a frontend is
+  * bound to all of its processes. After that, if the target is a "listen"
+  * instance, the function recursively descends the target's own targets along
+  * default_backend and use_backend rules. Since the bits are
+  * checked first to ensure that <to> is already bound to all processes of
+  * <from>, there is no risk of looping and we ensure to follow the shortest
+  * path to the destination.
+  *
+  * It is possible to set <to> to NULL for the first call so that the function
+  * takes care of visiting the initial frontend in <from>.
+  *
+  * It is important to note that the function relies on the fact that all names
+  * have already been resolved.
+  */

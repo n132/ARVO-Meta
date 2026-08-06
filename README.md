@@ -3,12 +3,17 @@
 This repository contains metadata and usage instructions for the ARVO vulnerability dataset described in our paper [ARVO: Atlas of Reproducible Vulnerabilities for Open-Source Software](./2026155803.pdf).
 
 ```bibtex
-@inproceedings{mei2026arvo,
-  title     = {{ARVO}: Atlas of Reproducible Vulnerabilities for Open-Source Software},
-  author    = {Mei, Xiang and Del Castillo, Jordi and Singh Singaria, Pulkit and Xi, Haoran and Benchikh, Abdelouahab and Bao, Tiffany and Wang, Ruoyu and Shoshitaishvili, Yan and Doup\'{e}, Adam and Pearce, Hammond and Dolan-Gavitt, Brendan},
-  booktitle = {IEEE European Symposium on Security and Privacy (EuroS\&P)},
-  year      = {2026}
-}
+@INPROCEEDINGS{11624217,
+  author={Mei, Xiang and Castillo, Jordi Del and Singh Singaria, Pulkit and Xi, Haoran and Benchikh, Abdelouahab and Bao, Tiffany and Wang, Ruoyu and Shoshitaishvili, Yan and Doupé, Adam and Pearce, Hammond and Dolan-Gavitt, Brendan},
+  booktitle={2026 IEEE 11th European Symposium on Security and Privacy (EuroS&P)}, 
+  title={ARVO: Atlas of Reproducible Vulnerabilities for Open-Source Software}, 
+  year={2026},
+  volume={},
+  number={},
+  pages={860-873},
+  keywords={Fuzzing;Security;Computer bugs;Printing;Software;Manuals;Codes;Accuracy;Labeling;Open source software;vulnerability dataset;reproducibility;open-source software},
+  doi={10.1109/EuroSP68448.2026.00060}}
+
 ```
 
 The code to generate the ARVO dataset is public on [ARVO][8]. The generated dokcer images and related metadata are updated on [dockerhub][10] and [the release page][9].

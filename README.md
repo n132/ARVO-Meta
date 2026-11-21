@@ -24,6 +24,12 @@ Download the arvo.db file on [the release page][9]. Each record includes related
 
 # How to use ARVO
 
+> ARVO has surpassed 20 million Docker Hub pulls! 🎉
+> You can check the latest pull count with:
+```bash
+curl -s https://hub.docker.com/v2/repositories/n132/arvo/ | jq '.pull_count'
+```
+
 Run the following command to feed the proof-of-concept (POC) to a vulnerability found on [this page][3]. You should see an ASAN report for a heap overflow bug.
 
 ```bash
@@ -55,6 +61,7 @@ arvo compile
 # Run this command inside the Docker container
 arvo
 ```
+
 # Patches
 
 In the [patches][5] folder, we provide the patches ARVO located for each vulnerability.
